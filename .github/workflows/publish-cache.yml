@@ -36,33 +36,6 @@ jobs:
             echo "::notice::Cache packages will not be signed. Set NIX_SIGNING_KEY secret to enable signing. Clients will need require-sigs = false."
           fi
 
-      - name: Update flake inputs and commit changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Update flake inputs
-          cd config
-          nix flake update
-          cd ..
-
-          # Stage any changes (flake.lock, public-key.txt)
-          git add -A
-          if git diff --cached --quiet; then
-            echo ">>> No changes to commit"
-          else
-            CHANGES=""
-            git diff --cached --name-only | while read f; do
-              case "$f" in
-                config/flake.lock) CHANGES="${CHANGES}updated flake inputs, " ;;
-                public-key.txt)    CHANGES="${CHANGES}updated public key, " ;;
-              esac
-            done
-            git commit -m "auto: update flake inputs and cache metadata"
-            git push
-            echo ">>> Committed changes"
-          fi
-
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 

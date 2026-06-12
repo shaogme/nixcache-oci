@@ -164,15 +164,6 @@ extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 此外，当构建工作流运行时，公钥也会被自动提交到仓库根目录下的 `public-key.txt` 文件中，方便你随时查阅和复制。
 
-### 自动更新
-
-`update-and-cache` 工作流每周会自动运行，执行以下操作：
-1. 在 `config/` 目录下执行 `nix flake update`
-2. 提交更新后的 `flake.lock` 到仓库
-3. 重新构建并缓存发生改变的新包
-
-你可以随时手动触发该工作流：`gh workflow run update-and-cache.yml`
-
 ### 客户端消费（使用缓存）
 
 #### 方法一 —— 手动运行本地代理：
