@@ -1,5 +1,4 @@
 use std::{env, process};
-use tracing_subscriber;
 
 mod nix;
 mod pipeline;
@@ -21,11 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--gc" | "--garbage-collect" => {
                 is_gc = true;
             }
-            "--retention-days" => {
-                if i + 1 < args.len() {
-                    retention_days = args[i + 1].parse().unwrap_or(30);
-                    i += 1;
-                }
+            "--retention-days" if i + 1 < args.len() => {
+                retention_days = args[i + 1].parse().unwrap_or(30);
+                i += 1;
             }
             "--dry-run" => {
                 dry_run = true;
@@ -46,12 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if active_token.is_empty() {
         // Attempt to run `gh auth token` to get the token, like the bash script did
-        if let Ok(output) = tokio::process::Command::new("gh").args(["auth", "token"]).output().await {
-            if output.status.success() {
-                let token_from_gh = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !token_from_gh.is_empty() {
-                    active_token = token_from_gh;
-                }
+        if let Ok(output) = tokio::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .await
+            && output.status.success()
+        {
+            let token_from_gh = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token_from_gh.is_empty() {
+                active_token = token_from_gh;
             }
         }
     }
@@ -64,7 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repo,
             &registry,
             &active_token,
-        ).await {
+        )
+        .await
+        {
             eprintln!("Garbage collection failed: {}", e);
             process::exit(1);
         }
@@ -75,7 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &registry,
             signing_key.as_deref(),
             &active_token,
-        ).await {
+        )
+        .await
+        {
             eprintln!("Pipeline failed: {}", e);
             process::exit(1);
         }

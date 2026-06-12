@@ -1,15 +1,14 @@
+use nixcache_oci::OciClient;
 use std::{env, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
-use nixcache_oci::OciClient;
 use tracing::info;
-use tracing_subscriber;
 
 // Module declarations
 mod index;
 mod proxy;
 
 use index::CacheIndex;
-use proxy::{create_router, AppState};
+use proxy::{AppState, create_router};
 
 fn get_index_dir(repo: &str) -> PathBuf {
     if let Ok(explicit) = env::var("NIXCACHE_INDEX_DIR") {
@@ -72,13 +71,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ttl_str = env::var("NIXCACHE_INDEX_TTL").unwrap_or_else(|_| "300".to_string());
     let ttl: u64 = ttl_str.parse().unwrap_or(300);
 
-    let upstream_str = env::var("NIXCACHE_UPSTREAM").unwrap_or_else(|_| "https://cache.nixos.org".to_string());
+    let upstream_str =
+        env::var("NIXCACHE_UPSTREAM").unwrap_or_else(|_| "https://cache.nixos.org".to_string());
     let upstream_caches: Vec<String> = upstream_str
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
 
-    info!("nixcache-proxy starting on http://{}:{}", listen_addr_str, port);
+    info!(
+        "nixcache-proxy starting on http://{}:{}",
+        listen_addr_str, port
+    );
     info!("  Repo: {}", repo);
     info!("  Upstream: {:?}", upstream_caches);
     info!("  Index TTL: {}s", ttl);

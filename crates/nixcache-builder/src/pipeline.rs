@@ -1,19 +1,15 @@
+use crate::nix;
+use chrono::{DateTime, Utc};
+use nixcache_oci::OciClient;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{
-    fs,
-    process::Command,
-    time::sleep,
-};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use nixcache_oci::OciClient;
-use crate::nix;
+use tokio::{fs, process::Command, time::sleep};
 use tracing::{error, info};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -38,25 +34,28 @@ struct CacheIndexData {
 }
 
 fn find_proxy_binary() -> PathBuf {
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let local_proxy = parent.join("nixcache-proxy");
-            if local_proxy.exists() {
-                return local_proxy;
-            }
-            let local_proxy_exe = parent.join("nixcache-proxy.exe");
-            if local_proxy_exe.exists() {
-                return local_proxy_exe;
-            }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let local_proxy = parent.join("nixcache-proxy");
+        if local_proxy.exists() {
+            return local_proxy;
+        }
+        let local_proxy_exe = parent.join("nixcache-proxy.exe");
+        if local_proxy_exe.exists() {
+            return local_proxy_exe;
         }
     }
     PathBuf::from("nixcache-proxy")
 }
 
-async fn write_nix_conf(substituters: &[&str], trusted_keys: &[&str]) -> Result<Option<(PathBuf, String)>, String> {
+async fn write_nix_conf(
+    substituters: &[&str],
+    trusted_keys: &[&str],
+) -> Result<Option<(PathBuf, String)>, String> {
     let mut nix_conf_path = PathBuf::from("/etc/nix/nix.conf");
     let has_etc_write = fs::metadata(&nix_conf_path).await.is_ok();
-    
+
     if !has_etc_write {
         if let Ok(home) = env::var("HOME") {
             nix_conf_path = PathBuf::from(home).join(".config/nix/nix.conf");
@@ -88,7 +87,8 @@ async fn write_nix_conf(substituters: &[&str], trusted_keys: &[&str]) -> Result<
         new_content.push_str(&format!("extra-trusted-public-keys = {}\n", key));
     }
 
-    fs::write(&nix_conf_path, new_content).await
+    fs::write(&nix_conf_path, new_content)
+        .await
         .map_err(|e| format!("Failed to write nix.conf: {}", e))?;
 
     info!("Added self-substituter to {:?}", nix_conf_path);
@@ -110,7 +110,10 @@ async fn get_own_public_key(signing_key_file: Option<&str>) -> Option<String> {
     let key_file = signing_key_file?;
     let pub_file = format!("{}.pub", key_file);
     if Path::new(&pub_file).exists() {
-        fs::read_to_string(&pub_file).await.ok().map(|s| s.trim().to_string())
+        fs::read_to_string(&pub_file)
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
     } else {
         // Run nix key convert-secret-to-public
         let mut output = Command::new("nix")
@@ -119,7 +122,7 @@ async fn get_own_public_key(signing_key_file: Option<&str>) -> Option<String> {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .ok()?;
-        
+
         // Write secret key to stdin
         use tokio::io::AsyncWriteExt;
         let secret = fs::read_to_string(key_file).await.ok()?;
@@ -153,7 +156,8 @@ pub async fn run_pipeline(
     info!("Starting self-substituter proxy using {:?}", proxy_bin);
 
     let mut proxy_cmd = Command::new(&proxy_bin);
-    proxy_cmd.env("NIXCACHE_REPO", repo)
+    proxy_cmd
+        .env("NIXCACHE_REPO", repo)
         .env("NIXCACHE_REGISTRY", registry)
         .env("NIXCACHE_PORT", "37515")
         .env("NIXCACHE_LISTEN", "127.0.0.1")
@@ -162,17 +166,21 @@ pub async fn run_pipeline(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let mut proxy_child = proxy_cmd.spawn()
+    let mut proxy_child = proxy_cmd
+        .spawn()
         .map_err(|e| format!("Failed to spawn nixcache-proxy: {}", e))?;
 
     let mut ready = false;
     let client = reqwest::Client::new();
     for _ in 1..=15 {
-        if let Ok(res) = client.get("http://127.0.0.1:37515/nix-cache-info").send().await {
-            if res.status().is_success() {
-                ready = true;
-                break;
-            }
+        if let Ok(res) = client
+            .get("http://127.0.0.1:37515/nix-cache-info")
+            .send()
+            .await
+            && res.status().is_success()
+        {
+            ready = true;
+            break;
         }
         sleep(Duration::from_secs(1)).await;
     }
@@ -208,24 +216,22 @@ pub async fn run_pipeline(
     let mut remote_index = CacheIndexData::default();
     let mut own_hashes = Vec::new();
 
-    if let Ok(Some(manifest_json)) = oci.get_manifest("cache-index").await {
-        if let Ok(manifest) = serde_json::from_str::<Value>(&manifest_json) {
-            if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
-                if !layers.is_empty() {
-                    if let Some(digest) = layers[0].get("digest").and_then(|d| d.as_str()) {
-                        if let Ok(blob_bytes) = oci.get_blob(digest).await {
-                            if let Ok(data) = serde_json::from_slice::<CacheIndexData>(&blob_bytes) {
-                                remote_index = data;
-                                own_hashes = remote_index.entries.keys().cloned().collect();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if let Ok(Some(manifest_json)) = oci.get_manifest("cache-index").await
+        && let Ok(manifest) = serde_json::from_str::<Value>(&manifest_json)
+        && let Some(layers) = manifest.get("layers").and_then(|l| l.as_array())
+        && !layers.is_empty()
+        && let Some(digest) = layers[0].get("digest").and_then(|d| d.as_str())
+        && let Ok(blob_bytes) = oci.get_blob(digest).await
+        && let Ok(data) = serde_json::from_slice::<CacheIndexData>(&blob_bytes)
+    {
+        remote_index = data;
+        own_hashes = remote_index.entries.keys().cloned().collect();
     }
 
-    info!("GHCR index contains {} previously-cached entries", own_hashes.len());
+    info!(
+        "GHCR index contains {} previously-cached entries",
+        own_hashes.len()
+    );
 
     // 6. Find locally built paths
     info!("Inspecting closure signatures to find locally-built paths");
@@ -239,9 +245,10 @@ pub async fn run_pipeline(
     info!("Locally-built paths to upload: {}", upload_list.len());
 
     // 7. Export paths
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| format!("Failed to create temporary directory: {}", e))?;
-    let exported = nix::export_paths_directly(&upload_list, signing_key_file, temp_dir.path()).await?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|e| format!("Failed to create temporary directory: {}", e))?;
+    let exported =
+        nix::export_paths_directly(&upload_list, signing_key_file, temp_dir.path()).await?;
 
     // 8. Upload NARs and accumulate new index entries
     let mut new_entries = HashMap::new();
@@ -256,7 +263,8 @@ pub async fn run_pipeline(
             continue;
         }
 
-        let metadata = fs::metadata(&nar_file_path).await
+        let metadata = fs::metadata(&nar_file_path)
+            .await
             .map_err(|e| format!("Failed to read nar file metadata: {}", e))?;
         let size = metadata.len();
 
@@ -264,19 +272,23 @@ pub async fn run_pipeline(
         match oci.push_blob(&nar_file_path).await {
             Ok(nar_digest) => {
                 if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
-                    let name = Path::new(&store_path).file_name()
+                    let name = Path::new(&store_path)
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .and_then(|s| s.split_once('-'))
                         .map(|x| x.1.to_string())
                         .unwrap_or(hash.clone());
 
-                    new_entries.insert(hash.clone(), IndexEntry {
-                        name,
-                        narinfo: narinfo_content,
-                        nar_digest,
-                        nar_size: size,
-                        added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    });
+                    new_entries.insert(
+                        hash.clone(),
+                        IndexEntry {
+                            name,
+                            narinfo: narinfo_content,
+                            nar_digest,
+                            nar_size: size,
+                            added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        },
+                    );
                     uploaded_count += 1;
                 }
             }
@@ -309,10 +321,10 @@ pub async fn run_pipeline(
     // Merge gc_roots
     let mut gc_roots_set: HashSet<String> = index.gc_roots.into_iter().collect();
     for p in &output_paths {
-        if let Some(file_name) = Path::new(p).file_name().and_then(|n| n.to_str()) {
-            if file_name.len() >= 32 {
-                gc_roots_set.insert(file_name[..32].to_string());
-            }
+        if let Some(file_name) = Path::new(p).file_name().and_then(|n| n.to_str())
+            && file_name.len() >= 32
+        {
+            gc_roots_set.insert(file_name[..32].to_string());
         }
     }
     index.gc_roots = gc_roots_set.into_iter().collect();
@@ -323,18 +335,28 @@ pub async fn run_pipeline(
         .map_err(|e| format!("Failed to serialize cache index: {}", e))?;
 
     let index_temp_path = temp_dir.path().join("cache-index.json");
-    fs::write(&index_temp_path, &index_json).await
+    fs::write(&index_temp_path, &index_json)
+        .await
         .map_err(|e| format!("Failed to write index temp: {}", e))?;
 
-    let index_digest = oci.push_blob(&index_temp_path).await.map_err(|e| e.to_string())?;
-    let index_size = fs::metadata(&index_temp_path).await
-        .map_err(|e| format!("Failed to get index size: {}", e))?.len();
+    let index_digest = oci
+        .push_blob(&index_temp_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let index_size = fs::metadata(&index_temp_path)
+        .await
+        .map_err(|e| format!("Failed to get index size: {}", e))?
+        .len();
 
     // Push empty config
     let config_temp_path = temp_dir.path().join("config.json");
-    fs::write(&config_temp_path, "{}").await
+    fs::write(&config_temp_path, "{}")
+        .await
         .map_err(|e| format!("Failed to write config temp: {}", e))?;
-    let config_digest = oci.push_blob(&config_temp_path).await.map_err(|e| e.to_string())?;
+    let config_digest = oci
+        .push_blob(&config_temp_path)
+        .await
+        .map_err(|e| e.to_string())?;
     let config_size = 2; // size of "{}"
 
     // Push index manifest
@@ -353,10 +375,18 @@ pub async fn run_pipeline(
         }]
     });
 
-    oci.push_manifest("cache-index", &manifest.to_string()).await.map_err(|e| e.to_string())?;
+    oci.push_manifest("cache-index", &manifest.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
     info!("Cache index updated ({} new entries)", uploaded_count);
 
-    write_step_summary(discovered.len(), upload_list.len(), uploaded_count, output_paths.len()).await;
+    write_step_summary(
+        discovered.len(),
+        upload_list.len(),
+        uploaded_count,
+        output_paths.len(),
+    )
+    .await;
     info!("Pipeline complete!");
     Ok(())
 }
@@ -372,23 +402,33 @@ pub async fn run_gc(
     info!("Running garbage collection");
     let oci = OciClient::new(registry, repo, github_token, true);
 
-    let manifest_json = oci.get_manifest("cache-index").await.map_err(|e| e.to_string())?
+    let manifest_json = oci
+        .get_manifest("cache-index")
+        .await
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| "No cache index found, nothing to GC".to_string())?;
 
     let manifest = serde_json::from_str::<Value>(&manifest_json)
         .map_err(|e| format!("Failed to parse index manifest: {}", e))?;
 
-    let layers = manifest.get("layers").and_then(|l| l.as_array())
+    let layers = manifest
+        .get("layers")
+        .and_then(|l| l.as_array())
         .ok_or_else(|| "Invalid manifest layers".to_string())?;
-    
+
     if layers.is_empty() {
         return Err("Manifest layers are empty".to_string());
     }
 
-    let index_digest = layers[0].get("digest").and_then(|d| d.as_str())
+    let index_digest = layers[0]
+        .get("digest")
+        .and_then(|d| d.as_str())
         .ok_or_else(|| "Index digest missing".to_string())?;
 
-    let index_bytes = oci.get_blob(index_digest).await.map_err(|e| e.to_string())?;
+    let index_bytes = oci
+        .get_blob(index_digest)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut index = serde_json::from_slice::<CacheIndexData>(&index_bytes)
         .map_err(|e| format!("Failed to parse index JSON: {}", e))?;
 
@@ -401,10 +441,10 @@ pub async fn run_gc(
 
     let mut live_hashes = HashSet::new();
     for p in live_closure {
-        if let Some(file_name) = Path::new(&p).file_name().and_then(|n| n.to_str()) {
-            if file_name.len() >= 32 {
-                live_hashes.insert(file_name[..32].to_string());
-            }
+        if let Some(file_name) = Path::new(&p).file_name().and_then(|n| n.to_str())
+            && file_name.len() >= 32
+        {
+            live_hashes.insert(file_name[..32].to_string());
         }
     }
 
@@ -412,7 +452,10 @@ pub async fn run_gc(
     let retention_duration = chrono::Duration::days(retention_days as i64);
     let cutoff = now - retention_duration;
 
-    info!("Cutoff date: {}", cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    info!(
+        "Cutoff date: {}",
+        cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
 
     let mut kept_entries = HashMap::new();
     let mut to_delete_count = 0;
@@ -435,7 +478,11 @@ pub async fn run_gc(
         }
     }
 
-    info!("\n>>> Total: {} keep, {} delete", kept_entries.len(), to_delete_count);
+    info!(
+        "\n>>> Total: {} keep, {} delete",
+        kept_entries.len(),
+        to_delete_count
+    );
 
     if dry_run {
         info!(">>> Dry run, no changes written");
@@ -451,19 +498,29 @@ pub async fn run_gc(
 
         let temp_dir = tempfile::tempdir()
             .map_err(|e| format!("Failed to create temporary directory: {}", e))?;
-        
+
         let index_temp_path = temp_dir.path().join("cache-index.json");
-        fs::write(&index_temp_path, &updated_index_json).await
+        fs::write(&index_temp_path, &updated_index_json)
+            .await
             .map_err(|e| format!("Failed to write index: {}", e))?;
 
-        let index_digest = oci.push_blob(&index_temp_path).await.map_err(|e| e.to_string())?;
-        let index_size = fs::metadata(&index_temp_path).await
-            .map_err(|e| format!("Failed to get index size: {}", e))?.len();
+        let index_digest = oci
+            .push_blob(&index_temp_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let index_size = fs::metadata(&index_temp_path)
+            .await
+            .map_err(|e| format!("Failed to get index size: {}", e))?
+            .len();
 
         let config_temp_path = temp_dir.path().join("config.json");
-        fs::write(&config_temp_path, "{}").await
+        fs::write(&config_temp_path, "{}")
+            .await
             .map_err(|e| format!("Failed to write config: {}", e))?;
-        let config_digest = oci.push_blob(&config_temp_path).await.map_err(|e| e.to_string())?;
+        let config_digest = oci
+            .push_blob(&config_temp_path)
+            .await
+            .map_err(|e| e.to_string())?;
         let config_size = 2;
 
         let manifest = json!({
@@ -481,14 +538,21 @@ pub async fn run_gc(
             }]
         });
 
-        oci.push_manifest("cache-index", &manifest.to_string()).await.map_err(|e| e.to_string())?;
+        oci.push_manifest("cache-index", &manifest.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
         info!(">>> GC complete, index updated");
     }
 
     Ok(())
 }
 
-async fn write_step_summary(outputs: usize, new_paths: usize, uploaded: usize, total_outputs: usize) {
+async fn write_step_summary(
+    outputs: usize,
+    new_paths: usize,
+    uploaded: usize,
+    total_outputs: usize,
+) {
     if let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") {
         let content = format!(
             "## Cache Build Summary\n\n| Metric | Count |\n|---|---|\n| Flake outputs discovered | {} |\n| Output paths built | {} |\n| New paths cached to GHCR | {} |\n| Successfully uploaded | {} |\n| Paths already cached | skipped |\n",

@@ -1,21 +1,12 @@
-use std::{
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    fs::File,
-    io::AsyncReadExt,
-    sync::Mutex,
-    time::Instant,
-};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{
-    header::{HeaderMap, HeaderValue},
     Client, Response, StatusCode,
+    header::{HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
+use std::{path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use tokio::{fs::File, io::AsyncReadExt, sync::Mutex, time::Instant};
 use tracing::info;
 
 #[derive(Error, Debug)]
@@ -79,10 +70,10 @@ impl OciClient {
 
     pub async fn get_token(&self) -> Result<String, OciError> {
         let mut cache = self.token_cache.lock().await;
-        if let Some((ref token, ref instant)) = *cache {
-            if instant.elapsed() < Duration::from_secs(240) {
-                return Ok(token.clone());
-            }
+        if let Some((ref token, ref instant)) = *cache
+            && instant.elapsed() < Duration::from_secs(240)
+        {
+            return Ok(token.clone());
         }
 
         let scope = if self.write_access {
@@ -155,10 +146,7 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.head(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let resp = self.client.head(&url).headers(headers).send().await?;
 
         if resp.status() == StatusCode::OK {
             Ok(true)
@@ -209,7 +197,9 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.post(&upload_init_url)
+        let resp = self
+            .client
+            .post(&upload_init_url)
             .headers(headers)
             .send()
             .await?;
@@ -219,7 +209,8 @@ impl OciClient {
             return Err(OciError::UploadFailed(status));
         }
 
-        let location = resp.headers()
+        let location = resp
+            .headers()
             .get("Location")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
@@ -242,12 +233,11 @@ impl OciClient {
             "Content-Type",
             HeaderValue::from_static("application/octet-stream"),
         );
-        headers.insert(
-            "Content-Length",
-            HeaderValue::from(size),
-        );
+        headers.insert("Content-Length", HeaderValue::from(size));
 
-        let put_resp = self.client.put(&put_url)
+        let put_resp = self
+            .client
+            .put(&put_url)
             .headers(headers)
             .body(body)
             .send()
@@ -269,16 +259,11 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(headers).send().await?;
 
         if resp.status() == StatusCode::OK {
             let body = resp.text().await?;
             Ok(Some(body))
-        } else if resp.status() == StatusCode::NOT_FOUND {
-            Ok(None)
         } else {
             Ok(None)
         }
@@ -296,14 +281,19 @@ impl OciClient {
             HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
         );
 
-        let resp = self.client.put(&url)
+        let resp = self
+            .client
+            .put(&url)
             .headers(headers)
             .body(manifest.to_string())
             .send()
             .await?;
 
         let status = resp.status();
-        if status == StatusCode::OK || status == StatusCode::CREATED || status == StatusCode::ACCEPTED {
+        if status == StatusCode::OK
+            || status == StatusCode::CREATED
+            || status == StatusCode::ACCEPTED
+        {
             info!("Successfully pushed manifest for tag {}", tag);
             Ok(())
         } else {
@@ -318,10 +308,7 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(headers).send().await?;
 
         if resp.status().is_success() {
             let bytes = resp.bytes().await?;
@@ -338,10 +325,7 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(headers).send().await?;
 
         Ok(resp)
     }

@@ -1,18 +1,18 @@
+use crate::index::CacheIndex;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, State},
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
+use nixcache_oci::OciClient;
 use serde::Serialize;
 use serde_json::json;
-use nixcache_oci::OciClient;
-use crate::index::CacheIndex;
 use tracing::error;
 
 #[derive(Clone)]
@@ -48,7 +48,10 @@ pub fn create_router(state: AppState) -> Router {
 async fn serve_cache_info() -> impl IntoResponse {
     let body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/x-nix-cache-info"));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/x-nix-cache-info"),
+    );
     (StatusCode::OK, headers, body)
 }
 
@@ -95,10 +98,7 @@ async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn serve_narinfo(
-    State(state): State<AppState>,
-    Path(hash_ext): Path<String>,
-) -> Response {
+async fn serve_narinfo(State(state): State<AppState>, Path(hash_ext): Path<String>) -> Response {
     if !hash_ext.ends_with(".narinfo") {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -129,10 +129,7 @@ async fn serve_narinfo(
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn serve_nar(
-    State(state): State<AppState>,
-    Path(nar_name): Path<String>,
-) -> Response {
+async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) -> Response {
     let content_type_str = if nar_name.ends_with(".xz") {
         "application/x-xz"
     } else {
@@ -145,7 +142,10 @@ async fn serve_nar(
             Ok(resp) if resp.status().is_success() => {
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+                headers.insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
                 if let Ok(val) = HeaderValue::from_str(content_type_str) {
                     headers.insert(CONTENT_TYPE, val);
                 }
@@ -158,7 +158,10 @@ async fn serve_nar(
                 return (StatusCode::OK, headers, body).into_response();
             }
             Err(e) => {
-                error!("[nixcache-proxy] Failed to stream blob {} from GHCR: {}", digest, e);
+                error!(
+                    "[nixcache-proxy] Failed to stream blob {} from GHCR: {}",
+                    digest, e
+                );
             }
             _ => {}
         }

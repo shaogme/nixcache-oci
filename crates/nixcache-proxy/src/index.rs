@@ -1,3 +1,6 @@
+use nixcache_oci::OciClient;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -5,9 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{fs, sync::RwLock};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use nixcache_oci::OciClient;
 use tracing::{error, info};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -85,10 +85,10 @@ impl CacheIndex {
     async fn refresh(&self) -> Result<(), String> {
         let mut last_ref = self.last_refresh.write().await;
         // Re-check after acquiring write lock
-        if let Some(inst) = *last_ref {
-            if inst.elapsed() < self.ttl {
-                return Ok(());
-            }
+        if let Some(inst) = *last_ref
+            && inst.elapsed() < self.ttl
+        {
+            return Ok(());
         }
 
         info!("[nixcache-proxy] Refreshing cache index from GHCR...");
@@ -96,34 +96,37 @@ impl CacheIndex {
 
         match self.oci_client.get_manifest("cache-index").await {
             Ok(Some(manifest_json)) => {
-                if let Ok(manifest) = serde_json::from_str::<Value>(&manifest_json) {
-                    if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
-                        if !layers.is_empty() {
-                            if let Some(digest) = layers[0].get("digest").and_then(|d| d.as_str()) {
-                                match self.oci_client.get_blob(digest).await {
-                                    Ok(blob_bytes) => {
-                                        if let Ok(index_data) = serde_json::from_slice::<CacheIndexData>(&blob_bytes) {
-                                            let mut current_data = self.data.write().await;
-                                            *current_data = index_data;
-                                            refresh_ok = true;
+                if let Ok(manifest) = serde_json::from_str::<Value>(&manifest_json)
+                    && let Some(layers) = manifest.get("layers").and_then(|l| l.as_array())
+                    && !layers.is_empty()
+                    && let Some(digest) = layers[0].get("digest").and_then(|d| d.as_str())
+                {
+                    match self.oci_client.get_blob(digest).await {
+                        Ok(blob_bytes) => {
+                            if let Ok(index_data) =
+                                serde_json::from_slice::<CacheIndexData>(&blob_bytes)
+                            {
+                                let mut current_data = self.data.write().await;
+                                *current_data = index_data;
+                                refresh_ok = true;
 
-                                            // Save backup file
-                                            let file_path = self.index_dir.join("cache-index.json");
-                                            if let Some(parent) = file_path.parent() {
-                                                let _ = fs::create_dir_all(parent).await;
-                                            }
-                                            if let Err(e) = fs::write(&file_path, &blob_bytes).await {
-                                                error!("[nixcache-proxy] Failed to write backup index: {}", e);
-                                            } else {
-                                                info!("[nixcache-proxy] Backup cache index saved to {:?}", file_path);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("[nixcache-proxy] Failed to fetch index blob: {}", e);
-                                    }
+                                // Save backup file
+                                let file_path = self.index_dir.join("cache-index.json");
+                                if let Some(parent) = file_path.parent() {
+                                    let _ = fs::create_dir_all(parent).await;
+                                }
+                                if let Err(e) = fs::write(&file_path, &blob_bytes).await {
+                                    error!("[nixcache-proxy] Failed to write backup index: {}", e);
+                                } else {
+                                    info!(
+                                        "[nixcache-proxy] Backup cache index saved to {:?}",
+                                        file_path
+                                    );
                                 }
                             }
+                        }
+                        Err(e) => {
+                            error!("[nixcache-proxy] Failed to fetch index blob: {}", e);
                         }
                     }
                 }
@@ -132,7 +135,10 @@ impl CacheIndex {
                 info!("[nixcache-proxy] Cache index manifest not found on GHCR.");
             }
             Err(e) => {
-                error!("[nixcache-proxy] Failed to fetch cache index manifest: {}", e);
+                error!(
+                    "[nixcache-proxy] Failed to fetch cache index manifest: {}",
+                    e
+                );
             }
         }
 
@@ -145,7 +151,10 @@ impl CacheIndex {
                         if let Ok(index_data) = serde_json::from_slice::<CacheIndexData>(&bytes) {
                             let mut current_data = self.data.write().await;
                             *current_data = index_data;
-                            info!("[nixcache-proxy] Loaded backup cache index from {:?}", file_path);
+                            info!(
+                                "[nixcache-proxy] Loaded backup cache index from {:?}",
+                                file_path
+                            );
                             refresh_ok = true;
                         }
                     }
@@ -160,7 +169,10 @@ impl CacheIndex {
 
         if refresh_ok {
             let current = self.data.read().await;
-            info!("[nixcache-proxy] Index refreshed successfully with {} entries.", current.entries.len());
+            info!(
+                "[nixcache-proxy] Index refreshed successfully with {} entries.",
+                current.entries.len()
+            );
             Ok(())
         } else {
             Err("Failed to refresh index from both remote registry and backup".to_string())
