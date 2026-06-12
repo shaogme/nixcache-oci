@@ -134,7 +134,11 @@ jobs:
           
           cd ..
           
-          jq --arg px86_l "$HASH_PROXY_X86_64_LINUX" \
+          SHA="${{ github.sha }}"
+          URL_PREFIX="https://github.com/${{ github.repository }}/releases/download/bin-${SHA}"
+          
+          jq --arg ver "$SHA" \
+             --arg px86_l "$HASH_PROXY_X86_64_LINUX" \
              --arg paarch_l "$HASH_PROXY_AARCH64_LINUX" \
              --arg px86_d "$HASH_PROXY_X86_64_DARWIN" \
              --arg paarch_d "$HASH_PROXY_AARCH64_DARWIN" \
@@ -142,21 +146,31 @@ jobs:
              --arg baarch_l "$HASH_BUILDER_AARCH64_LINUX" \
              --arg bx86_d "$HASH_BUILDER_X86_64_DARWIN" \
              --arg baarch_d "$HASH_BUILDER_AARCH64_DARWIN" \
-             '.["nixcache-proxy"]."x86_64-linux".hash = $px86_l |
+             --arg url_prefix "$URL_PREFIX" \
+             '.version = $ver |
+              .["nixcache-proxy"]."x86_64-linux".hash = $px86_l |
+              .["nixcache-proxy"]."x86_64-linux".url = ($url_prefix + "/nixcache-proxy-x86_64-linux") |
               .["nixcache-proxy"]."aarch64-linux".hash = $paarch_l |
+              .["nixcache-proxy"]."aarch64-linux".url = ($url_prefix + "/nixcache-proxy-aarch64-linux") |
               .["nixcache-proxy"]."x86_64-darwin".hash = $px86_d |
+              .["nixcache-proxy"]."x86_64-darwin".url = ($url_prefix + "/nixcache-proxy-x86_64-darwin") |
               .["nixcache-proxy"]."aarch64-darwin".hash = $paarch_d |
+              .["nixcache-proxy"]."aarch64-darwin".url = ($url_prefix + "/nixcache-proxy-aarch64-darwin") |
               .["nixcache-builder"]."x86_64-linux".hash = $bx86_l |
+              .["nixcache-builder"]."x86_64-linux".url = ($url_prefix + "/nixcache-builder-x86_64-linux") |
               .["nixcache-builder"]."aarch64-linux".hash = $baarch_l |
+              .["nixcache-builder"]."aarch64-linux".url = ($url_prefix + "/nixcache-builder-aarch64-linux") |
               .["nixcache-builder"]."x86_64-darwin".hash = $bx86_d |
-              .["nixcache-builder"]."aarch64-darwin".hash = $baarch_d' \
+              .["nixcache-builder"]."x86_64-darwin".url = ($url_prefix + "/nixcache-builder-x86_64-darwin") |
+              .["nixcache-builder"]."aarch64-darwin".hash = $baarch_d |
+              .["nixcache-builder"]."aarch64-darwin".url = ($url_prefix + "/nixcache-builder-aarch64-darwin")' \
              nix/binaries.json > temp.json && mv temp.json nix/binaries.json
 
       - name: Create / Update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "Latest Pre-compiled Binaries"
+          tag_name: bin-${{ github.sha }}
+          name: "Pre-compiled Binaries (${{ github.sha }})"
           prerelease: true
           files: |
             all-binaries/nixcache-proxy-x86_64-linux
