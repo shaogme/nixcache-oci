@@ -28,7 +28,7 @@ cleanup() {
         kill "$PROXY_PID" 2>/dev/null || true
     fi
     docker rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
-    rm -f test-secret.key test-public.key
+    rm -f test-secret.key test-public.key result-builder result-proxy result-builder-bin result-proxy-bin
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -39,8 +39,30 @@ rm -f test-secret.key test-public.key
 nix-store --generate-binary-cache-key test-key-1 test-secret.key test-public.key
 
 # 3. Build builder and proxy binaries
-echo ">>> Building cargo workspace..."
-cargo build --workspace
+BUILD_MODE="${1:-cargo}"
+echo ">>> Building in mode: $BUILD_MODE"
+
+if [[ "$BUILD_MODE" == "cargo" ]]; then
+    echo ">>> Building cargo workspace..."
+    cargo build --workspace
+    BUILDER_BIN="./target/debug/nixcache-builder"
+    PROXY_BIN="./target/debug/nixcache-proxy"
+elif [[ "$BUILD_MODE" == "nix-source" ]]; then
+    echo ">>> Building packages from Nix source..."
+    nix-build default.nix -A cache-builder --out-link result-builder
+    nix-build default.nix -A cache-proxy --out-link result-proxy
+    BUILDER_BIN="./result-builder/bin/nixcache-builder"
+    PROXY_BIN="./result-proxy/bin/nixcache-proxy"
+elif [[ "$BUILD_MODE" == "nix-bin" ]]; then
+    echo ">>> Fetching packages from Nix pre-built binaries..."
+    nix-build default.nix -A cache-builder-bin --out-link result-builder-bin
+    nix-build default.nix -A cache-proxy-bin --out-link result-proxy-bin
+    BUILDER_BIN="./result-builder-bin/bin/nixcache-builder"
+    PROXY_BIN="./result-proxy-bin/bin/nixcache-proxy"
+else
+    echo "!!! Unknown BUILD_MODE: $BUILD_MODE"
+    exit 1
+fi
 
 # 4. Run builder to build and push cache to local OCI registry
 echo ">>> Running nixcache-builder..."
@@ -57,7 +79,7 @@ TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder
-./target/debug/nixcache-builder
+"$BUILDER_BIN"
 
 # 5. Start proxy pointing to the local registry
 echo ">>> Starting nixcache-proxy..."
@@ -68,7 +90,7 @@ export NIXCACHE_UPSTREAM=""
 unset NIXCACHE_INDEX_DIR
 unset CACHE_DIRECTORY
 
-./target/debug/nixcache-proxy &
+"$PROXY_BIN" &
 PROXY_PID=$!
 
 echo ">>> Waiting for proxy to become ready..."
