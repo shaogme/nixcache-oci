@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# test-substitution.sh — Integration test using podman to verify OCI-backed cache works
+set -euo pipefail
+
+REPO="${1:-cmspam/nixcache-oci}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+echo "=== Nix Binary Cache (OCI) Substitution Test ==="
+echo "Repo: $REPO"
+
+# Fetch the cache index from GHCR
+echo ">>> Fetching cache index from GHCR..."
+CRED_TOKEN=$(gh auth token 2>/dev/null || echo "")
+# Exchange for OCI registry token
+TOKEN=$(curl -s -u "token:${CRED_TOKEN}" \
+    "https://ghcr.io/token?scope=repository:${REPO}/nix-cache:pull&service=ghcr.io" 2>/dev/null \
+    | jq -r '.token // empty')
+if [[ -z "$TOKEN" ]]; then
+    TOKEN="$CRED_TOKEN"
+fi
+
+MANIFEST=$(curl -fsSL \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+    "https://ghcr.io/v2/${REPO}/nix-cache/manifests/cache-index" 2>/dev/null) || {
+    echo "!!! Cannot fetch cache index. Has the cache been published?"
+    exit 1
+}
+
+INDEX_DIGEST=$(echo "$MANIFEST" | jq -r '.layers[0].digest')
+INDEX=$(curl -fsSL -L \
+    -H "Authorization: Bearer $TOKEN" \
+    "https://ghcr.io/v2/${REPO}/nix-cache/blobs/${INDEX_DIGEST}" 2>/dev/null)
+
+STORE_HASH=$(echo "$INDEX" | python3 -c "
+import json, sys
+idx = json.load(sys.stdin)
+roots = idx.get('gc_roots', [])
+entries = idx.get('entries', {})
+for r in roots:
+    if r in entries:
+        print(r)
+        sys.exit(0)
+if entries:
+    print(next(iter(entries)))
+")
+
+if [[ -z "$STORE_HASH" ]]; then
+    echo "!!! Index is empty"
+    exit 1
+fi
+
+STORE_NAME=$(echo "$INDEX" | python3 -c "
+import json, sys
+idx = json.load(sys.stdin)
+print(idx['entries']['$STORE_HASH'].get('name', 'unknown'))
+")
+
+echo ">>> Testing: $STORE_HASH-$STORE_NAME"
+
+cat <<'CONTAINER_SCRIPT' > "$PROJECT_DIR/test/run-in-container.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="$1"
+STORE_HASH="$2"
+
+echo "=== Inside container ==="
+
+echo ">>> Installing curl..."
+nix-env -iA nixpkgs.curl 2>&1 | tail -3
+
+echo ">>> Building proxy..."
+nix build /workspace#cache-proxy --profile /tmp/proxy-profile
+
+echo ">>> Starting proxy..."
+NIXCACHE_REPO="$REPO" /tmp/proxy-profile/bin/nixcache-proxy &
+PROXY_PID=$!
+sleep 3
+
+if ! kill -0 $PROXY_PID 2>/dev/null; then
+    echo "!!! Proxy failed to start"
+    exit 1
+fi
+
+echo ">>> Testing /nix-cache-info..."
+CACHE_INFO=$(curl -fs --max-time 10 http://localhost:37515/nix-cache-info)
+echo "$CACHE_INFO"
+
+# Wait for index to load (narinfo lookups need it)
+echo ">>> Waiting for index to load..."
+for i in $(seq 1 30); do
+    if curl -fs --max-time 5 "http://localhost:37515/${STORE_HASH}.narinfo" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+echo ">>> Testing narinfo lookup for $STORE_HASH..."
+NARINFO=$(curl -fs --max-time 15 "http://localhost:37515/${STORE_HASH}.narinfo") || {
+    echo "!!! narinfo lookup failed"
+    kill $PROXY_PID 2>/dev/null; exit 1
+}
+echo "$NARINFO"
+
+STORE_PATH=$(echo "$NARINFO" | grep '^StorePath: ' | cut -d' ' -f2)
+echo ">>> Full store path: $STORE_PATH"
+
+mkdir -p /etc/nix
+cat > /etc/nix/nix.conf <<EOF
+substituters = http://localhost:37515
+trusted-substituters = http://localhost:37515
+require-sigs = false
+sandbox = false
+experimental-features = nix-command flakes
+EOF
+
+echo ">>> Realising $STORE_PATH from cache..."
+nix-store --realise "$STORE_PATH" 2>&1 || {
+    echo "!!! Failed to realise store path"
+    kill $PROXY_PID 2>/dev/null; exit 1
+}
+
+if [[ -e "$STORE_PATH" ]]; then
+    echo ">>> SUCCESS: $STORE_PATH exists!"
+    if [[ -d "$STORE_PATH/bin" ]]; then
+        FIRST_BIN=$(ls "$STORE_PATH/bin/" | head -1)
+        echo ">>> Running $FIRST_BIN:"
+        "$STORE_PATH/bin/$FIRST_BIN" 2>&1 || true
+    fi
+else
+    echo "!!! Store path missing after realise"
+    kill $PROXY_PID 2>/dev/null; exit 1
+fi
+
+echo "=== Test PASSED ==="
+kill $PROXY_PID 2>/dev/null
+CONTAINER_SCRIPT
+chmod +x "$PROJECT_DIR/test/run-in-container.sh"
+
+CONTAINER_ENGINE="podman"
+if ! command -v podman &>/dev/null; then
+    if command -v docker &>/dev/null; then
+        CONTAINER_ENGINE="docker"
+    else
+        echo "!!! Neither podman nor docker was found in PATH"
+        exit 1
+    fi
+fi
+
+echo ">>> Running test in $CONTAINER_ENGINE container..."
+# Pass GH token for GHCR access (package may be private)
+GH_TOKEN_FOR_CONTAINER=$(gh auth token 2>/dev/null || echo "")
+$CONTAINER_ENGINE run --rm \
+    -v "$PROJECT_DIR:/workspace:ro" \
+    -v "$PROJECT_DIR/test/run-in-container.sh:/run-test.sh:ro" \
+    -e "NIX_CONFIG=experimental-features = nix-command flakes" \
+    -e "GITHUB_TOKEN=${GH_TOKEN_FOR_CONTAINER}" \
+    docker.io/nixos/nix:latest \
+    bash /run-test.sh "$REPO" "$STORE_HASH"
+
+echo "=== All tests passed ==="

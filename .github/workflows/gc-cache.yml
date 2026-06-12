@@ -1,0 +1,53 @@
+name: Garbage Collect Cache
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # weekly, Sunday 3am UTC
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Delete entries older than N days not in current closure'
+        default: '30'
+        type: string
+      dry_run:
+        description: 'Show what would be deleted without deleting'
+        default: 'true'
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build Rust binaries
+        run: |
+          nix build .#cache-builder .#cache-proxy
+          echo "${{ github.workspace }}/result/bin" >> $GITHUB_PATH
+          echo "${{ github.workspace }}/result-1/bin" >> $GITHUB_PATH
+
+      - name: Run garbage collection
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: config
+        run: |
+          RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          
+          ARGS="--gc --retention-days $RETENTION_DAYS"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          
+          nixcache-builder $ARGS

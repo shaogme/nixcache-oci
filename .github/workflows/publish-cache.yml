@@ -1,0 +1,80 @@
+name: Publish Binary Cache
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup signing key
+        run: |
+          if [[ -n "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
+            echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+            echo ">>> Signing key configured"
+
+            # Extract and commit the public key so it's always in the repo
+            nix key convert-secret-to-public < "$RUNNER_TEMP/signing-key" > public-key.txt 2>/dev/null || true
+            if [[ -f public-key.txt ]] && [[ -s public-key.txt ]]; then
+              echo ">>> Public key: $(cat public-key.txt)"
+            fi
+          else
+            echo ">>> No signing key configured — cache will be unsigned"
+            echo "::notice::Cache packages will not be signed. Set NIX_SIGNING_KEY secret to enable signing. Clients will need require-sigs = false."
+          fi
+
+      - name: Update flake inputs and commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Update flake inputs
+          cd config
+          nix flake update
+          cd ..
+
+          # Stage any changes (flake.lock, public-key.txt)
+          git add -A
+          if git diff --cached --quiet; then
+            echo ">>> No changes to commit"
+          else
+            CHANGES=""
+            git diff --cached --name-only | while read f; do
+              case "$f" in
+                config/flake.lock) CHANGES="${CHANGES}updated flake inputs, " ;;
+                public-key.txt)    CHANGES="${CHANGES}updated public key, " ;;
+              esac
+            done
+            git commit -m "auto: update flake inputs and cache metadata"
+            git push
+            echo ">>> Committed changes"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build Rust binaries
+        run: |
+          nix build .#cache-builder .#cache-proxy
+          echo "${{ github.workspace }}/result/bin" >> $GITHUB_PATH
+          echo "${{ github.workspace }}/result-1/bin" >> $GITHUB_PATH
+
+      - name: Build and publish cache
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: config
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: nixcache-builder
