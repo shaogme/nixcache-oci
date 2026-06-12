@@ -83,3 +83,14 @@ nix = {
   };
 };
 ```
+
+---
+
+## 集成测试 (E2E Integration Test)
+
+本项目支持在 GitHub Actions 中自动测试已部署的 Worker 状态。
+
+若要开启 Worker 的在线测试，请在您的 GitHub 仓库的 **Settings > Secrets and variables > Actions** 中，在 **Repository secrets** 下新建以下 Secret：
+- `TEST_WORKER_URL`：您已部署的 Worker 访问地址（例如：`https://nixcache-worker.example.workers.dev`）。
+
+当此变量存在时，E2E 测试工作流（`test/test-e2e.sh`）将会在每次构建和 CI 运行中，自动对该 Worker 的 `/nix-cache-info` 以及 `/_status` 等接口的连通性进行验证，以确保其保持正常运行。

@@ -26,6 +26,8 @@ jobs:
           docker run -d -p 5001:5000 --name nixcache-test-registry registry:2
 
       - name: Run E2E Test
+        env:
+          TEST_WORKER_URL: ${{ secrets.TEST_WORKER_URL }}
         run: |
           chmod +x test/test-e2e.sh
           ./test/test-e2e.sh ${{ matrix.build_mode }} ${{ matrix.test_mode }}
