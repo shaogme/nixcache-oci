@@ -16,22 +16,50 @@
 
 ## 快速开始
 
-### 发布缓存（仓库所有者）
+### 发布缓存
 
-1. 编辑 `config/flake.nix`：
-   ```nix
-   {
-     inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-     outputs = { self, nixpkgs }: {
-       packages.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.myPackage;
-       nixosConfigurations.my-host = nixpkgs.lib.nixosSystem { ... };
-     };
-   }
+你可以选择以下两种方式之一来发布二进制缓存：
+
+#### 方式一：直接在你的 GitHub 仓库中使用 GitHub Action（推荐，无需 fork）
+
+你可以在你现有的 Flake 项目仓库中，直接在 GitHub Actions 工作流中调用本项目的 Action 来构建并发布缓存。
+
+1. 在你的仓库中创建 `.github/workflows/publish-cache.yml`：
+   ```yaml
+   name: Publish Cache
+   on:
+     push:
+       branches: [ main ]
+     workflow_dispatch:
+
+   permissions:
+     contents: read
+     packages: write
+
+   jobs:
+     publish:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@main
+
+         - name: Install Nix
+           uses: DeterminateSystems/nix-installer-action@main
+
+         - name: Publish to GHCR
+           uses: shaogme/nixcache-oci@main
+           with:
+             flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
+             signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
    ```
 
-2. 推送更改到 `main` 分支。GitHub Actions 工作流会自动发现所有的 outputs 并进行构建，最终只上传那些在 `cache.nixos.org` 上找不到的自定义路径。
+2. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
-3. 配置签名（参见下文的[签名配置](#签名配置)），或者在测试阶段先临时禁用签名。
+#### 方式二：Fork 本项目（声明式管理）
+
+1. Fork 本项目，并克隆到本地。
+2. 编辑 `config/flake.nix`，在其中声明你需要缓存的软件、系统配置或开发环境。
+3. 推送更改到 `main` 分支。GitHub Actions 工作流会自动构建并发布仅本地编译过的 store 路径。
+4. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
 ### 签名配置
 

@@ -1,0 +1,63 @@
+name: 'NixCache OCI Publisher'
+description: 'Build your Nix Flake outputs and publish custom packages as OCI blobs to GHCR'
+inputs:
+  flake-path:
+    description: 'Path to the directory containing flake.nix'
+    required: false
+    default: '.'
+  registry:
+    description: 'OCI Registry to push cache to'
+    required: false
+    default: 'ghcr.io'
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  signing-key:
+    description: 'Nix secret key used to sign store paths'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token with package write permissions'
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Setup signing key
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.signing-key }}" ]]; then
+          echo "${{ inputs.signing-key }}" > "$RUNNER_TEMP/signing-key"
+          echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          echo ">>> Nix signing key configured"
+        else
+          echo ">>> No signing key configured — cache will be unsigned"
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Build and publish cache
+      shell: bash
+      env:
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_CONFIG_DIR: ${{ inputs.flake-path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF="${{ github.action_ref }}"
+        if [[ -z "$REF" ]]; then
+          REF="main"
+        fi
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin"
