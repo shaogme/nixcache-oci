@@ -114,6 +114,7 @@ jobs:
           merge-multiple: true
 
       - name: Calculate Hashes and Update JSON
+        id: calc_hashes
         run: |
           get_sri() {
             local file=$1
@@ -133,6 +134,31 @@ jobs:
           HASH_BUILDER_AARCH64_DARWIN=$(get_sri nixcache-builder-aarch64-darwin)
           
           cd ..
+
+          OLD_PROXY_X86_64_LINUX=$(jq -r '.["nixcache-proxy"]."x86_64-linux".hash // empty' nix/binaries.json)
+          OLD_PROXY_AARCH64_LINUX=$(jq -r '.["nixcache-proxy"]."aarch64-linux".hash // empty' nix/binaries.json)
+          OLD_PROXY_X86_64_DARWIN=$(jq -r '.["nixcache-proxy"]."x86_64-darwin".hash // empty' nix/binaries.json)
+          OLD_PROXY_AARCH64_DARWIN=$(jq -r '.["nixcache-proxy"]."aarch64-darwin".hash // empty' nix/binaries.json)
+
+          OLD_BUILDER_X86_64_LINUX=$(jq -r '.["nixcache-builder"]."x86_64-linux".hash // empty' nix/binaries.json)
+          OLD_BUILDER_AARCH64_LINUX=$(jq -r '.["nixcache-builder"]."aarch64-linux".hash // empty' nix/binaries.json)
+          OLD_BUILDER_X86_64_DARWIN=$(jq -r '.["nixcache-builder"]."x86_64-darwin".hash // empty' nix/binaries.json)
+          OLD_BUILDER_AARCH64_DARWIN=$(jq -r '.["nixcache-builder"]."aarch64-darwin".hash // empty' nix/binaries.json)
+
+          if [ "$HASH_PROXY_X86_64_LINUX" = "$OLD_PROXY_X86_64_LINUX" ] && \
+             [ "$HASH_PROXY_AARCH64_LINUX" = "$OLD_PROXY_AARCH64_LINUX" ] && \
+             [ "$HASH_PROXY_X86_64_DARWIN" = "$OLD_PROXY_X86_64_DARWIN" ] && \
+             [ "$HASH_PROXY_AARCH64_DARWIN" = "$OLD_PROXY_AARCH64_DARWIN" ] && \
+             [ "$HASH_BUILDER_X86_64_LINUX" = "$OLD_BUILDER_X86_64_LINUX" ] && \
+             [ "$HASH_BUILDER_AARCH64_LINUX" = "$OLD_BUILDER_AARCH64_LINUX" ] && \
+             [ "$HASH_BUILDER_X86_64_DARWIN" = "$OLD_BUILDER_X86_64_DARWIN" ] && \
+             [ "$HASH_BUILDER_AARCH64_DARWIN" = "$OLD_BUILDER_AARCH64_DARWIN" ]; then
+            echo "All hashes match the existing ones. Skipping release."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "skip=false" >> $GITHUB_OUTPUT
           
           SHA="${{ github.sha }}"
           URL_PREFIX="https://github.com/${{ github.repository }}/releases/download/bin-${SHA}"
@@ -167,6 +193,7 @@ jobs:
              nix/binaries.json > temp.json && mv temp.json nix/binaries.json
 
       - name: Create / Update Release
+        if: steps.calc_hashes.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: bin-${{ github.sha }}
@@ -185,6 +212,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Commit and Push binary hashes
+        if: steps.calc_hashes.outputs.skip != 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
