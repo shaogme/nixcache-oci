@@ -58,7 +58,7 @@ struct Args {
     )]
     mode: BuildMode,
 
-    #[arg(long, env = "NIXCACHE_FLAKE_PATH", aliases = ["config-dir"], help = "Path to the flake or config directory")]
+    #[arg(long, env = "NIXCACHE_FLAKE_PATH", help = "Path to the flake or config directory")]
     flake_path: Option<String>,
 
     #[arg(
