@@ -18,6 +18,7 @@ echo "Worker URL: $TEST_WORKER_URL"
 # Ensure clean state on exit
 cleanup() {
     echo ">>> Cleaning up worker test resources..."
+    git checkout -- examples/flake/flake.nix || true
     rm -f test-worker-secret.key test-worker-public.key result-builder-worker
     echo ">>> Cleanup complete."
 }
@@ -61,6 +62,10 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     echo "!!! GITHUB_TOKEN environment variable must be set to push to the registry."
     exit 1
 fi
+
+# Modify flake.nix to guarantee a unique hash that has no signatures and is not cached
+echo ">>> Modifying examples/flake/flake.nix to generate a unique package hash..."
+sed -i "s/2026-04-05/$(date +%s)/" examples/flake/flake.nix
 
 TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
 echo ">>> Target package store path: $TEST_STORE_PATH"
