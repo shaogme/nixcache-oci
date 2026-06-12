@@ -1,0 +1,53 @@
+name: Update NixCache Version
+
+on:
+  schedule:
+    # 每天凌晨自动检测更新
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Fetch Latest Commit SHA
+        id: fetch-sha
+        run: |
+          LATEST_SHA=$(curl -s "https://api.github.com/repos/shaogme/nixcache-oci/commits/main" | jq -r .sha)
+          if [[ -z "$LATEST_SHA" || "$LATEST_SHA" == "null" ]]; then
+            echo "::error::Failed to fetch latest commit SHA from shaogme/nixcache-oci"
+            exit 1
+          fi
+          echo "latest_sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+
+      - name: Compare and Update File
+        id: compare
+        run: |
+          LATEST_SHA="${{ steps.fetch-sha.outputs.latest_sha }}"
+          CURRENT_SHA=""
+          if [[ -f .nixcache-version ]]; then
+            CURRENT_SHA=$(cat .nixcache-version | tr -d '[:space:]')
+          fi
+          
+          if [[ "$LATEST_SHA" != "$CURRENT_SHA" ]]; then
+            echo "$LATEST_SHA" > .nixcache-version
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo ">>> Updated .nixcache-version to $LATEST_SHA"
+          else
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo ">>> Already up-to-date at $CURRENT_SHA"
+          fi
+
+      - name: Commit and Push Changes
+        if: steps.compare.outputs.updated == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .nixcache-version
+          git commit -m "chore: auto update .nixcache-version to ${{ steps.fetch-sha.outputs.latest_sha }}"
+          git push

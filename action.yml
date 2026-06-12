@@ -56,8 +56,18 @@ runs:
         NIXCACHE_CONFIG_DIR: ${{ inputs.flake-path }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        REF="${{ github.action_ref }}"
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+          if [[ -n "$REF" ]]; then
+            echo ">>> Found .nixcache-version file, using version: $REF"
+          fi
+        fi
         if [[ -z "$REF" ]]; then
-          REF="main"
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+          echo ">>> Using fallback version: $REF"
         fi
         nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin"
