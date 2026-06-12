@@ -111,7 +111,7 @@ echo ">>> Realising store path from Cloudflare Worker substituter..."
 nix-store --realise "$TEST_STORE_PATH" \
   --option substituters "$TEST_WORKER_URL" \
   --option trusted-public-keys "$(cat test-worker-public.key)" \
-  --option require-sigs true
+  --option require-sigs true -vvvvv
 
 echo ">>> Verifying the realized package..."
 if [[ -x "$TEST_STORE_PATH/bin/nixcache-test" ]]; then
