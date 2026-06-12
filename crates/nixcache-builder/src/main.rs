@@ -1,51 +1,107 @@
-use std::{env, process};
+use clap::Parser;
+use std::{path::PathBuf, process};
 
 mod nix;
 mod pipeline;
 
+use nix::BuildMode;
 use pipeline::{run_gc, run_pipeline};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "nixcache-builder",
+    version,
+    about = "OCI-backed Nix Cache Builder"
+)]
+struct Args {
+    #[arg(long, short, aliases = ["garbage-collect"], help = "Run garbage collection")]
+    gc: bool,
+
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Retention days for garbage collection"
+    )]
+    retention_days: u64,
+
+    #[arg(long, help = "Dry run mode for garbage collection")]
+    dry_run: bool,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_REPO",
+        default_value = "shaogme/nixcache-oci",
+        help = "OCI repository"
+    )]
+    repo: String,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_REGISTRY",
+        default_value = "ghcr.io",
+        help = "OCI registry"
+    )]
+    registry: String,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_SIGNING_KEY_FILE",
+        help = "Path to signing key file"
+    )]
+    signing_key_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_MODE",
+        default_value = "flake",
+        help = "Build mode"
+    )]
+    mode: BuildMode,
+
+    #[arg(long, env = "NIXCACHE_FLAKE_PATH", aliases = ["config-dir"], help = "Path to the flake or config directory")]
+    flake_path: Option<String>,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_CONFIG_DIR",
+        help = "Fallback path for configuration directory"
+    )]
+    config_dir: Option<String>,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_FILE",
+        default_value = "default.nix",
+        help = "Target file for build"
+    )]
+    file: String,
+
+    #[arg(
+        long,
+        env = "NIXCACHE_ATTRIBUTES",
+        help = "Attributes to build (comma or space separated)"
+    )]
+    attributes: Option<String>,
+
+    #[arg(long, env = "GITHUB_TOKEN", help = "GitHub token for authentication")]
+    github_token: Option<String>,
+
+    #[arg(long, env = "GH_TOKEN", help = "GitHub token fallback")]
+    gh_token: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = env::args().collect();
-    let mut is_gc = false;
-    let mut retention_days = 30u64;
-    let mut dry_run = false;
+    let args = Args::parse();
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--gc" | "--garbage-collect" => {
-                is_gc = true;
-            }
-            "--retention-days" if i + 1 < args.len() => {
-                retention_days = args[i + 1].parse().unwrap_or(30);
-                i += 1;
-            }
-            "--dry-run" => {
-                dry_run = true;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+    let flake_path = args
+        .flake_path
+        .or(args.config_dir)
+        .unwrap_or_else(|| ".".to_string());
 
-    let repo = env::var("NIXCACHE_REPO").unwrap_or_else(|_| "shaogme/nixcache-oci".to_string());
-    let registry = env::var("NIXCACHE_REGISTRY").unwrap_or_else(|_| "ghcr.io".to_string());
-    let signing_key = env::var("NIXCACHE_SIGNING_KEY_FILE").ok();
-
-    let mode_str = env::var("NIXCACHE_MODE").unwrap_or_else(|_| "flake".to_string());
-    let mode = match mode_str.as_str() {
-        "non-flake" => nix::BuildMode::NonFlake,
-        _ => nix::BuildMode::Flake,
-    };
-    let flake_path = env::var("NIXCACHE_FLAKE_PATH")
-        .or_else(|_| env::var("NIXCACHE_CONFIG_DIR"))
-        .unwrap_or_else(|_| ".".to_string());
-    let file = env::var("NIXCACHE_FILE").unwrap_or_else(|_| "default.nix".to_string());
-    let attributes_str = env::var("NIXCACHE_ATTRIBUTES").unwrap_or_default();
+    let attributes_str = args.attributes.unwrap_or_default();
     let attributes = attributes_str
         .split(|c: char| c == ' ' || c == ',')
         .map(|s| s.trim().to_string())
@@ -53,15 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
 
     let build_config = nix::BuildConfig {
-        mode,
+        mode: args.mode,
         flake_path,
-        file,
+        file: args.file,
         attributes,
     };
 
-    let mut active_token = env::var("GITHUB_TOKEN")
-        .or_else(|_| env::var("GH_TOKEN"))
-        .unwrap_or_default();
+    let signing_key = args
+        .signing_key_file
+        .map(|p| p.to_string_lossy().to_string());
+
+    let mut active_token = args.github_token.or(args.gh_token).unwrap_or_default();
 
     if active_token.is_empty() {
         // Attempt to run `gh auth token` to get the token, like the bash script did
@@ -78,13 +136,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if is_gc {
+    if args.gc {
         if let Err(e) = run_gc(
-            retention_days,
-            dry_run,
+            args.retention_days,
+            args.dry_run,
             &build_config,
-            &repo,
-            &registry,
+            &args.repo,
+            &args.registry,
             &active_token,
         )
         .await
@@ -95,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         if let Err(e) = run_pipeline(
             &build_config,
-            &repo,
-            &registry,
+            &args.repo,
+            &args.registry,
             signing_key.as_deref(),
             &active_token,
         )

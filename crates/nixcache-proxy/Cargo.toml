@@ -14,3 +14,4 @@ futures-util.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+clap.workspace = true

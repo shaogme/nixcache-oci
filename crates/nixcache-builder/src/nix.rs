@@ -1,11 +1,14 @@
+use clap::ValueEnum;
 use serde_json::Value;
 use std::{path::Path, process::Stdio, sync::Arc};
 use tokio::{fs, process::Command, sync::Semaphore};
 use tracing::{error, info};
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildMode {
+    #[value(name = "flake")]
     Flake,
+    #[value(name = "non-flake")]
     NonFlake,
 }
 

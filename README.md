@@ -113,6 +113,7 @@
 ```nix
 services.nixcache-proxy = {
   enable = true;
+  repo = "my-org/my-cache"; # 替换为您自己的 GitHub 仓库
   requireSignatures = false;
 };
 ```
@@ -150,6 +151,7 @@ my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 ```nix
 services.nixcache-proxy = {
   enable = true;
+  repo = "my-org/my-cache"; # 替换为您自己的 GitHub 仓库
   publicKey = "my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 };
 ```
@@ -169,7 +171,7 @@ extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 #### 方法一 —— 手动运行本地代理：
 ```bash
-nix run github:shaogme/nixcache-oci#cache-proxy &
+nix run github:shaogme/nixcache-oci#cache-proxy -- --repo my-org/my-cache &
 ```
 然后配置 Nix 客户端（详见上面的[签名配置](#签名配置)）。
 
@@ -184,6 +186,7 @@ nix run github:shaogme/nixcache-oci#cache-proxy &
         {
           services.nixcache-proxy = {
             enable = true;
+            repo = "my-org/my-cache"; # 必须指定您的 GitHub 仓库
             # 使用签名的情况：
             publicKey = "my-cache-1:BASE64KEY...=";
             # 不使用签名的情况：
@@ -198,11 +201,24 @@ nix run github:shaogme/nixcache-oci#cache-proxy &
 
 这会将本地代理以 `systemd` 服务形式启动，并自动配置 Nix 的替代器（substituters）和可信公钥。
 
+##### NixOS 模块可配置参数：
+
+| 参数项 | 类型 | 默认值 | 描述 |
+|---|---|---|---|
+| `services.nixcache-proxy.enable` | boolean | `false` | 是否启用 nixcache-proxy 本地代理服务 |
+| `services.nixcache-proxy.package` | package | 源码构建的 `cache-proxy` 包 | 要使用的 nixcache-proxy 软件包 |
+| `services.nixcache-proxy.repo` | string | `"shaogme/nixcache-oci"` | 托管 OCI 二进制缓存的 GitHub 仓库名称 |
+| `services.nixcache-proxy.port` | port | `37515` | 本地代理服务监听的端口 |
+| `services.nixcache-proxy.listenAddress`| string | `"127.0.0.1"` | 本地代理服务绑定的 IP 地址（若为其他机器服务可设为 `"0.0.0.0"`） |
+| `services.nixcache-proxy.publicKey` | string | `""` | 校验包签名所用的 Base64 公钥，留空代表不校验（此时需将 `requireSignatures` 设为 `false`） |
+| `services.nixcache-proxy.requireSignatures`| boolean | `true` | 是否强制校验缓存包的签名 |
+
+
 #### 方法三 —— 非 Flake 方式（直接构建，推荐在传统 Nix 环境下使用）：
 如果你没有启用 Flake，可以直接使用 `default.nix` 构建并运行本地代理：
 ```bash
 nix-build -A cache-proxy
-./result/bin/nixcache-proxy &
+./result/bin/nixcache-proxy --repo my-org/my-cache &
 ```
 
 此外，`default.nix` 已经对齐了 Flake 的输出结构，在非 Flake 环境下也可以直接导入并使用 NixOS 模块：
@@ -212,7 +228,10 @@ let
   nixcache = import ./path/to/nixcache-oci {};
 in {
   imports = [ nixcache.nixosModules.default ];
-  services.nixcache-proxy.enable = true;
+  services.nixcache-proxy = {
+    enable = true;
+    repo = "my-org/my-cache"; # 替换为您自己的 GitHub 仓库
+  };
 }
 ```
 
@@ -224,13 +243,14 @@ in {
 
 * **命令行即时运行**：
   ```bash
-  nix run github:shaogme/nixcache-oci#cache-proxy-bin &
+  nix run github:shaogme/nixcache-oci#cache-proxy-bin -- --repo my-org/my-cache &
   ```
 
 * **NixOS 模块引用**：
   ```nix
   services.nixcache-proxy = {
     enable = true;
+    repo = "my-org/my-cache"; # 替换为您自己的 GitHub 仓库
     # 覆盖默认的源码编译包，改用预编译包
     package = nixcache.packages.${pkgs.system}.cache-proxy-bin;
   };
@@ -239,7 +259,7 @@ in {
 * **非 Flake 方式（直接构建）**：
   ```bash
   nix-build -A cache-proxy-bin
-  ./result/bin/nixcache-proxy &
+  ./result/bin/nixcache-proxy --repo my-org/my-cache &
   ```
 
 ### 开发与依赖更新
@@ -251,16 +271,40 @@ npins update
 该命令会自动更新 `npins/sources.json` 锁定文件。请在更新后提交该文件的修改。
 
 
-## 代理服务配置说明
+## 配置参数说明
 
-| 环境变量 | 默认值 | 描述 |
-|---|---|---|
-| `NIXCACHE_REPO` | `shaogme/nixcache-oci` | GitHub 所有者/仓库名称 |
-| `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
-| `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可以为局域网内的其他设备服务） |
-| `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个地址以空格分隔） |
-| `GITHUB_TOKEN` | （无） | 用于私有仓库拉取包的 GitHub Token |
-| `NIXCACHE_INDEX_TTL` | `300` | 索引的刷新间隔（单位：秒） |
+现在 `nixcache-proxy` 和 `nixcache-builder` 均同时支持命令行参数与环境变量配置（命令行参数优先级更高）。
+
+### 代理服务 (nixcache-proxy) 配置
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--repo <REPO>` | `NIXCACHE_REPO` | （无） | OCI 仓库名称 (例如: `shaogme/nixcache-oci`) |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | OCI 镜像托管源 |
+| `--port <PORT>` | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
+| `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可对局域网提供服务） |
+| `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个以空格分隔） |
+| `--index-dir <DIR>` | `NIXCACHE_INDEX_DIR` | （见下方说明） | 缓存索引存储目录（若未指定，回退至 `CACHE_DIRECTORY` 环境变量或 `~/.cache/nixcache-proxy/...`） |
+| `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | 索引的本地缓存时间（单位：秒） |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | 用于认证 GitHub 接口/私有仓库的 Token |
+
+---
+
+### 构建与管理服务 (nixcache-builder) 配置
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `-g`, `--gc` | - | `false` | 运行垃圾回收（Garbage Collection） |
+| `--retention-days <DAYS>`| - | `30` | 垃圾回收所保留的缓存包天数 |
+| `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--mode <MODE>` | `NIXCACHE_MODE` | `flake` | 构建模式，可选值: `flake` 或 `non-flake` |
+| `--flake-path <PATH>` | `NIXCACHE_FLAKE_PATH` | `.` | 含有 `flake.nix` 的目录路径（别名: `--config-dir`, 回退环境变量: `NIXCACHE_CONFIG_DIR`） |
+| `--file <FILE>` | `NIXCACHE_FILE` | `default.nix` | 非 Flake 模式下的构建目标文件 |
+| `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 非 Flake 模式下要构建的属性（以逗号或空格分割） |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token（未提供时会尝试通过本地 `gh auth token` 自动获取） |
 
 ### 代理如何工作
 
