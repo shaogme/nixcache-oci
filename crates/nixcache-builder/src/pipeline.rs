@@ -165,7 +165,7 @@ async fn get_own_public_key(signing_key_file: Option<&str>) -> Option<String> {
 }
 
 pub async fn run_pipeline(
-    config_dir: &str,
+    build_config: &nix::BuildConfig,
     repo: &str,
     registry: &str,
     signing_key_file: Option<&str>,
@@ -173,7 +173,7 @@ pub async fn run_pipeline(
 ) -> Result<(), String> {
     info!("Starting OCI cache pipeline");
     let image = format!("{}/{}/nix-cache", registry, repo);
-    info!("Config: {} | Image: {}", config_dir, image);
+    info!("Config: {:?} | Image: {}", build_config, image);
 
     // 1. Start self-substituter proxy
     let proxy_bin = find_proxy_binary();
@@ -224,7 +224,7 @@ pub async fn run_pipeline(
     }
 
     // 2. Discover outputs
-    let discovered = nix::discover_outputs(config_dir).await?;
+    let discovered = nix::discover_outputs(build_config).await?;
     info!("Discovered {} output(s) to build", discovered.len());
 
     // 3. Build outputs
@@ -418,7 +418,7 @@ pub async fn run_pipeline(
 pub async fn run_gc(
     retention_days: u64,
     dry_run: bool,
-    config_dir: &str,
+    build_config: &nix::BuildConfig,
     repo: &str,
     registry: &str,
     github_token: &str,
@@ -459,7 +459,7 @@ pub async fn run_gc(
     info!("Loaded index with {} entries", index.entries.len());
 
     // Build current outputs to find live closure
-    let discovered = nix::discover_outputs(config_dir).await?;
+    let discovered = nix::discover_outputs(build_config).await?;
     let output_paths = nix::build_outputs(&discovered).await?;
     let live_closure = nix::get_closure(&output_paths).await?;
 

@@ -1,10 +1,22 @@
 name: 'NixCache OCI Publisher'
 description: 'Build your Nix Flake outputs and publish custom packages as OCI blobs to GHCR'
 inputs:
+  mode:
+    description: 'Build mode: "flake" or "non-flake"'
+    required: true
+    default: 'flake'
   flake-path:
-    description: 'Path to the directory containing flake.nix'
+    description: 'Path to the directory containing flake.nix (only for mode: flake)'
     required: false
     default: '.'
+  file:
+    description: 'Nix file to build (only for mode: non-flake)'
+    required: false
+    default: 'default.nix'
+  attributes:
+    description: 'Space-separated list of attribute paths to build (only for mode: non-flake)'
+    required: false
+    default: ''
   registry:
     description: 'OCI Registry to push cache to'
     required: false
@@ -51,9 +63,12 @@ runs:
     - name: Build and publish cache
       shell: bash
       env:
+        NIXCACHE_MODE: ${{ inputs.mode }}
+        NIXCACHE_FLAKE_PATH: ${{ inputs.flake-path }}
+        NIXCACHE_FILE: ${{ inputs.file }}
+        NIXCACHE_ATTRIBUTES: ${{ inputs.attributes }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
-        NIXCACHE_CONFIG_DIR: ${{ inputs.flake-path }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""

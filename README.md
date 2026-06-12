@@ -25,32 +25,64 @@
 你可以在你现有的 Flake 项目仓库中，直接在 GitHub Actions 工作流中调用本项目的 Action 来构建并发布缓存。
 
 1. 在你的仓库中创建 `.github/workflows/publish-cache.yml`：
-   ```yaml
-   name: Publish Cache
-   on:
-     push:
-       branches: [ main ]
-     workflow_dispatch:
+   - **Flake 模式（默认）：**
+     ```yaml
+     name: Publish Cache
+     on:
+       push:
+         branches: [ main ]
+       workflow_dispatch:
 
-   permissions:
-     contents: read
-     packages: write
+     permissions:
+       contents: read
+       packages: write
 
-   jobs:
-     publish:
-       runs-on: ubuntu-latest
-       steps:
-         - uses: actions/checkout@main
+     jobs:
+       publish:
+         runs-on: ubuntu-latest
+         steps:
+           - uses: actions/checkout@main
 
-         - name: Install Nix
-           uses: DeterminateSystems/nix-installer-action@main
+           - name: Install Nix
+             uses: DeterminateSystems/nix-installer-action@main
 
-         - name: Publish to GHCR
-           uses: shaogme/nixcache-oci@main
-           with:
-             flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
-             signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
-   ```
+           - name: Publish to GHCR
+             uses: shaogme/nixcache-oci@main
+             with:
+               mode: 'flake'
+               flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
+               signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
+     ```
+
+   - **非 Flake 模式：**
+     ```yaml
+     name: Publish Cache
+     on:
+       push:
+         branches: [ main ]
+       workflow_dispatch:
+
+     permissions:
+       contents: read
+       packages: write
+
+     jobs:
+       publish:
+         runs-on: ubuntu-latest
+         steps:
+           - uses: actions/checkout@main
+
+           - name: Install Nix
+             uses: DeterminateSystems/nix-installer-action@main
+
+           - name: Publish to GHCR
+             uses: shaogme/nixcache-oci@main
+             with:
+               mode: 'non-flake'
+               file: 'default.nix' # 选填，Nix 文件路径，默认为 'default.nix'
+               attributes: 'my-package another-package' # 选填，要构建的属性（以空格隔开），留空则构建整个 expression
+               signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
+     ```
 
 2. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 

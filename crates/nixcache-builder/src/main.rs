@@ -35,7 +35,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo = env::var("NIXCACHE_REPO").unwrap_or_else(|_| "shaogme/nixcache-oci".to_string());
     let registry = env::var("NIXCACHE_REGISTRY").unwrap_or_else(|_| "ghcr.io".to_string());
     let signing_key = env::var("NIXCACHE_SIGNING_KEY_FILE").ok();
-    let config_dir = env::var("NIXCACHE_CONFIG_DIR").unwrap_or_else(|_| "config".to_string());
+
+    let mode_str = env::var("NIXCACHE_MODE").unwrap_or_else(|_| "flake".to_string());
+    let mode = match mode_str.as_str() {
+        "non-flake" => nix::BuildMode::NonFlake,
+        _ => nix::BuildMode::Flake,
+    };
+    let flake_path = env::var("NIXCACHE_FLAKE_PATH")
+        .or_else(|_| env::var("NIXCACHE_CONFIG_DIR"))
+        .unwrap_or_else(|_| ".".to_string());
+    let file = env::var("NIXCACHE_FILE").unwrap_or_else(|_| "default.nix".to_string());
+    let attributes_str = env::var("NIXCACHE_ATTRIBUTES").unwrap_or_default();
+    let attributes = attributes_str
+        .split(|c: char| c == ' ' || c == ',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    let build_config = nix::BuildConfig {
+        mode,
+        flake_path,
+        file,
+        attributes,
+    };
 
     let mut active_token = env::var("GITHUB_TOKEN")
         .or_else(|_| env::var("GH_TOKEN"))
@@ -60,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = run_gc(
             retention_days,
             dry_run,
-            &config_dir,
+            &build_config,
             &repo,
             &registry,
             &active_token,
@@ -72,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         if let Err(e) = run_pipeline(
-            &config_dir,
+            &build_config,
             &repo,
             &registry,
             signing_key.as_deref(),

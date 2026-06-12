@@ -3,6 +3,52 @@ use std::{path::Path, process::Stdio, sync::Arc};
 use tokio::{fs, process::Command, sync::Semaphore};
 use tracing::{error, info};
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMode {
+    Flake,
+    NonFlake,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildConfig {
+    pub mode: BuildMode,
+    pub flake_path: String,
+    pub file: String,
+    pub attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BuildTarget {
+    Flake {
+        flake_ref: String,
+        attribute: String,
+    },
+    NonFlake {
+        file: String,
+        attribute: Option<String>,
+    },
+}
+
+impl std::fmt::Display for BuildTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildTarget::Flake {
+                flake_ref,
+                attribute,
+            } => {
+                write!(f, "{}#{}", flake_ref, attribute)
+            }
+            BuildTarget::NonFlake { file, attribute } => {
+                if let Some(attr) = attribute {
+                    write!(f, "{} -A {}", file, attr)
+                } else {
+                    write!(f, "{}", file)
+                }
+            }
+        }
+    }
+}
+
 pub async fn get_system() -> Result<String, String> {
     let output = Command::new("nix")
         .args([
@@ -23,130 +69,177 @@ pub async fn get_system() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub async fn discover_outputs(flake_dir: &str) -> Result<Vec<String>, String> {
-    let system = get_system().await?;
-    info!("Discovering flake outputs for {} in {}", system, flake_dir);
+pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, String> {
+    match config.mode {
+        BuildMode::Flake => {
+            let system = get_system().await?;
+            info!(
+                "Discovering flake outputs for {} in {}",
+                system, config.flake_path
+            );
 
-    let flake_ref = format!(
-        "path:{}",
-        fs::canonicalize(flake_dir)
-            .await
-            .map_err(|e| format!("Invalid path {}: {}", flake_dir, e))?
-            .to_string_lossy()
-    );
+            let flake_ref = format!(
+                "path:{}",
+                fs::canonicalize(&config.flake_path)
+                    .await
+                    .map_err(|e| format!("Invalid path {}: {}", config.flake_path, e))?
+                    .to_string_lossy()
+            );
 
-    let lock_file = Path::new(flake_dir).join("flake.lock");
-    if !lock_file.exists() {
-        info!("Generating flake.lock for {}", flake_dir);
-        let status = Command::new("nix")
-            .args(["flake", "update", "--flake", &flake_ref])
-            .status()
-            .await
-            .map_err(|e| format!("Failed to run nix flake update: {}", e))?;
-        if !status.success() {
-            return Err("nix flake update failed".to_string());
-        }
-    }
-
-    let mut refs = Vec::new();
-
-    // 1. Packages
-    let expr = format!("{}#packages.{}", flake_ref, system);
-    let output = Command::new("nix")
-        .args([
-            "eval",
-            &expr,
-            "--apply",
-            "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-            "--raw",
-        ])
-        .output()
-        .await;
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let names = String::from_utf8_lossy(&out.stdout);
-        for name in names.lines() {
-            if !name.trim().is_empty() {
-                refs.push(format!("{}#packages.{}.{}", flake_ref, system, name.trim()));
+            let lock_file = Path::new(&config.flake_path).join("flake.lock");
+            if !lock_file.exists() {
+                info!("Generating flake.lock for {}", config.flake_path);
+                let status = Command::new("nix")
+                    .args(["flake", "update", "--flake", &flake_ref])
+                    .status()
+                    .await
+                    .map_err(|e| format!("Failed to run nix flake update: {}", e))?;
+                if !status.success() {
+                    return Err("nix flake update failed".to_string());
+                }
             }
-        }
-    }
 
-    // 2. NixOS Configurations
-    let expr = format!("{}#nixosConfigurations", flake_ref);
-    let output = Command::new("nix")
-        .args([
-            "eval",
-            &expr,
-            "--apply",
-            "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-            "--raw",
-        ])
-        .output()
-        .await;
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let names = String::from_utf8_lossy(&out.stdout);
-        for name in names.lines() {
-            if !name.trim().is_empty() {
-                refs.push(format!(
-                    "{}#nixosConfigurations.{}.config.system.build.toplevel",
-                    flake_ref,
-                    name.trim()
+            let mut targets = Vec::new();
+
+            // 1. Packages
+            let expr = format!("{}#packages.{}", flake_ref, system);
+            let output = Command::new("nix")
+                .args([
+                    "eval",
+                    &expr,
+                    "--apply",
+                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
+                    "--raw",
+                ])
+                .output()
+                .await;
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let names = String::from_utf8_lossy(&out.stdout);
+                for name in names.lines() {
+                    if !name.trim().is_empty() {
+                        targets.push(BuildTarget::Flake {
+                            flake_ref: flake_ref.clone(),
+                            attribute: format!("packages.{}.{}", system, name.trim()),
+                        });
+                    }
+                }
+            }
+
+            // 2. NixOS Configurations
+            let expr = format!("{}#nixosConfigurations", flake_ref);
+            let output = Command::new("nix")
+                .args([
+                    "eval",
+                    &expr,
+                    "--apply",
+                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
+                    "--raw",
+                ])
+                .output()
+                .await;
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let names = String::from_utf8_lossy(&out.stdout);
+                for name in names.lines() {
+                    if !name.trim().is_empty() {
+                        targets.push(BuildTarget::Flake {
+                            flake_ref: flake_ref.clone(),
+                            attribute: format!(
+                                "nixosConfigurations.{}.config.system.build.toplevel",
+                                name.trim()
+                            ),
+                        });
+                    }
+                }
+            }
+
+            // 3. DevShells
+            let expr = format!("{}#devShells.{}", flake_ref, system);
+            let output = Command::new("nix")
+                .args([
+                    "eval",
+                    &expr,
+                    "--apply",
+                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
+                    "--raw",
+                ])
+                .output()
+                .await;
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let names = String::from_utf8_lossy(&out.stdout);
+                for name in names.lines() {
+                    if !name.trim().is_empty() {
+                        targets.push(BuildTarget::Flake {
+                            flake_ref: flake_ref.clone(),
+                            attribute: format!("devShells.{}.{}", system, name.trim()),
+                        });
+                    }
+                }
+            }
+
+            if targets.is_empty() {
+                return Err(format!(
+                    "No buildable outputs found for {} in {}",
+                    system, config.flake_path
                 ));
             }
-        }
-    }
 
-    // 3. DevShells
-    let expr = format!("{}#devShells.{}", flake_ref, system);
-    let output = Command::new("nix")
-        .args([
-            "eval",
-            &expr,
-            "--apply",
-            "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-            "--raw",
-        ])
-        .output()
-        .await;
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let names = String::from_utf8_lossy(&out.stdout);
-        for name in names.lines() {
-            if !name.trim().is_empty() {
-                refs.push(format!(
-                    "{}#devShells.{}.{}",
-                    flake_ref,
-                    system,
-                    name.trim()
-                ));
+            Ok(targets)
+        }
+        BuildMode::NonFlake => {
+            if !config.attributes.is_empty() {
+                let targets = config
+                    .attributes
+                    .iter()
+                    .map(|attr| BuildTarget::NonFlake {
+                        file: config.file.clone(),
+                        attribute: Some(attr.clone()),
+                    })
+                    .collect();
+                Ok(targets)
+            } else {
+                Ok(vec![BuildTarget::NonFlake {
+                    file: config.file.clone(),
+                    attribute: None,
+                }])
             }
         }
     }
-
-    if refs.is_empty() {
-        return Err(format!(
-            "No buildable outputs found for {} in {}",
-            system, flake_dir
-        ));
-    }
-
-    Ok(refs)
 }
 
-pub async fn build_outputs(refs: &[String]) -> Result<Vec<String>, String> {
+pub async fn build_outputs(targets: &[BuildTarget]) -> Result<Vec<String>, String> {
     let mut all_paths = Vec::new();
-    for r in refs {
-        info!("Building {}", r);
-        let output = Command::new("nix")
-            .args(["build", r, "--no-link", "--accept-flake-config", "--json"])
+    for target in targets {
+        info!("Building target: {}", target);
+        let mut cmd = Command::new("nix");
+        cmd.arg("build");
+
+        match target {
+            BuildTarget::Flake {
+                flake_ref,
+                attribute,
+            } => {
+                cmd.arg(format!("{}#{}", flake_ref, attribute));
+                cmd.args(["--no-link", "--accept-flake-config", "--json"]);
+            }
+            BuildTarget::NonFlake { file, attribute } => {
+                cmd.args(["--file", file]);
+                if let Some(attr) = attribute {
+                    cmd.arg(attr);
+                }
+                cmd.args(["--no-link", "--json"]);
+            }
+        }
+
+        let output = cmd
             .output()
             .await
-            .map_err(|e| format!("Failed to build {}: {}", r, e))?;
+            .map_err(|e| format!("Failed to build target: {}", e))?;
 
         if !output.status.success() {
             error!(
@@ -154,8 +247,24 @@ pub async fn build_outputs(refs: &[String]) -> Result<Vec<String>, String> {
                 String::from_utf8_lossy(&output.stderr)
             );
             // Fallback to nix path-info
-            let path_info_out = Command::new("nix")
-                .args(["path-info", r])
+            let mut path_info_cmd = Command::new("nix");
+            path_info_cmd.arg("path-info");
+            match target {
+                BuildTarget::Flake {
+                    flake_ref,
+                    attribute,
+                } => {
+                    path_info_cmd.arg(format!("{}#{}", flake_ref, attribute));
+                }
+                BuildTarget::NonFlake { file, attribute } => {
+                    path_info_cmd.args(["--file", file]);
+                    if let Some(attr) = attribute {
+                        path_info_cmd.arg(attr);
+                    }
+                }
+            }
+
+            let path_info_out = path_info_cmd
                 .output()
                 .await
                 .map_err(|e| format!("Fallback path-info failed: {}", e))?;
@@ -168,7 +277,7 @@ pub async fn build_outputs(refs: &[String]) -> Result<Vec<String>, String> {
                 }
                 continue;
             }
-            return Err(format!("Failed to build {}", r));
+            return Err(format!("Failed to build target: {}", target));
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
@@ -185,7 +294,10 @@ pub async fn build_outputs(refs: &[String]) -> Result<Vec<String>, String> {
                 }
             }
         } else {
-            return Err(format!("Failed to parse build JSON output for {}", r));
+            return Err(format!(
+                "Failed to parse build JSON output for target: {}",
+                target
+            ));
         }
     }
 
