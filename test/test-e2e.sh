@@ -156,30 +156,4 @@ else
     echo "!!! Realized package executable not found!"
     exit 1
 fi
-
-if [[ -n "${TEST_WORKER_URL:-}" ]]; then
-    echo ">>> Running Worker Integration Verification..."
-    echo "Testing Worker at: $TEST_WORKER_URL"
-    
-    # 1. Verify /nix-cache-info
-    CACHE_INFO=$(curl -fs "$TEST_WORKER_URL/nix-cache-info")
-    echo "Worker Cache Info:"
-    echo "$CACHE_INFO"
-    if ! echo "$CACHE_INFO" | grep -q "StoreDir: /nix/store"; then
-        echo "!!! Worker nix-cache-info failed"
-        exit 1
-    fi
-    
-    # 2. Verify /_status
-    STATUS_DATA=$(curl -fs "$TEST_WORKER_URL/_status")
-    echo "Worker Status:"
-    echo "$STATUS_DATA"
-    if ! echo "$STATUS_DATA" | grep -q "index_entries"; then
-        echo "!!! Worker status endpoint failed"
-        exit 1
-    fi
-    
-    echo ">>> Worker verification passed."
-fi
-
 echo "=== E2E INTEGRATION TEST PASSED SUCCESSFULLY ==="

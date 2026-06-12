@@ -93,4 +93,4 @@ nix = {
 若要开启 Worker 的在线测试，请在您的 GitHub 仓库的 **Settings > Secrets and variables > Actions** 中，在 **Repository secrets** 下新建以下 Secret：
 - `TEST_WORKER_URL`：您已部署的 Worker 访问地址（例如：`https://nixcache-worker.example.workers.dev`）。
 
-当此变量存在时，E2E 测试工作流（`test/test-e2e.sh`）将会在每次构建和 CI 运行中，自动对该 Worker 的 `/nix-cache-info` 以及 `/_status` 等接口的连通性进行验证，以确保其保持正常运行。
+当此变量存在时，E2E 独立测试工作流（`test/test-worker.sh`）将会在每次构建和 CI 运行中，自动使用 `nixcache-builder` 构建并推送测试包至目标仓库，接着调用 Worker 的 `/_refresh` 刷新接口，并通过 Worker 作为替代器（substituter）拉取还原该测试包，以此对 Worker 进行闭环的真实 E2E 校验。

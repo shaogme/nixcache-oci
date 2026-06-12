@@ -26,8 +26,22 @@ jobs:
           docker run -d -p 5001:5000 --name nixcache-test-registry registry:2
 
       - name: Run E2E Test
-        env:
-          TEST_WORKER_URL: ${{ secrets.TEST_WORKER_URL }}
         run: |
           chmod +x test/test-e2e.sh
           ./test/test-e2e.sh ${{ matrix.build_mode }} ${{ matrix.test_mode }}
+
+  test-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Run Worker E2E Test
+        env:
+          TEST_WORKER_URL: ${{ secrets.TEST_WORKER_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x test/test-worker.sh
+          ./test/test-worker.sh
