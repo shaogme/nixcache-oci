@@ -104,6 +104,10 @@ if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
 fi
 
 # 7. Perform substitution test from Worker
+# Sleep for 45 seconds to allow Cloudflare KV to propagate globally so nix-daemon (which might hit a different isolate) sees the updated index.
+echo ">>> Sleeping 45 seconds for KV propagation..."
+sleep 45
+
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 
