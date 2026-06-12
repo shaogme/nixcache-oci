@@ -40,8 +40,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/public-key", get(serve_public_key))
         .route("/_status", get(serve_status))
         .route("/_refresh", post(handle_refresh))
-        .route("/:hash_ext", get(serve_narinfo))
-        .route("/nar/:nar_name", get(serve_nar))
+        .route("/{hash_ext}", get(serve_narinfo))
+        .route("/nar/{nar_name}", get(serve_nar))
         .with_state(state)
 }
 
