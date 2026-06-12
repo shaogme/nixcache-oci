@@ -109,7 +109,7 @@ fi
 
 # 7. Perform substitution test
 echo ">>> Deleting local store path from Nix store (if possible)..."
-nix-store --delete "$TEST_STORE_PATH" --ignore-lsof || true
+nix-store --delete "$TEST_STORE_PATH" || true
 
 echo ">>> Realising store path from local proxy substituter..."
 nix-store --realise "$TEST_STORE_PATH" \
