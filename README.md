@@ -113,14 +113,14 @@ extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 #### 方法一 —— 手动运行本地代理：
 ```bash
-nix run github:cmspam/nixcache-oci#cache-proxy &
+nix run github:shaogme/nixcache-oci#cache-proxy &
 ```
 然后配置 Nix 客户端（详见上面的[签名配置](#签名配置)）。
 
 #### 方法二 —— NixOS 模块（常驻系统服务，推荐）：
 ```nix
 {
-  inputs.nixcache.url = "github:cmspam/nixcache-oci";
+  inputs.nixcache.url = "github:shaogme/nixcache-oci";
   outputs = { nixcache, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       modules = [
@@ -146,7 +146,7 @@ nix run github:cmspam/nixcache-oci#cache-proxy &
 
 | 环境变量 | 默认值 | 描述 |
 |---|---|---|
-| `NIXCACHE_REPO` | `cmspam/nixcache-oci` | GitHub 所有者/仓库名称 |
+| `NIXCACHE_REPO` | `shaogme/nixcache-oci` | GitHub 所有者/仓库名称 |
 | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
 | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可以为局域网内的其他设备服务） |
 | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个地址以空格分隔） |

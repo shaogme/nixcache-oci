@@ -2,7 +2,7 @@
 # test-substitution.sh — Integration test using podman to verify OCI-backed cache works
 set -euo pipefail
 
-REPO="${1:-cmspam/nixcache-oci}"
+REPO="${1:-shaogme/nixcache-oci}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 

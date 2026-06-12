@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let repo = env::var("NIXCACHE_REPO").unwrap_or_else(|_| "cmspam/nixcache-oci".to_string());
+    let repo = env::var("NIXCACHE_REPO").unwrap_or_else(|_| "shaogme/nixcache-oci".to_string());
     let registry = env::var("NIXCACHE_REGISTRY").unwrap_or_else(|_| "ghcr.io".to_string());
     let signing_key = env::var("NIXCACHE_SIGNING_KEY_FILE").ok();
     let config_dir = env::var("NIXCACHE_CONFIG_DIR").unwrap_or_else(|_| "config".to_string());

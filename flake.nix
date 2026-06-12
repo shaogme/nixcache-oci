@@ -54,7 +54,7 @@
         enable = lib.mkEnableOption "nixcache-proxy OCI substituter bridge";
         repo = lib.mkOption {
           type = lib.types.str;
-          default = "cmspam/nixcache-oci";
+          default = "shaogme/nixcache-oci";
           description = "GitHub owner/repo hosting the OCI cache.";
         };
         port = lib.mkOption {
