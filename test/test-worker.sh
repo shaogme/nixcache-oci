@@ -28,10 +28,11 @@ echo ">>> Generating signing key pair..."
 rm -f test-worker-secret.key test-worker-public.key
 nix-store --generate-binary-cache-key test-worker-key-1 test-worker-secret.key test-worker-public.key
 
-# 2. Build builder binary
-echo ">>> Building nixcache-builder..."
-cargo build -p nixcache-builder
+# 2. Build builder and proxy binaries
+echo ">>> Building nixcache-builder and nixcache-proxy..."
+cargo build -p nixcache-builder -p nixcache-proxy
 BUILDER_BIN="./target/debug/nixcache-builder"
+PROXY_BIN="./target/debug/nixcache-proxy"
 
 # 3. Retrieve target registry and repo from Worker status
 echo ">>> Fetching Worker status to identify target repo..."
@@ -66,8 +67,8 @@ echo ">>> Target package store path: $TEST_STORE_PATH"
 TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
-# Execute the builder to push the package
-"$BUILDER_BIN"
+# Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
+PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN"
 
 # 5. Force Worker to refresh its cache index
 echo ">>> Triggering Worker cache index refresh..."
