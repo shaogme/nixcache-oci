@@ -80,11 +80,23 @@ echo ">>> Triggering Worker cache index refresh..."
 REFRESH_RESP=$(curl -fs -X POST "$TEST_WORKER_URL/_refresh")
 echo "Worker refresh response: $REFRESH_RESP"
 
-# 6. Verify Narinfo resolves on Worker
+# 6. Verify Narinfo resolves on Worker (with retries for KV eventual consistency)
 echo ">>> Verifying .narinfo endpoint on Worker..."
-NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo")
-echo ">>> Retrieved narinfo:"
-echo "$NARINFO_CONTENT"
+NARINFO_CONTENT=""
+for i in {1..12}; do
+    if NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
+        echo ">>> Retrieved narinfo:"
+        echo "$NARINFO_CONTENT"
+        break
+    fi
+    echo ">>> Stale or 404 response, retrying in 5 seconds ($i/12)..."
+    sleep 5
+done
+
+if [[ -z "${NARINFO_CONTENT:-}" ]]; then
+    echo "!!! Failed to retrieve narinfo from Worker after 60 seconds."
+    exit 1
+fi
 
 if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
     echo "!!! Retrieved narinfo from Worker does not match target store path!"
