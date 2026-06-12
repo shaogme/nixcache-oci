@@ -235,6 +235,19 @@ in {
 }
 ```
 
+#### 方法四 —— Cloudflare Workers 无服务器代理（Serverless，极力推荐）：
+
+如果您不想在每台客户端机器上都运行本地 `nixcache-proxy` 代理进程，您可以将代理以 WebAssembly 的形式一键部署在 Cloudflare Workers 上，使用 Cloudflare 全球边缘网络进行极速响应和流式分发。
+
+具体配置与部署流程详见子项目：[nixcache-worker README](file:///d:/Documents/GitHub/nixcache-oci/crates/nixcache-worker/README.md)。
+
+部署完成后，您只需直接将 Worker 提供的 HTTPS 链接填入 Nix 的 `substituters` 列表中即可，无需本地运行任何常驻服务：
+```nix
+nix.settings.substituters = [
+  "https://nixcache-worker.<your-subdomain>.workers.dev"
+];
+```
+
 ### 使用预编译的二进制包（推荐，免编译）
 
 本项目在 GitHub Actions 中配置了跨架构（`x86_64-linux`、`aarch64-linux`、`x86_64-darwin`、`aarch64-darwin`）的预编译二进制发布流水线，并且与 Git Commit SHA 强绑定以保证版本控制的严密性。如果您的系统为上述支持的架构之一，建议使用预编译包以节省本地编译时间和内存资源。

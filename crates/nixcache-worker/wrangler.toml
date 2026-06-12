@@ -1,0 +1,16 @@
+name = "nixcache-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-04-03"
+
+[vars]
+NIXCACHE_REPO = "YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME"
+NIXCACHE_REGISTRY = "ghcr.io"
+NIXCACHE_UPSTREAM = "https://cache.nixos.org"
+NIXCACHE_INDEX_TTL = "300"
+
+[[kv_namespaces]]
+binding = "NIXCACHE_KV"
+id = "nixcache_kv_placeholder"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"

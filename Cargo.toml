@@ -4,6 +4,7 @@ members = [
     "crates/nixcache-oci",
     "crates/nixcache-proxy",
     "crates/nixcache-builder",
+    "crates/nixcache-worker",
 ]
 
 [workspace.dependencies]
