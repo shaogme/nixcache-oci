@@ -6,7 +6,7 @@
 
 ## 工作原理
 
-1. 将你的 Flake 配置放入 `config/` 目录中，在其中声明你需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。
+1. 在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明你需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。
 
 2. **GitHub Actions** 会自动构建所有内容，检测并过滤掉 `cache.nixos.org` 上已经存在的 store 路径，然后将仅在本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 GHCR。
 
@@ -93,7 +93,10 @@
 #### 方式二：Fork 本项目（声明式管理）
 
 1. Fork 本项目，并克隆到本地。
-2. 编辑 `config/flake.nix`，在其中声明你需要缓存的软件、系统配置或开发环境。
+2. 不建议修改 `examples/*`，而是修改 `env/default.env` 环境变量文件来进行配置：
+   - 将 `NIXCACHE_EXAMPLE` 设置为 `0` 以停用示例配置。
+   - 根据需求配置 `NIXCACHE_MODE`（如 `flake`）以及 `NIXCACHE_CONFIG_DIR`（例如指向您的 Flake 目录路径）。
+   - 在您指定的目录中编写 `flake.nix`（或 `default.nix` 等）来声明需要缓存的软件、系统配置或开发环境。
 3. 推送更改到 `main` 分支。GitHub Actions 工作流会自动构建并发布仅本地编译过的 store 路径。
 4. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
@@ -288,7 +291,7 @@ curl -X POST http://localhost:37515/_refresh
 ```mermaid
 graph TD
     subgraph 本地开发与客户端环境
-        FlakeConfig["config/flake.nix<br>(声明 packages, hosts, shells)"]
+        FlakeConfig["flake.nix<br>(声明 packages, hosts, shells)"]
         NixClient["Nix 客户端"]
         Proxy["nixcache-proxy<br>(本地代理 :37515)"]
     end
@@ -320,7 +323,7 @@ graph TD
 
 ### 输出自动发现机制
 
-GitHub Actions 工作流会自动发现并构建 `config/flake.nix` 中的下列输出：
+GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的下列输出：
 - `packages.<system>.<name>` -- 该运行器架构下的所有软件包。
 - `nixosConfigurations.<hostname>` -- 构建每个主机的 `config.system.build.toplevel`。
 - `devShells.<system>.<name>` -- 所有的开发环境 Shell。

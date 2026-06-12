@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         build_mode: [cargo, nix-source, nix-bin]
+        test_mode: [flake, legacy]
     steps:
       - uses: actions/checkout@main
 
@@ -27,4 +28,4 @@ jobs:
       - name: Run E2E Test
         run: |
           chmod +x test/test-e2e.sh
-          ./test/test-e2e.sh ${{ matrix.build_mode }}
+          ./test/test-e2e.sh ${{ matrix.build_mode }} ${{ matrix.test_mode }}

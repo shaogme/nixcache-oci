@@ -45,9 +45,18 @@ jobs:
           echo "${{ github.workspace }}/result/bin" >> $GITHUB_PATH
           echo "${{ github.workspace }}/result-1/bin" >> $GITHUB_PATH
 
+      - name: Load Environment Variables
+        run: |
+          chmod +x scripts/load-env.sh
+          ./scripts/load-env.sh flake
+          
+          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
+            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
+          fi
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
       - name: Build and publish cache
-        env:
-          NIXCACHE_REPO: ${{ github.repository }}
-          NIXCACHE_CONFIG_DIR: config
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: nixcache-builder
+

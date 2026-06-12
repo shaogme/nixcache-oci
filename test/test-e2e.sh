@@ -40,7 +40,8 @@ nix-store --generate-binary-cache-key test-key-1 test-secret.key test-public.key
 
 # 3. Build builder and proxy binaries
 BUILD_MODE="${1:-cargo}"
-echo ">>> Building in mode: $BUILD_MODE"
+TEST_MODE="${2:-flake}"
+echo ">>> Building in mode: $BUILD_MODE, Testing in mode: $TEST_MODE"
 
 if [[ "$BUILD_MODE" == "cargo" ]]; then
     echo ">>> Building cargo workspace..."
@@ -70,10 +71,19 @@ export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export NIXCACHE_REPO="test/cache"
 export NIXCACHE_SIGNING_KEY_FILE="test-secret.key"
 export GITHUB_TOKEN="dummy-token"
-export NIXCACHE_CONFIG_DIR="config"
 
-# Get the target store path of our test package
-TEST_STORE_PATH=$(nix build ./config#nixcache-test --no-link --print-out-paths)
+# 加载环境变量
+source "$(dirname "$0")/../scripts/load-env.sh" "$TEST_MODE"
+
+if [[ "${NIXCACHE_MODE:-flake}" == "flake" ]]; then
+    TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
+elif [[ "${NIXCACHE_MODE:-}" == "non-flake" ]]; then
+    TEST_STORE_PATH=$(nix build --file "${NIXCACHE_FILE}" "${NIXCACHE_ATTRIBUTES}" --no-link --print-out-paths)
+else
+    echo "!!! Unknown NIXCACHE_MODE: $NIXCACHE_MODE"
+    exit 1
+fi
+
 echo ">>> Target package store path: $TEST_STORE_PATH"
 TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"

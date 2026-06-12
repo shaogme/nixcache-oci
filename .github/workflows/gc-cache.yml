@@ -36,11 +36,19 @@ jobs:
           echo "${{ github.workspace }}/result/bin" >> $GITHUB_PATH
           echo "${{ github.workspace }}/result-1/bin" >> $GITHUB_PATH
 
+      - name: Load Environment Variables
+        run: |
+          chmod +x scripts/load-env.sh
+          ./scripts/load-env.sh flake
+          
+          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
+            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
+          fi
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
       - name: Run garbage collection
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIXCACHE_REPO: ${{ github.repository }}
-          NIXCACHE_CONFIG_DIR: config
         run: |
           RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
@@ -51,3 +59,4 @@ jobs:
           fi
           
           nixcache-builder $ARGS
+
