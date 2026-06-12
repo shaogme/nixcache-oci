@@ -1,0 +1,26 @@
+name: E2E Integration Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Start Local Registry
+        run: |
+          docker run -d -p 5001:5000 --name nixcache-test-registry registry:2
+
+      - name: Run E2E Test
+        run: |
+          chmod +x test/test-e2e.sh
+          ./test/test-e2e.sh

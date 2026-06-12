@@ -68,6 +68,18 @@ impl OciClient {
         }
     }
 
+    fn url_scheme(&self) -> &str {
+        if self.registry.starts_with("localhost:")
+            || self.registry.starts_with("127.0.0.1:")
+            || self.registry == "localhost"
+            || self.registry == "127.0.0.1"
+        {
+            "http"
+        } else {
+            "https"
+        }
+    }
+
     pub async fn get_token(&self) -> Result<String, OciError> {
         let mut cache = self.token_cache.lock().await;
         if let Some((ref token, ref instant)) = *cache
@@ -83,8 +95,12 @@ impl OciClient {
         };
 
         let token_url = format!(
-            "https://{}/token?scope=repository:{}/nix-cache:{}&service={}",
-            self.registry, self.repo, scope, self.registry
+            "{}://{}/token?scope=repository:{}/nix-cache:{}&service={}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            scope,
+            self.registry
         );
 
         let mut req = self.client.get(&token_url);
@@ -141,8 +157,11 @@ impl OciClient {
 
     pub async fn head_blob(&self, digest: &str) -> Result<bool, OciError> {
         let url = format!(
-            "https://{}/v2/{}/nix-cache/blobs/{}",
-            self.registry, self.repo, digest
+            "{}://{}/v2/{}/nix-cache/blobs/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            digest
         );
 
         let headers = self.get_auth_headers().await?;
@@ -192,8 +211,10 @@ impl OciClient {
 
         info!("Initiating upload for blob {}", digest);
         let upload_init_url = format!(
-            "https://{}/v2/{}/nix-cache/blobs/uploads/",
-            self.registry, self.repo
+            "{}://{}/v2/{}/nix-cache/blobs/uploads/",
+            self.url_scheme(),
+            self.registry,
+            self.repo
         );
 
         let headers = self.get_auth_headers().await?;
@@ -216,7 +237,7 @@ impl OciClient {
             .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
 
         let mut put_url = if location.starts_with('/') {
-            format!("https://{}{}", self.registry, location)
+            format!("{}://{}{}", self.url_scheme(), self.registry, location)
         } else {
             location.to_string()
         };
@@ -254,8 +275,11 @@ impl OciClient {
 
     pub async fn get_manifest(&self, tag: &str) -> Result<Option<String>, OciError> {
         let url = format!(
-            "https://{}/v2/{}/nix-cache/manifests/{}",
-            self.registry, self.repo, tag
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag
         );
 
         let headers = self.get_auth_headers().await?;
@@ -271,8 +295,11 @@ impl OciClient {
 
     pub async fn push_manifest(&self, tag: &str, manifest: &str) -> Result<(), OciError> {
         let url = format!(
-            "https://{}/v2/{}/nix-cache/manifests/{}",
-            self.registry, self.repo, tag
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag
         );
 
         let mut headers = self.get_auth_headers().await?;
@@ -303,8 +330,11 @@ impl OciClient {
 
     pub async fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
         let url = format!(
-            "https://{}/v2/{}/nix-cache/blobs/{}",
-            self.registry, self.repo, digest
+            "{}://{}/v2/{}/nix-cache/blobs/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            digest
         );
 
         let headers = self.get_auth_headers().await?;
@@ -320,8 +350,11 @@ impl OciClient {
 
     pub async fn stream_blob(&self, digest: &str) -> Result<Response, OciError> {
         let url = format!(
-            "https://{}/v2/{}/nix-cache/blobs/{}",
-            self.registry, self.repo, digest
+            "{}://{}/v2/{}/nix-cache/blobs/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            digest
         );
 
         let headers = self.get_auth_headers().await?;
