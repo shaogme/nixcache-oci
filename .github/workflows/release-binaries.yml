@@ -1,0 +1,183 @@
+name: Release Pre-compiled Binaries
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'nix/binaries.json'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Build
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-proxy
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-builder
+
+      - name: Rename and Prepare Artifact
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-x86_64-linux
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-x86_64-linux
+          else
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-aarch64-linux
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-aarch64-linux
+          fi
+        
+      - name: Upload Artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+
+  build-darwin:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Build
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-proxy
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-builder
+
+      - name: Rename and Prepare Artifact
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-x86_64-darwin
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-x86_64-darwin
+          else
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-aarch64-darwin
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-aarch64-darwin
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-darwin]
+    steps:
+      - uses: actions/checkout@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@main
+        with:
+          path: all-binaries
+          merge-multiple: true
+
+      - name: Calculate Hashes and Update JSON
+        run: |
+          get_sri() {
+            local file=$1
+            local b64=$(openssl dgst -sha256 -binary "$file" | openssl base64 | tr -d '\n')
+            echo "sha256-$b64"
+          }
+          
+          cd all-binaries
+          HASH_PROXY_X86_64_LINUX=$(get_sri nixcache-proxy-x86_64-linux)
+          HASH_PROXY_AARCH64_LINUX=$(get_sri nixcache-proxy-aarch64-linux)
+          HASH_PROXY_X86_64_DARWIN=$(get_sri nixcache-proxy-x86_64-darwin)
+          HASH_PROXY_AARCH64_DARWIN=$(get_sri nixcache-proxy-aarch64-darwin)
+
+          HASH_BUILDER_X86_64_LINUX=$(get_sri nixcache-builder-x86_64-linux)
+          HASH_BUILDER_AARCH64_LINUX=$(get_sri nixcache-builder-aarch64-linux)
+          HASH_BUILDER_X86_64_DARWIN=$(get_sri nixcache-builder-x86_64-darwin)
+          HASH_BUILDER_AARCH64_DARWIN=$(get_sri nixcache-builder-aarch64-darwin)
+          
+          cd ..
+          
+          jq --arg px86_l "$HASH_PROXY_X86_64_LINUX" \
+             --arg paarch_l "$HASH_PROXY_AARCH64_LINUX" \
+             --arg px86_d "$HASH_PROXY_X86_64_DARWIN" \
+             --arg paarch_d "$HASH_PROXY_AARCH64_DARWIN" \
+             --arg bx86_l "$HASH_BUILDER_X86_64_LINUX" \
+             --arg baarch_l "$HASH_BUILDER_AARCH64_LINUX" \
+             --arg bx86_d "$HASH_BUILDER_X86_64_DARWIN" \
+             --arg baarch_d "$HASH_BUILDER_AARCH64_DARWIN" \
+             '.["nixcache-proxy"]."x86_64-linux".hash = $px86_l |
+              .["nixcache-proxy"]."aarch64-linux".hash = $paarch_l |
+              .["nixcache-proxy"]."x86_64-darwin".hash = $px86_d |
+              .["nixcache-proxy"]."aarch64-darwin".hash = $paarch_d |
+              .["nixcache-builder"]."x86_64-linux".hash = $bx86_l |
+              .["nixcache-builder"]."aarch64-linux".hash = $baarch_l |
+              .["nixcache-builder"]."x86_64-darwin".hash = $bx86_d |
+              .["nixcache-builder"]."aarch64-darwin".hash = $baarch_d' \
+             nix/binaries.json > temp.json && mv temp.json nix/binaries.json
+
+      - name: Create / Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Pre-compiled Binaries"
+          prerelease: true
+          files: |
+            all-binaries/nixcache-proxy-x86_64-linux
+            all-binaries/nixcache-proxy-aarch64-linux
+            all-binaries/nixcache-proxy-x86_64-darwin
+            all-binaries/nixcache-proxy-aarch64-darwin
+            all-binaries/nixcache-builder-x86_64-linux
+            all-binaries/nixcache-builder-aarch64-linux
+            all-binaries/nixcache-builder-x86_64-darwin
+            all-binaries/nixcache-builder-aarch64-darwin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit and Push binary hashes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add nix/binaries.json
+          if git diff --cached --quiet; then
+            echo "No changes to binaries.json"
+          else
+            git commit -m "chore: update pre-compiled binary hashes [skip ci]"
+            git push origin main
+          fi

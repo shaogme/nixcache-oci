@@ -21,11 +21,14 @@ let
       };
       buildAndTestSubdir = "crates/nixcache-builder";
     };
+
+    cache-proxy-bin = import ./nix/binary.nix { inherit pkgs; pname = "nixcache-proxy"; };
+    cache-builder-bin = import ./nix/binary.nix { inherit pkgs; pname = "nixcache-builder"; };
   };
 in
 {
   # Legacy & top-level package shortcuts for convenience
-  inherit (packages) cache-proxy cache-builder;
+  inherit (packages) cache-proxy cache-builder cache-proxy-bin cache-builder-bin;
 
   # Align with flake output structure
   inherit packages;
