@@ -187,7 +187,7 @@ graph TD
 
     subgraph GitHub 托管平台
         Actions["GitHub Actions 工作流<br>(构建输出并过滤上游已有路径)"]
-        subgraph GHCR (ghcr.io)
+        subgraph GHCR ["GHCR (ghcr.io)"]
             Index["cache-index<br>(存储所有 narinfo)"]
             Blobs["NAR Blobs<br>(内容寻址 OCI Blobs)"]
         end
