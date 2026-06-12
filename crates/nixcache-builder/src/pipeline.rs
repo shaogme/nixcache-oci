@@ -53,20 +53,7 @@ async fn write_nix_conf(
     substituters: &[&str],
     trusted_keys: &[&str],
 ) -> Result<Option<(PathBuf, String)>, String> {
-    let mut nix_conf_path = PathBuf::from("/etc/nix/nix.conf");
-    let has_etc_write = fs::metadata(&nix_conf_path).await.is_ok();
-
-    if !has_etc_write {
-        if let Ok(home) = env::var("HOME") {
-            nix_conf_path = PathBuf::from(home).join(".config/nix/nix.conf");
-        } else {
-            return Ok(None);
-        }
-    }
-
-    if let Some(parent) = nix_conf_path.parent() {
-        let _ = fs::create_dir_all(parent).await;
-    }
+    let nix_conf_path = PathBuf::from("/etc/nix/nix.conf");
 
     let original_content = if nix_conf_path.exists() {
         fs::read_to_string(&nix_conf_path).await.unwrap_or_default()
@@ -87,12 +74,49 @@ async fn write_nix_conf(
         new_content.push_str(&format!("extra-trusted-public-keys = {}\n", key));
     }
 
-    fs::write(&nix_conf_path, new_content)
-        .await
-        .map_err(|e| format!("Failed to write nix.conf: {}", e))?;
-
-    info!("Added self-substituter to {:?}", nix_conf_path);
-    Ok(Some((nix_conf_path, original_content)))
+    match fs::write(&nix_conf_path, &new_content).await {
+        Ok(_) => {
+            info!("Added self-substituter to {:?}", nix_conf_path);
+            Ok(Some((nix_conf_path, original_content)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if let Ok(home) = env::var("HOME") {
+                let user_conf_path = PathBuf::from(home).join(".config/nix/nix.conf");
+                if let Some(parent) = user_conf_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                let user_original = if user_conf_path.exists() {
+                    fs::read_to_string(&user_conf_path)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let mut user_new = user_original.clone();
+                if !user_new.ends_with('\n') && !user_new.is_empty() {
+                    user_new.push('\n');
+                }
+                for sub in substituters {
+                    user_new.push_str(&format!("extra-substituters = {}\n", sub));
+                    user_new.push_str(&format!("extra-trusted-substituters = {}\n", sub));
+                }
+                for key in trusted_keys {
+                    user_new.push_str(&format!("extra-trusted-public-keys = {}\n", key));
+                }
+                fs::write(&user_conf_path, user_new)
+                    .await
+                    .map_err(|err| format!("Failed to write user nix.conf: {}", err))?;
+                info!("Added self-substituter to {:?}", user_conf_path);
+                Ok(Some((user_conf_path, user_original)))
+            } else {
+                Err(format!(
+                    "Permission denied for /etc/nix/nix.conf and HOME env is not set: {}",
+                    e
+                ))
+            }
+        }
+        Err(e) => Err(format!("Failed to write nix.conf: {}", e)),
+    }
 }
 
 async fn restore_nix_conf(backup: Option<(PathBuf, String)>) {
