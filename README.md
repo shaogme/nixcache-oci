@@ -160,6 +160,32 @@ in {
 }
 ```
 
+### 使用预编译的二进制包（推荐，免编译）
+
+本项目在 GitHub Actions 中配置了跨架构（`x86_64-linux`、`aarch64-linux`、`x86_64-darwin`、`aarch64-darwin`）的预编译二进制发布流水线，并且与 Git Commit SHA 强绑定以保证版本控制的严密性。如果您的系统为上述支持的架构之一，建议使用预编译包以节省本地编译时间和内存资源。
+
+在不同场景下，只需在原包名后加上 `-bin` 后缀即可使用：
+
+* **命令行即时运行**：
+  ```bash
+  nix run github:shaogme/nixcache-oci#cache-proxy-bin &
+  ```
+
+* **NixOS 模块引用**：
+  ```nix
+  services.nixcache-proxy = {
+    enable = true;
+    # 覆盖默认的源码编译包，改用预编译包
+    package = nixcache.packages.${pkgs.system}.cache-proxy-bin;
+  };
+  ```
+
+* **非 Flake 方式（直接构建）**：
+  ```bash
+  nix-build -A cache-proxy-bin
+  ./result/bin/nixcache-proxy &
+  ```
+
 ### 开发与依赖更新
 
 本项目使用 `npins` 管理 Nix 依赖。如果你需要更新 `nixpkgs` 或其他依赖，请在项目根目录下运行：
