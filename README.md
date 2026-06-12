@@ -142,6 +142,22 @@ nix run github:shaogme/nixcache-oci#cache-proxy &
 
 这会将本地代理以 `systemd` 服务形式启动，并自动配置 Nix 的替代器（substituters）和可信公钥。
 
+#### 方法三 —— 非 Flake 方式（直接构建，推荐在传统 Nix 环境下使用）：
+如果你没有启用 Flake，可以直接使用 `default.nix` 构建并运行本地代理：
+```bash
+nix-build -A cache-proxy
+./result/bin/nixcache-proxy &
+```
+
+### 开发与依赖更新
+
+本项目使用 `npins` 管理 Nix 依赖。如果你需要更新 `nixpkgs` 或其他依赖，请在项目根目录下运行：
+```bash
+npins update
+```
+该命令会自动更新 `npins/sources.json` 锁定文件。请在更新后提交该文件的修改。
+
+
 ## 代理服务配置说明
 
 | 环境变量 | 默认值 | 描述 |
