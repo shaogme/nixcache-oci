@@ -149,6 +149,17 @@ nix-build -A cache-proxy
 ./result/bin/nixcache-proxy &
 ```
 
+此外，`default.nix` 已经对齐了 Flake 的输出结构，在非 Flake 环境下也可以直接导入并使用 NixOS 模块：
+```nix
+# 在传统 Nix/NixOS 配置中导入
+let
+  nixcache = import ./path/to/nixcache-oci {};
+in {
+  imports = [ nixcache.nixosModules.default ];
+  services.nixcache-proxy.enable = true;
+}
+```
+
 ### 开发与依赖更新
 
 本项目使用 `npins` 管理 Nix 依赖。如果你需要更新 `nixpkgs` 或其他依赖，请在项目根目录下运行：
