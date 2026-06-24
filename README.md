@@ -239,7 +239,7 @@ in {
 
 如果您不想在每台客户端机器上都运行本地 `nixcache-proxy` 代理进程，您可以将代理以 WebAssembly 的形式一键部署在 Cloudflare Workers 上，使用 Cloudflare 全球边缘网络进行极速响应和流式分发。
 
-具体配置与部署流程详见子项目：[nixcache-worker README](file:///d:/Documents/GitHub/nixcache-oci/crates/nixcache-worker/README.md)。
+具体配置与部署流程详见子项目：[nixcache-worker README](crates/nixcache-worker/README.md)。
 
 部署完成后，您只需直接将 Worker 提供的 HTTPS 链接填入 Nix 的 `substituters` 列表中即可，无需本地运行任何常驻服务：
 ```nix
