@@ -85,7 +85,7 @@
 2. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
 3. **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
-   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](file:///root/workspace/examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
+   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
 
 
 #### 方式二：Fork 本项目（声明式管理）
@@ -239,7 +239,7 @@ in {
 
 如果您不想在每台客户端机器上都运行本地 `nixcache-proxy` 代理进程，您可以将代理以 WebAssembly 的形式一键部署在 Cloudflare Workers 上，使用 Cloudflare 全球边缘网络进行极速响应和流式分发。
 
-具体配置与部署流程详见子项目：[nixcache-worker README](file:///d:/Documents/GitHub/nixcache-oci/crates/nixcache-worker/README.md)。
+具体配置与部署流程详见子项目：[nixcache-worker README](crates/nixcache-worker/README.md)。
 
 部署完成后，您只需直接将 Worker 提供的 HTTPS 链接填入 Nix 的 `substituters` 列表中即可，无需本地运行任何常驻服务：
 ```nix
