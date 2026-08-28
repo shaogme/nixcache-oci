@@ -38,6 +38,18 @@ in
       type = "app";
       program = "${packages.cache-proxy}/bin/nixcache-proxy";
     };
+    cache-proxy-bin = {
+      type = "app";
+      program = "${packages.cache-proxy-bin}/bin/nixcache-proxy";
+    };
+    cache-builder = {
+      type = "app";
+      program = "${packages.cache-builder}/bin/nixcache-builder";
+    };
+    cache-builder-bin = {
+      type = "app";
+      program = "${packages.cache-builder-bin}/bin/nixcache-builder";
+    };
   };
 
   nixosModules = {
