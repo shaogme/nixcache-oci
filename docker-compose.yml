@@ -1,12 +1,15 @@
 services:
   # Base configuration for the application
   app-base: &app-base
-    image: ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
+    image: ghcr.io/shaogme/coding-images/npins-rust:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
+      - MISE_YES=1 # Non-interactive mode for mise
+      - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
     security_opt:
       - seccomp:unconfined # Required for some low-level operations
     cap_add:
+      - SYS_ADMIN
       - SYS_PTRACE
       - NET_ADMIN
     tty: true
@@ -14,22 +17,25 @@ services:
   # Develop mode: Mounts local directory for hot-reloading (Default)
   dev:
     <<: *app-base
-    container_name: dev
+    container_name: nixcache-oci-dev
     volumes:
+      # Mount host source code
       - .:/root/workspace
-      # Mount host SSH public key to temporary location
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
-    ports:
-      # SSH port mapping: connect via `ssh root@localhost -p 2222`
-      - "2222:22"
+      # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
+      - rust-target:/root/workspace/target
+      # Persist Cargo dependencies, crate index, and git checkouts
+      - cargo-cache:/root/.cargo
+      # Persist codex configuration
+      - codex-config:/root/.codex
+      - gemini-config:/root/.gemini
+      - opencode-config:/root/.config/opencode
+      - claude-config:/root/.claude
 
-  # Standalone mode: Uses code copied into the image (No host mounting)
-  standalone:
-    <<: *app-base
-    container_name: standalone
-    volumes:
-      - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
-    ports:
-      - "2223:22"
-    profiles:
-      - standalone
+volumes:
+  rust-target:
+  cargo-cache:
+  mise-cache:
+  codex-config:
+  gemini-config:
+  opencode-config:
+  claude-config:
