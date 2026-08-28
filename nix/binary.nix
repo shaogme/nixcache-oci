@@ -2,7 +2,7 @@
 
 let
   binaries = builtins.fromJSON (builtins.readFile ./binaries.json);
-  system = pkgs.system;
+  system = pkgs.stdenv.hostPlatform.system;
   
   hasPname = builtins.hasAttr pname binaries;
   pnameBinaries = if hasPname then binaries.${pname} else throw "Unsupported binary package: ${pname}";
@@ -34,5 +34,6 @@ pkgs.stdenv.mkDerivation {
     homepage = "https://github.com/shaogme/nixcache-oci";
     license = licenses.mit;
     platforms = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+    mainProgram = pname;
   };
 }
