@@ -10,6 +10,8 @@ let
         lockFile = ./Cargo.lock;
       };
       buildAndTestSubdir = "crates/nixcache-proxy";
+      nativeCheckInputs = [ pkgs.cacert ];
+      SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     };
 
     cache-builder = pkgs.rustPlatform.buildRustPackage {
@@ -20,6 +22,8 @@ let
         lockFile = ./Cargo.lock;
       };
       buildAndTestSubdir = "crates/nixcache-builder";
+      nativeCheckInputs = [ pkgs.cacert ];
+      SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       postInstall = ''
         ln -s ${packages.cache-proxy}/bin/nixcache-proxy $out/bin/nixcache-proxy
       '';
