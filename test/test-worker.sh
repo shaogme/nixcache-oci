@@ -104,18 +104,32 @@ if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
 fi
 
 # 7. Perform substitution test from Worker
-# Sleep for 45 seconds to allow Cloudflare KV to propagate globally so nix-daemon (which might hit a different isolate) sees the updated index.
-echo ">>> Sleeping 45 seconds for KV propagation..."
-sleep 45
+# Wait for Cloudflare KV replication & edge cache convergence
+echo ">>> Waiting 30 seconds for global KV replication and edge convergence..."
+sleep 30
 
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 
 echo ">>> Realising store path from Cloudflare Worker substituter..."
-nix-store --realise "$TEST_STORE_PATH" \
-  --option substituters "$TEST_WORKER_URL" \
-  --option trusted-public-keys "$(cat test-worker-public.key)" \
-  --option require-sigs true -vvvvv
+REALISE_SUCCESS=false
+for attempt in 1 2 3; do
+    echo ">>> Substitution attempt $attempt/3..."
+    if nix-store --realise "$TEST_STORE_PATH" \
+      --option substituters "$TEST_WORKER_URL" \
+      --option trusted-public-keys "$(cat test-worker-public.key)" \
+      --option require-sigs true -vvvvv; then
+        REALISE_SUCCESS=true
+        break
+    fi
+    echo ">>> Attempt $attempt failed, retrying in 10 seconds..."
+    sleep 10
+done
+
+if [[ "$REALISE_SUCCESS" != "true" ]]; then
+    echo "!!! Failed to realise store path from Worker substituter after 3 attempts."
+    exit 1
+fi
 
 echo ">>> Verifying the realized package..."
 if [[ -x "$TEST_STORE_PATH/bin/nixcache-test" ]]; then

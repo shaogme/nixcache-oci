@@ -58,7 +58,11 @@ struct Args {
     )]
     mode: BuildMode,
 
-    #[arg(long, env = "NIXCACHE_FLAKE_PATH", help = "Path to the flake or config directory")]
+    #[arg(
+        long,
+        env = "NIXCACHE_FLAKE_PATH",
+        help = "Path to the flake or config directory"
+    )]
     flake_path: Option<String>,
 
     #[arg(
@@ -103,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let attributes_str = args.attributes.unwrap_or_default();
     let attributes = attributes_str
-        .split(|c: char| c == ' ' || c == ',')
+        .split([' ', ','])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();

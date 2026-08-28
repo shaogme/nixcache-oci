@@ -1,11 +1,5 @@
-use crate::{
-    oci::OciClient,
-    store::CacheStore,
-};
-use worker::{
-    Env, Fetch, Headers, Request, Response, Result, Router,
-    event,
-};
+use crate::{oci::OciClient, store::CacheStore};
+use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 
 mod oci;
 mod store;
@@ -33,7 +27,9 @@ fn get_store(env: &Env) -> Result<CacheStore> {
         .map(|v| v.to_string())
         .map_err(|_| worker::Error::from("NIXCACHE_REPO environment variable must be set"))?;
     if repo.is_empty() || repo == "YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME" {
-        return Err(worker::Error::from("NIXCACHE_REPO must be configured with your actual GitHub repository (currently using default placeholder)"));
+        return Err(worker::Error::from(
+            "NIXCACHE_REPO must be configured with your actual GitHub repository (currently using default placeholder)",
+        ));
     }
     let github_token = env
         .secret("GITHUB_TOKEN")
@@ -69,7 +65,8 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                     } else {
                         let headers = Headers::new();
                         headers.set("Content-Type", "text/plain")?;
-                        Ok(Response::ok(format!("{}\n", index_data.public_key))?.with_headers(headers))
+                        Ok(Response::ok(format!("{}\n", index_data.public_key))?
+                            .with_headers(headers))
                     }
                 }
                 Err(e) => Response::error(format!("Failed to load index: {}", e), 500),
@@ -89,6 +86,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                     let status = serde_json::json!({
                         "index_entries": index_data.entries.len(),
                         "index_generated": index_data.generated,
+                        "manifest_digest": index_data.manifest_digest,
                         "repo": repo,
                         "upstream": upstream,
                     });
@@ -105,6 +103,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                     let res = serde_json::json!({
                         "refreshed": true,
                         "entries": data.entries.len(),
+                        "manifest_digest": data.manifest_digest,
                     });
                     Response::from_json(&res)
                 }
@@ -130,46 +129,31 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             };
 
             let store = get_store(&ctx.env)?;
-            let index_data = match store.get_data(&ctx.env).await {
-                Ok(data) => data,
-                Err(e) => return Response::error(format!("Failed to load index: {}", e), 500),
-            };
 
-            // 1. Try our GHCR cache — stream directly
-            let mut nar_digest = None;
-            for entry in index_data.entries.values() {
-                for line in entry.narinfo.lines() {
-                    if line.starts_with("URL: ") && line.contains(nar_name) {
-                        nar_digest = Some(entry.nar_digest.clone());
-                        break;
-                    }
-                }
-                if nar_digest.is_some() {
-                    break;
-                }
-            }
+            // 1. 使用带读穿透的 O(1) NAR 查找
+            match store.get_nar_digest_with_fallback(&ctx.env, nar_name).await {
+                Ok(Some(digest)) => {
+                    let registry = ctx
+                        .env
+                        .var("NIXCACHE_REGISTRY")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "ghcr.io".to_string());
+                    let repo = ctx
+                        .env
+                        .var("NIXCACHE_REPO")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| "shaogme/nixcache-oci".to_string());
+                    let github_token = ctx
+                        .env
+                        .secret("GITHUB_TOKEN")
+                        .map(|v| v.to_string())
+                        .or_else(|_| ctx.env.var("GITHUB_TOKEN").map(|v| v.to_string()))
+                        .unwrap_or_default();
 
-            if let Some(digest) = nar_digest {
-                let registry = ctx
-                    .env
-                    .var("NIXCACHE_REGISTRY")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|_| "ghcr.io".to_string());
-                let repo = ctx
-                    .env
-                    .var("NIXCACHE_REPO")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|_| "shaogme/nixcache-oci".to_string());
-                let github_token = ctx
-                    .env
-                    .secret("GITHUB_TOKEN")
-                    .map(|v| v.to_string())
-                    .or_else(|_| ctx.env.var("GITHUB_TOKEN").map(|v| v.to_string()))
-                    .unwrap_or_default();
-
-                let oci_client = OciClient::new(&registry, &repo, &github_token);
-                if let Ok(resp) = oci_client.fetch_blob_response(&digest).await {
-                    if resp.status_code() == 200 {
+                    let oci_client = OciClient::new(&registry, &repo, &github_token);
+                    if let Ok(resp) = oci_client.fetch_blob_response(&digest).await
+                        && resp.status_code() == 200
+                    {
                         let headers = Headers::new();
                         headers.set("Content-Type", content_type_str)?;
                         if let Ok(Some(len)) = resp.headers().get("Content-Length") {
@@ -178,21 +162,29 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                         return Ok(resp.with_headers(headers));
                     }
                 }
+                Ok(None) => {}
+                Err(e) => return Response::error(format!("Failed to query NAR index: {}", e), 500),
             }
 
             // 2. Fallback to upstream
             let upstreams = get_upstream_list(&ctx.env);
             for cache_url in upstreams {
                 let upstream_url = format!("{}/nar/{}", cache_url, nar_name);
-                if let Ok(resp) = Fetch::Url(upstream_url.parse().map_err(|e| worker::Error::from(format!("{:?}", e)))?).send().await {
-                    if resp.status_code() == 200 {
-                        let headers = Headers::new();
-                        headers.set("Content-Type", content_type_str)?;
-                        if let Ok(Some(len)) = resp.headers().get("Content-Length") {
-                            headers.set("Content-Length", &len)?;
-                        }
-                        return Ok(resp.with_headers(headers));
+                if let Ok(resp) = Fetch::Url(
+                    upstream_url
+                        .parse()
+                        .map_err(|e| worker::Error::from(format!("{:?}", e)))?,
+                )
+                .send()
+                .await
+                    && resp.status_code() == 200
+                {
+                    let headers = Headers::new();
+                    headers.set("Content-Type", content_type_str)?;
+                    if let Ok(Some(len)) = resp.headers().get("Content-Length") {
+                        headers.set("Content-Length", &len)?;
                     }
+                    return Ok(resp.with_headers(headers));
                 }
             }
 
@@ -210,30 +202,35 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             let store_hash = hash_ext.trim_end_matches(".narinfo");
 
             let store = get_store(&ctx.env)?;
-            let index_data = match store.get_data(&ctx.env).await {
-                Ok(data) => data,
-                Err(e) => return Response::error(format!("Failed to load index: {}", e), 500),
-            };
 
-            // 1. Look up in OCI index
-            if let Some(entry) = index_data.entries.get(store_hash) {
-                let headers = Headers::new();
-                headers.set("Content-Type", "text/x-nix-narinfo")?;
-                return Ok(Response::ok(&entry.narinfo)?.with_headers(headers));
+            // 1. 使用带读穿透的 narinfo 查找
+            match store.get_narinfo_with_fallback(&ctx.env, store_hash).await {
+                Ok(Some(narinfo)) => {
+                    let headers = Headers::new();
+                    headers.set("Content-Type", "text/x-nix-narinfo")?;
+                    return Ok(Response::ok(&narinfo)?.with_headers(headers));
+                }
+                Ok(None) => {}
+                Err(e) => return Response::error(format!("Failed to query narinfo: {}", e), 500),
             }
 
             // 2. Fallback to upstream
             let upstreams = get_upstream_list(&ctx.env);
             for cache_url in upstreams {
                 let upstream_url = format!("{}/{}.narinfo", cache_url, store_hash);
-                if let Ok(mut resp) = Fetch::Url(upstream_url.parse().map_err(|e| worker::Error::from(format!("{:?}", e)))?).send().await {
-                    if resp.status_code() == 200 {
-                        if let Ok(body) = resp.text().await {
-                            let headers = Headers::new();
-                            headers.set("Content-Type", "text/x-nix-narinfo")?;
-                            return Ok(Response::ok(body)?.with_headers(headers));
-                        }
-                    }
+                if let Ok(mut resp) = Fetch::Url(
+                    upstream_url
+                        .parse()
+                        .map_err(|e| worker::Error::from(format!("{:?}", e)))?,
+                )
+                .send()
+                .await
+                    && resp.status_code() == 200
+                    && let Ok(body) = resp.text().await
+                {
+                    let headers = Headers::new();
+                    headers.set("Content-Type", "text/x-nix-narinfo")?;
+                    return Ok(Response::ok(body)?.with_headers(headers));
                 }
             }
 

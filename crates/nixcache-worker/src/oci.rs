@@ -1,10 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::sync::Mutex;
-use worker::{
-    Fetch, Headers, Method, Response,
-    js_sys::Date,
-};
+use worker::{Fetch, Headers, Method, Request, RequestInit, Response, js_sys::Date};
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -45,10 +42,10 @@ impl OciClient {
         let now = Date::now(); // Milliseconds since epoch
         {
             let cache = TOKEN_CACHE.lock().map_err(|e| e.to_string())?;
-            if let Some((ref token, expiry)) = *cache {
-                if now < expiry {
-                    return Ok(token.clone());
-                }
+            if let Some((ref token, expiry)) = *cache
+                && now < expiry
+            {
+                return Ok(token.clone());
             }
         }
 
@@ -61,30 +58,37 @@ impl OciClient {
         );
 
         let headers = Headers::new();
-        headers.set("Accept", "application/json").map_err(|e| e.to_string())?;
+        headers
+            .set("Accept", "application/json")
+            .map_err(|e| e.to_string())?;
 
         if !self.github_token.is_empty() {
             let auth_str = format!("token:{}", self.github_token);
             let b64 = STANDARD.encode(auth_str);
-            headers.set("Authorization", &format!("Basic {}", b64)).map_err(|e| e.to_string())?;
+            headers
+                .set("Authorization", &format!("Basic {}", b64))
+                .map_err(|e| e.to_string())?;
         }
 
-        let mut req_init = worker::RequestInit::new();
+        let mut req_init = RequestInit::new();
         req_init.with_method(Method::Get);
         req_init.with_headers(headers);
 
-        let req = worker::Request::new_with_init(&token_url, &req_init).map_err(|e| e.to_string())?;
-        let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+        let req = Request::new_with_init(&token_url, &req_init).map_err(|e| e.to_string())?;
+        let mut resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
 
         if resp.status_code() == 200 {
             let text = resp.text().await.map_err(|e| e.to_string())?;
-            if let Ok(data) = serde_json::from_str::<TokenResponse>(&text) {
-                if let Some(token) = data.token {
-                    let mut cache = TOKEN_CACHE.lock().map_err(|e| e.to_string())?;
-                    // Token is usually valid for 1 hour (3600 seconds). Cache it for 4 minutes (240 seconds).
-                    *cache = Some((token.clone(), now + 240000.0));
-                    return Ok(token);
-                }
+            if let Ok(data) = serde_json::from_str::<TokenResponse>(&text)
+                && let Some(token) = data.token
+            {
+                let mut cache = TOKEN_CACHE.lock().map_err(|e| e.to_string())?;
+                // Token is usually valid for 1 hour (3600 seconds). Cache it for 4 minutes (240 seconds).
+                *cache = Some((token.clone(), now + 240000.0));
+                return Ok(token);
             }
         }
 
@@ -100,6 +104,12 @@ impl OciClient {
         headers
             .set("Accept", "application/vnd.oci.image.manifest.v1+json")
             .map_err(|e| e.to_string())?;
+        headers
+            .set("Cache-Control", "no-cache, no-store")
+            .map_err(|e| e.to_string())?;
+        headers
+            .set("Pragma", "no-cache")
+            .map_err(|e| e.to_string())?;
 
         let token = self.get_token().await?;
         if !token.is_empty() {
@@ -110,7 +120,10 @@ impl OciClient {
         Ok(headers)
     }
 
-    pub async fn get_manifest(&self, tag: &str) -> Result<Option<String>, String> {
+    pub async fn get_manifest_with_digest(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(String, String)>, String> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
@@ -120,16 +133,25 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let mut req_init = worker::RequestInit::new();
+        let mut req_init = RequestInit::new();
         req_init.with_method(Method::Get);
         req_init.with_headers(headers);
 
-        let req = worker::Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
-        let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+        let req = Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
+        let mut resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
 
         if resp.status_code() == 200 {
+            let digest = resp
+                .headers()
+                .get("Docker-Content-Digest")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let body = resp.text().await.map_err(|e| e.to_string())?;
-            Ok(Some(body))
+            Ok(Some((body, digest)))
         } else {
             Ok(None)
         }
@@ -145,18 +167,24 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let mut req_init = worker::RequestInit::new();
+        let mut req_init = RequestInit::new();
         req_init.with_method(Method::Get);
         req_init.with_headers(headers);
 
-        let req = worker::Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
-        let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+        let req = Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
+        let mut resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
 
         if resp.status_code() == 200 {
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
             Ok(bytes)
         } else {
-            Err(format!("Failed to get blob, status: {}", resp.status_code()))
+            Err(format!(
+                "Failed to get blob, status: {}",
+                resp.status_code()
+            ))
         }
     }
 
@@ -170,12 +198,15 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let mut req_init = worker::RequestInit::new();
+        let mut req_init = RequestInit::new();
         req_init.with_method(Method::Get);
         req_init.with_headers(headers);
 
-        let req = worker::Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
-        let resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+        let req = Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
+        let resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
 
         Ok(resp)
     }
