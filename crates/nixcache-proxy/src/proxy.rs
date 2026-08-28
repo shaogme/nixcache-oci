@@ -191,3 +191,403 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
 
     StatusCode::NOT_FOUND.into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use nixcache_oci::{CacheIndexData, IndexEntry};
+    use std::{collections::HashMap, path::PathBuf};
+    use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn test_cache_info_endpoint() {
+        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index_data = CacheIndexData {
+            public_key: "test-key-1:abcd".to_string(),
+            ..Default::default()
+        };
+        index.update_data_in_memory(index_data).await;
+
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec!["https://cache.nixos.org".to_string()],
+            index,
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nix-cache-info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/x-nix-cache-info"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("StoreDir: /nix/store"));
+        assert!(body_str.contains("WantMassQuery: 1"));
+        assert!(body_str.contains("Priority: 40"));
+    }
+
+    #[tokio::test]
+    async fn test_public_key_endpoint_present_and_missing() {
+        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index_data = CacheIndexData {
+            public_key: "test-key-1:abcd".to_string(),
+            ..Default::default()
+        };
+        index.update_data_in_memory(index_data).await;
+
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec![],
+            index: index.clone(),
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/public-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+        assert_eq!(body_str.trim(), "test-key-1:abcd");
+
+        // Missing key returns 404
+        index.update_data_in_memory(CacheIndexData::default()).await;
+        let empty_state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec![],
+            index,
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+        let empty_app = create_router(empty_state);
+
+        let missing_resp = empty_app
+            .oneshot(
+                Request::builder()
+                    .uri("/public-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_status_endpoint() {
+        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let mut entries = HashMap::new();
+        entries.insert(
+            "hash1".to_string(),
+            IndexEntry {
+                name: "pkg1".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/hash1-pkg1\n".to_string(),
+                nar_digest: "sha256:digest1".to_string(),
+                nar_size: 100,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+
+        let index_data = CacheIndexData {
+            generated: "2026-08-28T00:00:00Z".to_string(),
+            entries,
+            ..Default::default()
+        };
+        index.update_data_in_memory(index_data).await;
+
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec!["https://cache.nixos.org".to_string()],
+            index,
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status_json["index_entries"], 1);
+        assert_eq!(status_json["repo"], "test/repo");
+        assert_eq!(status_json["index_ttl"], 300);
+        assert_eq!(status_json["upstream"][0], "https://cache.nixos.org");
+    }
+
+    #[tokio::test]
+    async fn test_narinfo_hit_local_and_miss_upstream_fallback() {
+        let upstream_server = MockServer::start().await;
+        let upstream_url = upstream_server.uri();
+
+        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+
+        let local_narinfo = "StorePath: /nix/store/localhash-pkg\nURL: nar/local.nar.xz\n";
+        let mut entries = HashMap::new();
+        entries.insert(
+            "localhash".to_string(),
+            IndexEntry {
+                name: "local-pkg".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: local_narinfo.to_string(),
+                nar_digest: "sha256:localdigest".to_string(),
+                nar_size: 1024,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+
+        let index_data = CacheIndexData {
+            entries,
+            ..Default::default()
+        };
+        index.update_data_in_memory(index_data).await;
+
+        let upstream_narinfo = "StorePath: /nix/store/upstreamhash-pkg\nURL: nar/upstream.nar.xz\n";
+        Mock::given(method("GET"))
+            .and(path("/upstreamhash.narinfo"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/x-nix-narinfo")
+                    .set_body_string(upstream_narinfo),
+            )
+            .mount(&upstream_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/notfoundhash.narinfo"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream_server)
+            .await;
+
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec![upstream_url],
+            index,
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        // 1. Local hit
+        let local_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/localhash.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_resp.status(), StatusCode::OK);
+        let local_body = local_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8_lossy(&local_body), local_narinfo);
+
+        // 2. Upstream fallback hit
+        let upstream_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/upstreamhash.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upstream_resp.status(), StatusCode::OK);
+        let upstream_body = upstream_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(String::from_utf8_lossy(&upstream_body), upstream_narinfo);
+
+        // 3. Complete miss -> 404
+        let miss_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/notfoundhash.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss_resp.status(), StatusCode::NOT_FOUND);
+
+        // 4. Invalid extension -> 404
+        let invalid_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/localhash.notnarinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_nar_streaming_and_fallback() {
+        let oci_server = MockServer::start().await;
+        let oci_host = oci_server.address().to_string();
+
+        let upstream_server = MockServer::start().await;
+        let upstream_url = upstream_server.uri();
+
+        let index = CacheIndex::new(&oci_host, "test/repo", "", PathBuf::from("/tmp"), 300);
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "localhash".to_string(),
+            IndexEntry {
+                name: "local-pkg".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/localhash-pkg\nURL: nar/local.nar.xz\n".to_string(),
+                nar_digest: "sha256:localdigest123".to_string(),
+                nar_size: 5,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+
+        let index_data = CacheIndexData {
+            entries,
+            ..Default::default()
+        };
+        index.update_data_in_memory(index_data).await;
+
+        // Mock OCI Blob streaming
+        Mock::given(method("GET"))
+            .and(path("/v2/test/repo/nix-cache/blobs/sha256:localdigest123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "5")
+                    .set_body_bytes(b"HELLO"),
+            )
+            .mount(&oci_server)
+            .await;
+
+        // Mock Upstream NAR streaming
+        Mock::given(method("GET"))
+            .and(path("/nar/upstream.nar.xz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "5")
+                    .set_body_bytes(b"WORLD"),
+            )
+            .mount(&upstream_server)
+            .await;
+
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index_ttl: 300,
+            upstream_caches: vec![upstream_url],
+            index,
+            oci_client: OciClient::new(&oci_host, "test/repo", "", false),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        // 1. Local NAR stream
+        let local_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nar/local.nar.xz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_resp.status(), StatusCode::OK);
+        assert_eq!(
+            local_resp.headers().get("content-type").unwrap(),
+            "application/x-xz"
+        );
+        let body = local_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, b"HELLO"[..]);
+
+        // 2. Upstream NAR stream
+        let upstream_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nar/upstream.nar.xz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upstream_resp.status(), StatusCode::OK);
+        let body = upstream_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, b"WORLD"[..]);
+
+        // 3. Not found anywhere -> 404
+        let miss_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nar/nonexistent.nar.xz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss_resp.status(), StatusCode::NOT_FOUND);
+    }
+}

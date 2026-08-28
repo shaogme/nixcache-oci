@@ -14,6 +14,7 @@ pub enum BuildMode {
 
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
+    pub system: Option<String>,
     pub mode: BuildMode,
     pub flake_path: String,
     pub file: String,
@@ -75,7 +76,10 @@ pub async fn get_system() -> Result<String, String> {
 pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, String> {
     match config.mode {
         BuildMode::Flake => {
-            let system = get_system().await?;
+            let system = match &config.system {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => get_system().await?,
+            };
             info!(
                 "Discovering flake outputs for {} in {}",
                 system, config.flake_path
@@ -130,16 +134,14 @@ pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, 
                 }
             }
 
-            // 2. NixOS Configurations
+            // 2. NixOS Configurations (filtered by target system)
             let expr = format!("{}#nixosConfigurations", flake_ref);
+            let filter_expr = format!(
+                "attrs: builtins.concatStringsSep \"\\n\" (builtins.filter (name: (attrs.${{name}}.config.nixpkgs.system or attrs.${{name}}.pkgs.system or \"{}\") == \"{}\") (builtins.attrNames attrs))",
+                system, system
+            );
             let output = Command::new("nix")
-                .args([
-                    "eval",
-                    &expr,
-                    "--apply",
-                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-                    "--raw",
-                ])
+                .args(["eval", &expr, "--apply", &filter_expr, "--raw"])
                 .output()
                 .await;
             if let Ok(out) = output
@@ -307,32 +309,53 @@ pub async fn build_outputs(targets: &[BuildTarget]) -> Result<Vec<String>, Strin
     Ok(all_paths)
 }
 
-pub async fn get_closure(paths: &[String]) -> Result<Vec<String>, String> {
-    let mut cmd = Command::new("nix-store");
-    cmd.args(["--query", "--requisites"]);
-    for p in paths {
-        cmd.arg(p);
+pub fn parse_path_info_items(parsed: &Value) -> Result<Vec<Value>, String> {
+    if let Some(arr) = parsed.as_array() {
+        Ok(arr.clone())
+    } else if let Some(obj) = parsed.as_object() {
+        let mut list = Vec::new();
+        for (path, val) in obj {
+            let mut item = val.clone();
+            if let Some(item_obj) = item.as_object_mut() {
+                item_obj.insert("path".to_string(), Value::String(path.clone()));
+            }
+            list.push(item);
+        }
+        Ok(list)
+    } else {
+        Err("Unexpected path-info JSON format".to_string())
+    }
+}
+
+pub fn filter_locally_built_paths(items: &[Value], own_hashes: &[String]) -> Vec<String> {
+    let mut locally_built = Vec::new();
+    for item in items {
+        if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
+            let sigs = item
+                .get("signatures")
+                .or_else(|| item.get("sigs"))
+                .and_then(|s| s.as_array());
+
+            let has_sig = match sigs {
+                None => false,
+                Some(arr) => !arr.is_empty(),
+            };
+
+            if !has_sig
+                && let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str())
+                && name.len() >= 32
+            {
+                let hash = &name[..32];
+                if !own_hashes.iter().any(|h| h == hash) {
+                    locally_built.push(path.to_string());
+                }
+            }
+        }
     }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run nix-store query: {}", e))?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    let mut requisites: Vec<String> = out_str
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    requisites.sort();
-    requisites.dedup();
-    Ok(requisites)
+    locally_built.sort();
+    locally_built.dedup();
+    locally_built
 }
 
 pub async fn find_locally_built_paths(
@@ -358,52 +381,8 @@ pub async fn find_locally_built_paths(
     let parsed = serde_json::from_str::<Value>(&json_str)
         .map_err(|e| format!("Failed to parse path-info JSON: {}", e))?;
 
-    let items = if let Some(arr) = parsed.as_array() {
-        arr.clone()
-    } else if let Some(obj) = parsed.as_object() {
-        // Handle path-keyed dictionary by merging key and value
-        let mut list = Vec::new();
-        for (path, val) in obj {
-            let mut item = val.clone();
-            if let Some(item_obj) = item.as_object_mut() {
-                item_obj.insert("path".to_string(), Value::String(path.clone()));
-            }
-            list.push(item);
-        }
-        list
-    } else {
-        return Err("Unexpected path-info JSON format".to_string());
-    };
-
-    let mut locally_built = Vec::new();
-    for item in items {
-        if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
-            let sigs = item
-                .get("signatures")
-                .or_else(|| item.get("sigs"))
-                .and_then(|s| s.as_array());
-
-            // If signatures array is empty or missing, it's built locally
-            let has_sig = match sigs {
-                None => false,
-                Some(arr) => !arr.is_empty(),
-            };
-
-            if !has_sig
-                && let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str())
-                && name.len() >= 32
-            {
-                let hash = &name[..32];
-                if !own_hashes.iter().any(|h| h == hash) {
-                    locally_built.push(path.to_string());
-                }
-            }
-        }
-    }
-
-    locally_built.sort();
-    locally_built.dedup();
-    Ok(locally_built)
+    let items = parse_path_info_items(&parsed)?;
+    Ok(filter_locally_built_paths(&items, own_hashes))
 }
 
 pub async fn export_paths_directly(
@@ -641,4 +620,97 @@ pub async fn export_paths_directly(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_build_target_display() {
+        let flake_target = BuildTarget::Flake {
+            flake_ref: "path:/root/workspace".to_string(),
+            attribute: "packages.x86_64-linux.my-pkg".to_string(),
+        };
+        assert_eq!(
+            format!("{}", flake_target),
+            "path:/root/workspace#packages.x86_64-linux.my-pkg"
+        );
+
+        let non_flake_target_attr = BuildTarget::NonFlake {
+            file: "default.nix".to_string(),
+            attribute: Some("cache-proxy".to_string()),
+        };
+        assert_eq!(
+            format!("{}", non_flake_target_attr),
+            "default.nix -A cache-proxy"
+        );
+
+        let non_flake_target_no_attr = BuildTarget::NonFlake {
+            file: "default.nix".to_string(),
+            attribute: None,
+        };
+        assert_eq!(format!("{}", non_flake_target_no_attr), "default.nix");
+    }
+
+    #[test]
+    fn test_parse_path_info_array_format() {
+        let json_data = json!([
+            {
+                "path": "/nix/store/00000000000000000000000000000001-local-unsigned",
+                "signatures": [],
+                "narHash": "sha256:abcd",
+                "narSize": 1000
+            },
+            {
+                "path": "/nix/store/00000000000000000000000000000002-upstream-signed",
+                "signatures": ["cache.nixos.org-1:sig123"],
+                "narHash": "sha256:efgh",
+                "narSize": 2000
+            },
+            {
+                "path": "/nix/store/00000000000000000000000000000003-already-in-cache",
+                "signatures": [],
+                "narHash": "sha256:ijkl",
+                "narSize": 3000
+            }
+        ]);
+
+        let items = parse_path_info_items(&json_data).unwrap();
+        assert_eq!(items.len(), 3);
+
+        let own_hashes = vec!["00000000000000000000000000000003".to_string()];
+        let filtered = filter_locally_built_paths(&items, &own_hashes);
+
+        assert_eq!(
+            filtered,
+            vec!["/nix/store/00000000000000000000000000000001-local-unsigned".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_path_info_object_format() {
+        let json_data = json!({
+            "/nix/store/11111111111111111111111111111111-map-pkg": {
+                "narHash": "sha256:xxxx",
+                "narSize": 500
+            }
+        });
+
+        let items = parse_path_info_items(&json_data).unwrap();
+        assert_eq!(items.len(), 1);
+
+        let filtered = filter_locally_built_paths(&items, &[]);
+        assert_eq!(
+            filtered,
+            vec!["/nix/store/11111111111111111111111111111111-map-pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_path_info_invalid_format() {
+        let json_data = json!("invalid string");
+        assert!(parse_path_info_items(&json_data).is_err());
+    }
 }

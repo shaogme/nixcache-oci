@@ -16,78 +16,151 @@
 
 ### 发布缓存
 
-你可以选择以下两种方式之一来发布二进制缓存：
+你可以选择以下方式之一来发布二进制缓存：
 
 #### 方式一：直接在你的 GitHub 仓库中使用 GitHub Action（推荐，无需 fork）
 
 你可以在你现有的 Flake 项目仓库中，直接在 GitHub Actions 工作流中调用本项目的 Action 来构建并发布缓存。
 
-1. 在你的仓库中创建 `.github/workflows/publish-cache.yml`：
-   - **Flake 模式（默认）：**
-     ```yaml
-     name: Publish Cache
-     on:
-       push:
-         branches: [ main ]
-       workflow_dispatch:
+##### 1. 多架构 Matrix 矩阵并行构建与汇聚发布（推荐，Scatter-Gather 架构）
 
-     permissions:
-       contents: read
-       packages: write
+支持任意多架构（如 `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` 等）并发编译，各节点无锁并发上传 NAR Blobs 并生成 Build Receipt，最后由 Coordinator 单节点原子合并全局索引发布：
 
-     jobs:
-       publish:
-         runs-on: ubuntu-latest
-         steps:
-           - uses: actions/checkout@main
+在你的仓库中创建 `.github/workflows/publish-cache.yml`：
+```yaml
+name: Build & Publish Multi-Arch Cache
 
-           - name: Install Nix
-             uses: DeterminateSystems/nix-installer-action@main
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-           - name: Publish to GHCR
-             uses: shaogme/nixcache-oci@main
-             with:
-               mode: 'flake'
-               flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
-               signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
-               fail-fast: 'true' # 可选，默认为 'true'（Proxy 启动失败时立即报错；设为 'false' 则允许降级构建）
-     ```
+permissions:
+  contents: read
+  packages: write
 
-   - **非 Flake 模式：**
-     ```yaml
-     name: Publish Cache
-     on:
-       push:
-         branches: [ main ]
-       workflow_dispatch:
+jobs:
+  # =========================================================================
+  # 阶段 1: 并行编译多平台产物 (Scatter - GitHub Matrix 并发)
+  # =========================================================================
+  build-matrix:
+    name: Build (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+          - os: macos-14
+            system: aarch64-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
 
-     permissions:
-       contents: read
-       packages: write
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
 
-     jobs:
-       publish:
-         runs-on: ubuntu-latest
-         steps:
-           - uses: actions/checkout@main
+      - name: Build & Push Blobs
+        uses: shaogme/nixcache-oci/build@main
+        with:
+          system: ${{ matrix.system }}
+          mode: 'flake'
+          flake-path: '.'
+          signing-key: ${{ secrets.NIX_SIGNING_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-fast: 'true'
 
-           - name: Install Nix
-             uses: DeterminateSystems/nix-installer-action@main
+  # =========================================================================
+  # 阶段 2: 汇聚并原子发布统一缓存索引 (Gather - 单节点合并发布)
+  # =========================================================================
+  publish-index:
+    name: Merge & Publish Cache Index
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge Receipts & Finalize Index
+        uses: shaogme/nixcache-oci/merge@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
 
-           - name: Publish to GHCR
-             uses: shaogme/nixcache-oci@main
-             with:
-               mode: 'non-flake'
-               file: 'default.nix' # 选填，Nix 文件路径，默认为 'default.nix'
-               attributes: 'my-package another-package' # 选填，要构建的属性（以空格隔开），留空则构建整个 expression
-               signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
-               fail-fast: 'true' # 可选，默认为 'true'（Proxy 启动失败时立即报错；设为 'false' 则允许降级构建）
-     ```
+##### 2. 单机全流程一键发布（All-in-One，适用于单一架构或简易项目）
 
-2. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
+在单节点上直接完成编译、NAR 上传与索引发布：
 
-3. **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
-   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
+- **Flake 模式：**
+  ```yaml
+  name: Publish Cache
+  on:
+    push:
+      branches: [ main ]
+    workflow_dispatch:
+
+  permissions:
+    contents: read
+    packages: write
+
+  jobs:
+    publish:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@main
+
+        - name: Install Nix
+          uses: DeterminateSystems/nix-installer-action@main
+
+        - name: Publish to GHCR
+          uses: shaogme/nixcache-oci@main
+          with:
+            mode: 'flake'
+            flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
+            signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
+            fail-fast: 'true' # 可选，默认为 'true'
+  ```
+
+- **非 Flake 模式：**
+  ```yaml
+  name: Publish Cache
+  on:
+    push:
+      branches: [ main ]
+    workflow_dispatch:
+
+  permissions:
+    contents: read
+    packages: write
+
+  jobs:
+    publish:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@main
+
+        - name: Install Nix
+          uses: DeterminateSystems/nix-installer-action@main
+
+        - name: Publish to GHCR
+          uses: shaogme/nixcache-oci@main
+          with:
+            mode: 'non-flake'
+            file: 'default.nix'
+            attributes: 'my-package another-package'
+            signing-key: ${{ secrets.NIX_SIGNING_KEY }}
+            fail-fast: 'true'
+  ```
+
+##### 3. 版本控制与配置
+
+- **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
+  * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
+
+- 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
 
 #### 方式二：Fork 本项目（声明式管理）
@@ -305,23 +378,76 @@ npins update
 
 ---
 
-### 构建与管理服务 (nixcache-builder) 配置
+### 构建与管理服务 (nixcache-builder) CLI 子命令
+
+`nixcache-builder` 采用清晰的职责拆分子命令设计：
+
+#### 1. `build` (Matrix Worker 节点专用)
+构建指定平台的 Nix 产物、并发推送 NAR Blobs 到 GHCR，并生成本地轻量构建收据（Build Receipt）：
+```bash
+nixcache-builder build \
+  --system x86_64-linux \
+  --mode flake \
+  --flake-path . \
+  --repo owner/repo \
+  --registry ghcr.io \
+  --output-receipt receipt-x86_64-linux.json \
+  --fail-fast
+```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 |---|---|---|---|
-| `-g`, `--gc` | - | `false` | 运行垃圾回收（Garbage Collection） |
-| `--retention-days <DAYS>`| - | `30` | 垃圾回收所保留的缓存包天数 |
-| `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
-| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
-| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
-| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
-| `--mode <MODE>` | `NIXCACHE_MODE` | `flake` | 构建模式，可选值: `flake` 或 `non-flake` |
+| `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台架构（如 `x86_64-linux`, `aarch64-linux`） |
+| `--mode <MODE>` | `NIXCACHE_MODE` | `flake` | 构建模式，可选: `flake` 或 `non-flake` |
 | `--flake-path <PATH>` | `NIXCACHE_FLAKE_PATH` | `.` | 含有 `flake.nix` 的目录路径 |
 | `--config-dir <PATH>` | `NIXCACHE_CONFIG_DIR` | （无） | 配置目录路径（`flake-path` 的回退选项） |
 | `--file <FILE>` | `NIXCACHE_FILE` | `default.nix` | 非 Flake 模式下的构建目标文件 |
-| `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 非 Flake 模式下要构建的属性（以逗号或空格分割） |
-| `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | 当本地自替代代理（nixcache-proxy）启动失败或超时时是否立即报错退出（设为 `false` 则允许降级为无代理直接构建） |
-| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token（未提供时会尝试通过本地 `gh auth token` 自动获取） |
+| `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 非 Flake 模式下要构建的属性 |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | `receipt-<system>.json` | 生成的收据 JSON 文件路径 |
+| `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | Proxy 启动失败时是否立即报错退出 |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+#### 2. `merge` (Coordinator 汇聚节点专用)
+收集所有 Matrix 节点的 Build Receipts，原子合并全局索引清单并发布到 GHCR：
+```bash
+nixcache-builder merge \
+  --receipts-dir ./receipts \
+  --repo owner/repo \
+  --registry ghcr.io
+```
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--receipts-dir <DIR>` | `NIXCACHE_RECEIPTS_DIR` | （无） | 存放 BuildReceipt JSON 文件的目录 |
+| `--receipt <FILE...>` | - | （无） | 单独指定的 BuildReceipt JSON 文件路径（可多次指定） |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+#### 3. `gc` (跨平台垃圾回收阶段)
+聚合保留所有平台的活性根（GC Roots），清理失效孤立包：
+```bash
+nixcache-builder gc \
+  --repo owner/repo \
+  --registry ghcr.io \
+  --retention-days 30
+```
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--retention-days <DAYS>`| `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
+| `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+#### 4. `all-in-one` (单机全流程命令)
+在单节点直接完成本地构建、NAR 上传与索引更新发布（包含 `build` 与 `merge` 全流程）。
+
+---
 
 ### 代理如何工作
 
@@ -348,35 +474,43 @@ curl -X POST http://localhost:37515/_refresh
 ## 架构
 
 ```mermaid
-graph TD
-    subgraph 本地开发与客户端环境
-        FlakeConfig["flake.nix<br>(声明 packages, hosts, shells)"]
-        NixClient["Nix 客户端"]
-        Proxy["nixcache-proxy<br>(本地代理 :37515)"]
+flowchart TD
+    subgraph Matrix ["Phase 1: 并行构建 (Scatter - GitHub Matrix Runners)"]
+        RunnerA["Runner 1 (x86_64-linux)<br>nixcache-builder build --system x86_64-linux"]
+        RunnerB["Runner 2 (aarch64-linux)<br>nixcache-builder build --system aarch64-linux"]
+        RunnerC["Runner 3 (aarch64-darwin)<br>nixcache-builder build --system aarch64-darwin"]
     end
 
-    subgraph GitHub 托管平台
-        Actions["GitHub Actions 工作流<br>(构建输出并过滤上游已有路径)"]
-        subgraph GHCR ["GHCR (ghcr.io)"]
-            Index["cache-index<br>(存储所有 narinfo)"]
-            Blobs["NAR Blobs<br>(内容寻址 OCI Blobs)"]
-        end
+    subgraph OCI_Blobs ["GHCR (OCI Blobs 存储)"]
+        BlobStorage["NAR Blobs<br>(内容寻址, 并发上传天然幂等)"]
     end
 
-    subgraph 外部上游
-        NixosCache["cache.nixos.org<br>(官方缓存)"]
+    subgraph Receipts ["中间产物交换 (Artifacts)"]
+        ReceiptA["receipt-x86_64-linux.json"]
+        ReceiptB["receipt-aarch64-linux.json"]
+        ReceiptC["receipt-aarch64-darwin.json"]
     end
 
-    %% 构建与发布流程
-    FlakeConfig -- "1. 代码推送" --> Actions
-    Actions -- "2. 查询上游已存路径" --> NixosCache
-    Actions -- "3. 推送索引清单" --> Index
-    Actions -- "4. 推送仅本地构建的 NAR" --> Blobs
+    subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
+        Merger["nixcache-builder merge<br>(收集所有 Receipts + 获取旧 cache-index)"]
+        MergedIndex["全局 Cache Index v2<br>(合并 entries + 跨平台 gc_roots)"]
+        TagPush["更新 GHCR tag: cache-index"]
+    end
 
-    %% 客户端消费流程
-    NixClient -- "a. 请求 narinfo (内存即时响应) / nar" --> Proxy
-    Proxy -- "b. 获取自定义 NAR Blobs" --> Blobs
-    Proxy -- "c. 透明回退获取公共路径" --> NixosCache
+    RunnerA -->|1. 并发上传 NAR| BlobStorage
+    RunnerB -->|1. 并发上传 NAR| BlobStorage
+    RunnerC -->|1. 并发上传 NAR| BlobStorage
+
+    RunnerA -->|2. 输出构建凭证| ReceiptA
+    RunnerB -->|2. 输出构建凭证| ReceiptB
+    RunnerC -->|2. 输出构建凭证| ReceiptC
+
+    ReceiptA --> Merger
+    ReceiptB --> Merger
+    ReceiptC --> Merger
+
+    Merger --> MergedIndex
+    MergedIndex --> TagPush
 ```
 
 
@@ -406,6 +540,94 @@ GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的�
 - 且该缓存已超过保留期限（默认 30 天）。
 
 你可以通过以下命令手动触发垃圾回收：`gh workflow run gc-cache.yml`。
+
+## 测试与质量保障（Testing & QA）
+
+本项目构建了包含 **8 层严格测试金字塔** 的全方位质量防护网，涵盖单元测试、Mock 仿真、NixOS 模块静态评估、QEMU VM 虚拟机测试、全场景端到端测试与故障注入测试：
+
+```mermaid
+flowchart TB
+    subgraph L5 ["5. 边缘服务验证"]
+        T8["8. Cloudflare Worker 边缘端到端测试"]
+    end
+    subgraph L4 ["4. 容错与集成测试 (Resilience & E2E)"]
+        T7["7. 异常注入与容错测试 (503 回退 / 签名防篡改 / 12 节点并发合并)"]
+        T6["6. 多架构 Scatter-Gather 并行构建与发布测试"]
+        T5["5. 单机全模式 (Cargo / Nix-Src / Nix-Bin) 构建测试"]
+    end
+    subgraph L3 ["3. NixOS 模块评估与 VM 虚拟机"]
+        T4["4. NixOS VM QEMU 自动化生命周期驱动测试"]
+        T3["3. evalConfig Nix 模块配置静态断言检查"]
+    end
+    subgraph L2 ["2. 单元测试与网络 Mock"]
+        T2["2. Rust 单元测试 + WireMock / Tower 内存路由仿真"]
+    end
+    subgraph L1 ["1. 静态质量与规范检查"]
+        T1["1. Clippy + RustFmt + ShellCheck + ActionLint 全库静态检查"]
+    end
+
+    T1 --> T2
+    T1 --> T3
+    T2 --> T4
+    T3 --> T4
+    T4 --> T5
+    T4 --> T6
+    T4 --> T7
+    T4 --> T8
+```
+
+### 1. 本地运行测试指南
+
+开发者与贡献者可以在本地极速运行各层测试：
+
+
+#### Rust 单元测试与代码检查
+```bash
+# 运行工作区全部 30+ 单元测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
+cargo test --workspace
+
+# 执行 Rust 编码规范与 Clippy 静态分析
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+#### NixOS 模块评估与 VM 虚拟机集成测试
+```bash
+# 1. 执行模块配置静态检查 (验证默认关闭、端口传递、trusted-keys 等)
+nix-build default.nix -A tests.static --no-out-link
+
+# 2. 运行 NixOS VM 虚拟机自动化测试 (QEMU 启动虚拟节点，验证 systemd 与端口响应)
+nix-build default.nix -A tests.vmtest --no-out-link
+```
+
+#### 异常注入与容错安全测试（Fault Injection & Resilience）
+```bash
+# 1. 模拟 OCI Registry 503 宕机，验证 Proxy 优雅降级并透明回退至上游二进制缓存
+./test/test-fault-tolerance.sh
+
+# 2. 模拟供应链篡改与非法密钥，验证 Nix 客户端精准拦截损坏 NAR 与未授权签名
+./test/test-security-signature.sh
+
+# 3. 模拟 12 节点并发生成 Receipts，验证原子合并的幂等性与多架构 GC 根聚合
+./test/test-concurrency-merge.sh
+```
+
+#### 端到端（E2E）全流程测试
+```bash
+# 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])
+./test/test-e2e.sh cargo flake
+
+# 多架构 Scatter-Gather 并行构建与汇聚发布 E2E 测试
+./test/test-multiarch-e2e.sh
+```
+
+#### 工作流与 Shell 脚本检查
+```bash
+nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh scripts/*.sh && actionlint"
+```
+
+
+---
 
 ## 局限性
 

@@ -117,8 +117,9 @@ jobs:
         id: calc_hashes
         run: |
           get_sri() {
-            local file=$1
-            local b64=$(openssl dgst -sha256 -binary "$file" | openssl base64 | tr -d '\n')
+            local file="$1"
+            local b64
+            b64=$(openssl dgst -sha256 -binary "$file" | openssl base64 | tr -d '\n')
             echo "sha256-$b64"
           }
           
@@ -154,14 +155,15 @@ jobs:
              [ "$HASH_BUILDER_X86_64_DARWIN" = "$OLD_BUILDER_X86_64_DARWIN" ] && \
              [ "$HASH_BUILDER_AARCH64_DARWIN" = "$OLD_BUILDER_AARCH64_DARWIN" ]; then
             echo "All hashes match the existing ones. Skipping release."
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           
           SHA="${{ github.sha }}"
           URL_PREFIX="https://github.com/${{ github.repository }}/releases/download/bin-${SHA}"
+
           
           jq --arg ver "$SHA" \
              --arg px86_l "$HASH_PROXY_X86_64_LINUX" \

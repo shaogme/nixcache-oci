@@ -7,6 +7,8 @@ use worker::{Env, js_sys::Date};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexEntry {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
     pub narinfo: String,
     pub nar_digest: String,
     pub nar_size: u64,
@@ -22,7 +24,7 @@ pub struct CacheIndexData {
     pub generated: String,
     pub public_key: String,
     pub entries: HashMap<String, IndexEntry>,
-    pub gc_roots: Vec<String>,
+    pub gc_roots: HashMap<String, Vec<String>>,
     #[serde(skip)]
     pub nar_lookup: HashMap<String, String>,
     #[serde(skip)]
@@ -258,6 +260,7 @@ mod tests {
             "hash1".to_string(),
             IndexEntry {
                 name: "pkg1".to_string(),
+                system: Some("x86_64-linux".to_string()),
                 narinfo:
                     "StorePath: /nix/store/hash1-pkg1\nURL: nar/pkg1.nar.xz\nCompression: xz\n"
                         .to_string(),
@@ -270,6 +273,7 @@ mod tests {
             "hash2".to_string(),
             IndexEntry {
                 name: "pkg2".to_string(),
+                system: None,
                 narinfo: "StorePath: /nix/store/hash2-pkg2\nURL: pkg2.nar\nCompression: none\n"
                     .to_string(),
                 nar_digest: "sha256:digest2".to_string(),
@@ -294,5 +298,44 @@ mod tests {
             Some(&"sha256:digest2".to_string())
         );
         assert_eq!(data.nar_lookup.get("nonexistent.nar"), None);
+    }
+
+    #[test]
+    fn test_cache_index_data_serialization() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "hash1".to_string(),
+            IndexEntry {
+                name: "pkg1".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/hash1-pkg1\n".to_string(),
+                nar_digest: "sha256:digest1".to_string(),
+                nar_size: 1024,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+
+        let data = CacheIndexData {
+            version: 2,
+            repo: "owner/repo".to_string(),
+            registry: "ghcr.io".to_string(),
+            image: "ghcr.io/owner/repo/nix-cache".to_string(),
+            generated: "2026-08-28T00:00:00Z".to_string(),
+            public_key: "key:pub".to_string(),
+            entries,
+            gc_roots: HashMap::new(),
+            nar_lookup: HashMap::new(),
+            manifest_digest: "sha256:manifest".to_string(),
+        };
+
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: CacheIndexData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.repo, "owner/repo");
+        assert_eq!(parsed.entries.len(), 1);
+        // nar_lookup and manifest_digest are skipped in serialization
+        assert!(parsed.nar_lookup.is_empty());
+        assert!(parsed.manifest_digest.is_empty());
     }
 }

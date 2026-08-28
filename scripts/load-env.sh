@@ -27,8 +27,9 @@ load_nixcache_env() {
                 if [[ -n "${GITHUB_ENV:-}" ]]; then
                     echo "$cleaned_line" >> "$GITHUB_ENV"
                 fi
-                export "$cleaned_line"
+                export "${cleaned_line?}"
             done < "$env_file"
+
         fi
     }
     

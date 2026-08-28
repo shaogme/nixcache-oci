@@ -25,6 +25,8 @@
 
       apps = forAllSystems (system: (defaultForSystem system).apps);
 
+      checks = forAllSystems (system: (defaultForSystem system).tests);
+
       nixosModules = (import ./default.nix { }).nixosModules;
     };
 }

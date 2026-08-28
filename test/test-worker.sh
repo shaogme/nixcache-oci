@@ -73,7 +73,7 @@ TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
-PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN"
+PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" all-in-one
 
 # 5. Force Worker to refresh its cache index
 echo ">>> Triggering Worker cache index refresh..."

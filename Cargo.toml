@@ -25,4 +25,6 @@ num_cpus = "1.17"
 thiserror = "2.0"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "env"] }
-
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+wiremock = "0.6"

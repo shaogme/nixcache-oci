@@ -1,35 +1,12 @@
-use nixcache_oci::OciClient;
-use serde::{Deserialize, Serialize};
+use nixcache_oci::{CacheIndexData, IndexEntry, OciClient};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{fs, sync::RwLock};
 use tracing::{error, info};
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct IndexEntry {
-    pub name: String,
-    pub narinfo: String,
-    pub nar_digest: String,
-    pub nar_size: u64,
-    pub added: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct CacheIndexData {
-    pub version: u32,
-    pub repo: String,
-    pub registry: String,
-    pub image: String,
-    pub generated: String,
-    pub public_key: String,
-    pub entries: HashMap<String, IndexEntry>,
-    pub gc_roots: Vec<String>,
-}
 
 #[derive(Clone)]
 pub struct CacheIndex {
@@ -80,6 +57,14 @@ impl CacheIndex {
         self.refresh().await?;
         let current = self.data.read().await;
         Ok(current.entries.len())
+    }
+
+    #[cfg(test)]
+    pub async fn update_data_in_memory(&self, new_data: CacheIndexData) {
+        let mut data = self.data.write().await;
+        *data = new_data;
+        let mut last = self.last_refresh.write().await;
+        *last = Some(Instant::now());
     }
 
     async fn refresh(&self) -> Result<(), String> {
@@ -194,5 +179,159 @@ impl CacheIndex {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixcache_oci::IndexEntry;
+    use std::collections::HashMap;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn test_cache_index_lookup_and_find_nar_digest() {
+        let index = CacheIndex::new(
+            "ghcr.io",
+            "test/repo",
+            "",
+            PathBuf::from("/tmp/test-index-dir"),
+            300,
+        );
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "hash123".to_string(),
+            IndexEntry {
+                name: "mypkg".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/hash123-mypkg\nURL: nar/hash123.nar.xz\n"
+                    .to_string(),
+                nar_digest: "sha256:narblobdigest123".to_string(),
+                nar_size: 1024,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+
+        let data = CacheIndexData {
+            entries,
+            ..Default::default()
+        };
+        index.update_data_in_memory(data).await;
+
+        let entry = index.lookup("hash123").await.expect("Should find entry");
+        assert_eq!(entry.name, "mypkg");
+
+        assert_eq!(
+            index.find_nar_digest("hash123.nar.xz").await,
+            Some("sha256:narblobdigest123".to_string())
+        );
+        assert_eq!(index.find_nar_digest("nonexistent.nar.xz").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_backup_index_loading_when_remote_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backup_file = temp_dir.path().join("cache-index.json");
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "backuphash".to_string(),
+            IndexEntry {
+                name: "backup-pkg".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/backuphash-pkg\n".to_string(),
+                nar_digest: "sha256:backupdigest".to_string(),
+                nar_size: 2048,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+        let data = CacheIndexData {
+            repo: "test/backup-repo".to_string(),
+            entries,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_vec(&data).unwrap();
+        tokio::fs::write(&backup_file, json).await.unwrap();
+
+        // Registry 端口无法连接（引发远端失败），验证自动降级读取 backup
+        let index = CacheIndex::new(
+            "127.0.0.1:59999",
+            "test/backup-repo",
+            "",
+            temp_dir.path().to_path_buf(),
+            1, // 1s TTL
+        );
+
+        let loaded = index.get_data().await;
+        assert_eq!(loaded.repo, "test/backup-repo");
+        assert!(loaded.entries.contains_key("backuphash"));
+    }
+
+    #[tokio::test]
+    async fn test_remote_refresh_and_backup_saving() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "remotehash".to_string(),
+            IndexEntry {
+                name: "remote-pkg".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/remotehash-pkg\n".to_string(),
+                nar_digest: "sha256:remotedigest".to_string(),
+                nar_size: 512,
+                added: "2026-08-28T00:00:00Z".to_string(),
+            },
+        );
+        let index_data = CacheIndexData {
+            repo: "test/remote-repo".to_string(),
+            entries,
+            ..Default::default()
+        };
+        let blob_bytes = serde_json::to_vec(&index_data).unwrap();
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "layers": [{
+                "digest": "sha256:indexblob1",
+                "size": blob_bytes.len()
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v2/test/remote-repo/nix-cache/manifests/cache-index"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/test/remote-repo/nix-cache/blobs/sha256:indexblob1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_bytes))
+            .mount(&server)
+            .await;
+
+        let index = CacheIndex::new(
+            &host,
+            "test/remote-repo",
+            "",
+            temp_dir.path().to_path_buf(),
+            60,
+        );
+
+        let count = index.force_refresh().await.unwrap();
+        assert_eq!(count, 1);
+
+        // 验证 backup 文件已被自动写入
+        let backup_file = temp_dir.path().join("cache-index.json");
+        assert!(backup_file.exists());
     }
 }

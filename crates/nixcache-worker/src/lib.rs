@@ -4,17 +4,21 @@ use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 mod oci;
 mod store;
 
+pub fn parse_upstream_list(upstream_str: &str) -> Vec<String> {
+    upstream_str
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn get_upstream_list(env: &Env) -> Vec<String> {
     let upstream_str = env
         .var("NIXCACHE_UPSTREAM")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "https://cache.nixos.org".to_string());
 
-    upstream_str
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    parse_upstream_list(&upstream_str)
 }
 
 fn get_store(env: &Env) -> Result<CacheStore> {
@@ -238,4 +242,39 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         })
         .run(req, env)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_upstream_list;
+
+    #[test]
+    fn test_worker_upstream_parsing() {
+        let single = "https://cache.nixos.org";
+        assert_eq!(
+            parse_upstream_list(single),
+            vec!["https://cache.nixos.org".to_string()]
+        );
+
+        let comma_separated = "https://cache.nixos.org, https://nix-community.cachix.org";
+        assert_eq!(
+            parse_upstream_list(comma_separated),
+            vec![
+                "https://cache.nixos.org".to_string(),
+                "https://nix-community.cachix.org".to_string()
+            ]
+        );
+
+        let mixed_whitespace = "  https://cache.nixos.org \n  https://nix-community.cachix.org ,  ";
+        assert_eq!(
+            parse_upstream_list(mixed_whitespace),
+            vec![
+                "https://cache.nixos.org".to_string(),
+                "https://nix-community.cachix.org".to_string()
+            ]
+        );
+
+        let empty = "   \n\t  ";
+        assert!(parse_upstream_list(empty).is_empty());
+    }
 }

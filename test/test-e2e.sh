@@ -9,25 +9,49 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting Nix OCI Cache E2E Integration Test ==="
 
-# 1. Start a local OCI registry container
+# 1. Start a local OCI registry container or mock registry
 REGISTRY_CONTAINER="nixcache-test-registry"
 REGISTRY_PORT=5001
+REGISTRY_PID=""
 
-if docker ps -a --format '{{.Names}}' | grep -q "^${REGISTRY_CONTAINER}$"; then
-    echo ">>> Stopping existing registry container..."
-    docker rm -f "$REGISTRY_CONTAINER" >/dev/null
+if command -v docker &>/dev/null && docker ps &>/dev/null; then
+    if docker ps -a --format '{{.Names}}' | grep -q "^${REGISTRY_CONTAINER}$"; then
+        echo ">>> Stopping existing registry container..."
+        docker rm -f "$REGISTRY_CONTAINER" >/dev/null
+    fi
+
+    echo ">>> Launching local OCI registry via Docker..."
+    docker run -d -p "${REGISTRY_PORT}:5000" --name "$REGISTRY_CONTAINER" registry:2
+else
+    echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
+    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    lsof -ti:"${REGISTRY_PORT}" | xargs -r kill -9 2>/dev/null || true
+    python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+    REGISTRY_PID=$!
+    for _ in {1..20}; do
+        if curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+
 fi
-
-echo ">>> Launching local OCI registry..."
-docker run -d -p "${REGISTRY_PORT}:5000" --name "$REGISTRY_CONTAINER" registry:2
 
 # Ensure registry container is cleaned up on exit
 cleanup() {
     echo ">>> Cleaning up resources..."
+    git checkout -- examples/flake/flake.nix examples/legacy/default.nix 2>/dev/null || true
     if [[ -n "${PROXY_PID:-}" ]]; then
-        kill "$PROXY_PID" 2>/dev/null || true
+        kill -9 "$PROXY_PID" 2>/dev/null || true
     fi
-    docker rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
+    if [[ -n "${REGISTRY_PID:-}" ]]; then
+        kill -9 "$REGISTRY_PID" 2>/dev/null || true
+    fi
+    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    if command -v docker &>/dev/null && docker ps &>/dev/null; then
+        docker rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    rm -rf /tmp/mock-oci-registry
     rm -f test-secret.key test-public.key result-builder result-proxy result-builder-bin result-proxy-bin
     echo ">>> Cleanup complete."
 }
@@ -73,11 +97,14 @@ export NIXCACHE_SIGNING_KEY_FILE="test-secret.key"
 export GITHUB_TOKEN="dummy-token"
 
 # 加载环境变量
+# shellcheck disable=SC1091
 source "$(dirname "$0")/../scripts/load-env.sh" "$TEST_MODE"
 
 if [[ "${NIXCACHE_MODE:-flake}" == "flake" ]]; then
+    sed -i "s/Built at: .*/Built at: $(date +%s%N)\"/" examples/flake/flake.nix
     TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
 elif [[ "${NIXCACHE_MODE:-}" == "non-flake" ]]; then
+    sed -i "s/Built at: .*/Built at: $(date +%s%N)\"/" examples/legacy/default.nix
     TEST_STORE_PATH=$(nix build --file "${NIXCACHE_FILE}" "${NIXCACHE_ATTRIBUTES}" --no-link --print-out-paths)
 else
     echo "!!! Unknown NIXCACHE_MODE: $NIXCACHE_MODE"
@@ -89,7 +116,7 @@ TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
-PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN"
+PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" all-in-one
 
 # 5. Start proxy pointing to the local registry
 echo ">>> Starting nixcache-proxy..."
@@ -104,7 +131,7 @@ unset CACHE_DIRECTORY
 PROXY_PID=$!
 
 echo ">>> Waiting for proxy to become ready..."
-for i in {1..10}; do
+for _ in {1..10}; do
     if curl -fs http://127.0.0.1:37515/nix-cache-info >/dev/null 2>&1; then
         break
     fi
