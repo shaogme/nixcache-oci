@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::{fs, process::Command, time::sleep};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct IndexEntry {
@@ -170,6 +170,7 @@ pub async fn run_pipeline(
     registry: &str,
     signing_key_file: Option<&str>,
     github_token: &str,
+    fail_fast: bool,
 ) -> Result<(), String> {
     info!("Starting OCI cache pipeline");
     let image = format!("{}/{}/nix-cache", registry, repo);
@@ -190,24 +191,32 @@ pub async fn run_pipeline(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let mut proxy_child = proxy_cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn nixcache-proxy: {}", e))?;
-
-    let mut ready = false;
-    let client = reqwest::Client::new();
-    for _ in 1..=15 {
-        if let Ok(res) = client
-            .get("http://127.0.0.1:37515/nix-cache-info")
-            .send()
-            .await
-            && res.status().is_success()
-        {
-            ready = true;
-            break;
+    let (proxy_child, ready) = match proxy_cmd.spawn() {
+        Ok(child) => {
+            let mut ready = false;
+            let client = reqwest::Client::new();
+            for _ in 1..=15 {
+                if let Ok(res) = client
+                    .get("http://127.0.0.1:37515/nix-cache-info")
+                    .send()
+                    .await
+                    && res.status().is_success()
+                {
+                    ready = true;
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            (Some(child), ready)
         }
-        sleep(Duration::from_secs(1)).await;
-    }
+        Err(e) => {
+            if fail_fast {
+                return Err(format!("Failed to spawn nixcache-proxy: {}", e));
+            }
+            warn!("Could not spawn nixcache-proxy ({}). Proceeding without self-substituter.", e);
+            (None, false)
+        }
+    };
 
     let mut nix_conf_backup = None;
     if ready {
@@ -219,7 +228,13 @@ pub async fn run_pipeline(
             info!("Trusted own public key: {}", k);
         }
         nix_conf_backup = write_nix_conf(&["http://127.0.0.1:37515"], &keys).await?;
-    } else {
+    } else if proxy_child.is_some() {
+        if fail_fast {
+            if let Some(mut child) = proxy_child {
+                let _ = child.kill().await;
+            }
+            return Err("Self-substituter proxy failed to become ready (timed out after 15s)".to_string());
+        }
         info!("Self-substituter failed to respond, proceeding without it");
     }
 
@@ -233,7 +248,9 @@ pub async fn run_pipeline(
 
     // 4. Restore configuration and stop proxy
     restore_nix_conf(nix_conf_backup).await;
-    let _ = proxy_child.kill().await;
+    if let Some(mut child) = proxy_child {
+        let _ = child.kill().await;
+    }
 
     // 5. Fetch remote cache-index
     let oci = OciClient::new(registry, repo, github_token, true);

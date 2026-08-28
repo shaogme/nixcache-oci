@@ -20,6 +20,9 @@ let
         lockFile = ./Cargo.lock;
       };
       buildAndTestSubdir = "crates/nixcache-builder";
+      postInstall = ''
+        ln -s ${packages.cache-proxy}/bin/nixcache-proxy $out/bin/nixcache-proxy
+      '';
     };
 
     cache-proxy-bin = import ./nix/binary.nix { inherit pkgs; pname = "nixcache-proxy"; };

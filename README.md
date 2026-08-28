@@ -50,6 +50,7 @@
                mode: 'flake'
                flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
                signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
+               fail-fast: 'true' # 可选，默认为 'true'（Proxy 启动失败时立即报错；设为 'false' 则允许降级构建）
      ```
 
    - **非 Flake 模式：**
@@ -80,6 +81,7 @@
                file: 'default.nix' # 选填，Nix 文件路径，默认为 'default.nix'
                attributes: 'my-package another-package' # 选填，要构建的属性（以空格隔开），留空则构建整个 expression
                signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
+               fail-fast: 'true' # 可选，默认为 'true'（Proxy 启动失败时立即报错；设为 'false' 则允许降级构建）
      ```
 
 2. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
@@ -318,6 +320,7 @@ npins update
 | `--config-dir <PATH>` | `NIXCACHE_CONFIG_DIR` | （无） | 配置目录路径（`flake-path` 的回退选项） |
 | `--file <FILE>` | `NIXCACHE_FILE` | `default.nix` | 非 Flake 模式下的构建目标文件 |
 | `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 非 Flake 模式下要构建的属性（以逗号或空格分割） |
+| `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | 当本地自替代代理（nixcache-proxy）启动失败或超时时是否立即报错退出（设为 `false` 则允许降级为无代理直接构建） |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token（未提供时会尝试通过本地 `gh auth token` 自动获取） |
 
 ### 代理如何工作

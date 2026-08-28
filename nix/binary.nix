@@ -14,6 +14,14 @@ let
     url = target.url;
     hash = target.hash;
   };
+
+  proxyTarget = if builtins.hasAttr "nixcache-proxy" binaries && builtins.hasAttr system binaries."nixcache-proxy"
+    then binaries."nixcache-proxy".${system}
+    else null;
+  proxySrc = if proxyTarget != null then pkgs.fetchurl {
+    url = proxyTarget.url;
+    hash = proxyTarget.hash;
+  } else null;
 in
 pkgs.stdenv.mkDerivation {
   pname = "${pname}-bin";
@@ -27,6 +35,10 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/bin
     cp $src $out/bin/${pname}
     chmod +x $out/bin/${pname}
+    ${if pname == "nixcache-builder" && proxySrc != null then ''
+      cp ${proxySrc} $out/bin/nixcache-proxy
+      chmod +x $out/bin/nixcache-proxy
+    '' else ""}
   '';
 
   meta = with pkgs.lib; {

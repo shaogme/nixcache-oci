@@ -87,6 +87,21 @@ struct Args {
     )]
     attributes: Option<String>,
 
+    #[arg(
+        long,
+        env = "NIXCACHE_FAIL_FAST",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Fail fast if self-substituter proxy fails to start or become ready (default: true)"
+    )]
+    fail_fast: bool,
+
+    #[arg(
+        long,
+        help = "Allow self-substituter proxy failure (disables fail-fast)"
+    )]
+    no_fail_fast: bool,
+
     #[arg(long, env = "GITHUB_TOKEN", help = "GitHub token for authentication")]
     github_token: Option<String>,
 
@@ -140,6 +155,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let fail_fast = if args.no_fail_fast {
+        false
+    } else {
+        args.fail_fast
+    };
+
     if args.gc {
         if let Err(e) = run_gc(
             args.retention_days,
@@ -161,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &args.registry,
             signing_key.as_deref(),
             &active_token,
+            fail_fast,
         )
         .await
         {

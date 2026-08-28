@@ -29,6 +29,10 @@ inputs:
     description: 'Nix secret key used to sign store paths'
     required: false
     default: ''
+  fail-fast:
+    description: 'Fail fast if self-substituter proxy fails to start or become ready'
+    required: false
+    default: 'true'
   github-token:
     description: 'GitHub token with package write permissions'
     required: false
@@ -69,6 +73,7 @@ runs:
         NIXCACHE_ATTRIBUTES: ${{ inputs.attributes }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_FAIL_FAST: ${{ inputs.fail-fast }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""
