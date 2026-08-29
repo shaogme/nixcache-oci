@@ -160,7 +160,8 @@ impl OciTransport for MockRouterTransport {
         _stream: Self::BodyStream,
         byte_range: (u64, u64),
     ) -> Result<UploadChunkResponse, TransportError> {
-        self.patch_chunk(url, headers, Bytes::new(), byte_range).await
+        self.patch_chunk(url, headers, Bytes::new(), byte_range)
+            .await
     }
 
     async fn probe_upload_session(

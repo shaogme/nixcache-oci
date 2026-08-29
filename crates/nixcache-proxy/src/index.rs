@@ -3,9 +3,7 @@ use nixcache_core::{
     ArchCacheIndexData, ArchRunSessionManifest, CacheIndexData, IndexEntry, NarDigest,
     RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
 };
-use nixcache_oci::{
-    CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient,
-};
+use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use scc::HashMap as SccHashMap;
 use std::{
@@ -211,7 +209,10 @@ impl CacheIndex {
         let parsed_hash = StoreHash::parse(store_hash).ok()?;
 
         // Tier 0: 内存热注册表
-        if let Some(entry) = self.hot_entries.read_sync(&parsed_hash, |_, v| (**v).clone()) {
+        if let Some(entry) = self
+            .hot_entries
+            .read_sync(&parsed_hash, |_, v| (**v).clone())
+        {
             return Some(entry);
         }
 
@@ -356,7 +357,10 @@ impl CacheIndex {
             }
         }
 
-        if let Some(baseline) = self.baseline_cache.read_sync(&cache_key, |_, v| v.0.clone()) {
+        if let Some(baseline) = self
+            .baseline_cache
+            .read_sync(&cache_key, |_, v| v.0.clone())
+        {
             all_unique_hashes.extend(baseline.data.entries.keys().cloned());
         } else if let Some(baseline) = self
             .baseline_cache
@@ -451,10 +455,7 @@ impl CacheIndex {
                     "[nixcache-proxy] Failed to fetch baseline cache index: {}",
                     e
                 );
-                self.set_remote_status(
-                    false,
-                    Some(format!("Failed to connect to remote: {}", e)),
-                );
+                self.set_remote_status(false, Some(format!("Failed to connect to remote: {}", e)));
             }
         }
 
@@ -498,10 +499,7 @@ impl CacheIndex {
 
         let _ = self.baseline_cache.upsert_sync(
             cache_key,
-            (
-                result.clone(),
-                Instant::now() + self.config.baseline_ttl,
-            ),
+            (result.clone(), Instant::now() + self.config.baseline_ttl),
         );
         result
     }
@@ -579,10 +577,7 @@ impl CacheIndex {
                 let cached = Arc::new(CachedSession::from_arch_manifest(session));
                 let _ = self.session_cache.upsert_sync(
                     tag_str,
-                    (
-                        cached.clone(),
-                        Instant::now() + self.config.session_ttl,
-                    ),
+                    (cached.clone(), Instant::now() + self.config.session_ttl),
                 );
                 Some(cached)
             }
@@ -615,17 +610,11 @@ impl CacheIndex {
         let baseline = Arc::new(CachedBaseline::new(new_data));
         let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
-            (
-                baseline.clone(),
-                Instant::now() + Duration::from_secs(3600),
-            ),
+            (baseline.clone(), Instant::now() + Duration::from_secs(3600)),
         );
         let _ = self.baseline_cache.upsert_sync(
             cache_key,
-            (
-                baseline,
-                Instant::now() + Duration::from_secs(3600),
-            ),
+            (baseline, Instant::now() + Duration::from_secs(3600)),
         );
         self.set_remote_status(true, None);
     }

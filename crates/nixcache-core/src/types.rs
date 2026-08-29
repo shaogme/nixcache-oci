@@ -548,8 +548,7 @@ impl CacheIndexData {
         }
 
         let mut result = HashMap::new();
-        let mut all_systems: HashSet<SystemArch> =
-            partitioned_entries.keys().cloned().collect();
+        let mut all_systems: HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
         all_systems.extend(self.gc_roots.keys().cloned());
 
         for sys in all_systems {

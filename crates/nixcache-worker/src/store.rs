@@ -10,10 +10,7 @@ use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::Ordering,
-    },
+    sync::{Arc, atomic::Ordering},
 };
 use worker::{Env, js_sys::Date};
 
@@ -159,10 +156,8 @@ impl CacheStore {
 
         // 5. Miss: Debounced Read-Through to GHCR
         let now = Date::now();
-        let should_check_ghcr = WorkerState::global().try_acquire_ghcr_check(
-            now as u64,
-            DEBOUNCE_THRESHOLD_MS as u64,
-        );
+        let should_check_ghcr =
+            WorkerState::global().try_acquire_ghcr_check(now as u64, DEBOUNCE_THRESHOLD_MS as u64);
 
         if should_check_ghcr && self.force_refresh(env).await.is_ok() {
             if let Some(run_id) = self.config.run_id {
@@ -232,10 +227,8 @@ impl CacheStore {
 
         // 5. Miss: Debounced Read-Through to GHCR
         let now = Date::now();
-        let should_check_ghcr = WorkerState::global().try_acquire_ghcr_check(
-            now as u64,
-            DEBOUNCE_THRESHOLD_MS as u64,
-        );
+        let should_check_ghcr =
+            WorkerState::global().try_acquire_ghcr_check(now as u64, DEBOUNCE_THRESHOLD_MS as u64);
 
         if should_check_ghcr && self.force_refresh(env).await.is_ok() {
             if let Some(run_id) = self.config.run_id {
@@ -397,11 +390,13 @@ impl CacheStore {
             let data = wrapper.data;
             let nar_lookup = build_nar_lookup_map(&data.entries);
 
-            WorkerState::global().mem_baseline_cache.store(Some(Arc::new((
-                data.clone(),
-                nar_lookup.clone(),
-                now + L1_MEM_TTL_MS,
-            ))));
+            WorkerState::global()
+                .mem_baseline_cache
+                .store(Some(Arc::new((
+                    data.clone(),
+                    nar_lookup.clone(),
+                    now + L1_MEM_TTL_MS,
+                ))));
             return Ok((data, nar_lookup));
         }
 
@@ -452,11 +447,13 @@ impl CacheStore {
             .execute()
             .await;
 
-        WorkerState::global().mem_baseline_cache.store(Some(Arc::new((
-            index_data.clone(),
-            nar_lookup.clone(),
-            now + L1_MEM_TTL_MS,
-        ))));
+        WorkerState::global()
+            .mem_baseline_cache
+            .store(Some(Arc::new((
+                index_data.clone(),
+                nar_lookup.clone(),
+                now + L1_MEM_TTL_MS,
+            ))));
         WorkerState::global()
             .last_ghcr_check_ms
             .store(now as u64, Ordering::Release);

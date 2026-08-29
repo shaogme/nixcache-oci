@@ -148,7 +148,9 @@ where
                     let hash = this.hasher.clone().finalize();
                     format!(
                         "sha256:{}",
-                        hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                        hash.iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>()
                     )
                 });
                 Poll::Ready(None)

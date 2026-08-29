@@ -11,11 +11,7 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
-use loom::{
-    model::Builder,
-    sync::atomic::Ordering,
-    thread,
-};
+use loom::{model::Builder, sync::atomic::Ordering, thread};
 use nixcache_oci::{
     MockResponse, MockRouterTransport, TokenManager,
     token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
@@ -30,12 +26,8 @@ use std::{
 
 /// 轻量级 Loom 兼容的 Future 轮询驱动器
 fn loom_block_on<F: Future>(fut: F) -> F::Output {
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| RawWaker::new(p, &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
     let raw = RawWaker::new(ptr::null(), &VTABLE);
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);

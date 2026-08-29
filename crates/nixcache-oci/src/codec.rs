@@ -1,7 +1,7 @@
 use crate::{error::OciError, manifest::CacheLayerMediaType};
 use bytes::Bytes;
-use nixcache_utils::ZstdCodec;
 pub use nixcache_utils::DEFAULT_ZSTD_COMPRESSION_LEVEL;
+use nixcache_utils::ZstdCodec;
 use serde::{Serialize, de::DeserializeOwned};
 
 /// 强类型索引与清单编解码器

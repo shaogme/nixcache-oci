@@ -142,10 +142,7 @@ mod imp {
             if rx.changed().await.is_err() {
                 return Err(OciError::AuthFailed);
             }
-            rx.borrow()
-                .as_ref()
-                .cloned()
-                .ok_or(OciError::AuthFailed)
+            rx.borrow().as_ref().cloned().ok_or(OciError::AuthFailed)
         }
     }
 }

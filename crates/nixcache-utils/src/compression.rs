@@ -31,15 +31,10 @@ impl ZstdCodec {
     pub fn compress(data: &[u8], level: i32) -> Result<Bytes, CompressionError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut encoder =
-                zstd::stream::Encoder::new(Vec::with_capacity(data.len() / 4), level)
-                    .map_err(|e| CompressionError::ZstdError(e.to_string()))?;
-            encoder
-                .write_all(data)
-                .map_err(CompressionError::Io)?;
-            let compressed = encoder
-                .finish()
-                .map_err(CompressionError::Io)?;
+            let mut encoder = zstd::stream::Encoder::new(Vec::with_capacity(data.len() / 4), level)
+                .map_err(|e| CompressionError::ZstdError(e.to_string()))?;
+            encoder.write_all(data).map_err(CompressionError::Io)?;
+            let compressed = encoder.finish().map_err(CompressionError::Io)?;
             Ok(Bytes::from(compressed))
         }
 
@@ -92,7 +87,9 @@ mod tests {
     #[test]
     fn test_magic_detection() {
         assert!(ZstdCodec::is_valid_magic(&ZSTD_MAGIC));
-        assert!(ZstdCodec::is_valid_magic(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x01]));
+        assert!(ZstdCodec::is_valid_magic(&[
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x01
+        ]));
         assert!(!ZstdCodec::is_valid_magic(&[0x00, 0x00, 0x00, 0x00]));
         assert!(!ZstdCodec::is_valid_magic(&[0x28, 0xB5, 0x2F]));
         assert!(!ZstdCodec::is_valid_magic(&[]));

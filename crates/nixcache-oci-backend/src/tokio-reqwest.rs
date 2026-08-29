@@ -98,8 +98,10 @@ impl OciTransport for ReqwestTransport {
             .map_err(map_reqwest_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let stream: BoxStream<'static, Result<Bytes, TransportError>> =
-            Box::pin(resp.bytes_stream().map(|res| res.map_err(map_reqwest_error)));
+        let stream: BoxStream<'static, Result<Bytes, TransportError>> = Box::pin(
+            resp.bytes_stream()
+                .map(|res| res.map_err(map_reqwest_error)),
+        );
         Ok((status, headers, stream))
     }
 
@@ -520,12 +522,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                     {
                         if let Some(new_loc) = resp.location {
                             session_url = if new_loc.starts_with('/') {
-                                format!(
-                                    "{}://{}{}",
-                                    self.url_scheme(),
-                                    self.registry(),
-                                    new_loc
-                                )
+                                format!("{}://{}{}", self.url_scheme(), self.registry(), new_loc)
                             } else {
                                 new_loc
                             };
@@ -548,7 +545,9 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                 );
 
                 let backoff_ms = 100 * (1 << attempts.min(5));
-                self.transport().sleep(Duration::from_millis(backoff_ms)).await;
+                self.transport()
+                    .sleep(Duration::from_millis(backoff_ms))
+                    .await;
 
                 if let Ok(probe_headers) = self.get_auth_headers().await
                     && let Ok(Some(last_byte)) = self
@@ -635,8 +634,7 @@ mod tests {
                 "repository:test/repo/nix-cache:pull,push",
             ))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "token": "mocked-jwt-token" })),
+                ResponseTemplate::new(200).set_body_json(json!({ "token": "mocked-jwt-token" })),
             )
             .mount(&server)
             .await;
@@ -729,13 +727,17 @@ mod tests {
             .await;
 
         Mock::given(method("PATCH"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/chunked-session"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/chunked-session",
+            ))
             .respond_with(ResponseTemplate::new(202).insert_header("Range", "0-1048575"))
             .mount(&server)
             .await;
 
         Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/chunked-session"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/chunked-session",
+            ))
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;

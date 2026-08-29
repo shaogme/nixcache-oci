@@ -92,8 +92,7 @@ mod tests {
             },
         );
 
-        let client =
-            OciClient::with_transport("example.com", "test/repo", "", false, transport);
+        let client = OciClient::with_transport("example.com", "test/repo", "", false, transport);
 
         assert!(client.head_blob("sha256:exists").await.unwrap());
         assert!(!client.head_blob("sha256:missing").await.unwrap());
@@ -374,7 +373,8 @@ mod tests {
         let data = Bytes::from_static(b"fast monolithic payload");
         let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-        let client = OciClient::with_transport("example.com", "test/repo", "token123", true, transport);
+        let client =
+            OciClient::with_transport("example.com", "test/repo", "token123", true, transport);
         let pushed_digest = client
             .push_blob_bytes_with_digest(digest, data)
             .await
