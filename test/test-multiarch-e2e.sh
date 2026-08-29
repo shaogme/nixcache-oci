@@ -171,6 +171,7 @@ for m in manifests:
     sub_manifest_digest = m['digest']
     sub_manifest_json = subprocess.check_output([
         'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json',
         f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
     ]).decode('utf-8')
     sub_manifest = json.loads(sub_manifest_json)
@@ -242,6 +243,7 @@ for m in manifests:
     sub_manifest_digest = m['digest']
     sub_manifest_json = subprocess.check_output([
         'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json',
         f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
     ]).decode('utf-8')
     sub_manifest = json.loads(sub_manifest_json)
@@ -287,6 +289,7 @@ for m in manifests:
     sub_manifest_digest = m['digest']
     sub_manifest_json = subprocess.check_output([
         'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json',
         f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
     ]).decode('utf-8')
     sub_manifest = json.loads(sub_manifest_json)
@@ -324,6 +327,7 @@ for m in manifests:
     sub_manifest_digest = m['digest']
     sub_manifest_json = subprocess.check_output([
         'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json',
         f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
     ]).decode('utf-8')
     sub_manifest = json.loads(sub_manifest_json)
