@@ -4,30 +4,41 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Workspace crates
 nixcache-core = { workspace = true }
 nixcache-utils = { workspace = true }
+
+# Async & networking
 bytes = { workspace = true }
-http = { workspace = true }
-futures-util = { workspace = true }
 futures-channel = { workspace = true }
 futures-executor = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-base64 = { workspace = true }
-tracing = { workspace = true }
-sha2 = { workspace = true }
-chrono = { workspace = true }
-web-time = { workspace = true }
+
+# Concurrency & Synchronization
 arc-swap = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
-scc = { workspace = true }
 crossbeam-queue = { workspace = true }
 loom = { workspace = true }
+scc = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Utilities & Error handling
+base64 = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
 loom = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

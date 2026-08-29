@@ -7,16 +7,25 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Workspace crates
 nixcache-core = { workspace = true }
 nixcache-oci = { workspace = true }
+
+# Worker runtime & networking
 bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-thiserror = { workspace = true }
 worker = { version = "0.8.3", features = ["http"] }
+
+# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = { workspace = true }
-getrandom = { version = "0.2", features = ["js"] }
+
+# Concurrency & State
 arc-swap = { workspace = true }
 scc = { workspace = true }
+
+# Utilities & Error handling
+base64 = { workspace = true }
+getrandom = { version = "0.2", features = ["js"] }
+thiserror = { workspace = true }

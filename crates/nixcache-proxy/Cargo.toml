@@ -4,25 +4,36 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nixcache-core.workspace = true
-nixcache-oci.workspace = true
+# Workspace crates
+nixcache-core = { workspace = true }
+nixcache-oci = { workspace = true }
 nixcache-oci-backend = { workspace = true, features = ["tokio-reqwest"] }
-axum.workspace = true
+
+# Web & Async runtime
+axum = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-thiserror.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-futures-util.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
-tracing.workspace = true
-tracing-subscriber.workspace = true
-clap.workspace = true
-arc-swap.workspace = true
-scc.workspace = true
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Concurrency & State
+arc-swap = { workspace = true }
+scc = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI & Utilities
+clap = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-tower.workspace = true
-http-body-util.workspace = true
-wiremock.workspace = true
-tempfile.workspace = true
+http-body-util = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }
+wiremock = { workspace = true }

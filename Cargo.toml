@@ -11,39 +11,54 @@ members = [
 ]
 
 [workspace.dependencies]
-nixcache-utils = { path = "crates/nixcache-utils" }
+# Workspace crates
 nixcache-core = { path = "crates/nixcache-core" }
 nixcache-oci = { path = "crates/nixcache-oci", default-features = false }
 nixcache-oci-backend = { path = "crates/nixcache-oci-backend", default-features = false }
+nixcache-utils = { path = "crates/nixcache-utils" }
+
+# Async runtime & networking
 async-trait = "0.1"
-bytes = "1"
-http = "1"
 axum = { version = "0.8", features = ["http2"] }
-tokio = { version = "1" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tempfile = "3"
-futures-util = "0.3"
+bytes = "1"
 futures-channel = "0.3"
 futures-executor = "0.3"
-tokio-util = { version = "0.7" }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-sha2 = "0.11"
-chrono = { version = "0.4", features = ["serde"] }
-num_cpus = "1.17"
-thiserror = "2.0"
-base64 = "0.22"
-clap = { version = "4.6", features = ["derive", "env"] }
-tower = { version = "0.5", features = ["util"] }
+futures-util = "0.3"
+http = "1"
 http-body-util = "0.1"
-wiremock = "0.6"
-async-compression = { version = "0.4", features = ["tokio", "xz", "zstd"] }
-zstd = "0.13"
-ruzstd = "0.7"
-web-time = "1.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tokio = { version = "1" }
+tokio-util = { version = "0.7" }
+tower = { version = "0.5", features = ["util"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Concurrency & Synchronization
 arc-swap = "1.7"
-scc = "2.3"
 crossbeam-queue = "0.3"
 loom = "0.7"
+scc = "2.3"
+
+# Compression
+async-compression = { version = "0.4", features = ["tokio", "xz", "zstd"] }
+ruzstd = "0.7"
+zstd = "0.13"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Utilities & Error handling
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+num_cpus = "1.17"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2.0"
+web-time = "1.1"
+
+# Testing
+wiremock = "0.6"
