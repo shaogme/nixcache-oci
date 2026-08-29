@@ -205,8 +205,10 @@ jobs:
       # 构建完成后，差异捕获并原子上传新生成的 Store 路径
       - name: Capture & Upload Cache
         if: success() && github.ref == 'refs/heads/main'
-        run: |
-          nix run "github:shaogme/nixcache-oci#cache-builder-bin" -- session capture
+        uses: shaogme/nixcache-oci/capture@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
 ```
 
 ##### 4. 版本控制与配置

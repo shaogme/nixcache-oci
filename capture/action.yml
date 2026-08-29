@@ -1,0 +1,96 @@
+name: 'NixCache OCI Session Capture'
+description: 'Capture newly built store paths since setup/snapshot, upload NAR blobs to GHCR, update workflow session, and hot-register to local proxy'
+inputs:
+  system:
+    description: 'Target platform system architecture (e.g., x86_64-linux, aarch64-linux)'
+    required: false
+    default: ''
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  registry:
+    description: 'OCI Registry to push cache to'
+    required: false
+    default: 'ghcr.io'
+  run-id:
+    description: 'Workflow run ID for Tier 1 session'
+    required: false
+    default: ${{ github.run_id }}
+  job-id:
+    description: 'Job identifier'
+    required: false
+    default: ${{ github.job }}
+  signing-key:
+    description: 'Nix secret key used to sign store paths'
+    required: false
+    default: ''
+  output-receipt:
+    description: 'Output path for the BuildReceipt JSON file (optional)'
+    required: false
+    default: ''
+  proxy-url:
+    description: 'Local proxy URL for hot-registration'
+    required: false
+    default: 'http://127.0.0.1:37515'
+  snapshot-path:
+    description: 'Path to baseline store snapshot'
+    required: false
+    default: '/tmp/nixcache-snapshot-before.txt'
+  github-token:
+    description: 'GitHub token with package write permissions'
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Setup signing key
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.signing-key }}" ]]; then
+          echo "${{ inputs.signing-key }}" > "$RUNNER_TEMP/signing-key"
+          echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          echo ">>> Nix signing key configured"
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Capture newly built paths and upload session cache
+      shell: bash
+      env:
+        NIXCACHE_SYSTEM: ${{ inputs.system }}
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
+        NIXCACHE_JOB_ID: ${{ inputs.job-id }}
+        NIXCACHE_OUTPUT_RECEIPT: ${{ inputs.output-receipt }}
+        NIXCACHE_PROXY_URL: ${{ inputs.proxy-url }}
+        NIXCACHE_SNAPSHOT_PATH: ${{ inputs.snapshot-path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+          if [[ -n "$REF" ]]; then
+            echo ">>> Found .nixcache-version file, using version: $REF"
+          fi
+        fi
+        if [[ -z "$REF" ]]; then
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+          echo ">>> Using fallback version: $REF"
+        fi
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session capture

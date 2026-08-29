@@ -1,0 +1,68 @@
+name: 'NixCache OCI Garbage Collector'
+description: 'Perform cross-architecture graph reachability garbage collection on cache-index'
+inputs:
+  retention-days:
+    description: 'Delete entries older than N days not in current closure'
+    required: false
+    default: '30'
+  dry-run:
+    description: 'Dry run mode (show what would be deleted without deleting)'
+    required: false
+    default: 'false'
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  registry:
+    description: 'OCI Registry'
+    required: false
+    default: 'ghcr.io'
+  github-token:
+    description: 'GitHub token with package write permissions'
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Run Garbage Collection
+      shell: bash
+      env:
+        NIXCACHE_RETENTION_DAYS: ${{ inputs.retention-days }}
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+          if [[ -n "$REF" ]]; then
+            echo ">>> Found .nixcache-version file, using version: $REF"
+          fi
+        fi
+        if [[ -z "$REF" ]]; then
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+          echo ">>> Using fallback version: $REF"
+        fi
+        
+        EXTRA_ARGS=()
+        if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+          EXTRA_ARGS+=(--dry-run)
+        fi
+        
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- gc "${EXTRA_ARGS[@]}"
