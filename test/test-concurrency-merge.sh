@@ -131,7 +131,7 @@ export GITHUB_TOKEN="dummy-token"
 
 # 5. Verify merged cache-index in OCI registry
 echo ">>> Fetching and verifying merged cache-index manifest and blob..."
-MANIFEST_JSON=$(curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
+MANIFEST_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
 BLOB_DIGEST=$(echo "$MANIFEST_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
 BLOB_SAFE_NAME=$(echo "$BLOB_DIGEST" | tr ':' '_')
 INDEX_JSON=$(cat "/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME")
@@ -168,7 +168,7 @@ echo ">>> GC roots aggregation per system architecture verified."
 echo ">>> Testing merge idempotency by running merge again..."
 "$BUILDER_BIN" merge "$RECEIPTS_DIR"
 
-MANIFEST_JSON_2=$(curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
+MANIFEST_JSON_2=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
 BLOB_DIGEST_2=$(echo "$MANIFEST_JSON_2" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
 BLOB_SAFE_NAME_2=$(echo "$BLOB_DIGEST_2" | tr ':' '_')
 INDEX_JSON_2=$(cat "/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME_2")

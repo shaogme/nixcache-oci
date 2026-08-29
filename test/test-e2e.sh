@@ -153,6 +153,14 @@ if [[ "$FETCHED_PUBKEY" != "$EXPECTED_PUBKEY"* ]]; then
 fi
 echo ">>> Public key verified successfully."
 
+echo ">>> Verifying /_status endpoint..."
+STATUS_RESP=$(curl -fs "http://127.0.0.1:37515/_status")
+echo "Status response: $STATUS_RESP"
+if ! echo "$STATUS_RESP" | grep -q '"remote_connected":true'; then
+    echo "!!! Expected remote_connected: true in /_status!"
+    exit 1
+fi
+
 echo ">>> Verifying .narinfo endpoint..."
 # Force index refresh first to fetch the newly uploaded cache-index
 curl -fs -X POST http://127.0.0.1:37515/_refresh || true

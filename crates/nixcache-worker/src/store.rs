@@ -72,11 +72,60 @@ pub struct CacheStore {
     kv_ttl_ms: f64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RemoteStatus {
+    pub connected: bool,
+    pub error: Option<String>,
+    pub entries_count: usize,
+    pub generated: String,
+    pub manifest_digest: String,
+}
+
 impl CacheStore {
     pub fn new(oci_client: OciClient, ttl_seconds: u64) -> Self {
         Self {
             oci_client,
             kv_ttl_ms: (ttl_seconds * 1000) as f64,
+        }
+    }
+
+    /// 获取远程与缓存状态元信息
+    pub async fn get_status(&self, env: &Env) -> RemoteStatus {
+        match self.get_data(env).await {
+            Ok(data) => RemoteStatus {
+                connected: true,
+                error: None,
+                entries_count: data.entries.len(),
+                generated: data.generated,
+                manifest_digest: data.manifest_digest,
+            },
+            Err(e) => {
+                let local_data = match env.kv("NIXCACHE_KV") {
+                    Ok(kv) => {
+                        if let Ok(Some(wrapper)) =
+                            kv.get("cache_index_wrapper").json::<KVCacheWrapper>().await
+                        {
+                            Some(wrapper.data)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+
+                let (entries_count, generated, manifest_digest) = match local_data {
+                    Some(d) => (d.entries.len(), d.generated, d.manifest_digest),
+                    None => (0, String::new(), String::new()),
+                };
+
+                RemoteStatus {
+                    connected: false,
+                    error: Some(e),
+                    entries_count,
+                    generated,
+                    manifest_digest,
+                }
+            }
         }
     }
 
@@ -109,7 +158,20 @@ impl CacheStore {
         }
 
         // 3. 超过 TTL 或不存在，向 GHCR 刷新
-        self.force_refresh(env).await
+        match self.force_refresh(env).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                if let Ok(Some(wrapper)) =
+                    kv.get("cache_index_wrapper").json::<KVCacheWrapper>().await
+                {
+                    let mut data = wrapper.data;
+                    data.manifest_digest = wrapper.manifest_digest;
+                    data.rebuild_lookup_table();
+                    return Ok(data);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// 查询 Store Hash 对应的 narinfo，若未命中则智能触发读穿透
@@ -243,14 +305,17 @@ impl CacheStore {
 
                 Ok(index_data)
             }
-            None => Err("Cache index manifest not found on GHCR".to_string()),
+            None => {
+                // Manifest not found on GHCR (HTTP 404) - remote is connected, but no cache index pushed yet
+                Ok(CacheIndexData::default())
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheIndexData, IndexEntry};
+    use super::{CacheIndexData, IndexEntry, RemoteStatus};
     use std::collections::HashMap;
 
     #[test]
@@ -337,5 +402,22 @@ mod tests {
         // nar_lookup and manifest_digest are skipped in serialization
         assert!(parsed.nar_lookup.is_empty());
         assert!(parsed.manifest_digest.is_empty());
+    }
+
+    #[test]
+    fn test_remote_status_serialization() {
+        let status = RemoteStatus {
+            connected: true,
+            error: None,
+            entries_count: 5,
+            generated: "2026-08-28T00:00:00Z".to_string(),
+            manifest_digest: "sha256:digest".to_string(),
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: RemoteStatus = serde_json::from_str(&json).unwrap();
+        assert!(parsed.connected);
+        assert_eq!(parsed.entries_count, 5);
+        assert_eq!(parsed.error, None);
     }
 }

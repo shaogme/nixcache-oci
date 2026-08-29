@@ -27,10 +27,14 @@ pub struct AppState {
 
 #[derive(Serialize)]
 struct StatusResponse {
+    remote_connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_error: Option<String>,
+    registry: String,
+    repo: String,
     index_entries: usize,
     index_generated: String,
     index_ttl: u64,
-    repo: String,
     upstream: Vec<String>,
 }
 
@@ -69,11 +73,15 @@ async fn serve_public_key(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn serve_status(State(state): State<AppState>) -> impl IntoResponse {
     let index_data = state.index.get_data().await;
+    let (remote_connected, remote_error) = state.index.remote_status().await;
     let status = StatusResponse {
+        remote_connected,
+        remote_error,
+        registry: state.index.registry().to_string(),
+        repo: state.repo.clone(),
         index_entries: index_data.entries.len(),
         index_generated: index_data.generated.clone(),
         index_ttl: state.index_ttl,
-        repo: state.repo.clone(),
         upstream: state.upstream_caches.clone(),
     };
     (StatusCode::OK, axum::Json(status))
@@ -355,6 +363,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let status_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status_json["remote_connected"], true);
+        assert_eq!(status_json["registry"], "ghcr.io");
         assert_eq!(status_json["index_entries"], 1);
         assert_eq!(status_json["repo"], "test/repo");
         assert_eq!(status_json["index_ttl"], 300);

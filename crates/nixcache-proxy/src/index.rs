@@ -15,6 +15,9 @@ pub struct CacheIndex {
     oci_client: OciClient,
     data: Arc<RwLock<CacheIndexData>>,
     last_refresh: Arc<RwLock<Option<Instant>>>,
+    remote_connected: Arc<RwLock<bool>>,
+    remote_error: Arc<RwLock<Option<String>>>,
+    registry: String,
 }
 
 impl CacheIndex {
@@ -32,7 +35,20 @@ impl CacheIndex {
             oci_client,
             data: Arc::new(RwLock::new(CacheIndexData::default())),
             last_refresh: Arc::new(RwLock::new(None)),
+            remote_connected: Arc::new(RwLock::new(false)),
+            remote_error: Arc::new(RwLock::new(None)),
+            registry: registry.to_string(),
         }
+    }
+
+    pub async fn remote_status(&self) -> (bool, Option<String>) {
+        let connected = *self.remote_connected.read().await;
+        let error = self.remote_error.read().await.clone();
+        (connected, error)
+    }
+
+    pub fn registry(&self) -> &str {
+        &self.registry
     }
 
     pub async fn get_data(&self) -> CacheIndexData {
@@ -65,6 +81,8 @@ impl CacheIndex {
         *data = new_data;
         let mut last = self.last_refresh.write().await;
         *last = Some(Instant::now());
+        *self.remote_connected.write().await = true;
+        *self.remote_error.write().await = None;
     }
 
     async fn refresh(&self) -> Result<(), String> {
@@ -94,6 +112,8 @@ impl CacheIndex {
                                 let mut current_data = self.data.write().await;
                                 *current_data = index_data;
                                 refresh_ok = true;
+                                *self.remote_connected.write().await = true;
+                                *self.remote_error.write().await = None;
 
                                 // Save backup file
                                 let file_path = self.index_dir.join("cache-index.json");
@@ -112,18 +132,30 @@ impl CacheIndex {
                         }
                         Err(e) => {
                             error!("[nixcache-proxy] Failed to fetch index blob: {}", e);
+                            *self.remote_connected.write().await = false;
+                            *self.remote_error.write().await =
+                                Some(format!("Failed to fetch index blob: {}", e));
                         }
                     }
+                } else {
+                    *self.remote_connected.write().await = false;
+                    *self.remote_error.write().await =
+                        Some("Invalid manifest schema or missing layers".to_string());
                 }
             }
             Ok(None) => {
                 info!("[nixcache-proxy] Cache index manifest not found on GHCR.");
+                *self.remote_connected.write().await = true;
+                *self.remote_error.write().await = None;
             }
             Err(e) => {
                 error!(
                     "[nixcache-proxy] Failed to fetch cache index manifest: {}",
                     e
                 );
+                *self.remote_connected.write().await = false;
+                *self.remote_error.write().await =
+                    Some(format!("Failed to connect to remote: {}", e));
             }
         }
 

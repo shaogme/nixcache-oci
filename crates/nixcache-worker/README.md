@@ -86,6 +86,26 @@ nix = {
 
 ---
 
+## 管理与状态端点
+
+Worker 提供了与本地代理一致的管理端点：
+
+| 端点路径 | HTTP 方法 | 说明 |
+|---|---|---|
+| `/_status` | GET | 查看远端连接状态 (`remote_connected`)、错误诊断 (`remote_error`)、索引条目数、上游列表等 |
+| `/_refresh` | POST | 强制立即刷新 Worker 的 KV/内存索引缓存 |
+| `/public-key` | GET | 获取配置的公钥 |
+
+```bash
+# 查看 Worker 运行状态与远程连接情况
+curl https://nixcache-worker.<your-subdomain>.workers.dev/_status
+
+# 强制边缘节点拉取最新的 cache-index
+curl -X POST https://nixcache-worker.<your-subdomain>.workers.dev/_refresh
+```
+
+---
+
 ## 集成测试 (E2E Integration Test)
 
 本项目支持在 GitHub Actions 中自动测试已部署的 Worker 状态。

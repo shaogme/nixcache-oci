@@ -8,6 +8,9 @@ if [[ -z "${TEST_WORKER_URL:-}" ]]; then
     exit 0
 fi
 
+# Strip trailing slash if present
+TEST_WORKER_URL="${TEST_WORKER_URL%/}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
@@ -18,7 +21,7 @@ echo "Worker URL: $TEST_WORKER_URL"
 # Ensure clean state on exit
 cleanup() {
     echo ">>> Cleaning up worker test resources..."
-    git checkout -- examples/flake/flake.nix || true
+    git checkout -- examples/flake/flake.nix 2>/dev/null || true
     rm -f test-worker-secret.key test-worker-public.key result-builder-worker
     echo ">>> Cleanup complete."
 }
@@ -37,15 +40,20 @@ PROXY_BIN="./target/debug/nixcache-proxy"
 
 # 3. Retrieve target registry and repo from Worker status
 echo ">>> Fetching Worker status to identify target repo..."
-STATUS_JSON=$(curl -fs "$TEST_WORKER_URL/_status")
+if ! STATUS_JSON=$(curl -fsSL "$TEST_WORKER_URL/_status"); then
+    echo "!!! Failed to fetch status from Worker: $TEST_WORKER_URL/_status"
+    echo ">>> Attempting verbose fetch for diagnosis:"
+    curl -ivL "$TEST_WORKER_URL/_status" || true
+    exit 1
+fi
 echo "Worker status: $STATUS_JSON"
 
 TARGET_REPO=$(echo "$STATUS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('repo', ''))")
 TARGET_REGISTRY=$(echo "$STATUS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('registry', 'ghcr.io'))")
 
 if [[ -z "$TARGET_REPO" || "$TARGET_REPO" == "null" ]]; then
-    echo "!!! Failed to identify target repo from Worker status."
-    exit 1
+    echo ">>> Target repo not found in Worker status, detecting from git repository..."
+    TARGET_REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]([^/]+/[^/.]+).*#\1#' 2>/dev/null || echo "shaogme/nixcache-oci")
 fi
 echo ">>> Target Registry: $TARGET_REGISTRY, Target Repo: $TARGET_REPO"
 

@@ -294,8 +294,13 @@ impl OciClient {
         if resp.status() == StatusCode::OK {
             let body = resp.text().await?;
             Ok(Some(body))
-        } else {
+        } else if resp.status() == StatusCode::NOT_FOUND {
             Ok(None)
+        } else {
+            Err(OciError::Other(format!(
+                "OCI registry manifest request failed with status: {}",
+                resp.status()
+            )))
         }
     }
 

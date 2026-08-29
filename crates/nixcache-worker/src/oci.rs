@@ -152,8 +152,13 @@ impl OciClient {
                 .unwrap_or_default();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             Ok(Some((body, digest)))
-        } else {
+        } else if resp.status_code() == 404 {
             Ok(None)
+        } else {
+            Err(format!(
+                "OCI registry returned HTTP status {}",
+                resp.status_code()
+            ))
         }
     }
 

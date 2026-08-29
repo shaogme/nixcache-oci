@@ -459,17 +459,84 @@ nixcache-builder gc \
 
 | 端点路径 | HTTP 方法 | 描述 |
 |---|---|---|
-| `/_status` | GET | 查看索引条目、配置和上游缓存的状态 |
+| `/_status` | GET | 查看远端连接状态 (`remote_connected`)、索引条目、配置和上游缓存状态 |
 | `/_refresh` | POST | 强制立即刷新索引（无需等待 TTL 过期） |
 | `/public-key` | GET | 获取配置的二进制缓存签名公钥（如果已启用签名） |
 
 ```bash
-# 查看状态
+# 查看状态（包含 remote_connected、registry、repo、index_entries 等）
 curl http://localhost:37515/_status
 
 # 在发布新包后，强制立即刷新本地缓存
 curl -X POST http://localhost:37515/_refresh
 ```
+
+#### `/_status` 响应数据
+
+`/_status` 是健康检查与运行状态探测的核心端点，在 `nixcache-proxy`（本地代理）与 `nixcache-worker`（Cloudflare Worker）上保持统一的 JSON 结构规范：
+
+| 字段名 | 类型 | 说明 |
+|---|---|---|
+| `remote_connected` | `boolean` | **远程连接指示**：`true` 表示与远程 OCI Registry（如 GHCR）通信、认证及清单拉取成功；`false` 表示远程通信异常。 |
+| `remote_error` | `string \| null` | **错误诊断信息**：当 `remote_connected` 为 `false` 时提供具体的错误原因（如网络超时、503 服务不可用、401 鉴权失败等）；正常时省略。 |
+| `registry` | `string` | 当前代理所绑定的 OCI 注册表地址（如 `ghcr.io` 或 `127.0.0.1:5001`）。 |
+| `repo` | `string` | 目标包存储库路径（如 `shaogme/nixcache-oci`）。 |
+| `index_entries` | `number` | 当前已载入内存/KV 的缓存索引条目（包）总数。 |
+| `index_generated` | `string` | 远程构建产物 `cache-index` 的生成时间（ISO 8601 格式，如 `2026-08-29T04:40:00Z`）。 |
+| `manifest_digest` | `string` | 远程 OCI Manifest 镜像清单的 SHA-256 摘要哈希值。 |
+| `index_ttl` | `number` | 索引内存刷新周期（秒），默认 300 秒（仅本地代理提供）。 |
+| `upstream` | `string[]` | 配置的上游回退二进制缓存列表（如 `["https://cache.nixos.org"]`）。 |
+
+##### 典型响应示例
+
+- **场景 1：正常运行与成功连接远端**
+  ```json
+  {
+    "remote_connected": true,
+    "registry": "ghcr.io",
+    "repo": "shaogme/nixcache-oci",
+    "index_entries": 42,
+    "index_generated": "2026-08-29T04:40:00Z",
+    "manifest_digest": "sha256:49e9dbdae120e87984582ed2a5fe878bbef13626ce9db3c9714c6cb64fd18dcd",
+    "index_ttl": 300,
+    "upstream": [
+      "https://cache.nixos.org"
+    ]
+  }
+  ```
+
+- **场景 2：远程 Registry 故障/离线（安全降级使用本地快照或上游）**
+  ```json
+  {
+    "remote_connected": false,
+    "remote_error": "Failed to connect to remote: OCI registry manifest request failed with status: 503 Service Unavailable",
+    "registry": "127.0.0.1:5001",
+    "repo": "test/cache",
+    "index_entries": 12,
+    "index_generated": "2026-08-28T12:00:00Z",
+    "manifest_digest": "",
+    "index_ttl": 300,
+    "upstream": [
+      "https://cache.nixos.org"
+    ]
+  }
+  ```
+
+- **场景 3：新仓库冷启动（尚未发布任何构建索引）**
+  ```json
+  {
+    "remote_connected": true,
+    "registry": "ghcr.io",
+    "repo": "user/new-repo",
+    "index_entries": 0,
+    "index_generated": "",
+    "manifest_digest": "",
+    "index_ttl": 300,
+    "upstream": [
+      "https://cache.nixos.org"
+    ]
+  }
+  ```
 
 ## 架构
 

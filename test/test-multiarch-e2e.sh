@@ -148,7 +148,7 @@ echo ">>> [Phase 2] Running Merge Coordinator..."
     --registry "$NIXCACHE_REGISTRY"
 
 echo ">>> Fetching published cache-index from local registry to verify Schema v2..."
-INDEX_MANIFEST=$(curl -fsSL "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
+INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
 INDEX_DIGEST=$(echo "$INDEX_MANIFEST" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
 INDEX_JSON=$(curl -fsSL "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/blobs/${INDEX_DIGEST}")
 

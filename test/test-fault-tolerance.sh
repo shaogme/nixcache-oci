@@ -137,6 +137,15 @@ if [[ "$STATUS_CODE" != "404" ]]; then
     exit 1
 fi
 
+# 8. Verify /_status reports disconnected remote status during OCI fault
+echo ">>> Verifying /_status reports remote disconnection during fault..."
+STATUS_RESP=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
+echo "Fault status response: $STATUS_RESP"
+if ! echo "$STATUS_RESP" | grep -q '"remote_connected":false'; then
+    echo "!!! Expected remote_connected: false in /_status during OCI failure!"
+    exit 1
+fi
+
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "!!! Proxy crashed during fault tests!"
     exit 1

@@ -77,28 +77,44 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             }
         })
         .get_async("/_status", |_req, ctx| async move {
-            let store = get_store(&ctx.env)?;
-            match store.get_data(&ctx.env).await {
-                Ok(index_data) => {
-                    let repo = ctx
-                        .env
-                        .var("NIXCACHE_REPO")
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
-                    let upstream = get_upstream_list(&ctx.env);
+            let repo = ctx
+                .env
+                .var("NIXCACHE_REPO")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let registry = ctx
+                .env
+                .var("NIXCACHE_REGISTRY")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "ghcr.io".to_string());
+            let upstream = get_upstream_list(&ctx.env);
 
-                    let status = serde_json::json!({
-                        "index_entries": index_data.entries.len(),
-                        "index_generated": index_data.generated,
-                        "manifest_digest": index_data.manifest_digest,
-                        "repo": repo,
-                        "upstream": upstream,
-                    });
+            let status_data = match get_store(&ctx.env) {
+                Ok(store) => store.get_status(&ctx.env).await,
+                Err(e) => store::RemoteStatus {
+                    connected: false,
+                    error: Some(e.to_string()),
+                    entries_count: 0,
+                    generated: String::new(),
+                    manifest_digest: String::new(),
+                },
+            };
 
-                    Response::from_json(&status)
-                }
-                Err(e) => Response::error(format!("Failed to load index: {}", e), 500),
+            let mut status = serde_json::json!({
+                "remote_connected": status_data.connected,
+                "registry": registry,
+                "repo": repo,
+                "index_entries": status_data.entries_count,
+                "index_generated": status_data.generated,
+                "manifest_digest": status_data.manifest_digest,
+                "upstream": upstream,
+            });
+
+            if let Some(err) = status_data.error {
+                status["remote_error"] = serde_json::json!(err);
             }
+
+            Response::from_json(&status)
         })
         .post_async("/_refresh", |_req, ctx| async move {
             let store = get_store(&ctx.env)?;
