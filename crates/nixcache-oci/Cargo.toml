@@ -3,6 +3,10 @@ name = "nixcache-oci"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+loom = ["dep:loom"]
+
 [dependencies]
 # Workspace crates
 nixcache-core = { workspace = true }
@@ -10,8 +14,6 @@ nixcache-utils = { workspace = true }
 
 # Async & networking
 bytes = { workspace = true }
-futures-channel = { workspace = true }
-futures-executor = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -23,7 +25,7 @@ serde_json = { workspace = true }
 # Concurrency & Synchronization
 arc-swap = { workspace = true }
 crossbeam-queue = { workspace = true }
-loom = { workspace = true }
+loom = { workspace = true, optional = true }
 scc = { workspace = true }
 
 # Observability
@@ -37,7 +39,6 @@ thiserror = { workspace = true }
 web-time = { workspace = true }
 
 [dev-dependencies]
-loom = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [lints.rust]

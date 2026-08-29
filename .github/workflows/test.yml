@@ -100,7 +100,7 @@ jobs:
             ${{ runner.os }}-cargo-loom-
 
       - name: Run Loom Formal Model Checking Integration Tests
-        run: RUSTFLAGS="--cfg loom" cargo test -p nixcache-oci --test token_loom -- --nocapture
+        run: RUSTFLAGS="--cfg loom" cargo test -p nixcache-oci --features loom --test token_loom -- --nocapture
 
   nix-static-checks:
     name: 4. Nix Module Static Checks

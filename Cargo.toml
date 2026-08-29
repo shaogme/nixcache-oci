@@ -21,8 +21,6 @@ nixcache-utils = { path = "crates/nixcache-utils" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 bytes = "1"
-futures-channel = "0.3"
-futures-executor = "0.3"
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"

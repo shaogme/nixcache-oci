@@ -1,6 +1,6 @@
 //! TokenManager 并发与同步原语抽象层
 
-#[cfg(not(loom))]
+#[cfg(not(any(loom, feature = "loom")))]
 mod imp {
     use crate::error::OciError;
     use arc_swap::ArcSwapOption;
@@ -26,6 +26,12 @@ mod imp {
     impl fmt::Debug for InFlightState {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("InFlightState").finish_non_exhaustive()
+        }
+    }
+
+    impl Default for InFlightState {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -69,6 +75,12 @@ mod imp {
         }
     }
 
+    impl Default for TokenStorage {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TokenStorage {
         pub fn new() -> Self {
             Self {
@@ -103,6 +115,12 @@ mod imp {
         }
     }
 
+    impl Default for TokenBroadcaster {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TokenBroadcaster {
         pub fn new() -> Self {
             let (tx, rx) = watch::channel(None);
@@ -132,7 +150,7 @@ mod imp {
     }
 }
 
-#[cfg(loom)]
+#[cfg(any(loom, feature = "loom"))]
 mod imp {
     use crate::error::OciError;
     use loom::sync::{

@@ -1194,8 +1194,6 @@ dependencies = [
  "bytes",
  "chrono",
  "crossbeam-queue",
- "futures-channel",
- "futures-executor",
  "futures-util",
  "http",
  "loom",
