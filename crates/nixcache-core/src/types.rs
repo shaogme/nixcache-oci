@@ -582,7 +582,7 @@ impl CacheIndexData {
     }
 }
 
-/// 单架构生产基线索引数据 (Schema v4 - Arch-Scoped)
+/// 单架构生产基线索引数据
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ArchCacheIndexData {
     pub version: u32,
@@ -612,7 +612,7 @@ impl ArchCacheIndexData {
     }
 }
 
-/// 单架构工作流会话清单 (Schema v4 - Arch-Scoped)
+/// 单架构工作流会话清单
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ArchRunSessionManifest {
     pub version: u32,

@@ -87,10 +87,6 @@ pub trait OciTransport: 'static {
         content_len: u64,
     ) -> Result<StatusCode, TransportError>;
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
-
-    /// 核心解耦点：异步延迟抽象
-    /// Native (Tokio) 实现为 `tokio::time::sleep(duration).await`
-    /// Wasm (Cloudflare Worker) 实现为 `worker::Delay::from(duration).await`
     async fn sleep(&self, duration: Duration);
 }
 

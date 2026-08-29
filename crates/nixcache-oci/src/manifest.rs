@@ -9,7 +9,7 @@ pub const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.
 pub const NIX_CACHE_INDEX_MEDIA_TYPE: &str = "application/vnd.nix.cache.index.v1+json";
 pub const NIX_CACHE_SESSION_MEDIA_TYPE: &str = "application/vnd.nix.cache.session.v1+json";
 
-/// OCI Platform 结构 (遵循 OCI Image Spec v1.1)
+/// OCI Platform 结构
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OciPlatform {
     pub architecture: String,
@@ -60,7 +60,7 @@ pub struct OciDescriptor {
     pub annotations: Option<HashMap<String, String>>,
 }
 
-/// 强类型 OCI Image Index 规范结构体 (OCI Spec v1.1)
+/// 强类型 OCI Image Index 规范结构体
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct OciImageIndex {
     #[serde(rename = "schemaVersion")]
