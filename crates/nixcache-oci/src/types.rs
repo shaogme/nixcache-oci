@@ -25,8 +25,51 @@ pub struct CacheIndexData {
     #[serde(default)]
     pub public_key: String,
     pub entries: HashMap<String, IndexEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_gc_roots")]
     pub gc_roots: HashMap<String, Vec<String>>,
+}
+
+pub fn deserialize_gc_roots<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::Object(map) => {
+            let mut result = HashMap::new();
+            for (k, v) in map {
+                if let Value::Array(arr) = v {
+                    let strings: Vec<String> = arr
+                        .into_iter()
+                        .filter_map(|item| match item {
+                            Value::String(s) => Some(s),
+                            _ => None,
+                        })
+                        .collect();
+                    result.insert(k, strings);
+                }
+            }
+            Ok(result)
+        }
+        Value::Array(arr) => {
+            let strings: Vec<String> = arr
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            let mut result = HashMap::new();
+            if !strings.is_empty() {
+                result.insert("default".to_string(), strings);
+            }
+            Ok(result)
+        }
+        _ => Ok(HashMap::new()),
+    }
 }
 
 impl Default for CacheIndexData {

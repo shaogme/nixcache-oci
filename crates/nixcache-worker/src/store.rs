@@ -24,11 +24,55 @@ pub struct CacheIndexData {
     pub generated: String,
     pub public_key: String,
     pub entries: HashMap<String, IndexEntry>,
+    #[serde(default, deserialize_with = "deserialize_gc_roots")]
     pub gc_roots: HashMap<String, Vec<String>>,
     #[serde(skip)]
     pub nar_lookup: HashMap<String, String>,
     #[serde(skip)]
     pub manifest_digest: String,
+}
+
+pub fn deserialize_gc_roots<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::Object(map) => {
+            let mut result = HashMap::new();
+            for (k, v) in map {
+                if let Value::Array(arr) = v {
+                    let strings: Vec<String> = arr
+                        .into_iter()
+                        .filter_map(|item| match item {
+                            Value::String(s) => Some(s),
+                            _ => None,
+                        })
+                        .collect();
+                    result.insert(k, strings);
+                }
+            }
+            Ok(result)
+        }
+        Value::Array(arr) => {
+            let strings: Vec<String> = arr
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            let mut result = HashMap::new();
+            if !strings.is_empty() {
+                result.insert("default".to_string(), strings);
+            }
+            Ok(result)
+        }
+        _ => Ok(HashMap::new()),
+    }
 }
 
 impl CacheIndexData {
@@ -419,5 +463,53 @@ mod tests {
         assert!(parsed.connected);
         assert_eq!(parsed.entries_count, 5);
         assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn test_gc_roots_compatibility() {
+        // Test Schema v2 (Map)
+        let v2_json = r#"{
+            "version": 2,
+            "repo": "test/repo",
+            "registry": "ghcr.io",
+            "image": "ghcr.io/test/repo/nix-cache",
+            "generated": "2026-08-28T00:00:00Z",
+            "public_key": "",
+            "entries": {},
+            "gc_roots": {
+                "x86_64-linux": ["hash1", "hash2"],
+                "aarch64-linux": ["hash3"]
+            }
+        }"#;
+        let v2: CacheIndexData = serde_json::from_str(v2_json).unwrap();
+        assert_eq!(v2.gc_roots.get("x86_64-linux").unwrap().len(), 2);
+        assert_eq!(v2.gc_roots.get("aarch64-linux").unwrap().len(), 1);
+
+        // Test Schema v1 (Sequence / Array)
+        let v1_json = r#"{
+            "version": 1,
+            "repo": "test/repo",
+            "registry": "ghcr.io",
+            "image": "ghcr.io/test/repo/nix-cache",
+            "generated": "2026-08-28T00:00:00Z",
+            "public_key": "",
+            "entries": {},
+            "gc_roots": ["hash1", "hash2"]
+        }"#;
+        let v1: CacheIndexData = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(v1.gc_roots.get("default").unwrap().len(), 2);
+
+        // Test missing gc_roots
+        let v0_json = r#"{
+            "version": 1,
+            "repo": "test/repo",
+            "registry": "ghcr.io",
+            "image": "ghcr.io/test/repo/nix-cache",
+            "generated": "2026-08-28T00:00:00Z",
+            "public_key": "",
+            "entries": {}
+        }"#;
+        let v0: CacheIndexData = serde_json::from_str(v0_json).unwrap();
+        assert!(v0.gc_roots.is_empty());
     }
 }
