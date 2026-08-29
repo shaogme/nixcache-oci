@@ -1,25 +1,11 @@
 use crate::nix::BuildMode;
 use clap::{Parser, Subcommand};
+use nixcache_cli::{
+    AuthTokenArgs, CachePolicyArgs, OciTargetArgs, ServerBindArgs, SessionContextArgs,
+    SigningKeyArgs,
+};
+use nixcache_utils::Env;
 use std::path::PathBuf;
-
-pub fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key).ok().and_then(|s| {
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
-}
-
-pub fn env_path_non_empty(key: &str) -> Option<PathBuf> {
-    env_non_empty(key).map(PathBuf::from)
-}
-
-pub fn env_u64_non_empty(key: &str) -> Option<u64> {
-    env_non_empty(key).and_then(|s| s.parse().ok())
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,192 +51,40 @@ pub enum SessionCommands {
     Clean(SessionCleanArgs),
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct SessionInitArgs {
-    #[arg(long, help = "OCI repository (owner/repo) [env: NIXCACHE_REPO]")]
-    pub repo: Option<String>,
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
 
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    pub registry: Option<String>,
+    #[command(flatten)]
+    pub bind: ServerBindArgs,
 
-    #[arg(
-        long,
-        help = "GitHub Actions Workflow Run ID (Tier 1 Session) [env: NIXCACHE_RUN_ID]"
-    )]
-    pub run_id: Option<u64>,
+    #[command(flatten)]
+    pub session: SessionContextArgs,
 
-    #[arg(
-        long,
-        help = "Branch name or PR number (Tier 2 Session) [env: NIXCACHE_BRANCH]"
-    )]
-    pub branch: Option<String>,
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
 
-    #[arg(long, help = "Port for proxy daemon [env: NIXCACHE_PORT]")]
-    pub port: Option<u16>,
+    #[command(flatten)]
+    pub signing: SigningKeyArgs,
 
-    #[arg(long, help = "Address for proxy daemon [env: NIXCACHE_LISTEN]")]
-    pub listen: Option<String>,
-
-    #[arg(long, help = "Upstream cache URLs [env: NIXCACHE_UPSTREAM]")]
-    pub upstream: Option<String>,
-
-    #[arg(
-        long,
-        help = "Session index TTL in seconds [env: NIXCACHE_SESSION_TTL]"
-    )]
-    pub session_ttl: Option<u64>,
-
-    #[arg(
-        long,
-        help = "Baseline index TTL in seconds [env: NIXCACHE_BASELINE_TTL]"
-    )]
-    pub baseline_ttl: Option<u64>,
-
-    #[arg(long, help = "Baseline production tag [env: NIXCACHE_BASELINE_TAG]")]
-    pub baseline_tag: Option<String>,
-
-    #[arg(
-        long,
-        help = "Path to signing key file [env: NIXCACHE_SIGNING_KEY_FILE]"
-    )]
-    pub signing_key_file: Option<PathBuf>,
-
-    #[arg(
-        long,
-        help = "Path to record baseline store paths snapshot [env: NIXCACHE_SNAPSHOT_PATH]"
-    )]
-    pub snapshot_path: Option<PathBuf>,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    pub github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    pub gh_token: Option<String>,
+    #[command(flatten)]
+    pub cache: CachePolicyArgs,
 }
 
-impl SessionInitArgs {
-    pub fn repo(&self) -> String {
-        self.repo
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REPO"))
-            .unwrap_or_else(|| "shaogme/nixcache-oci".to_string())
-    }
-
-    pub fn registry(&self) -> String {
-        self.registry
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-            .unwrap_or_else(|| "ghcr.io".to_string())
-    }
-
-    pub fn run_id(&self) -> Option<u64> {
-        self.run_id
-            .or_else(|| env_u64_non_empty("NIXCACHE_RUN_ID"))
-            .or_else(|| env_u64_non_empty("GITHUB_RUN_ID"))
-    }
-
-    pub fn branch(&self) -> Option<String> {
-        self.branch
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_BRANCH"))
-            .or_else(|| env_non_empty("GITHUB_REF_NAME"))
-            .or_else(|| env_non_empty("GITHUB_HEAD_REF"))
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-            .or_else(|| env_non_empty("NIXCACHE_PORT").and_then(|s| s.parse().ok()))
-            .unwrap_or(37515)
-    }
-
-    pub fn listen(&self) -> String {
-        self.listen
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_LISTEN"))
-            .unwrap_or_else(|| "127.0.0.1".to_string())
-    }
-
-    pub fn upstream(&self) -> String {
-        self.upstream
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_UPSTREAM"))
-            .unwrap_or_else(|| "https://cache.nixos.org".to_string())
-    }
-
-    pub fn session_ttl(&self) -> u64 {
-        self.session_ttl
-            .or_else(|| env_u64_non_empty("NIXCACHE_SESSION_TTL"))
-            .unwrap_or(10)
-    }
-
-    pub fn baseline_ttl(&self) -> u64 {
-        self.baseline_ttl
-            .or_else(|| env_u64_non_empty("NIXCACHE_BASELINE_TTL"))
-            .unwrap_or(300)
-    }
-
-    pub fn baseline_tag(&self) -> String {
-        self.baseline_tag
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_BASELINE_TAG"))
-            .unwrap_or_else(|| "cache-index".to_string())
-    }
-
-    pub fn signing_key_file(&self) -> Option<PathBuf> {
-        self.signing_key_file
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SIGNING_KEY_FILE"))
-    }
-
-    pub fn snapshot_path(&self) -> PathBuf {
-        self.snapshot_path
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SNAPSHOT_PATH"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/nixcache-snapshot-before.txt"))
-    }
-}
-
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct SessionCaptureArgs {
-    #[arg(long, help = "OCI repository (owner/repo) [env: NIXCACHE_REPO]")]
-    pub repo: Option<String>,
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
 
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    pub registry: Option<String>,
+    #[command(flatten)]
+    pub session: SessionContextArgs,
 
-    #[arg(long, help = "GitHub Actions Workflow Run ID [env: NIXCACHE_RUN_ID]")]
-    pub run_id: Option<u64>,
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
 
-    #[arg(long, help = "GitHub Actions Job Identifier [env: NIXCACHE_JOB_ID]")]
-    pub job_id: Option<String>,
-
-    #[arg(
-        long,
-        help = "Target platform system architecture [env: NIXCACHE_SYSTEM]"
-    )]
-    pub system: Option<String>,
-
-    #[arg(
-        long,
-        help = "Path to signing key file [env: NIXCACHE_SIGNING_KEY_FILE]"
-    )]
-    pub signing_key_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub signing: SigningKeyArgs,
 
     #[arg(
         long,
@@ -272,93 +106,37 @@ pub struct SessionCaptureArgs {
 
     #[arg(value_name = "PATHS", help = "Explicit store paths to capture")]
     pub paths: Vec<String>,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    pub github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    pub gh_token: Option<String>,
 }
 
 impl SessionCaptureArgs {
-    pub fn repo(&self) -> String {
-        self.repo
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REPO"))
-            .unwrap_or_else(|| "shaogme/nixcache-oci".to_string())
-    }
-
-    pub fn registry(&self) -> String {
-        self.registry
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-            .unwrap_or_else(|| "ghcr.io".to_string())
-    }
-
-    pub fn run_id(&self) -> Option<u64> {
-        self.run_id
-            .or_else(|| env_u64_non_empty("NIXCACHE_RUN_ID"))
-            .or_else(|| env_u64_non_empty("GITHUB_RUN_ID"))
-    }
-
-    pub fn job_id(&self) -> String {
-        self.job_id
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_JOB_ID"))
-            .or_else(|| env_non_empty("GITHUB_JOB"))
-            .unwrap_or_else(|| "default-job".to_string())
-    }
-
-    pub fn system(&self) -> Option<String> {
-        self.system
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_SYSTEM"))
-    }
-
-    pub fn signing_key_file(&self) -> Option<PathBuf> {
-        self.signing_key_file
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SIGNING_KEY_FILE"))
-    }
-
-    pub fn output_receipt(&self) -> Option<PathBuf> {
-        self.output_receipt
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_OUTPUT_RECEIPT"))
-    }
-
-    pub fn proxy_url(&self) -> String {
+    pub fn resolve_proxy_url(&self) -> String {
         self.proxy_url
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_PROXY_URL"))
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_PROXY_URL"))
             .unwrap_or_else(|| "http://127.0.0.1:37515".to_string())
     }
 
-    pub fn snapshot_before(&self) -> PathBuf {
+    pub fn resolve_output_receipt(&self) -> Option<PathBuf> {
+        self.output_receipt
+            .as_deref()
+            .and_then(Env::non_empty_path)
+            .map(PathBuf::from)
+            .or_else(|| Env::get_path("NIXCACHE_OUTPUT_RECEIPT"))
+    }
+
+    pub fn resolve_snapshot_before(&self) -> PathBuf {
         self.snapshot_before
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SNAPSHOT_PATH"))
+            .as_deref()
+            .and_then(Env::non_empty_path)
+            .map(PathBuf::from)
+            .or_else(|| Env::get_path("NIXCACHE_SNAPSHOT_PATH"))
             .unwrap_or_else(|| PathBuf::from("/tmp/nixcache-snapshot-before.txt"))
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct SessionCleanArgs {
     #[arg(
         long,
@@ -368,18 +146,27 @@ pub struct SessionCleanArgs {
 }
 
 impl SessionCleanArgs {
-    pub fn snapshot_path(&self) -> PathBuf {
+    pub fn resolve_snapshot_path(&self) -> PathBuf {
         self.snapshot_path
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SNAPSHOT_PATH"))
+            .as_deref()
+            .and_then(Env::non_empty_path)
+            .map(PathBuf::from)
+            .or_else(|| Env::get_path("NIXCACHE_SNAPSHOT_PATH"))
             .unwrap_or_else(|| PathBuf::from("/tmp/nixcache-snapshot-before.txt"))
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct BuildArgs {
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
+
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
+
+    #[command(flatten)]
+    pub signing: SigningKeyArgs,
+
     #[arg(
         long,
         help = "Target platform system architecture (e.g., x86_64-linux) [env: NIXCACHE_SYSTEM]"
@@ -407,18 +194,6 @@ pub struct BuildArgs {
     )]
     pub attributes: Option<String>,
 
-    #[arg(long, help = "OCI repository (owner/repo) [env: NIXCACHE_REPO]")]
-    pub repo: Option<String>,
-
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    pub registry: Option<String>,
-
-    #[arg(
-        long,
-        help = "Path to signing key file [env: NIXCACHE_SIGNING_KEY_FILE]"
-    )]
-    pub signing_key_file: Option<PathBuf>,
-
     #[arg(
         long,
         help = "Output path for the BuildReceipt JSON file [env: NIXCACHE_OUTPUT_RECEIPT]"
@@ -438,119 +213,89 @@ pub struct BuildArgs {
         help = "Allow self-substituter proxy failure (disables fail-fast)"
     )]
     pub no_fail_fast: bool,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    pub github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    pub gh_token: Option<String>,
 }
 
 impl BuildArgs {
-    pub fn system(&self) -> Option<String> {
+    pub fn resolve_system(&self) -> Option<String> {
         self.system
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_SYSTEM"))
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_SYSTEM"))
     }
 
-    pub fn mode(&self) -> BuildMode {
-        if let Some(m) = self.mode {
-            return m;
-        }
-        if let Some(env_m) = env_non_empty("NIXCACHE_MODE")
-            && let Ok(m) = env_m.parse::<BuildMode>()
-        {
-            return m;
-        }
-        BuildMode::Flake
-
+    pub fn resolve_mode(&self) -> BuildMode {
+        self.mode
+            .or_else(|| Env::parse("NIXCACHE_MODE"))
+            .unwrap_or(BuildMode::Flake)
     }
 
-    pub fn flake_path(&self) -> Option<String> {
+    pub fn resolve_flake_path(&self) -> String {
         self.flake_path
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_FLAKE_PATH"))
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .or_else(|| self.config_dir.as_deref().and_then(Env::non_empty_str))
+            .map(|s| s.to_string())
+            .or_else(|| Env::get_first(&["NIXCACHE_FLAKE_PATH", "NIXCACHE_CONFIG_DIR"]))
+            .unwrap_or_else(|| ".".to_string())
     }
 
-    pub fn config_dir(&self) -> Option<String> {
-        self.config_dir
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_CONFIG_DIR"))
-    }
-
-    pub fn file(&self) -> String {
+    pub fn resolve_file(&self) -> String {
         self.file
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_FILE"))
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_FILE"))
             .unwrap_or_else(|| "default.nix".to_string())
     }
 
-    pub fn attributes(&self) -> Option<String> {
-        self.attributes
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_ATTRIBUTES"))
+    pub fn resolve_attributes(&self) -> Vec<String> {
+        let attr_str = self
+            .attributes
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_ATTRIBUTES"))
+            .unwrap_or_default();
+
+        attr_str
+            .split([' ', ','])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
-    pub fn repo(&self) -> String {
-        self.repo
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REPO"))
-            .unwrap_or_else(|| "shaogme/nixcache-oci".to_string())
-    }
-
-    pub fn registry(&self) -> String {
-        self.registry
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-            .unwrap_or_else(|| "ghcr.io".to_string())
-    }
-
-    pub fn signing_key_file(&self) -> Option<PathBuf> {
-        self.signing_key_file
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_SIGNING_KEY_FILE"))
-    }
-
-    pub fn output_receipt(&self) -> Option<PathBuf> {
+    pub fn resolve_output_receipt(&self, system_name: Option<&str>) -> PathBuf {
         self.output_receipt
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_OUTPUT_RECEIPT"))
+            .as_deref()
+            .and_then(Env::non_empty_path)
+            .map(PathBuf::from)
+            .or_else(|| Env::get_path("NIXCACHE_OUTPUT_RECEIPT"))
+            .unwrap_or_else(|| {
+                let default_name = format!("receipt-{}.json", system_name.unwrap_or("output"));
+                PathBuf::from(default_name)
+            })
     }
 
-    pub fn fail_fast(&self) -> bool {
+    pub fn resolve_fail_fast(&self) -> bool {
         if self.no_fail_fast {
             return false;
         }
         if let Some(ff) = self.fail_fast {
             return ff;
         }
-        if let Some(env_ff) = env_non_empty("NIXCACHE_FAIL_FAST") {
-            return env_ff != "0" && env_ff.to_lowercase() != "false";
-        }
-        true
+        Env::get_bool("NIXCACHE_FAIL_FAST").unwrap_or(true)
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct PromoteArgs {
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
+
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
+
     #[arg(
         long,
         help = "GitHub Actions Workflow Run ID to promote [env: NIXCACHE_RUN_ID]"
@@ -572,12 +317,6 @@ pub struct PromoteArgs {
     #[arg(value_name = "PATHS", help = "Receipt files or directories to merge")]
     pub positional_paths: Vec<PathBuf>,
 
-    #[arg(long, help = "OCI repository (owner/repo) [env: NIXCACHE_REPO]")]
-    pub repo: Option<String>,
-
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    pub registry: Option<String>,
-
     #[arg(
         long,
         help = "Target OCI tag for production baseline [env: NIXCACHE_TARGET_TAG]"
@@ -594,57 +333,40 @@ pub struct PromoteArgs {
 
     #[arg(long, help = "Disable cleaning up workflow run session tag")]
     pub no_cleanup_session: bool,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    pub github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    pub gh_token: Option<String>,
 }
 
 impl PromoteArgs {
-    pub fn run_id(&self) -> Option<u64> {
+    pub fn resolve_run_id(&self) -> Option<u64> {
         self.run_id
-            .or_else(|| env_u64_non_empty("NIXCACHE_RUN_ID"))
-            .or_else(|| env_u64_non_empty("GITHUB_RUN_ID"))
+            .or_else(|| Env::parse_first(&["NIXCACHE_RUN_ID", "GITHUB_RUN_ID"]))
     }
 
-    pub fn receipts_dir(&self) -> Option<PathBuf> {
-        self.receipts_dir
-            .as_ref()
-            .filter(|p| !p.as_os_str().is_empty())
-            .cloned()
-            .or_else(|| env_path_non_empty("NIXCACHE_RECEIPTS_DIR"))
-    }
-
-    pub fn repo(&self) -> String {
-        self.repo
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REPO"))
-            .unwrap_or_else(|| "shaogme/nixcache-oci".to_string())
-    }
-
-    pub fn registry(&self) -> String {
-        self.registry
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-            .unwrap_or_else(|| "ghcr.io".to_string())
-    }
-
-    pub fn target_tag(&self) -> String {
+    pub fn resolve_target_tag(&self) -> String {
         self.target_tag
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_TARGET_TAG"))
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_TARGET_TAG"))
             .unwrap_or_else(|| "cache-index".to_string())
     }
 
-    pub fn cleanup_session(&self) -> bool {
+    pub fn resolve_receipt_paths(&self) -> Vec<PathBuf> {
+        let receipts_dir = self
+            .receipts_dir
+            .as_deref()
+            .and_then(Env::non_empty_path)
+            .map(PathBuf::from)
+            .or_else(|| Env::get_path("NIXCACHE_RECEIPTS_DIR"));
+
+        let mut paths = self.receipts.clone();
+        if let Some(dir) = receipts_dir {
+            paths.push(dir);
+        }
+        paths.extend(self.positional_paths.clone());
+        paths
+    }
+
+    pub fn resolve_cleanup_session(&self) -> bool {
         if self.no_cleanup_session {
             return false;
         }
@@ -652,8 +374,14 @@ impl PromoteArgs {
     }
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct GcArgs {
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
+
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
+
     #[arg(
         long,
         help = "Retention days for garbage collection [env: NIXCACHE_RETENTION_DAYS]"
@@ -662,69 +390,12 @@ pub struct GcArgs {
 
     #[arg(long, help = "Dry run mode for garbage collection")]
     pub dry_run: bool,
-
-    #[arg(long, help = "OCI repository [env: NIXCACHE_REPO]")]
-    pub repo: Option<String>,
-
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    pub registry: Option<String>,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    pub github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    pub gh_token: Option<String>,
 }
 
 impl GcArgs {
-    pub fn retention_days(&self) -> u64 {
+    pub fn resolve_retention_days(&self) -> u64 {
         self.retention_days
-            .or_else(|| env_u64_non_empty("NIXCACHE_RETENTION_DAYS"))
+            .or_else(|| Env::parse("NIXCACHE_RETENTION_DAYS"))
             .unwrap_or(30)
     }
-
-    pub fn repo(&self) -> String {
-        self.repo
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REPO"))
-            .unwrap_or_else(|| "shaogme/nixcache-oci".to_string())
-    }
-
-    pub fn registry(&self) -> String {
-        self.registry
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .cloned()
-            .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-            .unwrap_or_else(|| "ghcr.io".to_string())
-    }
 }
-
-pub async fn resolve_github_token(
-    github_token: Option<&str>,
-    gh_token: Option<&str>,
-) -> String {
-    let mut token = github_token
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| gh_token.filter(|s| !s.trim().is_empty()))
-        .map(|s| s.to_string())
-        .or_else(|| env_non_empty("GITHUB_TOKEN"))
-        .or_else(|| env_non_empty("GH_TOKEN"))
-        .unwrap_or_default();
-    if token.is_empty()
-        && let Ok(output) = tokio::process::Command::new("gh")
-            .args(["auth", "token"])
-            .output()
-            .await
-        && output.status.success()
-    {
-        let token_from_gh = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token_from_gh.is_empty() {
-            token = token_from_gh;
-        }
-    }
-    token
-}
-

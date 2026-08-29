@@ -1158,9 +1158,11 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "nixcache-cli",
  "nixcache-core",
  "nixcache-oci",
  "nixcache-oci-backend",
+ "nixcache-utils",
  "num_cpus",
  "reqwest",
  "serde",
@@ -1173,6 +1175,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+]
+
+[[package]]
+name = "nixcache-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "nixcache-core",
+ "nixcache-utils",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1242,9 +1257,11 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "nixcache-cli",
  "nixcache-core",
  "nixcache-oci",
  "nixcache-oci-backend",
+ "nixcache-utils",
  "reqwest",
  "scc",
  "serde",

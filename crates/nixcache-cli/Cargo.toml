@@ -1,0 +1,16 @@
+[package]
+name = "nixcache-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nixcache-core = { workspace = true }
+nixcache-utils = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

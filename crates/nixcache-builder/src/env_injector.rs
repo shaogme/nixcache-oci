@@ -70,7 +70,6 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::fs;
 
-
     #[test]
     fn test_generate_nix_config() {
         let subs = ["http://127.0.0.1:37515", "https://cache.nixos.org"];

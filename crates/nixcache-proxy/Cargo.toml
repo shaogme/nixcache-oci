@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 # Workspace crates
+nixcache-cli = { workspace = true }
 nixcache-core = { workspace = true }
 nixcache-oci = { workspace = true }
 nixcache-oci-backend = { workspace = true, features = ["tokio-reqwest"] }
+nixcache-utils = { workspace = true }
 
 # Web & Async runtime
 axum = { workspace = true }

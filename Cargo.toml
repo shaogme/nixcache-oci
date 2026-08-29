@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/nixcache-utils",
     "crates/nixcache-core",
+    "crates/nixcache-cli",
     "crates/nixcache-oci",
     "crates/nixcache-proxy",
     "crates/nixcache-builder",
@@ -12,6 +13,7 @@ members = [
 
 [workspace.dependencies]
 # Workspace crates
+nixcache-cli = { path = "crates/nixcache-cli" }
 nixcache-core = { path = "crates/nixcache-core" }
 nixcache-oci = { path = "crates/nixcache-oci", default-features = false }
 nixcache-oci-backend = { path = "crates/nixcache-oci-backend", default-features = false }

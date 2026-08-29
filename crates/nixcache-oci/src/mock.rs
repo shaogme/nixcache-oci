@@ -1,8 +1,8 @@
-use async_trait::async_trait;
 use crate::{
     error::TransportError,
     transport::{BoxBodyStream, OciTransport, UploadChunkResponse},
 };
+use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use http::{HeaderMap, StatusCode};

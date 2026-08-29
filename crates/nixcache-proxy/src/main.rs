@@ -1,7 +1,12 @@
 use clap::Parser;
+use nixcache_cli::{
+    AuthTokenArgs, CachePolicyArgs, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT, OciTargetArgs,
+    ServerBindArgs, SessionContextArgs,
+};
 use nixcache_core::SystemArch;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{error::Error, net::SocketAddr, path::PathBuf, time::Duration};
+use nixcache_utils::Env;
+use std::{error::Error, net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -15,25 +20,6 @@ mod proxy;
 use index::{CacheIndex, CascadingProxyConfig, detect_current_system};
 use proxy::{AppState, create_router};
 
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key).ok().and_then(|s| {
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
-}
-
-fn env_path_non_empty(key: &str) -> Option<PathBuf> {
-    env_non_empty(key).map(PathBuf::from)
-}
-
-fn env_u64_non_empty(key: &str) -> Option<u64> {
-    env_non_empty(key).and_then(|s| s.parse().ok())
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "nixcache-proxy",
@@ -41,62 +27,23 @@ fn env_u64_non_empty(key: &str) -> Option<u64> {
     about = "OCI-backed Nix Cache Proxy with 4-tier cascading resolution"
 )]
 struct Args {
-    #[arg(long, help = "OCI repository (e.g., shaogme/nixcache-oci) [env: NIXCACHE_REPO]")]
-    repo: Option<String>,
+    #[command(flatten)]
+    oci: OciTargetArgs,
 
-    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
-    registry: Option<String>,
+    #[command(flatten)]
+    bind: ServerBindArgs,
 
-    #[arg(long, help = "Port to listen on [env: NIXCACHE_PORT]")]
-    port: Option<u16>,
+    #[command(flatten)]
+    session: SessionContextArgs,
 
-    #[arg(long, help = "Address to listen on [env: NIXCACHE_LISTEN]")]
-    listen: Option<String>,
+    #[command(flatten)]
+    auth: AuthTokenArgs,
 
-    #[arg(long, help = "GitHub Actions Workflow Run ID (Tier 1 Session) [env: NIXCACHE_RUN_ID]")]
-    run_id: Option<u64>,
-
-    #[arg(long, help = "Branch name or PR number (Tier 2 Branch/PR Session) [env: NIXCACHE_BRANCH]")]
-    branch: Option<String>,
-
-    #[arg(long, help = "Directory to store cache index [env: NIXCACHE_INDEX_DIR]")]
-    index_dir: Option<PathBuf>,
-
-    #[arg(long, help = "Session index TTL in seconds [env: NIXCACHE_SESSION_TTL]")]
-    session_ttl: Option<u64>,
-
-    #[arg(long, help = "Baseline index TTL in seconds [env: NIXCACHE_INDEX_TTL]")]
-    index_ttl: Option<u64>,
-
-    #[arg(long, help = "Baseline production tag [env: NIXCACHE_BASELINE_TAG]")]
-    baseline_tag: Option<String>,
-
-    #[arg(long, help = "Upstream cache URLs [env: NIXCACHE_UPSTREAM]")]
-    upstream: Option<String>,
+    #[command(flatten)]
+    cache: CachePolicyArgs,
 
     #[arg(long, help = "Target system architecture [env: NIXCACHE_SYSTEM]")]
     system: Option<String>,
-
-    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
-    github_token: Option<String>,
-
-    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
-    gh_token: Option<String>,
-}
-
-fn get_index_dir(repo: &str, explicit_dir: Option<PathBuf>) -> PathBuf {
-    if let Some(dir) = explicit_dir {
-        return dir;
-    }
-    if let Some(cache_dir) = env_non_empty("CACHE_DIRECTORY") {
-        return PathBuf::from(cache_dir);
-    }
-
-    let home = env_non_empty("HOME").unwrap_or_else(|| ".".to_string());
-    PathBuf::from(home)
-        .join(".cache")
-        .join("nixcache-proxy")
-        .join(repo.replace('/', "--"))
 }
 
 async fn shutdown_signal() {
@@ -131,92 +78,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
 
-    let repo = args
-        .repo
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_REPO"))
-        .unwrap_or_default();
+    let (repo, registry) = args.oci.resolve("");
+    let (listen, port) = args
+        .bind
+        .resolve(DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT);
+    let github_token = args.auth.resolve_token().await;
+    let run_id = args.session.resolve_run_id();
+    let branch = args.session.resolve_branch();
 
-    let registry = args
-        .registry
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
-        .unwrap_or_else(|| "ghcr.io".to_string());
-
-    let port = args
-        .port
-        .or_else(|| env_non_empty("NIXCACHE_PORT").and_then(|s| s.parse().ok()))
-        .unwrap_or(37515);
-
-    let listen = args
-        .listen
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_LISTEN"))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-
-    let github_token = args
-        .github_token
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| args.gh_token.filter(|s| !s.trim().is_empty()))
-        .or_else(|| env_non_empty("GITHUB_TOKEN"))
-        .or_else(|| env_non_empty("GH_TOKEN"))
-        .unwrap_or_default();
-
-    let index_dir_opt = args
-        .index_dir
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| env_path_non_empty("NIXCACHE_INDEX_DIR"));
-    let index_dir = get_index_dir(&repo, index_dir_opt);
-
-    let upstream_str = args
-        .upstream
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_UPSTREAM"))
-        .unwrap_or_else(|| "https://cache.nixos.org".to_string());
-
-    let upstream_caches: Vec<String> = upstream_str
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
-
-    let run_id = args
-        .run_id
-        .or_else(|| env_u64_non_empty("NIXCACHE_RUN_ID"))
-        .or_else(|| env_u64_non_empty("GITHUB_RUN_ID"));
-
-    let branch = args
-        .branch
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_BRANCH"))
-        .or_else(|| env_non_empty("GITHUB_REF_NAME"))
-        .or_else(|| env_non_empty("GITHUB_HEAD_REF"));
-
-    let session_ttl = args
-        .session_ttl
-        .or_else(|| env_u64_non_empty("NIXCACHE_SESSION_TTL"))
-        .unwrap_or(10);
-
-    let index_ttl = args
-        .index_ttl
-        .or_else(|| env_u64_non_empty("NIXCACHE_INDEX_TTL"))
-        .unwrap_or(300);
-
-    let baseline_tag = args
-        .baseline_tag
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_BASELINE_TAG"))
-        .unwrap_or_else(|| "cache-index".to_string());
+    let index_dir = args.cache.resolve_index_dir(&repo);
+    let upstream_caches = args.cache.resolve_upstream_list();
+    let session_ttl = args.cache.resolve_session_ttl();
+    let index_ttl = args.cache.resolve_baseline_ttl();
+    let baseline_tag = args.cache.resolve_baseline_tag();
 
     let system_arch_opt = args
         .system
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env_non_empty("NIXCACHE_SYSTEM"));
+        .as_deref()
+        .and_then(Env::non_empty_str)
+        .map(|s| s.to_string())
+        .or_else(|| args.session.resolve_system());
 
     let target_system = match system_arch_opt {
         Some(ref s) => SystemArch::from(s.as_str()),
         None => detect_current_system(),
     };
-
 
     info!(
         "Starting nixcache-proxy for {}/{} on {}:{}",

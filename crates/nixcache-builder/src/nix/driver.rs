@@ -2,7 +2,7 @@ use crate::{env_injector::NixEnvInjector, error::BuilderError};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{env, fmt, path::Path, process::Stdio};
+use std::{env, fmt, path::Path, process::Stdio, str::FromStr};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 use tracing::{error, info};
 
@@ -14,7 +14,7 @@ pub enum BuildMode {
     NonFlake,
 }
 
-impl std::str::FromStr for BuildMode {
+impl FromStr for BuildMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -25,7 +25,6 @@ impl std::str::FromStr for BuildMode {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct BuildConfig {

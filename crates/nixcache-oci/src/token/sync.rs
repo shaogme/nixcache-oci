@@ -256,7 +256,6 @@ mod imp {
             }
         }
 
-
         pub fn broadcast(&self, token: String) {
             let (lock, cvar) = &*self.channel;
             let mut broadcast = lock.lock().unwrap();
