@@ -20,6 +20,7 @@ sha2.workspace = true
 chrono.workspace = true
 num_cpus.workspace = true
 clap.workspace = true
+async-compression.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

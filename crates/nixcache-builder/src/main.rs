@@ -2,15 +2,21 @@ use clap::Parser;
 use std::{path::PathBuf, process};
 
 mod cli;
+mod env_injector;
 mod error;
+mod gc;
 mod nix;
-mod pipeline;
+mod promote;
+mod session;
+mod summary;
+mod worker;
 
 use cli::{Cli, Commands, SessionCommands, resolve_github_token};
+use gc::run_gc;
 use nix::BuildConfig;
-use pipeline::{
-    run_build_worker, run_gc, run_promote, run_session_capture, run_session_clean, run_session_init,
-};
+use promote::run_promote;
+use session::{run_session_capture, run_session_clean, run_session_init};
+use worker::run_build_worker;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
