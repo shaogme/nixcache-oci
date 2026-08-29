@@ -13,14 +13,15 @@ use std::{
 
 pub const L1_MEM_TTL_MS: f64 = 10_000.0;
 pub const DEBOUNCE_THRESHOLD_MS: f64 = 500.0;
+pub type CachedSessionEntry = (RunSessionManifest, HashMap<String, NarDigest>, f64);
+pub type CachedBaselineEntry = (CacheIndexData, HashMap<String, NarDigest>, f64);
 
 /// 收敛的 Worker 全局内存状态
 pub struct WorkerState {
     pub hot_entries: SccHashMap<StoreHash, Arc<IndexEntry>>,
     pub hot_nar_lookup: SccHashMap<String, NarDigest>,
-    pub mem_session_cache:
-        SccHashMap<String, Arc<(RunSessionManifest, HashMap<String, NarDigest>, f64)>>,
-    pub mem_baseline_cache: ArcSwapOption<(CacheIndexData, HashMap<String, NarDigest>, f64)>,
+    pub mem_session_cache: SccHashMap<String, Arc<CachedSessionEntry>>,
+    pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
     pub last_ghcr_check_ms: AtomicU64,
 }
 

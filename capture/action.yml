@@ -93,4 +93,5 @@ runs:
           fi
           echo ">>> Using fallback version: $REF"
         fi
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session capture
+
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session capture

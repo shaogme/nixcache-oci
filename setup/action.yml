@@ -89,4 +89,5 @@ runs:
             REF="main"
           fi
         fi
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session init
+
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session init

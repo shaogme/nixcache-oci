@@ -12,6 +12,7 @@ nixcache-core = { workspace = true }
 nixcache-oci = { workspace = true }
 
 # Worker runtime & networking
+async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }

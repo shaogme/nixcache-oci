@@ -1,4 +1,5 @@
 use crate::error::TransportError;
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, ready, stream::BoxStream};
 use http::{HeaderMap, StatusCode};
@@ -180,7 +181,8 @@ pub fn parse_range_header(header_val: &str) -> Option<(u64, u64)> {
 }
 
 /// 纯协议层 OCI 传输抽象特征（零条件编译，Rust 2024 原生 Trait 异步方法）
-#[allow(async_fn_in_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait OciTransport: 'static {
     type BodyStream: Stream<Item = Result<Bytes, TransportError>> + 'static;
 

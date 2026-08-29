@@ -298,10 +298,9 @@ impl CacheStore {
         if let Some(cached) = WorkerState::global()
             .mem_session_cache
             .read_sync(tag, |_, v| v.clone())
+            && now < cached.2
         {
-            if now < cached.2 {
-                return Ok(Some((cached.0.clone(), cached.1.clone())));
-            }
+            return Ok(Some((cached.0.clone(), cached.1.clone())));
         }
 
         // 2. L2 Cloudflare KV
@@ -373,10 +372,10 @@ impl CacheStore {
         let now = Date::now();
 
         // 1. L1 Memory Cache
-        if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full() {
-            if now < cached.2 {
-                return Ok((cached.0.clone(), cached.1.clone()));
-            }
+        if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full()
+            && now < cached.2
+        {
+            return Ok((cached.0.clone(), cached.1.clone()));
         }
 
         // 2. L2 Cloudflare KV

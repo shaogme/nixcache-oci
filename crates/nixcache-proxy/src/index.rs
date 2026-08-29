@@ -504,11 +504,6 @@ impl CacheIndex {
         result
     }
 
-    pub async fn get_data(&self) -> Arc<CacheIndexData> {
-        let baseline = self.get_baseline_data().await;
-        Arc::new(baseline.data.clone())
-    }
-
     /// 强制刷新所有层级的索引
     pub async fn force_refresh(&self) -> Result<usize, String> {
         let mut errs = Vec::new();

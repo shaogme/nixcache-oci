@@ -96,5 +96,5 @@ runs:
           fi
           echo ">>> Using fallback version: $REF"
         fi
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- build
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- promote --receipt "${{ runner.temp }}/receipt.json"
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- build
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- promote --receipt "${{ runner.temp }}/receipt.json"

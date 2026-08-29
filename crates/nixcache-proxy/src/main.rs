@@ -1,6 +1,7 @@
 use clap::Parser;
+use nixcache_core::SystemArch;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -11,8 +12,27 @@ use std::future;
 mod index;
 mod proxy;
 
-use index::{CacheIndex, CascadingProxyConfig};
+use index::{CacheIndex, CascadingProxyConfig, detect_current_system};
 use proxy::{AppState, create_router};
+
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key).ok().and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn env_path_non_empty(key: &str) -> Option<PathBuf> {
+    env_non_empty(key).map(PathBuf::from)
+}
+
+fn env_u64_non_empty(key: &str) -> Option<u64> {
+    env_non_empty(key).and_then(|s| s.parse().ok())
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -21,101 +41,46 @@ use proxy::{AppState, create_router};
     about = "OCI-backed Nix Cache Proxy with 4-tier cascading resolution"
 )]
 struct Args {
-    #[arg(
-        long,
-        env = "NIXCACHE_REPO",
-        help = "OCI repository (e.g., shaogme/nixcache-oci)"
-    )]
-    repo: String,
+    #[arg(long, help = "OCI repository (e.g., shaogme/nixcache-oci) [env: NIXCACHE_REPO]")]
+    repo: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_REGISTRY",
-        default_value = "ghcr.io",
-        help = "OCI registry"
-    )]
-    registry: String,
+    #[arg(long, help = "OCI registry [env: NIXCACHE_REGISTRY]")]
+    registry: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_PORT",
-        default_value_t = 37515,
-        help = "Port to listen on"
-    )]
-    port: u16,
+    #[arg(long, help = "Port to listen on [env: NIXCACHE_PORT]")]
+    port: Option<u16>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_LISTEN",
-        default_value = "127.0.0.1",
-        help = "Address to listen on"
-    )]
-    listen: String,
+    #[arg(long, help = "Address to listen on [env: NIXCACHE_LISTEN]")]
+    listen: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_RUN_ID",
-        help = "GitHub Actions Workflow Run ID (Tier 1 Session)"
-    )]
+    #[arg(long, help = "GitHub Actions Workflow Run ID (Tier 1 Session) [env: NIXCACHE_RUN_ID]")]
     run_id: Option<u64>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_BRANCH",
-        help = "Branch name or PR number (Tier 2 Branch/PR Session)"
-    )]
+    #[arg(long, help = "Branch name or PR number (Tier 2 Branch/PR Session) [env: NIXCACHE_BRANCH]")]
     branch: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_INDEX_DIR",
-        help = "Directory to store cache index"
-    )]
+    #[arg(long, help = "Directory to store cache index [env: NIXCACHE_INDEX_DIR]")]
     index_dir: Option<PathBuf>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_SESSION_TTL",
-        default_value_t = 10,
-        help = "Session index TTL in seconds"
-    )]
-    session_ttl: u64,
+    #[arg(long, help = "Session index TTL in seconds [env: NIXCACHE_SESSION_TTL]")]
+    session_ttl: Option<u64>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_INDEX_TTL",
-        default_value_t = 300,
-        help = "Baseline index TTL in seconds"
-    )]
-    index_ttl: u64,
+    #[arg(long, help = "Baseline index TTL in seconds [env: NIXCACHE_INDEX_TTL]")]
+    index_ttl: Option<u64>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_BASELINE_TAG",
-        default_value = "cache-index",
-        help = "Baseline production tag"
-    )]
-    baseline_tag: String,
+    #[arg(long, help = "Baseline production tag [env: NIXCACHE_BASELINE_TAG]")]
+    baseline_tag: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_UPSTREAM",
-        default_value = "https://cache.nixos.org",
-        help = "Upstream cache URLs"
-    )]
-    upstream: String,
+    #[arg(long, help = "Upstream cache URLs [env: NIXCACHE_UPSTREAM]")]
+    upstream: Option<String>,
 
-    #[arg(
-        long,
-        env = "NIXCACHE_SYSTEM",
-        help = "Target system platform (e.g. x86_64-linux, defaults to current host)"
-    )]
+    #[arg(long, help = "Target system architecture [env: NIXCACHE_SYSTEM]")]
     system: Option<String>,
 
-    #[arg(long, env = "GITHUB_TOKEN", help = "GitHub token for authentication")]
+    #[arg(long, help = "GitHub token for authentication [env: GITHUB_TOKEN]")]
     github_token: Option<String>,
 
-    #[arg(long, env = "GH_TOKEN", help = "GitHub token fallback")]
+    #[arg(long, help = "GitHub token fallback [env: GH_TOKEN]")]
     gh_token: Option<String>,
 }
 
@@ -123,11 +88,11 @@ fn get_index_dir(repo: &str, explicit_dir: Option<PathBuf>) -> PathBuf {
     if let Some(dir) = explicit_dir {
         return dir;
     }
-    if let Ok(cache_dir) = env::var("CACHE_DIRECTORY") {
+    if let Some(cache_dir) = env_non_empty("CACHE_DIRECTORY") {
         return PathBuf::from(cache_dir);
     }
 
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = env_non_empty("HOME").unwrap_or_else(|| ".".to_string());
     PathBuf::from(home)
         .join(".cache")
         .join("nixcache-proxy")
@@ -166,83 +131,135 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
 
-    let github_token = args.github_token.or(args.gh_token).unwrap_or_default();
+    let repo = args
+        .repo
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_REPO"))
+        .unwrap_or_default();
 
-    let index_dir = get_index_dir(&args.repo, args.index_dir);
+    let registry = args
+        .registry
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_REGISTRY"))
+        .unwrap_or_else(|| "ghcr.io".to_string());
 
-    let upstream_caches: Vec<String> = args
+    let port = args
+        .port
+        .or_else(|| env_non_empty("NIXCACHE_PORT").and_then(|s| s.parse().ok()))
+        .unwrap_or(37515);
+
+    let listen = args
+        .listen
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_LISTEN"))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let github_token = args
+        .github_token
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| args.gh_token.filter(|s| !s.trim().is_empty()))
+        .or_else(|| env_non_empty("GITHUB_TOKEN"))
+        .or_else(|| env_non_empty("GH_TOKEN"))
+        .unwrap_or_default();
+
+    let index_dir_opt = args
+        .index_dir
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| env_path_non_empty("NIXCACHE_INDEX_DIR"));
+    let index_dir = get_index_dir(&repo, index_dir_opt);
+
+    let upstream_str = args
         .upstream
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_UPSTREAM"))
+        .unwrap_or_else(|| "https://cache.nixos.org".to_string());
+
+    let upstream_caches: Vec<String> = upstream_str
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
 
-    // Fallback run_id from GITHUB_RUN_ID if not explicitly provided
-    let run_id = args.run_id.or_else(|| {
-        env::var("GITHUB_RUN_ID")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-    });
+    let run_id = args
+        .run_id
+        .or_else(|| env_u64_non_empty("NIXCACHE_RUN_ID"))
+        .or_else(|| env_u64_non_empty("GITHUB_RUN_ID"));
 
-    // Fallback branch from GITHUB_REF_NAME if not explicitly provided
     let branch = args
         .branch
-        .or_else(|| env::var("GITHUB_REF_NAME").ok())
-        .or_else(|| env::var("GITHUB_HEAD_REF").ok());
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_BRANCH"))
+        .or_else(|| env_non_empty("GITHUB_REF_NAME"))
+        .or_else(|| env_non_empty("GITHUB_HEAD_REF"));
 
-    let target_system = args
+    let session_ttl = args
+        .session_ttl
+        .or_else(|| env_u64_non_empty("NIXCACHE_SESSION_TTL"))
+        .unwrap_or(10);
+
+    let index_ttl = args
+        .index_ttl
+        .or_else(|| env_u64_non_empty("NIXCACHE_INDEX_TTL"))
+        .unwrap_or(300);
+
+    let baseline_tag = args
+        .baseline_tag
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_BASELINE_TAG"))
+        .unwrap_or_else(|| "cache-index".to_string());
+
+    let system_arch_opt = args
         .system
-        .map(|s| nixcache_core::SystemArch::from(s.as_str()))
-        .unwrap_or_else(index::detect_current_system);
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_non_empty("NIXCACHE_SYSTEM"));
+
+    let target_system = match system_arch_opt {
+        Some(ref s) => SystemArch::from(s.as_str()),
+        None => detect_current_system(),
+    };
+
 
     info!(
-        "nixcache-proxy starting on http://{}:{}",
-        args.listen, args.port
+        "Starting nixcache-proxy for {}/{} on {}:{}",
+        registry, repo, listen, port
     );
-    info!("  Repo: {}", args.repo);
-    info!("  System (Target Platform): {}", target_system);
-    info!("  Run ID (Tier 1): {:?}", run_id);
-    info!("  Branch/PR (Tier 2): {:?}", branch);
-    info!("  Baseline Tag (Tier 3): {}", args.baseline_tag);
-    info!("  Upstream: {:?}", upstream_caches);
-    info!("  Session TTL: {}s", args.session_ttl);
-    info!("  Baseline TTL: {}s", args.index_ttl);
-    info!("  Index Dir: {:?}", index_dir);
+    info!(
+        "Config: run_id={:?}, branch={:?}, baseline_tag={}, session_ttl={}s, index_ttl={}s, system={:?}",
+        run_id, branch, baseline_tag, session_ttl, index_ttl, target_system
+    );
+    info!("Index cache directory: {:?}", index_dir);
+    info!("Upstream caches: {:?}", upstream_caches);
 
-    let config = CascadingProxyConfig {
-        repo: args.repo.clone(),
-        registry: args.registry.clone(),
+    let oci = create_tokio_reqwest_client(&registry, &repo, &github_token, false);
+
+    let proxy_config = CascadingProxyConfig {
+        repo: repo.clone(),
+        registry,
         run_id,
         branch_or_pr: branch,
-        baseline_tag: args.baseline_tag,
+        baseline_tag,
         upstream_caches,
-        session_ttl: Duration::from_secs(args.session_ttl),
-        baseline_ttl: Duration::from_secs(args.index_ttl),
+        session_ttl: Duration::from_secs(session_ttl),
+        baseline_ttl: Duration::from_secs(index_ttl),
         index_dir,
         target_system,
     };
 
-    let index = CacheIndex::with_config(config, &github_token);
-    let oci_client = create_tokio_reqwest_client(&args.registry, &args.repo, &github_token, false);
-    let http_client = reqwest::Client::new();
-
-    // Trigger pre-fetch of the index in the background
-    let index_clone = index.clone();
-    tokio::spawn(async move {
-        let _ = index_clone.get_data().await;
-    });
+    let cache_index = CacheIndex::with_config(proxy_config, &github_token);
 
     let state = AppState {
-        repo: args.repo,
-        index,
-        oci_client,
-        http_client,
+        repo,
+        index: cache_index,
+        oci_client: oci,
+        http_client: reqwest::Client::new(),
     };
 
-    let router = create_router(state);
-    let bind_addr: SocketAddr = format!("{}:{}", args.listen, args.port).parse()?;
-    let listener = TcpListener::bind(&bind_addr).await?;
+    let app = create_router(state);
 
-    axum::serve(listener, router)
+    let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on http://{}", addr);
+
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

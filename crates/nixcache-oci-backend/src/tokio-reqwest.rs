@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream::BoxStream};
 use http::{
@@ -52,6 +53,8 @@ impl ReqwestTransport {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OciTransport for ReqwestTransport {
     type BodyStream = BoxBodyStream;
 
@@ -395,7 +398,7 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
-#[allow(async_fn_in_trait)]
+#[async_trait]
 pub trait OciClientExt {
     async fn push_blob_file(&self, file_path: &Path) -> Result<String, OciError>;
 
@@ -407,6 +410,7 @@ pub trait OciClientExt {
     ) -> Result<String, OciError>;
 }
 
+#[async_trait]
 impl OciClientExt for OciClient<ReqwestTransport> {
     async fn push_blob_file(&self, file_path: &Path) -> Result<String, OciError> {
         let meta = metadata(file_path).await?;

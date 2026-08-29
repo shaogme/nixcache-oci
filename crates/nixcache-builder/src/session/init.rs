@@ -132,11 +132,8 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         info!("Trusted own public key: {}", k);
     }
 
-    // 零侵入注入 NIX_CONFIG
+    // 零侵入导出 NIX_CONFIG 至 GITHUB_ENV
     let nix_config = NixEnvInjector::generate_nix_config(&[&proxy_substituter], &keys);
-    unsafe {
-        env::set_var("NIX_CONFIG", &nix_config);
-    }
     NixEnvInjector::export_to_github_env(&nix_config).await?;
 
     if let Some(snap) = opts.snapshot_path {

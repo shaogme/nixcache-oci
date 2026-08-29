@@ -65,4 +65,4 @@ runs:
           EXTRA_ARGS+=(--dry-run)
         fi
         
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- gc "${EXTRA_ARGS[@]}"
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- gc "${EXTRA_ARGS[@]}"

@@ -14,6 +14,19 @@ pub enum BuildMode {
     NonFlake,
 }
 
+impl std::str::FromStr for BuildMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "flake" => Ok(BuildMode::Flake),
+            "non-flake" | "nonflake" => Ok(BuildMode::NonFlake),
+            other => Err(format!("Invalid build mode: {}", other)),
+        }
+    }
+}
+
+
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
     pub system: Option<String>,

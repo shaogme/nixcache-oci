@@ -23,22 +23,12 @@ use tracing::{error, info, warn};
 
 pub struct ProxyGuard {
     child: Option<Child>,
-    previous_nix_config: Option<String>,
 }
 
 impl ProxyGuard {
     pub async fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
-        }
-        if let Some(prev) = self.previous_nix_config.take() {
-            unsafe {
-                env::set_var("NIX_CONFIG", prev);
-            }
-        } else {
-            unsafe {
-                env::remove_var("NIX_CONFIG");
-            }
         }
     }
 }
@@ -47,15 +37,6 @@ impl Drop for ProxyGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
-        }
-        if let Some(prev) = self.previous_nix_config.take() {
-            unsafe {
-                env::set_var("NIX_CONFIG", prev);
-            }
-        } else {
-            unsafe {
-                env::remove_var("NIX_CONFIG");
-            }
         }
     }
 }
@@ -114,8 +95,6 @@ pub async fn setup_self_substituter(
         }
     };
 
-    let previous_nix_config = env::var("NIX_CONFIG").ok();
-
     if ready {
         info!("Self-substituter running on port 37515");
         let mut keys = Vec::new();
@@ -125,9 +104,6 @@ pub async fn setup_self_substituter(
             info!("Trusted own public key: {}", k);
         }
         let nix_config = NixEnvInjector::generate_nix_config(&["http://127.0.0.1:37515"], &keys);
-        unsafe {
-            env::set_var("NIX_CONFIG", &nix_config);
-        }
         let _ = NixEnvInjector::export_to_github_env(&nix_config).await;
     } else if proxy_child.is_some() {
         if fail_fast {
@@ -141,10 +117,7 @@ pub async fn setup_self_substituter(
         info!("Self-substituter failed to respond, proceeding without it");
     }
 
-    Ok(ProxyGuard {
-        child: proxy_child,
-        previous_nix_config,
-    })
+    Ok(ProxyGuard { child: proxy_child })
 }
 
 pub async fn fetch_remote_cache_index(

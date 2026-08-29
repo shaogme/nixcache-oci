@@ -23,17 +23,22 @@ impl NixEnvInjector {
 
     /// 在 GitHub Actions 环境下自动导出至 GITHUB_ENV
     pub async fn export_to_github_env(nix_config: &str) -> io::Result<()> {
+        Self::export_to_file(nix_config, env::var("GITHUB_ENV").ok().as_deref()).await
+    }
+
+    /// 导出 NIX_CONFIG 到指定的文件路径
+    pub async fn export_to_file(nix_config: &str, file_path_opt: Option<&str>) -> io::Result<()> {
         if nix_config.trim().is_empty() {
             return Ok(());
         }
 
-        if let Ok(github_env_path) = env::var("GITHUB_ENV") {
+        if let Some(github_env_path) = file_path_opt {
             let delimiter = "EOF_NIXCACHE_CONFIG";
             let payload = format!("NIX_CONFIG<<{}\n{}\n{}\n", delimiter, nix_config, delimiter);
             OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&github_env_path)
+                .open(github_env_path)
                 .await?
                 .write_all(payload.as_bytes())
                 .await?;
@@ -62,9 +67,9 @@ impl NixEnvInjector {
 #[cfg(test)]
 mod tests {
     use super::NixEnvInjector;
-    use std::env;
     use tempfile::NamedTempFile;
     use tokio::fs;
+
 
     #[test]
     fn test_generate_nix_config() {
@@ -94,21 +99,13 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path_str = temp_file.path().to_string_lossy().to_string();
 
-        unsafe {
-            env::set_var("GITHUB_ENV", &path_str);
-        }
-
         let config = "extra-substituters = http://127.0.0.1:37515";
-        let res = NixEnvInjector::export_to_github_env(config).await;
+        let res = NixEnvInjector::export_to_file(config, Some(&path_str)).await;
         assert!(res.is_ok());
 
         let written = fs::read_to_string(&path_str).await.unwrap();
         assert!(written.contains("NIX_CONFIG<<EOF_NIXCACHE_CONFIG"));
         assert!(written.contains("extra-substituters = http://127.0.0.1:37515"));
-
-        unsafe {
-            env::remove_var("GITHUB_ENV");
-        }
     }
 
     #[test]

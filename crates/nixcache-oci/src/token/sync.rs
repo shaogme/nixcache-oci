@@ -170,6 +170,12 @@ mod imp {
         }
     }
 
+    impl Default for InFlightState {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl InFlightState {
         pub fn new() -> Self {
             Self {
@@ -204,6 +210,12 @@ mod imp {
         }
     }
 
+    impl Default for TokenStorage {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TokenStorage {
         pub fn new() -> Self {
             Self {
@@ -231,12 +243,19 @@ mod imp {
         }
     }
 
+    impl Default for TokenBroadcaster {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TokenBroadcaster {
         pub fn new() -> Self {
             Self {
                 channel: Arc::new((Mutex::new(None), Condvar::new())),
             }
         }
+
 
         pub fn broadcast(&self, token: String) {
             let (lock, cvar) = &*self.channel;

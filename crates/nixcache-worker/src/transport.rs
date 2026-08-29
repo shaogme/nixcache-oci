@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use http::{
@@ -36,6 +37,7 @@ fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, Transport
     Ok(http_headers)
 }
 
+#[async_trait(?Send)]
 impl OciTransport for WorkerFetchTransport {
     type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + 'static>>;
 
