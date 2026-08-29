@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::{path::PathBuf, process};
+use std::{env, error::Error, path::PathBuf, process};
 
 mod cli;
 mod env_injector;
@@ -22,7 +22,7 @@ use session::{
 use worker::run_build_worker;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -32,14 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SessionCommands::Init(args) => {
                 let active_token = resolve_github_token(args.github_token, args.gh_token).await;
                 let run_id = args.run_id.or_else(|| {
-                    std::env::var("GITHUB_RUN_ID")
+                    env::var("GITHUB_RUN_ID")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                 });
                 let branch = args
                     .branch
-                    .or_else(|| std::env::var("GITHUB_REF_NAME").ok())
-                    .or_else(|| std::env::var("GITHUB_HEAD_REF").ok());
+                    .or_else(|| env::var("GITHUB_REF_NAME").ok())
+                    .or_else(|| env::var("GITHUB_HEAD_REF").ok());
 
                 let signing_key = args
                     .signing_key_file
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let run_id = args
                     .run_id
                     .or_else(|| {
-                        std::env::var("GITHUB_RUN_ID")
+                        env::var("GITHUB_RUN_ID")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                     })
@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let job_id = args
                     .job_id
-                    .or_else(|| std::env::var("GITHUB_JOB").ok())
+                    .or_else(|| env::var("GITHUB_JOB").ok())
                     .unwrap_or_else(|| "default-job".to_string());
 
                 let signing_key = args
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Promote(args) => {
             let active_token = resolve_github_token(args.github_token, args.gh_token).await;
             let run_id = args.run_id.or_else(|| {
-                std::env::var("GITHUB_RUN_ID")
+                env::var("GITHUB_RUN_ID")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
             });

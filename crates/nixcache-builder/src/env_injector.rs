@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, io};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, process::Command};
 use tracing::info;
 
@@ -22,7 +22,7 @@ impl NixEnvInjector {
     }
 
     /// 在 GitHub Actions 环境下自动导出至 GITHUB_ENV
-    pub async fn export_to_github_env(nix_config: &str) -> std::io::Result<()> {
+    pub async fn export_to_github_env(nix_config: &str) -> io::Result<()> {
         if nix_config.trim().is_empty() {
             return Ok(());
         }
@@ -113,10 +113,11 @@ mod tests {
 
     #[test]
     fn test_apply_to_command() {
+        use std::ffi::OsStr;
+
         let mut cmd = tokio::process::Command::new("nix");
         NixEnvInjector::apply_to_command(&mut cmd, "extra-substituters = http://127.0.0.1:37515");
-        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> =
-            cmd.as_std().get_envs().collect();
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = cmd.as_std().get_envs().collect();
         let nix_cfg_opt = envs
             .iter()
             .find(|(k, _)| *k == "NIX_CONFIG")

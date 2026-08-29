@@ -10,6 +10,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
 futures-channel = { workspace = true }
+futures-executor = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +19,15 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 web-time = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+scc = { workspace = true }
+crossbeam-queue = { workspace = true }
+loom = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+loom = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

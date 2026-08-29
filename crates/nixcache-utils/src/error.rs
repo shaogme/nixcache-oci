@@ -1,3 +1,4 @@
+use std::io;
 use thiserror::Error;
 
 /// 跨平台统一压缩错误枚举
@@ -13,7 +14,7 @@ pub enum CompressionError {
     Unsupported(String),
 
     #[error("I/O error during compression/decompression: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 }
 
 /// 平台差异工具库通用错误枚举

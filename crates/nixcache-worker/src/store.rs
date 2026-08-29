@@ -8,7 +8,13 @@ use nixcache_core::{
 };
 use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::Ordering,
+    },
+};
 use worker::{Env, js_sys::Date};
 
 pub type WorkerOciClient = OciClient<WorkerFetchTransport>;
@@ -98,9 +104,7 @@ impl CacheStore {
 
     /// 动态注册新编译完成的条目到 Tier 0 内存热表中 (0ms 延迟可用)
     pub fn register_hot_entries(entries: HashMap<StoreHash, IndexEntry>) {
-        if let Ok(mut state) = WorkerState::global().lock() {
-            state.register_hot(entries);
-        }
+        WorkerState::global().register_hot(entries);
     }
 
     /// 级联查询 Store Hash 对应的 narinfo (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3 -> 智能防抖穿透)
@@ -115,8 +119,9 @@ impl CacheStore {
         };
 
         // 1. Tier 0: In-Memory Hot Registry
-        if let Ok(state) = WorkerState::global().lock()
-            && let Some(entry) = state.hot_entries.get(&parsed_hash)
+        if let Some(entry) = WorkerState::global()
+            .hot_entries
+            .read(&parsed_hash, |_, v| (**v).clone())
         {
             return Ok(Some(entry.to_narinfo_string()));
         }
@@ -154,18 +159,10 @@ impl CacheStore {
 
         // 5. Miss: Debounced Read-Through to GHCR
         let now = Date::now();
-        let should_check_ghcr = {
-            if let Ok(mut state) = WorkerState::global().lock() {
-                if now - state.last_ghcr_check > DEBOUNCE_THRESHOLD_MS {
-                    state.last_ghcr_check = now;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
+        let should_check_ghcr = WorkerState::global().try_acquire_ghcr_check(
+            now as u64,
+            DEBOUNCE_THRESHOLD_MS as u64,
+        );
 
         if should_check_ghcr && self.force_refresh(env).await.is_ok() {
             if let Some(run_id) = self.config.run_id {
@@ -195,10 +192,11 @@ impl CacheStore {
         let normalized = extract_nar_basename(nar_basename);
 
         // 1. Tier 0: In-Memory Hot Registry
-        if let Ok(state) = WorkerState::global().lock()
-            && let Some(digest) = state.hot_nar_lookup.get(normalized)
+        if let Some(digest) = WorkerState::global()
+            .hot_nar_lookup
+            .read(normalized, |_, v| v.clone())
         {
-            return Ok(Some(digest.clone()));
+            return Ok(Some(digest));
         }
 
         // 2. Tier 1: Workflow Run Session (run-<run_id>)
@@ -234,18 +232,10 @@ impl CacheStore {
 
         // 5. Miss: Debounced Read-Through to GHCR
         let now = Date::now();
-        let should_check_ghcr = {
-            if let Ok(mut state) = WorkerState::global().lock() {
-                if now - state.last_ghcr_check > DEBOUNCE_THRESHOLD_MS {
-                    state.last_ghcr_check = now;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
+        let should_check_ghcr = WorkerState::global().try_acquire_ghcr_check(
+            now as u64,
+            DEBOUNCE_THRESHOLD_MS as u64,
+        );
 
         if should_check_ghcr && self.force_refresh(env).await.is_ok() {
             if let Some(run_id) = self.config.run_id {
@@ -312,11 +302,13 @@ impl CacheStore {
         let now = Date::now();
 
         // 1. L1 Memory Cache
-        if let Ok(state) = WorkerState::global().lock()
-            && let Some((session, nar_lookup, expiry)) = state.mem_session_cache.get(tag)
-            && now < *expiry
+        if let Some(cached) = WorkerState::global()
+            .mem_session_cache
+            .read(tag, |_, v| v.clone())
         {
-            return Ok(Some((session.clone(), nar_lookup.clone())));
+            if now < cached.2 {
+                return Ok(Some((cached.0.clone(), cached.1.clone())));
+            }
         }
 
         // 2. L2 Cloudflare KV
@@ -331,12 +323,10 @@ impl CacheStore {
             let session = wrapper.data;
             let nar_lookup = build_nar_lookup_map(&session.entries);
 
-            if let Ok(mut state) = WorkerState::global().lock() {
-                state.mem_session_cache.insert(
-                    tag.to_string(),
-                    (session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS),
-                );
-            }
+            let _ = WorkerState::global().mem_session_cache.upsert(
+                tag.to_string(),
+                Arc::new((session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+            );
             return Ok(Some((session, nar_lookup)));
         }
 
@@ -358,12 +348,10 @@ impl CacheStore {
                         .await;
                 }
 
-                if let Ok(mut state) = WorkerState::global().lock() {
-                    state.mem_session_cache.insert(
-                        tag.to_string(),
-                        (session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS),
-                    );
-                }
+                let _ = WorkerState::global().mem_session_cache.upsert(
+                    tag.to_string(),
+                    Arc::new((session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+                );
 
                 Ok(Some((session, nar_lookup)))
             }
@@ -392,11 +380,10 @@ impl CacheStore {
         let now = Date::now();
 
         // 1. L1 Memory Cache
-        if let Ok(state) = WorkerState::global().lock()
-            && let Some((ref data, ref nar_lookup, expiry)) = state.mem_baseline_cache
-            && now < expiry
-        {
-            return Ok((data.clone(), nar_lookup.clone()));
+        if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full() {
+            if now < cached.2 {
+                return Ok((cached.0.clone(), cached.1.clone()));
+            }
         }
 
         // 2. L2 Cloudflare KV
@@ -410,10 +397,11 @@ impl CacheStore {
             let data = wrapper.data;
             let nar_lookup = build_nar_lookup_map(&data.entries);
 
-            if let Ok(mut state) = WorkerState::global().lock() {
-                state.mem_baseline_cache =
-                    Some((data.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS));
-            }
+            WorkerState::global().mem_baseline_cache.store(Some(Arc::new((
+                data.clone(),
+                nar_lookup.clone(),
+                now + L1_MEM_TTL_MS,
+            ))));
             return Ok((data, nar_lookup));
         }
 
@@ -464,11 +452,14 @@ impl CacheStore {
             .execute()
             .await;
 
-        if let Ok(mut state) = WorkerState::global().lock() {
-            state.mem_baseline_cache =
-                Some((index_data.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS));
-            state.last_ghcr_check = now;
-        }
+        WorkerState::global().mem_baseline_cache.store(Some(Arc::new((
+            index_data.clone(),
+            nar_lookup.clone(),
+            now + L1_MEM_TTL_MS,
+        ))));
+        WorkerState::global()
+            .last_ghcr_check_ms
+            .store(now as u64, Ordering::Release);
 
         Ok((index_data, nar_lookup))
     }
@@ -477,9 +468,7 @@ impl CacheStore {
     pub async fn force_refresh(&self, env: &Env) -> Result<usize, String> {
         let mut errors = Vec::new();
 
-        if let Ok(mut state) = WorkerState::global().lock() {
-            state.clear_l1_caches();
-        }
+        WorkerState::global().clear_l1_caches();
 
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
@@ -517,10 +506,10 @@ impl CacheStore {
 
     /// 获取完整的状态元信息与各层级统计
     pub async fn get_status(&self, env: &Env) -> RemoteStatus {
-        let hot_count = WorkerState::global()
-            .lock()
-            .map(|s| s.hot_entries.len())
-            .unwrap_or(0);
+        let mut hot_count = 0;
+        WorkerState::global().hot_entries.scan(|_, _| {
+            hot_count += 1;
+        });
 
         let mut tier1_count = 0;
         let mut session_opt = None;
@@ -575,9 +564,9 @@ impl CacheStore {
             };
 
         let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
-        if let Ok(state) = WorkerState::global().lock() {
-            unique_hashes.extend(state.hot_entries.keys().cloned());
-        }
+        WorkerState::global().hot_entries.scan(|k, _| {
+            unique_hashes.insert((*k).clone());
+        });
         if let Some(s) = session_opt {
             unique_hashes.extend(s.entries.keys().cloned());
         }

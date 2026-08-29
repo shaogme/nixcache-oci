@@ -1,6 +1,9 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::process;
+
 /// 获取当前环境进程 ID 或伪随机标识
 ///
-/// 在原生操作系统平台下返回 `std::process::id()`；
+/// 在原生操作系统平台下返回 `process::id()`；
 /// 在 wasm32 等沙箱无进程环境下返回 0 作为抖动基数。
 pub fn get_process_id() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -10,7 +13,7 @@ pub fn get_process_id() -> u64 {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::process::id() as u64
+        process::id() as u64
     }
 }
 

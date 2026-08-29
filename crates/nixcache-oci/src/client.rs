@@ -20,7 +20,7 @@ use nixcache_core::{
 use nixcache_utils::get_process_id;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{mem, pin::pin, time::Duration};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -354,7 +354,7 @@ impl<T: OciTransport> OciClient<T> {
         config: &UploadConfig,
     ) -> Result<(String, u64), OciError> {
         let (hashing_stream, hash_state) = HashingStream::new(stream);
-        let mut pinned_stream = std::pin::pin!(hashing_stream);
+        let mut pinned_stream = pin!(hashing_stream);
 
         info!("Initiating streaming resumable chunked upload");
         let upload_init_url = format!(
@@ -390,7 +390,7 @@ impl<T: OciTransport> OciClient<T> {
             chunk_buf.extend_from_slice(&bytes);
 
             if chunk_buf.len() >= chunk_limit {
-                let send_bytes = Bytes::from(std::mem::replace(
+                let send_bytes = Bytes::from(mem::replace(
                     &mut chunk_buf,
                     Vec::with_capacity(chunk_limit),
                 ));

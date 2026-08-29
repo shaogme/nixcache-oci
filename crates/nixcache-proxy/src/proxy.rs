@@ -93,7 +93,7 @@ async fn serve_public_key(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn serve_status(State(state): State<AppState>) -> impl IntoResponse {
-    let (remote_connected, remote_error) = state.index.remote_status().await;
+    let (remote_connected, remote_error) = state.index.remote_status();
     let counts = state.index.get_entry_counts().await;
     let config = state.index.config();
 

@@ -2,7 +2,7 @@ use crate::{env_injector::NixEnvInjector, error::BuilderError};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{env, fmt, path::Path};
+use std::{env, fmt, path::Path, process::Stdio};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 use tracing::{error, info};
 
@@ -213,8 +213,8 @@ impl NixCli {
         } else {
             let mut output = Command::new("nix")
                 .args(["key", "convert-secret-to-public"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .spawn()
                 .ok()?;
 

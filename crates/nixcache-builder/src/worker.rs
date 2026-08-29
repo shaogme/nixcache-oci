@@ -15,6 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::Path,
+    process::Stdio,
     time::Duration,
 };
 use tokio::{fs, process::Child, time::sleep};
@@ -77,8 +78,8 @@ pub async fn setup_self_substituter(
         .env("NIXCACHE_LISTEN", "127.0.0.1")
         .env("NIXCACHE_UPSTREAM", "")
         .env("GITHUB_TOKEN", github_token)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     let (proxy_child, ready) = match proxy_cmd.spawn() {
         Ok(child) => {

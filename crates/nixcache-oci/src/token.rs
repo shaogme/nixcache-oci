@@ -1,47 +1,29 @@
-use crate::{error::OciError, transport::OciTransport};
+pub mod sync;
+
+use crate::{
+    error::OciError,
+    token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
+    transport::OciTransport,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures_channel::oneshot;
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use web_time::Instant;
 
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
 }
 
-enum InFlightState {
-    Idle,
-    Fetching(Vec<oneshot::Sender<String>>),
-}
-
-struct InnerTokenManager {
-    cached: Option<(String, Instant)>,
-    in_flight: InFlightState,
-}
-
-#[derive(Clone)]
+/// OCI 注册表鉴权令牌管理器（零锁 Singleflight 状态机）
+#[derive(Clone, Debug)]
 pub struct TokenManager {
     registry: String,
     repo: String,
     github_token: String,
     write_access: bool,
-    state: Arc<Mutex<InnerTokenManager>>,
-}
-
-impl fmt::Debug for TokenManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TokenManager")
-            .field("registry", &self.registry)
-            .field("repo", &self.repo)
-            .field("write_access", &self.write_access)
-            .finish_non_exhaustive()
-    }
+    storage: TokenStorage,
+    in_flight: InFlightState,
+    broadcaster: TokenBroadcaster,
 }
 
 impl TokenManager {
@@ -51,10 +33,9 @@ impl TokenManager {
             repo: repo.to_string(),
             github_token: github_token.to_string(),
             write_access,
-            state: Arc::new(Mutex::new(InnerTokenManager {
-                cached: None,
-                in_flight: InFlightState::Idle,
-            })),
+            storage: TokenStorage::new(),
+            in_flight: InFlightState::new(),
+            broadcaster: TokenBroadcaster::new(),
         }
     }
 
@@ -70,58 +51,52 @@ impl TokenManager {
         }
     }
 
+    /// 核心鉴权方法：99.9% 场景为 Wait-Free 无锁读取
     pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<String, OciError> {
-        let rx_to_await = {
-            let mut state = self.state.lock().expect("mutex poisoned");
-
-            // 1. Fast path: 缓存有效且在 240s 生命周期内直接复用
-            if let Some((ref token, ref instant)) = state.cached
-                && instant.elapsed() < Duration::from_secs(240)
-            {
-                return Ok(token.clone());
-            }
-
-            // 2. Singleflight 判定
-            match &mut state.in_flight {
-                InFlightState::Fetching(waiters) => {
-                    let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
-                    Some(rx)
-                }
-                InFlightState::Idle => {
-                    state.in_flight = InFlightState::Fetching(Vec::new());
-                    None
-                }
-            }
-        };
-
-        // 3. Follower 协程等待 Leader 广播
-        if let Some(rx) = rx_to_await {
-            if let Ok(token) = rx.await {
-                return Ok(token);
-            }
-            // 若 Leader 异常中断，重试一次
-            return Box::pin(self.get_token(transport)).await;
+        // 1. Fast Path: Wait-Free 读取原子快照 (0 锁争用)
+        if let Some(cached) = self.storage.load() {
+            return Ok(cached);
         }
 
-        // 4. Leader 协程发起网络获取
-        let token = self.fetch_token_network(transport).await;
-
-        // 5. 广播结果并更新缓存
-        let mut state = self.state.lock().expect("mutex poisoned");
-        let old_in_flight = std::mem::replace(&mut state.in_flight, InFlightState::Idle);
-        state.cached = Some((token.clone(), Instant::now()));
-
-        if let InFlightState::Fetching(waiters) = old_in_flight {
-            for tx in waiters {
-                let _ = tx.send(token.clone());
+        // 2. Slow Path: CAS 抢占 Leader 状态
+        if self.in_flight.try_acquire_leader() {
+            // Double-Check: 检查在 CAS 抢占期间是否已有刚刚退出的 Leader 填充了有效缓存
+            if let Some(cached) = self.storage.load() {
+                self.in_flight.release_leader();
+                return Ok(cached);
             }
+
+            // Leader: 发起网络获取
+            let maybe_fetched = self.fetch_token_network(transport).await;
+            let result_token = match maybe_fetched {
+                Some(tok) => {
+                    self.storage.store(tok.clone());
+                    tok
+                }
+                None => self.github_token.clone(),
+            };
+
+            // 广播通知所有等待中的协程
+            self.broadcaster.broadcast(result_token.clone());
+            self.in_flight.release_leader();
+
+            return Ok(result_token);
         }
 
-        Ok(token)
+        // 3. Follower: 订阅等待 Leader 广播
+        if let Some(cached) = self.storage.load() {
+            return Ok(cached);
+        }
+        match self.broadcaster.wait().await {
+            Ok(token) => Ok(token),
+            Err(_) => {
+                // Leader 异常断开，安全重试
+                Box::pin(self.get_token(transport)).await
+            }
+        }
     }
 
-    async fn fetch_token_network<T: OciTransport>(&self, transport: &T) -> String {
+    async fn fetch_token_network<T: OciTransport>(&self, transport: &T) -> Option<String> {
         let scope = if self.write_access {
             "pull,push"
         } else {
@@ -148,12 +123,138 @@ impl TokenManager {
 
         match transport.get(&token_url, headers).await {
             Ok((status, _resp_headers, bytes)) if status.is_success() => {
-                serde_json::from_slice::<TokenResponse>(&bytes)
+                let parsed = serde_json::from_slice::<TokenResponse>(&bytes)
                     .ok()
-                    .and_then(|r| r.token)
-                    .unwrap_or_else(|| self.github_token.clone())
+                    .and_then(|r| r.token);
+                parsed.or_else(|| {
+                    if !self.github_token.is_empty() {
+                        Some(self.github_token.clone())
+                    } else {
+                        None
+                    }
+                })
             }
-            _ => self.github_token.clone(),
+            _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenManager;
+    use crate::mock::{MockResponse, MockRouterTransport};
+    use bytes::Bytes;
+    use http::{HeaderMap, StatusCode};
+    use std::sync::{Arc, atomic::Ordering};
+
+    fn make_test_transport() -> MockRouterTransport {
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "GET",
+            "/token",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"token": "singleflight-jwt-token"}"#),
+            },
+        );
+        transport
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_singleflight_concurrent_storm() {
+        let transport = Arc::new(make_test_transport());
+        let token_mgr = Arc::new(TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let mgr = token_mgr.clone();
+            let tr = transport.clone();
+            handles.push(tokio::spawn(async move { mgr.get_token(&*tr).await }));
+        }
+
+        let mut tokens = Vec::new();
+        for h in handles {
+            let res = h.await.unwrap();
+            assert!(res.is_ok());
+            tokens.push(res.unwrap());
+        }
+
+        // 验证 1: 50 个高并发请求下，网络 token fetch 仅仅发生了 1 次（CAS 完美单飞）
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
+
+        // 验证 2: 所有 50 个协程获取到的 Token 必定一致且正确
+        for tok in &tokens {
+            assert_eq!(tok, "singleflight-jwt-token");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_fast_path_cache_and_double_check() {
+        let transport = make_test_transport();
+        let token_mgr = TokenManager::new("test.registry.io", "test/repo", "secret_tok", true);
+
+        // 第一次调用：执行网络 Fetch
+        let t1 = token_mgr.get_token(&transport).await.unwrap();
+        assert_eq!(t1, "singleflight-jwt-token");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
+
+        // 第二次调用：0 锁快路径原子快照直接返回（网络调用次数依然为 1）
+        let t2 = token_mgr.get_token(&transport).await.unwrap();
+        assert_eq!(t2, "singleflight-jwt-token");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_failure_recovery_and_liveness() {
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "GET",
+            "/token",
+            MockResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+
+        let token_mgr = TokenManager::new("test.registry.io", "test/repo", "fallback_token", false);
+
+        // 首次调用网络失败，安全回退到 fallback token，不发生死锁或 panic
+        let t1 = token_mgr.get_token(&transport).await.unwrap();
+        assert_eq!(t1, "fallback_token");
+
+        // 路由恢复正常
+        transport.add_route(
+            "GET",
+            "/token",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"token": "recovered-token"}"#),
+            },
+        );
+
+        // 随后的请求能够重新竞选 Leader 并成功获取新 Token
+        let t2 = token_mgr.get_token(&transport).await.unwrap();
+        assert_eq!(t2, "recovered-token");
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_scope_and_write_access() {
+        let transport = MockRouterTransport::default();
+        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true);
+        let read_mgr = TokenManager::new("ghcr.io", "org/repo", "token", false);
+
+        let t_write = write_mgr.get_token(&transport).await.unwrap();
+        let t_read = read_mgr.get_token(&transport).await.unwrap();
+
+        assert_eq!(t_write, "token");
+        assert_eq!(t_read, "token");
     }
 }

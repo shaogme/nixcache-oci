@@ -317,6 +317,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 mod tests {
     use super::{RegisterPayload, parse_upstream_list};
     use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash};
+    use std::collections::HashMap;
 
     #[test]
     fn test_worker_upstream_parsing() {
@@ -373,7 +374,7 @@ mod tests {
             origin_job: None,
         };
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         let sh1 = StoreHash::parse(hash1_str).unwrap();
         map.insert(sh1.clone(), entry1.clone());
         let map_json = serde_json::to_string(&map).unwrap();
@@ -433,7 +434,7 @@ mod tests {
             added: "2026-08-29T10:00:00Z".to_string(),
             origin_job: None,
         };
-        let mut obj_map = std::collections::HashMap::new();
+        let mut obj_map = HashMap::new();
         let sh3 = StoreHash::parse(hash3_str).unwrap();
         obj_map.insert(sh3.clone(), entry3);
         let obj = RegisterPayload::Object { entries: obj_map };

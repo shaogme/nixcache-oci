@@ -26,6 +26,7 @@ serde_json = "1.0"
 tempfile = "3"
 futures-util = "0.3"
 futures-channel = "0.3"
+futures-executor = "0.3"
 tokio-util = { version = "0.7" }
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -38,8 +39,11 @@ clap = { version = "4.6", features = ["derive", "env"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 wiremock = "0.6"
-moka = { version = "0.12", features = ["future"] }
 async-compression = { version = "0.4", features = ["tokio", "xz", "zstd"] }
 zstd = "0.13"
 ruzstd = "0.7"
 web-time = "1.1"
+arc-swap = "1.7"
+scc = "2.3"
+crossbeam-queue = "0.3"
+loom = "0.7"

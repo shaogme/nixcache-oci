@@ -5,6 +5,7 @@ use crate::{
 use std::{
     env,
     path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
 use tokio::{fs, process::Command, time::sleep};
@@ -87,8 +88,8 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         .env("NIXCACHE_INDEX_TTL", opts.baseline_ttl.to_string())
         .env("NIXCACHE_BASELINE_TAG", opts.baseline_tag)
         .env("GITHUB_TOKEN", opts.github_token)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     if let Some(rid) = opts.run_id {
         proxy_cmd.env("NIXCACHE_RUN_ID", rid.to_string());

@@ -1,6 +1,14 @@
 use crate::error::TypeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{borrow::Borrow, collections::HashMap, fmt, ops::Deref, str::FromStr};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    fmt,
+    ops::Deref,
+    path::Path,
+    str::FromStr,
+};
 
 pub const SCHEMA_VERSION: u32 = 4;
 pub const CACHE_INDEX_VERSION: u32 = 4;
@@ -322,7 +330,7 @@ impl fmt::Display for SystemArch {
 }
 
 impl FromStr for SystemArch {
-    type Err = std::convert::Infallible;
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::from(s))
@@ -387,7 +395,7 @@ pub struct NarInfoMeta {
 impl NarInfoMeta {
     /// 从 store_path 中提取 32 字符 Nix 散列值
     pub fn store_hash(&self) -> Option<StoreHash> {
-        let name = std::path::Path::new(&self.store_path)
+        let name = Path::new(&self.store_path)
             .file_name()
             .and_then(|n| n.to_str())?;
         if name.len() >= 32 {
@@ -540,7 +548,7 @@ impl CacheIndexData {
         }
 
         let mut result = HashMap::new();
-        let mut all_systems: std::collections::HashSet<SystemArch> =
+        let mut all_systems: HashSet<SystemArch> =
             partitioned_entries.keys().cloned().collect();
         all_systems.extend(self.gc_roots.keys().cloned());
 

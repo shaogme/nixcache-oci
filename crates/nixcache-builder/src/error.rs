@@ -1,5 +1,6 @@
 use nixcache_core::CoreError;
 use nixcache_oci::OciError;
+use std::io;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -8,7 +9,7 @@ pub enum BuilderError {
     NixCli(String),
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

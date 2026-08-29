@@ -1,8 +1,11 @@
 use clap::Parser;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
+
+#[cfg(not(unix))]
+use std::future;
 
 // Module declarations
 mod index;
@@ -147,7 +150,7 @@ async fn shutdown_signal() {
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = future::pending::<()>();
 
     tokio::select! {
         _ = ctrl_c => {},
@@ -158,7 +161,7 @@ async fn shutdown_signal() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
