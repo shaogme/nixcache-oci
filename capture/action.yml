@@ -37,6 +37,10 @@ inputs:
     description: 'Path to baseline store snapshot'
     required: false
     default: '/tmp/nixcache-snapshot-before.txt'
+  export-concurrency:
+    description: 'Parallel export concurrency level (default: autodetect based on CPU cores, clamp(2, 8))'
+    required: false
+    default: ''
   github-token:
     description: 'GitHub token with package write permissions'
     required: false
@@ -77,6 +81,7 @@ runs:
         NIXCACHE_OUTPUT_RECEIPT: ${{ inputs.output-receipt }}
         NIXCACHE_PROXY_URL: ${{ inputs.proxy-url }}
         NIXCACHE_SNAPSHOT_PATH: ${{ inputs.snapshot-path }}
+        NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""

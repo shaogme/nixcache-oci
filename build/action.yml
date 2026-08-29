@@ -37,6 +37,10 @@ inputs:
     description: 'Fail fast if self-substituter proxy fails to start or become ready'
     required: false
     default: 'true'
+  export-concurrency:
+    description: 'Parallel export concurrency level (default: autodetect based on CPU cores, clamp(2, 8))'
+    required: false
+    default: ''
   github-token:
     description: 'GitHub token with package write permissions'
     required: false
@@ -87,6 +91,7 @@ runs:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_FAIL_FAST: ${{ inputs.fail-fast }}
+        NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt.json
         GITHUB_TOKEN: ${{ inputs.github-token }}

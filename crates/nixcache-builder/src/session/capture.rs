@@ -5,16 +5,15 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{
-    BuildReceipt, BuildStats, IndexEntry, NarDigest, NarInfo, StoreHash, SystemArch,
+    BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::SessionMutationRequest;
-use nixcache_oci_backend::{OciClientExt, create_tokio_reqwest_client};
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
     collections::{HashMap, HashSet},
     env,
     path::Path,
 };
-use tempfile::tempdir;
 use tokio::fs;
 use tracing::{error, info};
 
@@ -30,10 +29,11 @@ pub struct SessionCaptureOptions<'a> {
     pub output_receipt_path: Option<&'a Path>,
     pub proxy_url: Option<&'a str>,
     pub snapshot_before: Option<&'a Path>,
+    pub export_concurrency: usize,
     pub explicit_paths: &'a [String],
 }
 
-/// Session Capture: 捕获本 Job 新构建产物，导出并上传 NAR Blobs，CAS 更新 run-<run_id>，热注册到 Proxy
+/// Session Capture: 捕获本 Job 新构建产物，并行无盘流式导出并上传 NAR Blobs，CAS 更新 run-<run_id>，热注册到 Proxy
 pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(), BuilderError> {
     let system = match opts.system_opt {
         Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
@@ -80,67 +80,40 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
     );
 
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
-    let temp_dir = tempdir()?;
 
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
 
     if !candidate_paths.is_empty() {
-        let exported =
-            nix::export_paths_directly(&candidate_paths, opts.signing_key_file, temp_dir.path())
+        info!(
+            "Capturing {} paths via ParallelExporter (Diskless, concurrency: {})",
+            candidate_paths.len(),
+            opts.export_concurrency
+        );
+
+        let export_config = nix::ParallelExportConfig {
+            concurrency: opts.export_concurrency,
+            signing_key_file: opts.signing_key_file.map(|s| s.to_string()),
+            fail_fast: false,
+            upload_config: nixcache_oci::UploadConfig::default(),
+            system,
+            origin_job: Some(format!("job:{}", opts.job_id)),
+        };
+
+        let report =
+            nix::ParallelExporter::export_and_upload_paths(&candidate_paths, &oci, &export_config)
                 .await?;
-        for (hash, store_path) in exported {
-            let narinfo_path = temp_dir.path().join(format!("{}.narinfo", hash));
-            let nar_file_path = temp_dir.path().join("nar").join(format!("{}.nar.xz", hash));
 
-            if !nar_file_path.exists() {
-                continue;
-            }
+        for exported in report.successful {
+            new_entries.insert(exported.store_hash, exported.index_entry);
+            uploaded_count += 1;
+            total_bytes_uploaded += exported.file_size;
+        }
 
-            let metadata = fs::metadata(&nar_file_path).await?;
-            let size = metadata.len();
-
-            info!("  Uploading NAR for {} ({} bytes)", hash, size);
-            match oci.push_blob_file(&nar_file_path).await {
-                Ok(nar_digest_str) => {
-                    if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
-                        let name = Path::new(&store_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .and_then(|s| s.split_once('-'))
-                            .map(|x| x.1.to_string())
-                            .unwrap_or_else(|| hash.clone());
-
-                        if let Ok(narinfo) = NarInfo::parse(&narinfo_content) {
-                            let (narinfo_meta, nar_size) = narinfo.into_meta();
-                            let store_hash = narinfo_meta
-                                .store_hash()
-                                .unwrap_or_else(|| StoreHash::new_unchecked(&hash));
-                            let nar_digest = NarDigest::parse(&nar_digest_str)
-                                .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest_str));
-
-                            new_entries.insert(
-                                store_hash,
-                                IndexEntry {
-                                    name,
-                                    system: Some(system),
-                                    narinfo_meta,
-                                    nar_digest,
-                                    nar_size: size.max(nar_size),
-                                    added: Utc::now()
-                                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                    origin_job: Some(format!("job:{}", opts.job_id)),
-                                },
-                            );
-                            uploaded_count += 1;
-                            total_bytes_uploaded += size;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to upload NAR for {}: {}", hash, e);
-                }
+        if !report.failed.is_empty() {
+            for (path, err) in &report.failed {
+                error!("Failed to export & upload {}: {}", path, err);
             }
         }
     }

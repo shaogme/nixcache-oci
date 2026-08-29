@@ -91,6 +91,7 @@ jobs:
           signing-key: ${{ secrets.NIX_SIGNING_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           fail-fast: 'true'
+          export-concurrency: '4' # 可选，自定义并发导出与上传数量（默认自适应 2~8）
 
   # =========================================================================
   # 阶段 2: 汇聚并原子发布统一缓存索引 (Gather - 单节点合并发布)
@@ -209,6 +210,7 @@ jobs:
         uses: shaogme/nixcache-oci/capture@main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          export-concurrency: '4' # 可选，并发导出与上传 Worker 数量
 
 ```
 
@@ -499,6 +501,7 @@ nixcache-builder session clean
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（可选） |
 | `--proxy-url <URL>` | `NIXCACHE_PROXY_URL` | `http://127.0.0.1:37515` | 本地 Proxy 代理地址（用于热注册新产物） |
 | `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 构建前 Store 路径快照文件路径（用于自动 diff） |
+| `--export-concurrency <NUM>` | `NIXCACHE_EXPORT_CONCURRENCY` | 自适应 (`num_cpus.clamp(2, 8)`) | 并行导出与上传的最大并发 Worker 数 |
 | `[PATHS...]` | - | （无） | 显式指定要捕获的 Store 路径（位置参数，可选） |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
@@ -533,6 +536,7 @@ nixcache-builder build \
 | `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | `receipt-<system>.json` | 生成的收据 JSON 文件路径 |
 | `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | Proxy 启动失败时是否立即报错退出 |
+| `--export-concurrency <NUM>` | `NIXCACHE_EXPORT_CONCURRENCY` | 自适应 (`num_cpus.clamp(2, 8)`) | 并行导出与上传的最大并发 Worker 数 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 3. `promote` (Coordinator 汇聚与晋升发布节点专用)

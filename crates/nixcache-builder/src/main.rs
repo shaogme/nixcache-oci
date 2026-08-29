@@ -80,6 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let output_receipt = args.resolve_output_receipt();
                 let proxy_url = args.resolve_proxy_url();
                 let snapshot_before = args.resolve_snapshot_before();
+                let export_concurrency = args.resolve_export_concurrency();
 
                 let capture_opts = SessionCaptureOptions {
                     repo: &repo,
@@ -92,6 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     output_receipt_path: output_receipt.as_deref(),
                     proxy_url: Some(&proxy_url),
                     snapshot_before: Some(&snapshot_before),
+                    export_concurrency,
                     explicit_paths: &args.paths,
                 };
 
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let attributes = args.resolve_attributes();
             let fail_fast = args.resolve_fail_fast();
             let receipt_path = args.resolve_output_receipt(system_name.as_deref());
+            let export_concurrency = args.resolve_export_concurrency();
 
             let build_config = BuildConfig {
                 system: system_name,
@@ -137,6 +140,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &active_token,
                 &receipt_path,
                 fail_fast,
+                export_concurrency,
             )
             .await
             {

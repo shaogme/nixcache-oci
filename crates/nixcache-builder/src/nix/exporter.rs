@@ -1,86 +1,27 @@
 use crate::error::BuilderError;
 use async_compression::tokio::write::XzEncoder;
-use futures_util::TryStreamExt;
+use chrono::Utc;
+use futures_util::{StreamExt, TryStreamExt, stream};
+use nixcache_core::{
+    IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
+};
 use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use nixcache_oci_backend::ReqwestTransport;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     io,
     path::Path,
-    pin::Pin,
     process::Stdio,
     sync::Arc,
-    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{
-    fs,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
-    sync::Semaphore,
 };
 use tokio_util::io::ReaderStream;
-use tracing::info;
-
-#[derive(Debug, Clone)]
-pub struct UploadedNarMetadata {
-    pub store_hash: String,
-    pub store_path: String,
-    pub nar_digest: String,
-    pub nar_size: u64,
-    pub narinfo_content: String,
-}
-
-/// 异步哈希与字节计数写入器
-pub struct HashingWriter<W> {
-    inner: W,
-    hasher: Sha256,
-    bytes_written: u64,
-}
-
-impl<W> HashingWriter<W> {
-    pub fn new(inner: W) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-            bytes_written: 0,
-        }
-    }
-
-    pub fn into_inner_and_digest(self) -> (W, String, u64) {
-        let hash = self.hasher.finalize();
-        let hex = hash
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-        (self.inner, hex, self.bytes_written)
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match Pin::new(&mut self.inner).poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => {
-                self.hasher.update(&buf[..n]);
-                self.bytes_written += n as u64;
-                Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
+use tracing::{error, info, warn};
 
 /// 原生流式单向复制数据并写入压缩编码器。
 ///
@@ -106,468 +47,524 @@ where
     Ok(total_bytes)
 }
 
-/// 原生流式导出 store paths 并生成 .nar.xz 与 .narinfo
-pub async fn export_paths_directly(
-    paths: &[String],
-    signing_key_file: Option<&str>,
-    cache_dir: &Path,
-) -> Result<Vec<(String, String)>, BuilderError> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let nar_dir = cache_dir.join("nar");
-    fs::create_dir_all(&nar_dir).await?;
-
-    if let Some(key) = signing_key_file {
-        info!("Signing {} store paths", paths.len());
-        let mut cmd = Command::new("nix");
-        cmd.args(["store", "sign", "--key-file", key]);
-        for p in paths {
-            cmd.arg(p);
-        }
-        let status = cmd.status().await?;
-        if !status.success() {
-            info!("Signing command returned non-zero status, continuing...");
-        }
-    }
-
-    info!(
-        "Exporting {} store paths via native async streaming pipeline",
-        paths.len()
-    );
-
-    let concurrency_limit = num_cpus::get().max(2);
-    let sem = Arc::new(Semaphore::new(concurrency_limit));
-    let mut tasks = Vec::new();
-
-    for store_path in paths {
-        let store_path = store_path.clone();
-        let nar_dir = nar_dir.clone();
-        let sem = sem.clone();
-
-        let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
-
-            let file_name = Path::new(&store_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| format!("Invalid store path: {}", store_path))?;
-
-            if file_name.len() < 32 {
-                return Err(format!("Path name too short: {}", file_name));
-            }
-            let hash = &file_name[..32];
-            let nar_file_path = nar_dir.join(format!("{}.nar.xz", hash));
-
-            // 1. 原生流式导出与压缩：nix-store --dump -> Async XzEncoder -> HashingWriter
-            let mut dump_proc = Command::new("nix-store")
-                .args(["--dump", &store_path])
-                .stdout(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn nix-store --dump: {}", e))?;
-
-            let mut dump_stdout = dump_proc
-                .stdout
-                .take()
-                .ok_or_else(|| "Failed to capture nix-store stdout".to_string())?;
-
-            let nar_file = fs::File::create(&nar_file_path)
-                .await
-                .map_err(|e| format!("Failed to create nar file: {}", e))?;
-
-            let hashing_writer = HashingWriter::new(nar_file);
-            let mut encoder = XzEncoder::new(hashing_writer);
-
-            copy_nar_stream(&mut dump_stdout, &mut encoder)
-                .await
-                .map_err(|e| format!("Failed to compress NAR stream: {}", e))?;
-
-            encoder
-                .shutdown()
-                .await
-                .map_err(|e| format!("Failed to flush encoder: {}", e))?;
-
-            let hashing_writer = encoder.into_inner();
-            let (mut file, file_hash_hex, file_size) = hashing_writer.into_inner_and_digest();
-            file.flush()
-                .await
-                .map_err(|e| format!("Failed to flush file: {}", e))?;
-
-            let dump_status = dump_proc
-                .wait()
-                .await
-                .map_err(|e| format!("nix-store dump wait failed: {}", e))?;
-
-            if !dump_status.success() {
-                return Err(format!("nix-store dump failed for {}", store_path));
-            }
-
-            // 2. 获取 path-info 构建 narinfo 元数据
-            let path_info_out = Command::new("nix")
-                .args(["path-info", "--json", &store_path])
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run nix path-info for {}: {}", store_path, e))?;
-
-            if !path_info_out.status.success() {
-                return Err(format!(
-                    "nix path-info failed: {}",
-                    String::from_utf8_lossy(&path_info_out.stderr)
-                ));
-            }
-
-            let path_info_json = String::from_utf8_lossy(&path_info_out.stdout);
-            let parsed_info = serde_json::from_str::<Value>(&path_info_json)
-                .map_err(|e| format!("Failed to parse path info: {}", e))?;
-
-            let info = if let Some(arr) = parsed_info.as_array() {
-                arr.first()
-                    .ok_or_else(|| "Empty path-info array".to_string())?
-                    .clone()
-            } else if let Some(obj) = parsed_info.as_object() {
-                obj.get(&store_path)
-                    .ok_or_else(|| "Path not found in path-info object".to_string())?
-                    .clone()
-            } else {
-                return Err("Unexpected path-info structure".to_string());
-            };
-
-            let nar_hash = info
-                .get("narHash")
-                .and_then(|h| h.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let nar_size = info.get("narSize").and_then(|s| s.as_u64()).unwrap_or(0);
-            let references = info.get("references").and_then(|r| r.as_array());
-            let deriver = info
-                .get("deriver")
-                .and_then(|d| d.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let signatures = info
-                .get("signatures")
-                .or_else(|| info.get("sigs"))
-                .and_then(|s| s.as_array());
-
-            let mut ref_basenames = Vec::new();
-            if let Some(refs_arr) = references {
-                for r_val in refs_arr {
-                    if let Some(r_str) = r_val.as_str()
-                        && let Some(bname) = Path::new(r_str).file_name().and_then(|n| n.to_str())
-                    {
-                        ref_basenames.push(bname.to_string());
-                    }
-                }
-            }
-            let ref_names = ref_basenames.join(" ");
-
-            let mut lines = vec![
-                format!("StorePath: {}", store_path),
-                format!("URL: nar/{}.nar.xz", hash),
-                "Compression: xz".to_string(),
-                format!("FileHash: sha256:{}", file_hash_hex),
-                format!("FileSize: {}", file_size),
-                format!("NarHash: {}", nar_hash),
-                format!("NarSize: {}", nar_size),
-            ];
-
-            if !ref_names.is_empty() {
-                lines.push(format!("References: {}", ref_names));
-            }
-            if !deriver.is_empty()
-                && let Some(deriver_bname) =
-                    Path::new(&deriver).file_name().and_then(|n| n.to_str())
-            {
-                lines.push(format!("Deriver: {}", deriver_bname));
-            }
-
-            if let Some(sigs_arr) = signatures {
-                for sig_val in sigs_arr {
-                    if let Some(sig_str) = sig_val.as_str() {
-                        lines.push(format!("Sig: {}", sig_str));
-                    }
-                }
-            }
-
-            let narinfo_content = lines.join("\n") + "\n";
-            let narinfo_path = nar_dir
-                .parent()
-                .ok_or_else(|| "No parent dir".to_string())?
-                .join(format!("{}.narinfo", hash));
-            fs::write(&narinfo_path, narinfo_content)
-                .await
-                .map_err(|e| format!("Failed to write narinfo: {}", e))?;
-
-            info!("  Exported {} ({} bytes)", hash, file_size);
-            Ok((hash.to_string(), store_path))
-        });
-
-        tasks.push(task);
-    }
-
-    let mut results = Vec::new();
-    for t in tasks {
-        match t.await {
-            Ok(Ok(pair)) => results.push(pair),
-            Ok(Err(e)) => return Err(BuilderError::NixCli(e)),
-            Err(e) => return Err(BuilderError::Other(format!("Task panicked: {}", e))),
-        }
-    }
-
-    Ok(results)
+/// 并行导出与上传配置
+#[derive(Clone, Debug)]
+pub struct ParallelExportConfig {
+    /// 最大并发 Worker 数
+    pub concurrency: usize,
+    /// 签名私钥文件路径
+    pub signing_key_file: Option<String>,
+    /// 是否在遇到单个产物导出失败时立即中止退出
+    pub fail_fast: bool,
+    /// OCI 上传底层配置
+    pub upload_config: UploadConfig,
+    /// 目标平台系统架构
+    pub system: SystemArch,
+    /// 来源 Job 标识符
+    pub origin_job: Option<String>,
 }
 
-/// 端到端流式无盘导出并上传单个 store path (Diskless Streaming Pipe)
-pub async fn export_and_upload_path_stream(
-    store_path: &str,
-    signing_key_file: Option<&str>,
-    oci_client: &OciClient<ReqwestTransport>,
-    upload_config: &UploadConfig,
-) -> Result<UploadedNarMetadata, BuilderError> {
-    if let Some(key) = signing_key_file {
-        let mut cmd = Command::new("nix");
-        cmd.args(["store", "sign", "--key-file", key, store_path]);
-        let _ = cmd.status().await;
-    }
-
-    let file_name = Path::new(store_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| BuilderError::Other(format!("Invalid store path: {}", store_path)))?;
-
-    if file_name.len() < 32 {
-        return Err(BuilderError::Other(format!(
-            "Path name too short: {}",
-            file_name
-        )));
-    }
-    let hash = &file_name[..32];
-
-    let mut dump_proc = Command::new("nix-store")
-        .args(["--dump", store_path])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| BuilderError::Other(format!("Failed to spawn nix-store --dump: {}", e)))?;
-
-    let dump_stdout = dump_proc
-        .stdout
-        .take()
-        .ok_or_else(|| BuilderError::Other("Failed to capture nix-store stdout".to_string()))?;
-
-    let (reader, writer) = tokio::io::duplex(8 * 1024 * 1024);
-
-    let compress_handle = tokio::spawn(async move {
-        let mut encoder = XzEncoder::new(writer);
-        let mut reader = dump_stdout;
-        let res = copy_nar_stream(&mut reader, &mut encoder).await;
-        let shutdown_res = encoder.shutdown().await;
-        if let Err(e) = res {
-            return Err(format!("Compression copy failed: {}", e));
+impl Default for ParallelExportConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: num_cpus::get().clamp(2, 8),
+            signing_key_file: None,
+            fail_fast: false,
+            upload_config: UploadConfig::default(),
+            system: SystemArch::from("x86_64-linux"),
+            origin_job: None,
         }
-        if let Err(e) = shutdown_res {
-            return Err(format!("Encoder shutdown failed: {}", e));
+    }
+}
+
+/// 单个 Store Path 导出上传完成后的元数据
+#[derive(Clone, Debug)]
+pub struct ExportedStorePath {
+    pub store_hash: StoreHash,
+    pub index_entry: IndexEntry,
+    pub file_size: u64,
+}
+
+/// 并行导出总览报告
+#[derive(Clone, Debug, Default)]
+pub struct ParallelExportReport {
+    pub successful: Vec<ExportedStorePath>,
+    pub failed: Vec<(String, String)>,
+    pub total_bytes_uploaded: u64,
+    pub elapsed: Duration,
+}
+
+/// 预查的单路径原始元数据结构
+#[derive(Clone, Debug, Default)]
+pub struct RawPathInfo {
+    pub nar_hash: String,
+    pub nar_size: u64,
+    pub references: Vec<String>,
+    pub deriver: Option<String>,
+    pub signatures: Vec<String>,
+    pub ca: Option<String>,
+}
+
+/// 高性能无盘流式并行 Export 协调器
+pub struct ParallelExporter;
+
+impl ParallelExporter {
+    /// 批量预处理、端到端无盘流式并行导出并上传
+    pub async fn export_and_upload_paths(
+        paths: &[String],
+        oci_client: &OciClient<ReqwestTransport>,
+        config: &ParallelExportConfig,
+    ) -> Result<ParallelExportReport, BuilderError> {
+        if paths.is_empty() {
+            return Ok(ParallelExportReport::default());
+        }
+
+        let start_time = Instant::now();
+        info!(
+            "Starting parallel export for {} paths (concurrency: {}, fail_fast: {})",
+            paths.len(),
+            config.concurrency,
+            config.fail_fast
+        );
+
+        // 1. 批量签名 (按批次调用，防止超出命令行长度限制)
+        if let Some(ref key) = config.signing_key_file {
+            Self::batch_sign_paths(paths, key).await?;
+        }
+
+        // 2. 批量预查元数据并构建内存字典
+        let info_map = Arc::new(Self::batch_fetch_path_infos(paths).await?);
+
+        // 3. 执行流式无盘并发池
+        let report =
+            Self::execute_parallel_pipeline(paths, oci_client, config, info_map, start_time)
+                .await?;
+
+        info!(
+            "Parallel export finished in {:.2?}: {} succeeded, {} failed, {} bytes uploaded",
+            report.elapsed,
+            report.successful.len(),
+            report.failed.len(),
+            report.total_bytes_uploaded
+        );
+
+        Ok(report)
+    }
+
+    /// 分批执行 `nix store sign` 签名
+    pub async fn batch_sign_paths(paths: &[String], key_file: &str) -> Result<(), BuilderError> {
+        info!("Batch signing {} store paths", paths.len());
+        const BATCH_SIZE: usize = 128;
+
+        for chunk in paths.chunks(BATCH_SIZE) {
+            let mut cmd = Command::new("nix");
+            cmd.args(["store", "sign", "--key-file", key_file]);
+            for p in chunk {
+                cmd.arg(p);
+            }
+            let status = cmd.status().await?;
+            if !status.success() {
+                warn!("Signing command returned non-zero status, continuing...");
+            }
         }
         Ok(())
-    });
+    }
 
-    let reader_stream = ReaderStream::new(reader);
-    let oci_stream = Box::pin(reader_stream.map_err(TransportError::Io));
+    /// 分批批量查询 `nix path-info --json` 元数据
+    pub async fn batch_fetch_path_infos(
+        paths: &[String],
+    ) -> Result<HashMap<String, RawPathInfo>, BuilderError> {
+        info!("Batch querying path-info for {} paths", paths.len());
+        let mut map = HashMap::new();
+        const BATCH_SIZE: usize = 128;
 
-    let (nar_digest, nar_size) = oci_client
-        .push_blob_streaming_resumable(oci_stream, upload_config)
-        .await
-        .map_err(|e| BuilderError::Other(format!("Streaming upload failed: {}", e)))?;
+        for chunk in paths.chunks(BATCH_SIZE) {
+            let mut cmd = Command::new("nix");
+            cmd.args(["path-info", "--json"]);
+            for p in chunk {
+                cmd.arg(p);
+            }
 
-    match compress_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(BuilderError::Other(e)),
-        Err(e) => {
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                return Err(BuilderError::NixCli(format!(
+                    "nix path-info failed: {}",
+                    err_msg
+                )));
+            }
+
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let parsed: Value = serde_json::from_str(&json_str)?;
+            let chunk_map = Self::parse_path_info_json(&parsed)?;
+            map.extend(chunk_map);
+        }
+
+        Ok(map)
+    }
+
+    /// 解析 `nix path-info --json` 输出（支持 Array 格式与 Map 格式）
+    pub fn parse_path_info_json(
+        parsed: &Value,
+    ) -> Result<HashMap<String, RawPathInfo>, BuilderError> {
+        let mut result = HashMap::new();
+
+        if let Some(arr) = parsed.as_array() {
+            for item in arr {
+                if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
+                    let info = Self::extract_single_raw_path_info(item);
+                    result.insert(path.to_string(), info);
+                }
+            }
+        } else if let Some(obj) = parsed.as_object() {
+            for (path, item) in obj {
+                let info = Self::extract_single_raw_path_info(item);
+                result.insert(path.clone(), info);
+            }
+        } else {
+            return Err(BuilderError::NixCli(
+                "Unexpected path-info JSON format".to_string(),
+            ));
+        }
+
+        Ok(result)
+    }
+
+    fn extract_single_raw_path_info(item: &Value) -> RawPathInfo {
+        let nar_hash = item
+            .get("narHash")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let nar_size = item.get("narSize").and_then(|s| s.as_u64()).unwrap_or(0);
+        let deriver = item
+            .get("deriver")
+            .and_then(|d| d.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let ca = item
+            .get("ca")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let mut references = Vec::new();
+        if let Some(refs_arr) = item.get("references").and_then(|r| r.as_array()) {
+            for r_val in refs_arr {
+                if let Some(r_str) = r_val.as_str() {
+                    let bname = Path::new(r_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(r_str);
+                    references.push(bname.to_string());
+                }
+            }
+        }
+
+        let mut signatures = Vec::new();
+        let sigs_val = item.get("signatures").or_else(|| item.get("sigs"));
+        if let Some(sigs_arr) = sigs_val.and_then(|s| s.as_array()) {
+            for sig_val in sigs_arr {
+                if let Some(sig_str) = sig_val.as_str() {
+                    signatures.push(sig_str.to_string());
+                }
+            }
+        }
+
+        RawPathInfo {
+            nar_hash,
+            nar_size,
+            references,
+            deriver,
+            signatures,
+            ca,
+        }
+    }
+
+    /// 执行单路径端到端无盘流式导出并推送到 OCI Registry
+    pub async fn export_single_path_stream(
+        store_path: &str,
+        oci_client: &OciClient<ReqwestTransport>,
+        upload_config: &UploadConfig,
+        path_info: &RawPathInfo,
+        system: SystemArch,
+        origin_job: Option<&str>,
+    ) -> Result<ExportedStorePath, BuilderError> {
+        let file_name = Path::new(store_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| BuilderError::Other(format!("Invalid store path: {}", store_path)))?;
+
+        if file_name.len() < 32 {
             return Err(BuilderError::Other(format!(
-                "Compression task join error: {}",
-                e
+                "Path name too short: {}",
+                file_name
             )));
         }
-    }
+        let hash = &file_name[..32];
 
-    let dump_status = dump_proc
-        .wait()
-        .await
-        .map_err(|e| BuilderError::Other(format!("nix-store dump wait failed: {}", e)))?;
+        let mut dump_proc = Command::new("nix-store")
+            .args(["--dump", store_path])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| BuilderError::Other(format!("Failed to spawn nix-store --dump: {}", e)))?;
 
-    if !dump_status.success() {
-        return Err(BuilderError::Other(format!(
-            "nix-store dump failed for {}",
-            store_path
-        )));
-    }
+        let dump_stdout = dump_proc
+            .stdout
+            .take()
+            .ok_or_else(|| BuilderError::Other("Failed to capture nix-store stdout".to_string()))?;
 
-    let path_info_out = Command::new("nix")
-        .args(["path-info", "--json", store_path])
-        .output()
-        .await
-        .map_err(|e| {
-            BuilderError::Other(format!(
-                "Failed to run nix path-info for {}: {}",
-                store_path, e
-            ))
-        })?;
+        let (reader, writer) = tokio::io::duplex(8 * 1024 * 1024);
 
-    if !path_info_out.status.success() {
-        return Err(BuilderError::Other(format!(
-            "nix path-info failed: {}",
-            String::from_utf8_lossy(&path_info_out.stderr)
-        )));
-    }
+        let compress_handle = tokio::spawn(async move {
+            let mut encoder = XzEncoder::new(writer);
+            let mut reader = dump_stdout;
+            let res = copy_nar_stream(&mut reader, &mut encoder).await;
+            let shutdown_res = encoder.shutdown().await;
+            if let Err(e) = res {
+                return Err(format!("Compression copy failed: {}", e));
+            }
+            if let Err(e) = shutdown_res {
+                return Err(format!("Encoder shutdown failed: {}", e));
+            }
+            Ok(())
+        });
 
-    let path_info_json = String::from_utf8_lossy(&path_info_out.stdout);
-    let parsed_info = serde_json::from_str::<Value>(&path_info_json)
-        .map_err(|e| BuilderError::Other(format!("Failed to parse path info: {}", e)))?;
+        let reader_stream = ReaderStream::new(reader);
+        let oci_stream = Box::pin(reader_stream.map_err(TransportError::Io));
 
-    let info = if let Some(arr) = parsed_info.as_array() {
-        arr.first()
-            .ok_or_else(|| BuilderError::Other("Empty path-info array".to_string()))?
-            .clone()
-    } else if let Some(obj) = parsed_info.as_object() {
-        obj.get(store_path)
-            .ok_or_else(|| BuilderError::Other("Path not found in path-info object".to_string()))?
-            .clone()
-    } else {
-        return Err(BuilderError::Other(
-            "Unexpected path-info structure".to_string(),
-        ));
-    };
+        let (nar_digest, nar_size) = oci_client
+            .push_blob_streaming_resumable(oci_stream, upload_config)
+            .await
+            .map_err(|e| BuilderError::Other(format!("Streaming upload failed: {}", e)))?;
 
-    let nar_hash = info
-        .get("narHash")
-        .and_then(|h| h.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let original_nar_size = info.get("narSize").and_then(|s| s.as_u64()).unwrap_or(0);
-    let references = info.get("references").and_then(|r| r.as_array());
-    let deriver = info
-        .get("deriver")
-        .and_then(|d| d.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let signatures = info
-        .get("signatures")
-        .or_else(|| info.get("sigs"))
-        .and_then(|s| s.as_array());
-
-    let mut ref_basenames = Vec::new();
-    if let Some(refs_arr) = references {
-        for r_val in refs_arr {
-            if let Some(r_str) = r_val.as_str()
-                && let Some(bname) = Path::new(r_str).file_name().and_then(|n| n.to_str())
-            {
-                ref_basenames.push(bname.to_string());
+        match compress_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(BuilderError::Other(e)),
+            Err(e) => {
+                return Err(BuilderError::Other(format!(
+                    "Compression task join error: {}",
+                    e
+                )));
             }
         }
-    }
-    let ref_names = ref_basenames.join(" ");
 
-    let raw_hash = nar_digest.strip_prefix("sha256:").unwrap_or(&nar_digest);
-    let mut lines = vec![
-        format!("StorePath: {}", store_path),
-        format!("URL: nar/{}.nar.xz", hash),
-        "Compression: xz".to_string(),
-        format!("FileHash: sha256:{}", raw_hash),
-        format!("FileSize: {}", nar_size),
-        format!("NarHash: {}", nar_hash),
-        format!("NarSize: {}", original_nar_size),
-    ];
+        let dump_status = dump_proc
+            .wait()
+            .await
+            .map_err(|e| BuilderError::Other(format!("nix-store dump wait failed: {}", e)))?;
 
-    if !ref_names.is_empty() {
-        lines.push(format!("References: {}", ref_names));
-    }
-    if !deriver.is_empty()
-        && let Some(deriver_bname) = Path::new(&deriver).file_name().and_then(|n| n.to_str())
-    {
-        lines.push(format!("Deriver: {}", deriver_bname));
+        if !dump_status.success() {
+            return Err(BuilderError::Other(format!(
+                "nix-store dump failed for {}",
+                store_path
+            )));
+        }
+
+        // 构造 NarInfo 与 IndexEntry
+        let raw_hash = nar_digest.strip_prefix("sha256:").unwrap_or(&nar_digest);
+        let deriver_bname = path_info.deriver.as_deref().and_then(|d| {
+            Path::new(d)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        });
+
+        let narinfo_meta = NarInfoMeta {
+            store_path: store_path.to_string(),
+            nar_basename: format!("{}.nar.xz", hash),
+            compression: Some("xz".to_string()),
+            file_hash: Some(format!("sha256:{}", raw_hash)),
+            file_size: Some(nar_size),
+            nar_hash: path_info.nar_hash.clone(),
+            references: path_info.references.clone(),
+            deriver: deriver_bname,
+            signatures: path_info.signatures.clone(),
+            ca: path_info.ca.clone(),
+        };
+
+        let store_hash = StoreHash::parse(hash)
+            .unwrap_or_else(|_| StoreHash::new_unchecked(hash));
+        let nar_digest_obj = NarDigest::parse(&nar_digest)
+            .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest));
+
+        let name = Path::new(store_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.split_once('-'))
+            .map(|x| x.1.to_string())
+            .unwrap_or_else(|| hash.to_string());
+
+        let index_entry = IndexEntry {
+            name,
+            system: Some(system),
+            narinfo_meta,
+            nar_digest: nar_digest_obj,
+            nar_size: nar_size.max(path_info.nar_size),
+            added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            origin_job: origin_job.map(|s| s.to_string()),
+        };
+
+        Ok(ExportedStorePath {
+            store_hash,
+            index_entry,
+            file_size: nar_size,
+        })
     }
 
-    if let Some(sigs_arr) = signatures {
-        for sig_val in sigs_arr {
-            if let Some(sig_str) = sig_val.as_str() {
-                lines.push(format!("Sig: {}", sig_str));
+    /// 执行并发流式管道调度
+    async fn execute_parallel_pipeline(
+        paths: &[String],
+        oci_client: &OciClient<ReqwestTransport>,
+        config: &ParallelExportConfig,
+        info_map: Arc<HashMap<String, RawPathInfo>>,
+        start_time: Instant,
+    ) -> Result<ParallelExportReport, BuilderError> {
+        let concurrency = config.concurrency.max(1);
+        let paths_stream = stream::iter(paths.iter().cloned().map(|path| {
+            let oci_client = oci_client.clone();
+            let upload_config = config.upload_config.clone();
+            let path_info = info_map.get(&path).cloned().unwrap_or_default();
+            let system = config.system;
+            let origin_job = config.origin_job.clone();
+
+            async move {
+                let res = Self::export_single_path_stream(
+                    &path,
+                    &oci_client,
+                    &upload_config,
+                    &path_info,
+                    system,
+                    origin_job.as_deref(),
+                )
+                .await;
+                (path, res)
+            }
+        }));
+
+        let mut buffered = paths_stream.buffer_unordered(concurrency);
+        let mut report = ParallelExportReport::default();
+
+        while let Some((path, result)) = buffered.next().await {
+            match result {
+                Ok(exported) => {
+                    info!(
+                        "  [OK] Exported & uploaded {} ({} bytes)",
+                        exported.index_entry.name, exported.file_size
+                    );
+                    report.total_bytes_uploaded += exported.file_size;
+                    report.successful.push(exported);
+                }
+                Err(e) => {
+                    error!("  [FAIL] Failed to export {}: {}", path, e);
+                    if config.fail_fast {
+                        return Err(e);
+                    }
+                    report.failed.push((path, e.to_string()));
+                }
             }
         }
+
+        report.elapsed = start_time.elapsed();
+        Ok(report)
     }
-
-    let narinfo_content = lines.join("\n") + "\n";
-
-    Ok(UploadedNarMetadata {
-        store_hash: hash.to_string(),
-        store_path: store_path.to_string(),
-        nar_digest,
-        nar_size,
-        narinfo_content,
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HashingWriter, UploadedNarMetadata, copy_nar_stream, export_paths_directly};
+    use super::{ExportedStorePath, ParallelExporter, copy_nar_stream};
     use async_compression::tokio::{bufread::XzDecoder, write::XzEncoder};
-    use sha2::{Digest, Sha256};
+    use nixcache_core::{IndexEntry, NarDigest, StoreHash, SystemArch};
+    use serde_json::json;
     use std::{
-        io::{self, Cursor},
+        io::{self},
         pin::Pin,
         task::{Context, Poll},
     };
-    use tokio::{
-        fs,
-        io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
-        process::Command,
-    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-    #[tokio::test]
-    async fn test_hashing_writer_computes_sha256_and_size() {
-        let buffer = Vec::new();
-        let cursor = Cursor::new(buffer);
-        let mut writer = HashingWriter::new(cursor);
+    #[test]
+    fn test_parse_path_info_json_array_and_object() {
+        let array_json = json!([
+            {
+                "path": "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg",
+                "narHash": "sha256:1111",
+                "narSize": 1024,
+                "references": ["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"],
+                "deriver": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test.drv",
+                "signatures": ["sig1", "sig2"]
+            }
+        ]);
 
-        let data1 = b"Hello, ";
-        let data2 = b"NixCache OCI Native Stream!";
+        let map = ParallelExporter::parse_path_info_json(&array_json).unwrap();
+        assert_eq!(map.len(), 1);
+        let item = map
+            .get("/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg")
+            .unwrap();
+        assert_eq!(item.nar_hash, "sha256:1111");
+        assert_eq!(item.nar_size, 1024);
+        assert_eq!(item.references, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"]);
+        assert_eq!(
+            item.deriver.as_deref(),
+            Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test.drv")
+        );
+        assert_eq!(item.signatures, vec!["sig1", "sig2"]);
 
-        writer.write_all(data1).await.unwrap();
-        writer.write_all(data2).await.unwrap();
-        writer.flush().await.unwrap();
+        let object_json = json!({
+            "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg": {
+                "narHash": "sha256:2222",
+                "narSize": 2048,
+                "references": []
+            }
+        });
 
-        let (cursor, digest_hex, bytes_written) = writer.into_inner_and_digest();
-        assert_eq!(bytes_written, (data1.len() + data2.len()) as u64);
-        assert_eq!(cursor.into_inner(), b"Hello, NixCache OCI Native Stream!");
-
-        let mut hasher = Sha256::new();
-        hasher.update(b"Hello, NixCache OCI Native Stream!");
-        let expected_hex = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-
-        assert_eq!(digest_hex, expected_hex);
+        let map2 = ParallelExporter::parse_path_info_json(&object_json).unwrap();
+        assert_eq!(map2.len(), 1);
+        let item2 = map2
+            .get("/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg")
+            .unwrap();
+        assert_eq!(item2.nar_hash, "sha256:2222");
+        assert_eq!(item2.nar_size, 2048);
     }
 
     #[test]
-    fn test_uploaded_nar_metadata_structure() {
-        let meta = UploadedNarMetadata {
-            store_hash: "s66mzxpvicwk07gjbjfw9izjfa797vsw".to_string(),
+    fn test_exported_store_path_structure() {
+        let store_hash = StoreHash::new_unchecked("s66mzxpvicwk07gjbjfw9izjfa797vsw");
+        let nar_digest = NarDigest::new_unchecked("sha256:1111111111111111111111111111111111111111111111111111111111111111");
+        let meta = nixcache_core::NarInfoMeta {
             store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
-            nar_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            nar_size: 2048,
-            narinfo_content: "StorePath: /nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test\n"
-                .to_string(),
+            nar_basename: "s66mzxpvicwk07gjbjfw9izjfa797vsw.nar.xz".to_string(),
+            compression: Some("xz".to_string()),
+            file_hash: Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string()),
+            file_size: Some(100),
+            nar_hash: "sha256:2222".to_string(),
+            references: vec![],
+            deriver: None,
+            signatures: vec![],
+            ca: None,
         };
 
-        assert_eq!(meta.store_hash, "s66mzxpvicwk07gjbjfw9izjfa797vsw");
-        assert_eq!(meta.nar_size, 2048);
-        assert!(meta.narinfo_content.starts_with("StorePath:"));
+        let index_entry = IndexEntry {
+            name: "test".to_string(),
+            system: Some(SystemArch::from("x86_64-linux")),
+            narinfo_meta: meta,
+            nar_digest: nar_digest.clone(),
+            nar_size: 200,
+            added: "2026-08-29T00:00:00Z".to_string(),
+            origin_job: None,
+        };
+
+        let exported = ExportedStorePath {
+            store_hash: store_hash.clone(),
+            index_entry,
+            file_size: 100,
+        };
+
+        assert_eq!(exported.store_hash.as_str(), "s66mzxpvicwk07gjbjfw9izjfa797vsw");
+        assert_eq!(exported.file_size, 100);
+        assert_eq!(exported.index_entry.name, "test");
     }
 
-    /// 模拟在数据块之间不断返回 `Poll::Pending` 的异步 Reader
     struct IntermittentPendingReader {
         chunks: Vec<Vec<u8>>,
         index: usize,
@@ -600,7 +597,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_nar_stream_prevents_liblzma_flush_conflict_regression() {
-        // 构建由多个数据块组成的原始数据，块间模拟 Pending 中断
         let mut original_data = Vec::new();
         let mut chunks = Vec::new();
         for i in 0..10 {
@@ -632,7 +628,6 @@ mod tests {
         let compressed = encoder.into_inner();
         assert!(!compressed.is_empty());
 
-        // 解压并验证数据一致性
         let mut decoder = XzDecoder::new(&compressed[..]);
         let mut decompressed = Vec::new();
         decoder
@@ -643,8 +638,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_export_paths_directly_real_store() {
-        let nix_store_available = Command::new("nix-store")
+    async fn test_parallel_exporter_empty_paths() {
+        let server = wiremock::MockServer::start().await;
+        let oci = nixcache_oci_backend::create_tokio_reqwest_client(
+            &server.address().to_string(),
+            "test/repo",
+            "",
+            true,
+        );
+        let config = super::ParallelExportConfig::default();
+        let report = ParallelExporter::export_and_upload_paths(&[], &oci, &config)
+            .await
+            .unwrap();
+        assert!(report.successful.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.total_bytes_uploaded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_exporter_real_store_mock_oci() {
+        let nix_store_available = tokio::process::Command::new("nix-store")
             .arg("--version")
             .output()
             .await
@@ -655,14 +668,14 @@ mod tests {
         }
 
         let mut paths = Vec::new();
-        if let Ok(mut entries) = fs::read_dir("/nix/store").await {
+        if let Ok(mut entries) = tokio::fs::read_dir("/nix/store").await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Some(name) = entry.file_name().to_str()
                     && !name.ends_with(".drv")
                     && !name.ends_with(".lock")
                 {
                     paths.push(format!("/nix/store/{}", name));
-                    if paths.len() >= 15 {
+                    if paths.len() >= 3 {
                         break;
                     }
                 }
@@ -673,8 +686,48 @@ mod tests {
             return;
         }
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let res = export_paths_directly(&paths, None, temp_dir.path()).await;
-        assert!(res.is_ok(), "export_paths_directly failed: {:?}", res);
+        let server = wiremock::MockServer::start().await;
+        let host = server.address().to_string();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202).insert_header(
+                    "Location",
+                    "/v2/test/repo/nix-cache/blobs/uploads/session-mock",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202).insert_header("Range", "0-1048575"),
+            )
+            .mount(&server)
+            .await;
+
+        let oci = nixcache_oci_backend::create_tokio_reqwest_client(&host, "test/repo", "", true);
+        let config = super::ParallelExportConfig {
+            concurrency: 4,
+            signing_key_file: None,
+            fail_fast: true,
+            upload_config: nixcache_oci::UploadConfig::default(),
+            system: nixcache_core::SystemArch::from("x86_64-linux"),
+            origin_job: Some("job:test".to_string()),
+        };
+
+        let report = ParallelExporter::export_and_upload_paths(&paths, &oci, &config)
+            .await
+            .expect("Parallel export should succeed");
+
+        assert_eq!(report.successful.len(), paths.len());
+        assert!(report.failed.is_empty());
+        assert!(report.total_bytes_uploaded > 0);
     }
 }

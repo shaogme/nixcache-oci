@@ -104,6 +104,12 @@ pub struct SessionCaptureArgs {
     )]
     pub snapshot_before: Option<PathBuf>,
 
+    #[arg(
+        long,
+        help = "Parallel export concurrency [env: NIXCACHE_EXPORT_CONCURRENCY]"
+    )]
+    pub export_concurrency: Option<usize>,
+
     #[arg(value_name = "PATHS", help = "Explicit store paths to capture")]
     pub paths: Vec<String>,
 }
@@ -133,6 +139,12 @@ impl SessionCaptureArgs {
             .map(PathBuf::from)
             .or_else(|| Env::get_path("NIXCACHE_SNAPSHOT_PATH"))
             .unwrap_or_else(|| PathBuf::from("/tmp/nixcache-snapshot-before.txt"))
+    }
+
+    pub fn resolve_export_concurrency(&self) -> usize {
+        self.export_concurrency
+            .or_else(|| Env::parse("NIXCACHE_EXPORT_CONCURRENCY"))
+            .unwrap_or_else(|| num_cpus::get().clamp(2, 8))
     }
 }
 
@@ -213,6 +225,12 @@ pub struct BuildArgs {
         help = "Allow self-substituter proxy failure (disables fail-fast)"
     )]
     pub no_fail_fast: bool,
+
+    #[arg(
+        long,
+        help = "Parallel export concurrency [env: NIXCACHE_EXPORT_CONCURRENCY]"
+    )]
+    pub export_concurrency: Option<usize>,
 }
 
 impl BuildArgs {
@@ -285,6 +303,12 @@ impl BuildArgs {
             return ff;
         }
         Env::get_bool("NIXCACHE_FAIL_FAST").unwrap_or(true)
+    }
+
+    pub fn resolve_export_concurrency(&self) -> usize {
+        self.export_concurrency
+            .or_else(|| Env::parse("NIXCACHE_EXPORT_CONCURRENCY"))
+            .unwrap_or_else(|| num_cpus::get().clamp(2, 8))
     }
 }
 

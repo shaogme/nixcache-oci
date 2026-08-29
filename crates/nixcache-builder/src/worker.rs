@@ -7,7 +7,7 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{
-    BuildReceipt, BuildStats, CacheIndexData, IndexEntry, NarDigest, NarInfo, StoreHash, SystemArch,
+    BuildReceipt, BuildStats, CacheIndexData, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::OciClient;
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
@@ -143,6 +143,7 @@ pub async fn run_build_worker(
     github_token: &str,
     output_receipt_path: &Path,
     fail_fast: bool,
+    export_concurrency: usize,
 ) -> Result<(), BuilderError> {
     let system = match &build_config.system {
         Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
@@ -179,7 +180,7 @@ pub async fn run_build_worker(
 
     let own_hashes_vec: Vec<String> = own_hashes.into_iter().map(|h| h.into_inner()).collect();
 
-    // 6. 查找本地新构建的路径
+    // 6. 查找本地新构建的路径并执行端到端无盘流式并行 Export
     let upload_list = nix::find_locally_built_paths(&output_paths, &own_hashes_vec).await?;
 
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
@@ -187,60 +188,39 @@ pub async fn run_build_worker(
     let mut total_bytes_uploaded = 0u64;
 
     if !upload_list.is_empty() {
-        info!("Locally-built paths to upload: {}", upload_list.len());
-        let upload_config = nixcache_oci::UploadConfig::default();
+        info!(
+            "Locally-built paths to export & upload in parallel: {} (concurrency: {})",
+            upload_list.len(),
+            export_concurrency
+        );
+        let export_config = nix::ParallelExportConfig {
+            concurrency: export_concurrency,
+            signing_key_file: signing_key_file.map(|s| s.to_string()),
+            fail_fast,
+            upload_config: nixcache_oci::UploadConfig::default(),
+            system,
+            origin_job: env::var("GITHUB_JOB").ok().map(|j| format!("job:{}", j)),
+        };
 
-        for store_path in &upload_list {
-            info!("  Streaming export & upload for {}", store_path);
-            match nix::export_and_upload_path_stream(
-                store_path,
-                signing_key_file,
-                &oci,
-                &upload_config,
-            )
-            .await
-            {
-                Ok(meta) => {
-                    let name = Path::new(&meta.store_path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .and_then(|s| s.split_once('-'))
-                        .map(|x| x.1.to_string())
-                        .unwrap_or_else(|| meta.store_hash.clone());
+        let report =
+            nix::ParallelExporter::export_and_upload_paths(&upload_list, &oci, &export_config)
+                .await?;
 
-                    if let Ok(narinfo) = NarInfo::parse(&meta.narinfo_content) {
-                        let (narinfo_meta, nar_size) = narinfo.into_meta();
-                        let store_hash = narinfo_meta
-                            .store_hash()
-                            .unwrap_or_else(|| StoreHash::new_unchecked(&meta.store_hash));
-                        let nar_digest = NarDigest::parse(&meta.nar_digest)
-                            .unwrap_or_else(|_| NarDigest::new_unchecked(&meta.nar_digest));
+        for exported in report.successful {
+            new_entries.insert(exported.store_hash, exported.index_entry);
+            uploaded_count += 1;
+            total_bytes_uploaded += exported.file_size;
+        }
 
-                        new_entries.insert(
-                            store_hash,
-                            IndexEntry {
-                                name,
-                                system: Some(system),
-                                narinfo_meta,
-                                nar_digest,
-                                nar_size: meta.nar_size.max(nar_size),
-                                added: Utc::now()
-                                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                origin_job: env::var("GITHUB_JOB")
-                                    .ok()
-                                    .map(|j| format!("job:{}", j)),
-                            },
-                        );
-                        uploaded_count += 1;
-                        total_bytes_uploaded += meta.nar_size;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to stream export and upload for {}: {}",
-                        store_path, e
-                    );
-                }
+        if !report.failed.is_empty() {
+            for (path, err) in &report.failed {
+                error!("Failed to export & upload {}: {}", path, err);
+            }
+            if fail_fast {
+                return Err(BuilderError::Other(format!(
+                    "Parallel export failed for {} path(s)",
+                    report.failed.len()
+                )));
             }
         }
     } else {
