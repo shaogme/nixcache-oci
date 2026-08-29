@@ -24,7 +24,7 @@ use session::{
     SessionCaptureOptions, SessionInitOptions, run_session_capture, run_session_clean,
     run_session_init,
 };
-use worker::run_build_worker;
+use worker::{BuildWorkerOptions, run_build_worker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -132,18 +132,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 attributes,
             };
 
-            if let Err(e) = run_build_worker(
-                &build_config,
-                &repo,
-                &registry,
-                signing_key.as_deref(),
-                &active_token,
-                &receipt_path,
+            let worker_opts = BuildWorkerOptions {
+                build_config: &build_config,
+                repo: &repo,
+                registry: &registry,
+                signing_key_file: signing_key.as_deref(),
+                github_token: &active_token,
+                output_receipt_path: &receipt_path,
                 fail_fast,
                 export_concurrency,
-            )
-            .await
-            {
+            };
+
+            if let Err(e) = run_build_worker(&worker_opts).await {
                 eprintln!("Worker build failed: {}", e);
                 process::exit(1);
             }

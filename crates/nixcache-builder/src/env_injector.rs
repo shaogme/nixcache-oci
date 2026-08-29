@@ -35,13 +35,13 @@ impl NixEnvInjector {
         if let Some(github_env_path) = file_path_opt {
             let delimiter = "EOF_NIXCACHE_CONFIG";
             let payload = format!("NIX_CONFIG<<{}\n{}\n{}\n", delimiter, nix_config, delimiter);
-            OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(github_env_path)
-                .await?
-                .write_all(payload.as_bytes())
                 .await?;
+            file.write_all(payload.as_bytes()).await?;
+            file.flush().await?;
             info!(
                 "Exported NIX_CONFIG to GITHUB_ENV file at {}",
                 github_env_path
@@ -67,7 +67,7 @@ impl NixEnvInjector {
 #[cfg(test)]
 mod tests {
     use super::NixEnvInjector;
-    use tempfile::NamedTempFile;
+    use tempfile::tempdir;
     use tokio::fs;
 
     #[test]
@@ -95,14 +95,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_to_github_env() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let path_str = temp_file.path().to_string_lossy().to_string();
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("github_env.txt");
+        let path_str = path.to_string_lossy().to_string();
 
         let config = "extra-substituters = http://127.0.0.1:37515";
         let res = NixEnvInjector::export_to_file(config, Some(&path_str)).await;
         assert!(res.is_ok());
 
-        let written = fs::read_to_string(&path_str).await.unwrap();
+        let written = fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("NIX_CONFIG<<EOF_NIXCACHE_CONFIG"));
         assert!(written.contains("extra-substituters = http://127.0.0.1:37515"));
     }
