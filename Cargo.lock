@@ -1274,7 +1274,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-util",
- "getrandom 0.4.3",
  "http",
  "nixcache-core",
  "nixcache-oci",

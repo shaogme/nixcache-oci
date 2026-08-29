@@ -27,5 +27,4 @@ scc = { workspace = true }
 
 # Utilities & Error handling
 base64 = { workspace = true }
-getrandom = { version = "0.4", features = ["wasm_js"] }
 thiserror = { workspace = true }

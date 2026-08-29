@@ -6,7 +6,7 @@ use std::io::Read;
 use std::io::Write;
 
 #[cfg(target_arch = "wasm32")]
-use ruzstd::StreamingDecoder;
+use ruzstd::decoding::StreamingDecoder;
 
 /// Zstd 压缩默认等级
 pub const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 3;
