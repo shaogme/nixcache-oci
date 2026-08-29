@@ -123,8 +123,7 @@ pub async fn setup_self_substituter(
             keys.push(k.as_str());
             info!("Trusted own public key: {}", k);
         }
-        let nix_config =
-            NixEnvInjector::generate_nix_config(&["http://127.0.0.1:37515"], &keys);
+        let nix_config = NixEnvInjector::generate_nix_config(&["http://127.0.0.1:37515"], &keys);
         unsafe {
             env::set_var("NIX_CONFIG", &nix_config);
         }

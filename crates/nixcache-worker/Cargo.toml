@@ -8,6 +8,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nixcache-core = { workspace = true }
+nixcache-oci = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
 thiserror = { workspace = true }
 worker = { version = "0.8.3", features = ["http"] }
 serde = { workspace = true }

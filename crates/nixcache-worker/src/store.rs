@@ -1,14 +1,17 @@
 use crate::{
-    oci::OciClient,
     state::{DEBOUNCE_THRESHOLD_MS, L1_MEM_TTL_MS, WorkerState},
+    transport::WorkerFetchTransport,
 };
 use nixcache_core::{
     CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
     extract_nar_basename,
 };
+use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use worker::{Env, js_sys::Date};
+
+pub type WorkerOciClient = OciClient<WorkerFetchTransport>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct KVCacheWrapper<T> {
@@ -70,14 +73,14 @@ pub struct RemoteStatus {
 }
 
 pub struct CacheStore {
-    oci_client: OciClient,
+    oci_client: WorkerOciClient,
     config: WorkerProxyConfig,
     session_ttl_ms: f64,
     baseline_ttl_ms: f64,
 }
 
 impl CacheStore {
-    pub fn new(oci_client: OciClient, config: WorkerProxyConfig) -> Self {
+    pub fn new(oci_client: WorkerOciClient, config: WorkerProxyConfig) -> Self {
         let session_ttl_ms = (config.session_ttl_secs * 1000) as f64;
         let baseline_ttl_ms = (config.baseline_ttl_secs * 1000) as f64;
         Self {
@@ -92,7 +95,7 @@ impl CacheStore {
         &self.config
     }
 
-    pub fn oci_client(&self) -> &OciClient {
+    pub fn oci_client(&self) -> &WorkerOciClient {
         &self.oci_client
     }
 
@@ -379,7 +382,7 @@ impl CacheStore {
                     let nar_lookup = build_nar_lookup_map(&session.entries);
                     return Ok(Some((session, nar_lookup)));
                 }
-                Err(e)
+                Err(e.to_string())
             }
         }
     }
@@ -443,7 +446,8 @@ impl CacheStore {
         let (index_data, manifest_digest) = match self
             .oci_client
             .get_cache_index(&self.config.baseline_tag)
-            .await?
+            .await
+            .map_err(|e| e.to_string())?
         {
             Some((data, digest)) => (data, digest),
             None => (CacheIndexData::default(), String::new()),

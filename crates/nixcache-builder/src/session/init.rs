@@ -1,7 +1,5 @@
 use crate::{
-    env_injector::NixEnvInjector,
-    error::BuilderError,
-    nix::driver::get_own_public_key,
+    env_injector::NixEnvInjector, error::BuilderError, nix::driver::get_own_public_key,
     summary::write_session_init_summary,
 };
 use std::{

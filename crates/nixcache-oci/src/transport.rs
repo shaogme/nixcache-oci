@@ -1,12 +1,19 @@
 use crate::error::TransportError;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, stream::BoxStream};
+use futures_util::{Stream, stream::BoxStream};
 use http::{HeaderMap, StatusCode};
-use reqwest::{Client, header::CONTENT_LENGTH};
-use std::{fmt, io, time::Duration};
+use std::{fmt, time::Duration};
 
-pub type BoxBodyStream = BoxStream<'static, Result<Bytes, io::Error>>;
+#[cfg(feature = "reqwest")]
+use futures_util::StreamExt;
+#[cfg(feature = "reqwest")]
+use reqwest::{
+    Client,
+    header::{CONTENT_LENGTH, HeaderValue},
+};
+
+pub type BoxBodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
 
 pub struct OciBlobStream<S = BoxBodyStream> {
     pub status: StatusCode,
@@ -34,15 +41,21 @@ impl<S> OciBlobStream<S> {
 
     pub fn content_length(&self) -> Option<u64> {
         self.headers
-            .get(CONTENT_LENGTH)
+            .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
     }
 }
 
-#[async_trait]
-pub trait OciTransport: Send + Sync + 'static {
-    type BodyStream: Stream<Item = Result<Bytes, io::Error>> + Send + 'static;
+/// 平台无关的 OCI 传输与环境能力特征
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait OciTransport: 'static {
+    #[cfg(not(target_arch = "wasm32"))]
+    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Send + 'static;
+
+    #[cfg(target_arch = "wasm32")]
+    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + 'static;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
     async fn get(
@@ -74,13 +87,20 @@ pub trait OciTransport: Send + Sync + 'static {
         content_len: u64,
     ) -> Result<StatusCode, TransportError>;
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
+
+    /// 核心解耦点：异步延迟抽象
+    /// Native (Tokio) 实现为 `tokio::time::sleep(duration).await`
+    /// Wasm (Cloudflare Worker) 实现为 `worker::Delay::from(duration).await`
+    async fn sleep(&self, duration: Duration);
 }
 
+#[cfg(feature = "reqwest")]
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
     client: Client,
 }
 
+#[cfg(feature = "reqwest")]
 impl Default for ReqwestTransport {
     fn default() -> Self {
         let client = Client::builder()
@@ -91,6 +111,7 @@ impl Default for ReqwestTransport {
     }
 }
 
+#[cfg(feature = "reqwest")]
 impl ReqwestTransport {
     pub fn new(client: Client) -> Self {
         Self { client }
@@ -101,7 +122,9 @@ impl ReqwestTransport {
     }
 }
 
-#[async_trait]
+#[cfg(feature = "reqwest")]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OciTransport for ReqwestTransport {
     type BodyStream = BoxBodyStream;
 
@@ -132,7 +155,7 @@ impl OciTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         let stream = Box::pin(
             resp.bytes_stream()
-                .map(|res| res.map_err(|e| io::Error::other(e.to_string()))),
+                .map(|res| res.map_err(TransportError::Reqwest)),
         );
         Ok((status, headers, stream))
     }
@@ -169,10 +192,7 @@ impl OciTransport for ReqwestTransport {
         stream: Self::BodyStream,
         content_len: u64,
     ) -> Result<StatusCode, TransportError> {
-        headers.insert(
-            CONTENT_LENGTH,
-            reqwest::header::HeaderValue::from(content_len),
-        );
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(content_len));
         let body = reqwest::Body::wrap_stream(stream);
         let resp = self
             .client
@@ -187,5 +207,9 @@ impl OciTransport for ReqwestTransport {
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
         let resp = self.client.delete(url).headers(headers).send().await?;
         Ok(resp.status())
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
     }
 }

@@ -72,9 +72,9 @@ mod tests {
         let keys = ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="];
 
         let config = NixEnvInjector::generate_nix_config(&subs, &keys);
-        assert!(config.contains(
-            "extra-substituters = http://127.0.0.1:37515 https://cache.nixos.org"
-        ));
+        assert!(
+            config.contains("extra-substituters = http://127.0.0.1:37515 https://cache.nixos.org")
+        );
         assert!(config.contains(
             "extra-trusted-substituters = http://127.0.0.1:37515 https://cache.nixos.org"
         ));
@@ -115,10 +115,19 @@ mod tests {
     fn test_apply_to_command() {
         let mut cmd = tokio::process::Command::new("nix");
         NixEnvInjector::apply_to_command(&mut cmd, "extra-substituters = http://127.0.0.1:37515");
-        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.as_std().get_envs().collect();
-        let nix_cfg_opt = envs.iter().find(|(k, _)| *k == "NIX_CONFIG").and_then(|(_, v)| *v);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> =
+            cmd.as_std().get_envs().collect();
+        let nix_cfg_opt = envs
+            .iter()
+            .find(|(k, _)| *k == "NIX_CONFIG")
+            .and_then(|(_, v)| *v);
         assert!(nix_cfg_opt.is_some());
-        assert!(nix_cfg_opt.unwrap().to_str().unwrap().contains("extra-substituters = http://127.0.0.1:37515"));
+        assert!(
+            nix_cfg_opt
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("extra-substituters = http://127.0.0.1:37515")
+        );
     }
 }
-

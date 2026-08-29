@@ -1,22 +1,23 @@
 use crate::{error::OciError, transport::OciTransport};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures_channel::oneshot;
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
-use std::{fmt, sync::Arc, time::Duration};
-use tokio::{
-    sync::{Mutex, watch},
-    time::Instant,
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
+use web_time::Instant;
 
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
 }
 
-#[derive(Clone)]
 enum InFlightState {
     Idle,
-    Fetching(watch::Receiver<Option<String>>),
+    Fetching(Vec<oneshot::Sender<String>>),
 }
 
 struct InnerTokenManager {
@@ -70,10 +71,8 @@ impl TokenManager {
     }
 
     pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<String, OciError> {
-        let rx_to_await;
-
-        {
-            let mut state = self.state.lock().await;
+        let rx_to_await = {
+            let mut state = self.state.lock().expect("mutex poisoned");
 
             // 1. Fast path: 缓存有效且在 240s 生命周期内直接复用
             if let Some((ref token, ref instant)) = state.cached
@@ -82,42 +81,44 @@ impl TokenManager {
                 return Ok(token.clone());
             }
 
-            // 2. Singleflight 防击穿：检查是否已有在途网络请求
+            // 2. Singleflight 判定
             match &mut state.in_flight {
-                InFlightState::Fetching(rx) => {
-                    rx_to_await = Some(rx.clone());
+                InFlightState::Fetching(waiters) => {
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    Some(rx)
                 }
                 InFlightState::Idle => {
-                    let (tx, rx) = watch::channel(None);
-                    state.in_flight = InFlightState::Fetching(rx);
-                    drop(state);
-
-                    // 获准成为 Leader 执行网络获取
-                    let token = self.fetch_token_network(transport).await;
-
-                    let mut state = self.state.lock().await;
-                    state.in_flight = InFlightState::Idle;
-                    state.cached = Some((token.clone(), Instant::now()));
-                    let _ = tx.send(Some(token.clone()));
-                    return Ok(token);
+                    state.in_flight = InFlightState::Fetching(Vec::new());
+                    None
                 }
+            }
+        };
+
+        // 3. Follower 协程等待 Leader 广播
+        if let Some(rx) = rx_to_await {
+            if let Ok(token) = rx.await {
+                return Ok(token);
+            }
+            // 若 Leader 异常中断，重试一次
+            return Box::pin(self.get_token(transport)).await;
+        }
+
+        // 4. Leader 协程发起网络获取
+        let token = self.fetch_token_network(transport).await;
+
+        // 5. 广播结果并更新缓存
+        let mut state = self.state.lock().expect("mutex poisoned");
+        let old_in_flight = std::mem::replace(&mut state.in_flight, InFlightState::Idle);
+        state.cached = Some((token.clone(), Instant::now()));
+
+        if let InFlightState::Fetching(waiters) = old_in_flight {
+            for tx in waiters {
+                let _ = tx.send(token.clone());
             }
         }
 
-        // 3. Follower 任务等待 Leader 广播获取结果
-        if let Some(mut rx) = rx_to_await {
-            loop {
-                if let Some(ref token) = *rx.borrow() {
-                    return Ok(token.clone());
-                }
-                if rx.changed().await.is_err() {
-                    // 若 Leader 意外断开 channel，回退重新尝试
-                    return Box::pin(self.get_token(transport)).await;
-                }
-            }
-        }
-
-        Ok(self.github_token.clone())
+        Ok(token)
     }
 
     async fn fetch_token_network<T: OciTransport>(&self, transport: &T) -> String {
@@ -146,18 +147,13 @@ impl TokenManager {
         }
 
         match transport.get(&token_url, headers).await {
-            Ok((status, _resp_headers, bytes)) => {
-                if status.is_success() {
-                    if let Ok(data) = serde_json::from_slice::<TokenResponse>(&bytes) {
-                        data.token.unwrap_or_else(|| self.github_token.clone())
-                    } else {
-                        self.github_token.clone()
-                    }
-                } else {
-                    self.github_token.clone()
-                }
+            Ok((status, _resp_headers, bytes)) if status.is_success() => {
+                serde_json::from_slice::<TokenResponse>(&bytes)
+                    .ok()
+                    .and_then(|r| r.token)
+                    .unwrap_or_else(|| self.github_token.clone())
             }
-            Err(_) => self.github_token.clone(),
+            _ => self.github_token.clone(),
         }
     }
 }

@@ -196,8 +196,13 @@ pub async fn run_promote(
         }
     }
 
-    write_promote_step_summary(run_id, target_tag, total_promoted_entries, total_promoted_entries)
-        .await;
+    write_promote_step_summary(
+        run_id,
+        target_tag,
+        total_promoted_entries,
+        total_promoted_entries,
+    )
+    .await;
     Ok(())
 }
 

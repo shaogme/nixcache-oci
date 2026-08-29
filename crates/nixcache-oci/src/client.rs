@@ -6,7 +6,7 @@ use crate::{
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
-    transport::{OciBlobStream, OciTransport, ReqwestTransport},
+    transport::{OciBlobStream, OciTransport},
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -14,9 +14,14 @@ use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{CacheIndexData, RUN_SESSION_VERSION, RunSessionManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, path::Path, time::Duration};
-use tokio::time::sleep;
+use std::{collections::HashMap, time::Duration};
 use tracing::{error, info, warn};
+
+#[cfg(feature = "reqwest")]
+use crate::transport::ReqwestTransport;
+
+#[cfg(feature = "tokio-fs")]
+use std::path::Path;
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -30,6 +35,7 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
+#[cfg(feature = "reqwest")]
 #[derive(Clone)]
 pub struct OciClient<T: OciTransport = ReqwestTransport> {
     registry: String,
@@ -38,6 +44,16 @@ pub struct OciClient<T: OciTransport = ReqwestTransport> {
     transport: T,
 }
 
+#[cfg(not(feature = "reqwest"))]
+#[derive(Clone)]
+pub struct OciClient<T: OciTransport> {
+    registry: String,
+    repo: String,
+    token_manager: TokenManager,
+    transport: T,
+}
+
+#[cfg(feature = "reqwest")]
 impl OciClient<ReqwestTransport> {
     pub fn new(registry: &str, repo: &str, github_token: &str, write_access: bool) -> Self {
         let transport = ReqwestTransport::default();
@@ -261,6 +277,7 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
+    #[cfg(feature = "tokio-fs")]
     pub async fn push_blob(&self, file_path: &Path) -> Result<String, OciError> {
         let data = tokio::fs::read(file_path).await?;
         self.push_blob_bytes(Bytes::from(data)).await
@@ -487,13 +504,25 @@ impl<T: OciTransport> OciClient<T> {
             {
                 Ok(_) => return Ok(()),
                 Err(OciError::CasConflict(_)) if attempt <= max_retries => {
-                    let backoff_ms = (500 * (1 << attempt.min(5)))
-                        + ((std::process::id() as u64 * 37 + attempt as u64 * 53) % 150);
+                    let pid = {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            0u64
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            std::process::id() as u64
+                        }
+                    };
+                    let backoff_ms =
+                        (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
                     warn!(
                         "CAS conflict on tag {}, retrying in {}ms (attempt {}/{})",
                         tag, backoff_ms, attempt, max_retries
                     );
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    self.transport
+                        .sleep(Duration::from_millis(backoff_ms))
+                        .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -556,13 +585,25 @@ impl<T: OciTransport> OciClient<T> {
                     return Ok(());
                 }
                 Err(OciError::CasConflict(_)) if attempt <= request.max_retries => {
-                    let backoff_ms = (500 * (1 << attempt.min(5)))
-                        + ((std::process::id() as u64 * 37 + attempt as u64 * 53) % 150);
+                    let pid = {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            0u64
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            std::process::id() as u64
+                        }
+                    };
+                    let backoff_ms =
+                        (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
                     warn!(
                         "CAS conflict on tag {}, retrying in {}ms (attempt {}/{})",
                         tag, backoff_ms, attempt, request.max_retries
                     );
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    self.transport
+                        .sleep(Duration::from_millis(backoff_ms))
+                        .await;
                 }
                 Err(e) => {
                     error!(

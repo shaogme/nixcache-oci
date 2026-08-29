@@ -20,7 +20,10 @@ pub use nixcache_core::{
     extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use token::TokenManager;
-pub use transport::{BoxBodyStream, OciBlobStream, OciTransport, ReqwestTransport};
+pub use transport::{BoxBodyStream, OciBlobStream, OciTransport};
+
+#[cfg(feature = "reqwest")]
+pub use transport::ReqwestTransport;
 
 #[cfg(test)]
 mod tests {
@@ -28,6 +31,7 @@ mod tests {
         IndexEntry, NarDigest, NarInfoMeta, OciClient, OciError, ReqwestTransport,
         SessionMutationRequest, StoreHash, SystemArch, TokenManager, TransportError,
     };
+
     use async_trait::async_trait;
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
@@ -499,6 +503,8 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Ok(StatusCode::ACCEPTED)
         }
+
+        async fn sleep(&self, _duration: std::time::Duration) {}
     }
 
     #[tokio::test]

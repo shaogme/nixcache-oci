@@ -239,7 +239,8 @@ pub async fn export_paths_directly(
                 lines.push(format!("References: {}", ref_names));
             }
             if !deriver.is_empty()
-                && let Some(deriver_bname) = Path::new(&deriver).file_name().and_then(|n| n.to_str())
+                && let Some(deriver_bname) =
+                    Path::new(&deriver).file_name().and_then(|n| n.to_str())
             {
                 lines.push(format!("Deriver: {}", deriver_bname));
             }

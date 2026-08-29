@@ -1,10 +1,10 @@
-mod oci;
 mod state;
 mod store;
+mod transport;
 
 use crate::{
-    oci::OciClient,
-    store::{CacheStore, WorkerProxyConfig},
+    store::{CacheStore, WorkerOciClient, WorkerProxyConfig},
+    transport::WorkerFetchTransport,
 };
 use nixcache_core::{IndexEntry, StoreHash};
 use serde::Deserialize;
@@ -98,7 +98,13 @@ fn get_store(env: &Env) -> Result<CacheStore> {
         .or_else(|_| env.var("GITHUB_TOKEN").map(|v| v.to_string()))
         .unwrap_or_default();
 
-    let oci_client = OciClient::new(&config.registry, &config.repo, &github_token);
+    let oci_client = WorkerOciClient::with_transport(
+        &config.registry,
+        &config.repo,
+        &github_token,
+        false,
+        WorkerFetchTransport,
+    );
     Ok(CacheStore::new(oci_client, config))
 }
 
@@ -219,18 +225,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
             match store.lookup_nar_digest_cascading(&ctx.env, nar_name).await {
                 Ok(Some(digest)) => {
-                    if let Ok(resp) = store
-                        .oci_client()
-                        .fetch_blob_response(digest.as_str())
-                        .await
-                        && resp.status_code() == 200
-                    {
+                    if let Ok(bytes) = store.oci_client().get_blob(digest.as_str()).await {
                         let headers = Headers::new();
                         headers.set("Content-Type", content_type_str)?;
-                        if let Ok(Some(len)) = resp.headers().get("Content-Length") {
-                            headers.set("Content-Length", &len)?;
-                        }
-                        return Ok(resp.with_headers(headers));
+
+                        headers.set("Content-Length", &bytes.len().to_string())?;
+                        return Ok(Response::from_bytes(bytes.to_vec())?.with_headers(headers));
                     }
                 }
                 Ok(None) => {}
