@@ -2,9 +2,7 @@ use crate::error::BuilderError;
 use async_compression::tokio::write::XzEncoder;
 use chrono::Utc;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use nixcache_core::{
-    IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
-};
+use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
 use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use nixcache_oci_backend::ReqwestTransport;
 use serde_json::Value;
@@ -383,10 +381,9 @@ impl ParallelExporter {
             ca: path_info.ca.clone(),
         };
 
-        let store_hash = StoreHash::parse(hash)
-            .unwrap_or_else(|_| StoreHash::new_unchecked(hash));
-        let nar_digest_obj = NarDigest::parse(&nar_digest)
-            .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest));
+        let store_hash = StoreHash::parse(hash).unwrap_or_else(|_| StoreHash::new_unchecked(hash));
+        let nar_digest_obj =
+            NarDigest::parse(&nar_digest).unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest));
 
         let name = Path::new(store_path)
             .file_name()
@@ -503,7 +500,10 @@ mod tests {
             .unwrap();
         assert_eq!(item.nar_hash, "sha256:1111");
         assert_eq!(item.nar_size, 1024);
-        assert_eq!(item.references, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"]);
+        assert_eq!(
+            item.references,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"]
+        );
         assert_eq!(
             item.deriver.as_deref(),
             Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test.drv")
@@ -530,12 +530,17 @@ mod tests {
     #[test]
     fn test_exported_store_path_structure() {
         let store_hash = StoreHash::new_unchecked("s66mzxpvicwk07gjbjfw9izjfa797vsw");
-        let nar_digest = NarDigest::new_unchecked("sha256:1111111111111111111111111111111111111111111111111111111111111111");
+        let nar_digest = NarDigest::new_unchecked(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        );
         let meta = nixcache_core::NarInfoMeta {
             store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
             nar_basename: "s66mzxpvicwk07gjbjfw9izjfa797vsw.nar.xz".to_string(),
             compression: Some("xz".to_string()),
-            file_hash: Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string()),
+            file_hash: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            ),
             file_size: Some(100),
             nar_hash: "sha256:2222".to_string(),
             references: vec![],
@@ -560,7 +565,10 @@ mod tests {
             file_size: 100,
         };
 
-        assert_eq!(exported.store_hash.as_str(), "s66mzxpvicwk07gjbjfw9izjfa797vsw");
+        assert_eq!(
+            exported.store_hash.as_str(),
+            "s66mzxpvicwk07gjbjfw9izjfa797vsw"
+        );
         assert_eq!(exported.file_size, 100);
         assert_eq!(exported.index_entry.name, "test");
     }
@@ -690,13 +698,13 @@ mod tests {
         let host = server.address().to_string();
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202).insert_header(
-                    "Location",
-                    "/v2/test/repo/nix-cache/blobs/uploads/session-mock",
-                ),
-            )
+            .and(wiremock::matchers::path(
+                "/v2/test/repo/nix-cache/blobs/uploads/",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/session-mock",
+            ))
             .mount(&server)
             .await;
 
@@ -706,9 +714,7 @@ mod tests {
             .await;
 
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202).insert_header("Range", "0-1048575"),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(202).insert_header("Range", "0-1048575"))
             .mount(&server)
             .await;
 

@@ -6,9 +6,7 @@ use crate::{
     summary::write_worker_step_summary,
 };
 use chrono::Utc;
-use nixcache_core::{
-    BuildReceipt, BuildStats, CacheIndexData, IndexEntry, StoreHash, SystemArch,
-};
+use nixcache_core::{BuildReceipt, BuildStats, CacheIndexData, IndexEntry, StoreHash, SystemArch};
 use nixcache_oci::OciClient;
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use std::{
@@ -134,33 +132,42 @@ pub async fn fetch_remote_cache_index(
     (remote_index, own_hashes)
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildWorkerOptions<'a> {
+    pub build_config: &'a BuildConfig,
+    pub repo: &'a str,
+    pub registry: &'a str,
+    pub signing_key_file: Option<&'a str>,
+    pub github_token: &'a str,
+    pub output_receipt_path: &'a Path,
+    pub fail_fast: bool,
+    pub export_concurrency: usize,
+}
+
 /// 阶段 1: 编译构建阶段 (Worker / Matrix 节点)
-pub async fn run_build_worker(
-    build_config: &BuildConfig,
-    repo: &str,
-    registry: &str,
-    signing_key_file: Option<&str>,
-    github_token: &str,
-    output_receipt_path: &Path,
-    fail_fast: bool,
-    export_concurrency: usize,
-) -> Result<(), BuilderError> {
-    let system = match &build_config.system {
+pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), BuilderError> {
+    let system = match &opts.build_config.system {
         Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
         _ => SystemArch::from(nix::get_system().await?.as_str()),
     };
 
     info!(
         "Starting worker build for system: {} | Repo: {}/{}",
-        system, registry, repo
+        system, opts.registry, opts.repo
     );
 
     // 1. 启动自替代代理并注入 NIX_CONFIG
-    let mut proxy_guard =
-        setup_self_substituter(repo, registry, github_token, signing_key_file, fail_fast).await?;
+    let mut proxy_guard = setup_self_substituter(
+        opts.repo,
+        opts.registry,
+        opts.github_token,
+        opts.signing_key_file,
+        opts.fail_fast,
+    )
+    .await?;
 
     // 2. 发现目标
-    let discovered = nix::discover_outputs(build_config).await?;
+    let discovered = nix::discover_outputs(opts.build_config).await?;
     info!("Discovered {} output target(s)", discovered.len());
 
     // 3. 构建目标
@@ -171,7 +178,7 @@ pub async fn run_build_worker(
     proxy_guard.stop().await;
 
     // 5. 获取已有远端 hashes
-    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
     let (_remote_index, own_hashes) = fetch_remote_cache_index(&oci).await;
     info!(
         "GHCR index contains {} previously-cached entries",
@@ -191,12 +198,12 @@ pub async fn run_build_worker(
         info!(
             "Locally-built paths to export & upload in parallel: {} (concurrency: {})",
             upload_list.len(),
-            export_concurrency
+            opts.export_concurrency
         );
         let export_config = nix::ParallelExportConfig {
-            concurrency: export_concurrency,
-            signing_key_file: signing_key_file.map(|s| s.to_string()),
-            fail_fast,
+            concurrency: opts.export_concurrency,
+            signing_key_file: opts.signing_key_file.map(|s| s.to_string()),
+            fail_fast: opts.fail_fast,
             upload_config: nixcache_oci::UploadConfig::default(),
             system,
             origin_job: env::var("GITHUB_JOB").ok().map(|j| format!("job:{}", j)),
@@ -216,7 +223,7 @@ pub async fn run_build_worker(
             for (path, err) in &report.failed {
                 error!("Failed to export & upload {}: {}", path, err);
             }
-            if fail_fast {
+            if opts.fail_fast {
                 return Err(BuilderError::Other(format!(
                     "Parallel export failed for {} path(s)",
                     report.failed.len()
@@ -240,7 +247,7 @@ pub async fn run_build_worker(
     active_gc_roots.sort();
     active_gc_roots.dedup();
 
-    let pub_key = get_own_public_key(signing_key_file).await;
+    let pub_key = get_own_public_key(opts.signing_key_file).await;
 
     let stats = BuildStats {
         discovered_outputs: discovered.len(),
@@ -257,7 +264,7 @@ pub async fn run_build_worker(
 
     let receipt = BuildReceipt::new(
         system,
-        repo.to_string(),
+        opts.repo.to_string(),
         Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         pub_key,
         new_entries,
@@ -266,18 +273,18 @@ pub async fn run_build_worker(
     )
     .with_run_info(run_id, job_id);
 
-    if let Some(parent) = output_receipt_path.parent()
+    if let Some(parent) = opts.output_receipt_path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent).await?;
     }
 
     let receipt_json = serde_json::to_string_pretty(&receipt)?;
-    fs::write(output_receipt_path, receipt_json).await?;
+    fs::write(opts.output_receipt_path, receipt_json).await?;
 
     info!(
         "Build receipt written to {:?} (system: {}, uploaded: {} blobs)",
-        output_receipt_path, system, uploaded_count
+        opts.output_receipt_path, system, uploaded_count
     );
 
     write_worker_step_summary(

@@ -4,9 +4,7 @@ use crate::{
     summary::write_session_capture_summary,
 };
 use chrono::Utc;
-use nixcache_core::{
-    BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch,
-};
+use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
 use nixcache_oci::SessionMutationRequest;
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
