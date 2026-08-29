@@ -1,7 +1,7 @@
 services:
   # Base configuration for the application
   app-base: &app-base
-    image: ghcr.io/shaogme/coding-images/npins-rust:latest
+    image: ghcr.io/shaogme/coding-images/rust-wasm:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
       - MISE_YES=1 # Non-interactive mode for mise
@@ -25,6 +25,8 @@ services:
       - rust-target:/root/workspace/target
       # Persist Cargo dependencies, crate index, and git checkouts
       - cargo-cache:/root/.cargo
+      # Persist direnv data
+      - direnv-data:/root/.local/share/direnv
       # Persist codex configuration
       - codex-config:/root/.codex
       - gemini-config:/root/.gemini
@@ -35,6 +37,7 @@ volumes:
   rust-target:
   cargo-cache:
   mise-cache:
+  direnv-data:
   codex-config:
   gemini-config:
   opencode-config:

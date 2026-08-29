@@ -1,0 +1,3 @@
+[tools]
+node = { version = "latest" }
+wrangler = { version = "latest", allow_builds = ["esbuild", "sharp", "workerd"] }
