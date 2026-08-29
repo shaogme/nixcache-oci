@@ -18,9 +18,11 @@
 
 3. **直通式流传输与零常驻开销**：从 GHCR 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压，内存占用极低。
 
-4. **解耦的 5-Crate 架构体系**：
-   - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（无原生 IO 依赖，Wasm 兼容）。
-   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎与 CAS 并发安全更新器。
+4. **解耦的 7-Crate 架构体系**：
+   - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
+   - `nixcache-utils`：跨平台系统调用封装、时间与系统工具，以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口）。
+   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、CAS 并发安全更新器与并发防击穿 Token 管理器。
+   - `nixcache-oci-backend`：通用 OCI 后端抽象层与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
    - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum）。
    - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与安全环境隔离）。
    - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 GHCR 3 级穿透）。
@@ -168,7 +170,46 @@ jobs:
             fail-fast: 'true'
   ```
 
-##### 3. 版本控制与配置
+##### 3. 复杂流水线即时缓存与会话加速（setup Action）
+
+如果你的 CI 包含多个独立的构建/测试步骤，或者希望在现有的自定义工作流中即时享受 4 级级联缓存加速，可使用官方 `setup` Action 在工作流初始化阶段一键启动代理守护进程并配置 Nix 替代器：
+
+```yaml
+name: CI with NixCache Acceleration
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  packages: write # 需要读取/写入 GHCR 包权限
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      # 初始化 NixCache 会话与本地 Proxy 守护进程，自动安全注入 NIX_CONFIG substituters 并记录 Store 快照
+      - name: Setup NixCache Session
+        uses: shaogme/nixcache-oci/setup@main
+        with:
+          signing-key: ${{ secrets.NIX_SIGNING_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 你的任意常规构建步骤，此时将自动通过本地 Proxy 极速下载与命中缓存
+      - name: Build Flake Outputs
+        run: nix build .#my-app
+
+      # 构建完成后，差异捕获并原子上传新生成的 Store 路径
+      - name: Capture & Upload Cache
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          nix run "github:shaogme/nixcache-oci#cache-builder-bin" -- session capture
+```
+
+##### 4. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
@@ -371,10 +412,18 @@ npins update
 ```
 该命令会自动更新 `npins/sources.json` 锁定文件。请在更新后提交该文件的修改。
 
+更多关于依赖管理、代码引用覆盖与测试规范的深度文档请查阅：
+- [npins CLI 命令行操作指南](docs/npins/cli.md)：添加、更新、锁定与通道切换规范。
+- [npins 产物使用与覆盖指南](docs/npins/usage.md)：在 Nix 代码中正确引用外部源及调试覆盖方法。
+- [项目测试与质量规范指南](docs/npins/testing.md)：静态检查、VM 虚拟机测试编写与验证规范。
+
 
 ## 配置参数说明
 
 现在 `nixcache-proxy` 和 `nixcache-builder` 均同时支持命令行参数与环境变量配置（命令行参数优先级更高）。
+
+> [!TIP]
+> **凭据自动探测机制**：`--github-token`（或 `GITHUB_TOKEN` / `GH_TOKEN`）在未显式提供时，程序会自动回退尝试调用本地已登录的 GitHub CLI (`gh auth token`) 探测认证凭据，极大简化了开发者在本地环境下的调试流程。
 
 ### 代理服务 (nixcache-proxy) 配置
 
@@ -384,6 +433,7 @@ npins update
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | OCI 镜像托管源 |
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
 | `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可对局域网提供服务） |
+| `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测宿主机） | 目标平台系统架构（例如 `x86_64-linux`） |
 | `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` / `GITHUB_RUN_ID` | （无） | GitHub Actions 工作流 Run ID（启用 Tier 1 会话级缓存） |
 | `--branch <BRANCH>` | `NIXCACHE_BRANCH` / `GITHUB_REF_NAME` | （无） | 分支名称或 PR 编号（启用 Tier 2 分支级缓存） |
 | `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag（Tier 3 基线缓存） |
@@ -391,13 +441,13 @@ npins update
 | `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | Tier 3 生产基线索引刷新周期（单位：秒） |
 | `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个以空格分隔） |
 | `--index-dir <DIR>` | `NIXCACHE_INDEX_DIR` | （见下方说明） | 缓存索引存储目录（若未指定，回退至 `CACHE_DIRECTORY` 环境变量或 `~/.cache/nixcache-proxy/...`） |
-| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | 用于认证 GitHub 接口/私有仓库的 Token |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （自动探测） | 用于认证 GitHub 接口/私有仓库的 Token（支持 `gh auth token` 自动发现） |
 
 ---
 
 ### 构建与管理服务 (nixcache-builder) CLI 子命令
 
-`nixcache-builder` 采用清晰的职责拆分子命令设计：
+`nixcache-builder` 采用清晰的职责拆分子命令设计，且预编译产物与 Nix 包中均内嵌了同版本的 `nixcache-proxy` 守护进程，使会话初始化与代理拉起开箱即用：
 
 #### 1. `session` (流水线会话全生命周期与级联协调)
 支持 GitHub Actions 工作流在不同 Job 阶段进行透明级联缓存与原子 CAS 上传：
@@ -535,8 +585,18 @@ nixcache-builder gc \
 
 **NAR blob 采用直通式流传输**：从 GHCR（或上游缓存）获取的数据会直接以 64 KB 的块流式传输给 Nix 客户端。代理服务不会在内存中缓冲整个包，也不会将其写入代理主机的磁盘。Nix 客户端收到数据后，会像往常一样直接将其解压存入本地的 `/nix/store/`。这保证了本地代理服务几乎不占用磁盘空间，并且内存消耗极低。
 
-### 代理管理端点
+### 代理服务通信与管理端点
 
+`nixcache-proxy` 与 `nixcache-worker` 完整实现了 Nix 标准二进制缓存协议，并提供了丰富的运维与热注册管理端点：
+
+#### 1. Nix 标准协议端点
+| 端点路径 | HTTP 方法 | Content-Type | 描述 |
+|---|---|---|---|
+| `/nix-cache-info` | GET | `text/x-nix-cache-info` | Nix 替代器握手端点（返回 StoreDir、WantMassQuery、Priority 等元数据） |
+| `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持 Tier 0~3 级联与上游透明回退） |
+| `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/x-xz` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
+
+#### 2. 代理管理与运维端点
 | 端点路径 | HTTP 方法 | 描述 |
 |---|---|---|
 | `/_status` | GET | 查看远端连接状态 (`remote_connected`)、各 Tier 索引条目统计、配置和上游缓存状态 |
@@ -646,28 +706,42 @@ curl -X POST http://localhost:37515/_refresh
 
 ### 1. Workspace Crate 拓扑与分层
 
-本项目严格遵循领域驱动与单一职责原则，划分为 5 个清晰解耦的 Crate：
+本项目严格遵循领域驱动与单一职责原则，划分为 7 个清晰解耦的 Crate：
 
 ```mermaid
 flowchart TD
     Core["crates/nixcache-core<br>(纯核心模型 / Schema v3 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
+    Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 系统环境工具)"]
     OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
+    Backend["crates/nixcache-oci-backend<br>(通用 OCI 后端抽象 / tokio-reqwest / 压缩索引切片)"]
     Proxy["crates/nixcache-proxy<br>(Axum 4 级级联代理 / O(1) 内存双向查找 / 流式转发)"]
     Builder["crates/nixcache-builder<br>(CI 构建协调 / 会话生命周期 / 安全环境隔离)"]
     Worker["crates/nixcache-worker<br>(Cloudflare Worker 边缘无服务器代理 / 3 级穿透)"]
 
+    Core --> Utils
     Core --> OCI
+    Utils --> OCI
+    OCI --> Backend
+    Utils --> Backend
+    Core --> Backend
     Core --> Proxy
-    Core --> Worker
-    OCI --> Builder
+    Backend --> Proxy
     OCI --> Proxy
+    Core --> Builder
+    Backend --> Builder
+    OCI --> Builder
+    Core --> Worker
+    OCI --> Worker
+    Utils --> Worker
 ```
 
-- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
-- **`crates/nixcache-oci`**：OCI 注册表交互层，提供强类型 Manifest/Descriptor 构建、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
-- **`crates/nixcache-proxy`**：本地反向代理，实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 映射，直通式流传输。
-- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单。
-- **`crates/nixcache-worker`**：极薄的 Cloudflare Worker 适配层，共享 `nixcache-core` 模型，通过内存 -> KV -> GHCR 3 级穿透提供边缘加速。
+- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`ArchCacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
+- **`crates/nixcache-utils`**：跨平台底层系统调用与压缩工具，实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象，以及时间与环境工具。
+- **`crates/nixcache-oci`**：OCI 注册表交互与规范定义层，提供强类型 Manifest/Descriptor 构建、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
+- **`crates/nixcache-oci-backend`**：通用 OCI 存储后端抽象层与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引（Compressed Index）分片读写与高并发流式下载。
+- **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
+- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
+- **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器代理，共享 `nixcache-core` 与 `nixcache-utils`，通过内存 -> KV -> GHCR 3 级穿透提供边缘低延迟加速。
 
 ---
 
@@ -713,6 +787,10 @@ flowchart TD
     MergedIndex --> TagPush
 ```
 
+- **多架构分片索引（Arch-scoped Index / Session）**：在并行 Matrix 阶段，各 Runner 独立构建目标平台产物（如 `x86_64-linux`、`aarch64-linux`），并将架构专有索引保存为特定 Tag（如 `session-<run_id>-<system>`），避免多架构节点在构建期相互干扰。
+- **CAS（Compare-And-Swap）原子更新与指数退避**：所有 OCI 清单的更新均通过 CAS 条件写入机制进行，在并发竞争时采用抖动指数退避自动重试，确保多节点无锁并发提交时绝对不会发生数据覆盖或丢失。
+- **Coordinator 汇聚与 GC 活性根聚合**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session 分片，合并为全局统一的 `cache-index`（Schema v3），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
+
 
 ### 输出自动发现机制
 
@@ -751,7 +829,7 @@ flowchart TB
         T8["8. Cloudflare Worker 边缘端到端测试"]
     end
     subgraph L4 ["4. 容错与集成测试 (Resilience & E2E)"]
-        T7["7. 异常注入与容错测试 (503 回退 / 签名防篡改 / 12 节点并发合并)"]
+        T7["7. 异常注入与容错测试 (503 回退 / 签名防篡改 / 12 节点并发合并 / CAS 重试)"]
         T6["6. 多架构 Scatter-Gather 并行构建与发布测试"]
         T5["5. 单机全模式 (Cargo / Nix-Src / Nix-Bin) 构建测试"]
     end
@@ -759,16 +837,18 @@ flowchart TB
         T4["4. NixOS VM QEMU 自动化生命周期驱动测试"]
         T3["3. evalConfig Nix 模块配置静态断言检查"]
     end
-    subgraph L2 ["2. 单元测试与网络 Mock"]
-        T2["2. Rust 单元测试 + WireMock / Tower 内存路由仿真"]
+    subgraph L2 ["2. 单元测试与形式化验证"]
+        T2_2["2.2 Loom 形式化并发模型检验 (CAS 状态机 / Token 竞态)"]
+        T2_1["2.1 Rust 单元测试 + WireMock / Tower 内存路由仿真"]
     end
     subgraph L1 ["1. 静态质量与规范检查"]
         T1["1. Clippy + RustFmt + ShellCheck + ActionLint 全库静态检查"]
     end
 
-    T1 --> T2
-    T1 --> T3
-    T2 --> T4
+    T1 --> T2_1
+    T1 --> T2_2
+    T2_1 --> T3
+    T2_2 --> T3
     T3 --> T4
     T4 --> T5
     T4 --> T6
@@ -781,10 +861,13 @@ flowchart TB
 开发者与贡献者可以在本地极速运行各层测试：
 
 
-#### Rust 单元测试与代码检查
+#### Rust 单元测试与形式化并发检验
 ```bash
 # 运行工作区全部 30+ 单元测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
 cargo test --workspace
+
+# 运行 Loom 形式化并发模型检验（验证 CAS 状态机与 Token 并发竞态无锁安全性）
+RUSTFLAGS="--cfg loom" cargo test -p nixcache-oci --features loom --test token_loom -- --nocapture
 
 # 执行 Rust 编码规范与 Clippy 静态分析
 cargo fmt --check
@@ -816,6 +899,10 @@ nix-build default.nix -A tests.vmtest --no-out-link
 ```
 
 #### 端到端（E2E）与替换器测试
+
+> [!TIP]
+> **自适应免 Docker 运行**：本地集成测试内置了轻量级 Python Mock OCI Registry（`test/mock_registry.py`）。当宿主机未安装或未启动 Docker 守护进程时，测试脚本会自动无缝启动内置 Mock 服务完成全套 E2E 闭环测试。
+
 ```bash
 # 1. 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])
 ./test/test-e2e.sh cargo flake
@@ -840,7 +927,7 @@ nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh scripts/*.sh && a
 
 ## 局限性
 
-- **必须运行本地代理**：Nix 客户端无法直接与 OCI 协议通信，因此必须在本地运行代理服务来进行协议桥接。
+- **需通过协议桥接代理**：Nix 客户端原生无法直接通过 OCI 镜像协议拉取包，因此需要通过代理服务桥接协议。用户可根据实际场景选择：在客户端运行轻量级 `nixcache-proxy` 本地常驻服务，或将 `nixcache-worker` 一键部署于 Cloudflare Workers 无服务器边缘网络（完全无需本地运行任何后台守护进程）。
 - **GitHub 接口频率限制**：GitHub 的 API 对于未认证的用户有限制，已认证用户为每小时 5,000 次。代理通过本地内存索引和 Nix 自带的缓存机制来大幅减少对 GitHub API 的直接请求，从而缓解这一限制。
 - **私有仓库限制**：私有仓库的 GHCR 存储和带宽超出免费额度（500 MB 存储，1 GB/月流量）后将按量计费。公开仓库则完全免费。
 - **GitHub 依赖性**：如果 GitHub 或 GHCR 发生宕机，你的自定义软件包缓存将暂时不可用（但上游缓存如 `cache.nixos.org` 中的官方软件包依然可以通过代理透明回退访问）。

@@ -38,7 +38,7 @@ id = "1bf99e8de9b544aba41d6c85e0eeee95"
 将该输出中的 `id` 复制并替换到 `wrangler.toml` 文件中相应的 `id` 占位符上。
 
 ### 3. 配置环境变量 (`wrangler.toml`)
-打开 [wrangler.toml](file:///d:/Documents/GitHub/nixcache-oci/crates/nixcache-worker/wrangler.toml) 并根据您的需求修改环境变量：
+打开 [wrangler.toml](./wrangler.toml) 并根据您的需求修改环境变量：
 - `NIXCACHE_REGISTRY` (选填): OCI 托管源，默认 `ghcr.io`。
 - `NIXCACHE_UPSTREAM` (选填): 多个上游缓存源（如 `https://cache.nixos.org`），以空格或逗号分隔。
 - `NIXCACHE_INDEX_TTL` (选填): 索引在 KV 和内存中的最大缓存时间（默认 300 秒）。
