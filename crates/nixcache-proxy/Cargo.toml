@@ -32,6 +32,7 @@ tracing-subscriber = { workspace = true }
 
 # CLI & Utilities
 clap = { workspace = true }
+mimalloc = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -1,6 +1,10 @@
 use clap::Parser;
+use mimalloc::MiMalloc;
 use nixcache_cli::{DEFAULT_NIXCACHE_REPO, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT};
 use std::{error::Error, process};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 mod cli;
 mod env_injector;

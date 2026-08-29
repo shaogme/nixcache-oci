@@ -16,15 +16,16 @@
    - **Upstream（上游透明回退）**：请求不存在于任何 Tier 时，透明重定向并回退至 `cache.nixos.org` 等公共缓存源。
    - 全链路在内存中维护双向哈希与 NAR Basename 映射表，彻底消除线性扫描，将路径与 NAR Blob 寻址降为 **$O(1)$ 常数时间**。
 
-3. **直通式流传输与零常驻开销**：从 GHCR 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压，内存占用极低。
+3. **直通式流传输与零常驻开销**：从 GHCR 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
 
-4. **解耦的 7-Crate 架构体系**：
+4. **解耦的 8-Crate 架构体系**：
    - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
-   - `nixcache-utils`：跨平台系统调用封装、时间与系统工具，以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口）。
+   - `nixcache-utils`：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口，零 tokio/clap 依赖）。
+   - `nixcache-cli`：共享 CLI 参数组件（`OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs` 等）与声明式强类型领域配置转换体系。
    - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、CAS 并发安全更新器与并发防击穿 Token 管理器。
    - `nixcache-oci-backend`：通用 OCI 后端抽象层与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
-   - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum）。
-   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与安全环境隔离）。
+   - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum 与 `nixcache-cli`）。
+   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与 `nixcache-cli`）。
    - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 GHCR 3 级穿透）。
 
 ## 快速开始
@@ -585,7 +586,7 @@ nixcache-builder gc \
 
 代理服务只缓存一样东西：**索引（Index）**（包含所有的 `.narinfo` 数据）。索引会被加载到内存中，并根据 `NIXCACHE_INDEX_TTL`（默认 5 分钟）定期从 GHCR 刷新。这意味着 `.narinfo` 的查找是即时的 —— 不需要进行任何网络往返。在你的 Actions 成功发布新构建后，客户端最晚会在该时间窗口内看到新包。
 
-**NAR blob 采用直通式流传输**：从 GHCR（或上游缓存）获取的数据会直接以 64 KB 的块流式传输给 Nix 客户端。代理服务不会在内存中缓冲整个包，也不会将其写入代理主机的磁盘。Nix 客户端收到数据后，会像往常一样直接将其解压存入本地的 `/nix/store/`。这保证了本地代理服务几乎不占用磁盘空间，并且内存消耗极低。
+**NAR blob 采用直通式流传输**：从 GHCR（或上游缓存）获取的数据会直接以 64 KB 的块流式传输给 Nix 客户端。代理服务不会在内存中缓冲整个包，也不会将其写入代理主机的磁盘。同时，服务内置 `mimalloc` 全局内存分配器，消除 musl/Linux 默认分配器在高并发下的锁争用问题。Nix 客户端收到数据后，会像往常一样直接将其解压存入本地的 `/nix/store/`。这保证了本地代理服务几乎不占用磁盘空间，并且内存消耗极低。
 
 ### 代理服务通信与管理端点
 
@@ -708,12 +709,13 @@ curl -X POST http://localhost:37515/_refresh
 
 ### 1. Workspace Crate 拓扑与分层
 
-本项目严格遵循领域驱动与单一职责原则，划分为 7 个清晰解耦的 Crate：
+本项目严格遵循领域驱动与单一职责原则，划分为 8 个清晰解耦的 Crate：
 
 ```mermaid
 flowchart TD
     Core["crates/nixcache-core<br>(纯核心模型 / Schema v3 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
-    Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 系统环境工具)"]
+    Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 纯标准库 Env 工具)"]
+    CLI["crates/nixcache-cli<br>(共享 CLI 参数组件 / 认证探测 / 强类型配置转换)"]
     OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
     Backend["crates/nixcache-oci-backend<br>(通用 OCI 后端抽象 / tokio-reqwest / 压缩索引切片)"]
     Proxy["crates/nixcache-proxy<br>(Axum 4 级级联代理 / O(1) 内存双向查找 / 流式转发)"]
@@ -726,9 +728,13 @@ flowchart TD
     OCI --> Backend
     Utils --> Backend
     Core --> Backend
+    Core --> CLI
+    Utils --> CLI
+    CLI --> Proxy
     Core --> Proxy
     Backend --> Proxy
     OCI --> Proxy
+    CLI --> Builder
     Core --> Builder
     Backend --> Builder
     OCI --> Builder
@@ -738,11 +744,12 @@ flowchart TD
 ```
 
 - **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`ArchCacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
-- **`crates/nixcache-utils`**：跨平台底层系统调用与压缩工具，实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象，以及时间与环境工具。
+- **`crates/nixcache-utils`**：跨平台底层系统调用、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
+- **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
 - **`crates/nixcache-oci`**：OCI 注册表交互与规范定义层，提供强类型 Manifest/Descriptor 构建、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
 - **`crates/nixcache-oci-backend`**：通用 OCI 存储后端抽象层与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引（Compressed Index）分片读写与高并发流式下载。
-- **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
-- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
+- **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
+- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
 - **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器代理，共享 `nixcache-core` 与 `nixcache-utils`，通过内存 -> KV -> GHCR 3 级穿透提供边缘低延迟加速。
 
 ---
@@ -865,7 +872,7 @@ flowchart TB
 
 #### Rust 单元测试与形式化并发检验
 ```bash
-# 运行工作区全部 30+ 单元测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
+# 运行工作区全部 70+ 单元与集成测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
 cargo test --workspace
 
 # 运行 Loom 形式化并发模型检验（验证 CAS 状态机与 Token 并发竞态无锁安全性）

@@ -1,4 +1,5 @@
 use clap::Parser;
+use mimalloc::MiMalloc;
 use nixcache_cli::{
     AuthTokenArgs, CachePolicyArgs, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT, OciTargetArgs,
     ServerBindArgs, SessionContextArgs,
@@ -12,6 +13,9 @@ use tracing::info;
 
 #[cfg(not(unix))]
 use std::future;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 // Module declarations
 mod index;
