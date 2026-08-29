@@ -1,5 +1,8 @@
 use chrono::Utc;
-use nixcache_core::{IndexEntry, JobSummaryMetadata, RunSessionManifest, StoreHash, SystemArch};
+use nixcache_core::{
+    ArchRunSessionManifest, IndexEntry, JobSummaryMetadata, RunSessionManifest, StoreHash,
+    SystemArch,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -91,6 +94,41 @@ impl SessionMutationRequest {
         let mut sorted: Vec<StoreHash> = set.into_iter().collect();
         sorted.sort();
         *roots_entry = sorted;
+        session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        session.completed_jobs.push(JobSummaryMetadata {
+            job_id: self.job_id.clone(),
+            system: self.system.clone(),
+            uploaded_blobs: self.uploaded_blobs,
+            uploaded_bytes: self.uploaded_bytes,
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        });
+    }
+
+    pub fn apply_to_arch(&self, session: &mut ArchRunSessionManifest) {
+        if session.head_sha.is_empty()
+            && let Some(ref sha) = self.head_sha
+        {
+            session.head_sha = sha.clone();
+        }
+        if session.ref_name.is_empty()
+            && let Some(ref rn) = self.ref_name
+        {
+            session.ref_name = rn.clone();
+        }
+        if session.public_key.is_none()
+            && let Some(ref pk) = self.public_key
+            && !pk.is_empty()
+        {
+            session.public_key = Some(pk.clone());
+        }
+
+        session.entries.extend(self.new_entries.clone());
+        let mut set: HashSet<StoreHash> = session.gc_roots.iter().cloned().collect();
+        set.extend(self.new_roots.clone());
+        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
+        sorted.sort();
+        session.gc_roots = sorted;
         session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         session.completed_jobs.push(JobSummaryMetadata {

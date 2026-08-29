@@ -1,9 +1,14 @@
 use crate::{error::BuilderError, summary::write_promote_step_summary};
+use bytes::Bytes;
 use chrono::Utc;
 use nixcache_core::{
-    BuildReceipt, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, StoreHash, SystemArch,
+    ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
 };
-use nixcache_oci::OciClient;
+use nixcache_oci::{
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor, OciPlatform,
+    build_arch_index_manifest, build_image_index,
+};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -11,7 +16,19 @@ use std::{
 use tokio::fs;
 use tracing::{info, warn};
 
-/// Promote: 汇聚会话清单 (run-<run_id>) 与 Receipt，原子 CAS 发布生产 cache-index
+fn compute_sha256_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    format!(
+        "sha256:{}",
+        hash.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    )
+}
+
+/// Promote: 汇聚多架构会话清单与 Receipts，分架构生成 Sub-Manifest，并原子发布顶层 OCI Image Index
 pub async fn run_promote(
     run_id: Option<u64>,
     receipt_paths: &[PathBuf],
@@ -22,13 +39,13 @@ pub async fn run_promote(
     github_token: &str,
 ) -> Result<(), BuilderError> {
     info!(
-        "Promoting cache to tag '{}' for repo: {}/{} (Run ID: {:?})",
+        "Promoting multi-arch cache to tag '{}' for repo: {}/{} (Run ID: {:?})",
         target_tag, registry, repo, run_id
     );
 
     let oci = OciClient::new(registry, repo, github_token, true);
 
-    // 1. 准备待合并的数据集
+    // 1. 准备待合并的数据集 (按系统架构分桶)
     let mut session_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut session_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
     let mut session_pub_key: Option<String> = None;
@@ -134,66 +151,156 @@ pub async fn run_promote(
     let total_promoted_entries = session_entries.len() + receipt_entries.len();
 
     if !session_found && receipt_paths.is_empty() && total_promoted_entries == 0 {
-        info!("No session manifest or receipts found to promote. Pushing current baseline state.");
+        info!("No session manifest or receipts found to promote. Merging with existing baseline.");
     }
 
-    // 3. 基于 OCI CAS 乐观并发重试机制合并并发布全局 cache-index
-    let repo_str = repo.to_string();
-    let registry_str = registry.to_string();
-    let image_str = format!("{}/{}/nix-cache", registry, repo);
+    // 3. 拉取现存 Baseline 数据并按 SystemArch 分桶
+    let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
+        HashMap::new();
+    let mut partitioned_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
+    let mut base_pub_key = session_pub_key.or(receipt_pub_key).unwrap_or_default();
 
-    oci.update_manifest_cas::<CacheIndexData, _>(target_tag, 5, |existing_opt| {
-        let mut index = existing_opt.unwrap_or_default();
-        index.version = CACHE_INDEX_VERSION;
-        index.repo = repo_str.clone();
-        index.registry = registry_str.clone();
-        index.image = image_str.clone();
-        index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        index.last_promoted_run = run_id;
-
-        if let Some(pk) = session_pub_key.as_deref().or(receipt_pub_key.as_deref()) {
-            index.public_key = pk.to_string();
+    if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
+        for desc in artifact.index.manifests {
+            if let Ok(Some((sub_json, _))) = oci.get_manifest_with_digest(&desc.digest).await
+                && let Ok(sub_manifest) = serde_json::from_str::<nixcache_oci::OciImageManifest>(&sub_json)
+                && let Some(blob_digest) = sub_manifest.first_layer_digest()
+                && let Ok(blob_bytes) = oci.get_blob(blob_digest).await
+                && let Ok(arch_data) = serde_json::from_slice::<ArchCacheIndexData>(&blob_bytes)
+            {
+                if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
+                    base_pub_key = arch_data.public_key;
+                }
+                partitioned_entries
+                    .entry(arch_data.system.clone())
+                    .or_default()
+                    .extend(arch_data.entries);
+                partitioned_roots
+                    .entry(arch_data.system)
+                    .or_default()
+                    .extend(arch_data.gc_roots);
+            }
         }
+    }
 
-        // 合并 session 条目
-        index.entries.extend(session_entries.clone());
-        for (sys, roots) in &session_roots {
-            let system_roots = index.gc_roots.entry(sys.clone()).or_default();
-            let mut set: HashSet<StoreHash> = system_roots.iter().cloned().collect();
-            set.extend(roots.iter().cloned());
-            let mut sorted: Vec<StoreHash> = set.into_iter().collect();
-            sorted.sort();
-            *system_roots = sorted;
-        }
+    // 合并 session 条目到分桶
+    for (hash, entry) in session_entries {
+        let sys = entry.system.clone().unwrap_or_default();
+        partitioned_entries.entry(sys).or_default().insert(hash, entry);
+    }
+    for (sys, roots) in session_roots {
+        let entry_roots = partitioned_roots.entry(sys).or_default();
+        let mut set: HashSet<StoreHash> = entry_roots.iter().cloned().collect();
+        set.extend(roots);
+        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
+        sorted.sort();
+        *entry_roots = sorted;
+    }
 
-        // 合并 receipt 条目
-        index.entries.extend(receipt_entries.clone());
-        for (sys, roots) in &receipt_roots {
-            let system_roots = index.gc_roots.entry(sys.clone()).or_default();
-            let mut set: HashSet<StoreHash> = system_roots.iter().cloned().collect();
-            set.extend(roots.iter().cloned());
-            let mut sorted: Vec<StoreHash> = set.into_iter().collect();
-            sorted.sort();
-            *system_roots = sorted;
-        }
+    // 合并 receipt 条目到分桶
+    for (hash, entry) in receipt_entries {
+        let sys = entry.system.clone().unwrap_or_default();
+        partitioned_entries.entry(sys).or_default().insert(hash, entry);
+    }
+    for (sys, roots) in receipt_roots {
+        let entry_roots = partitioned_roots.entry(sys).or_default();
+        let mut set: HashSet<StoreHash> = entry_roots.iter().cloned().collect();
+        set.extend(roots);
+        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
+        sorted.sort();
+        *entry_roots = sorted;
+    }
 
+    // 4. 为每个系统架构构建并推送 Sub-Manifest 与 Index Blob
+    let empty_config = Bytes::from_static(b"{}");
+    let config_digest = oci.push_blob_bytes(empty_config).await?;
+    let config_size = 2u64;
+
+    let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
+    let all_systems: Vec<SystemArch> = partitioned_entries.keys().cloned().collect();
+
+    for sys in all_systems {
+        let entries = partitioned_entries.remove(&sys).unwrap_or_default();
+        let roots = partitioned_roots.remove(&sys).unwrap_or_default();
+
+        let arch_data = ArchCacheIndexData {
+            version: CACHE_INDEX_VERSION,
+            system: sys.clone(),
+            repo: repo.to_string(),
+            registry: registry.to_string(),
+            generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            public_key: base_pub_key.clone(),
+            entries,
+            gc_roots: roots,
+            last_promoted_run: run_id,
+        };
+
+        // 推送单架构 Index Blob
+        let (blob_digest, blob_size) = oci.push_json_blob(&arch_data).await?;
+
+        // 构造单架构 Sub-Manifest
+        let sub_manifest =
+            build_arch_index_manifest(&blob_digest, blob_size, &config_digest, config_size, &sys);
+        let sub_manifest_json = sub_manifest.to_json_string()?;
+        let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
+
+        // 推送架构特定 Tag (如 cache-index-x86_64-linux)
+        let arch_tag = format!("{}-{}", target_tag, sys.as_str());
+        oci.push_manifest(&arch_tag, &sub_manifest_json).await?;
+
+        info!(
+            "Pushed Sub-Manifest for architecture: {} (tag: {})",
+            sys, arch_tag
+        );
+
+        // 生成挂载到顶层 Image Index 的 Descriptor
+        let mut desc_annotations = HashMap::new();
+        desc_annotations.insert("org.nixos.nixcache.system".to_string(), sys.to_string());
+
+        manifest_descriptors.push(OciDescriptor {
+            media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: sub_manifest_digest,
+            size: sub_manifest_json.len() as u64,
+            platform: Some(OciPlatform::from_system(&sys)),
+            annotations: Some(desc_annotations),
+        });
+    }
+
+    // 5. 组装并原子发布顶层 OCI Image Index (cache-index)
+    let final_descriptors = manifest_descriptors;
+    oci.update_image_index_cas(target_tag, 5, |_existing| {
+        let mut index = build_image_index(
+            final_descriptors.clone(),
+            "NixCache Multi-Architecture Global Index",
+        );
+        index.schema_version = 2;
         Ok(index)
     })
     .await?;
 
     info!(
-        "Promote complete! Global cache-index updated atomically via CAS for tag '{}'.",
+        "Promote complete! Multi-Architecture OCI Image Index published for tag '{}'.",
         target_tag
     );
 
-    // 4. 清理会话标签
+    // 6. 清理会话标签 (包括全局会话与各架构专属会话)
     if cleanup_session && let Some(rid) = run_id {
-        let tag = format!("run-{}", rid);
-        if let Ok(deleted) = oci.delete_manifest(&tag).await
-            && deleted
-        {
-            info!("Cleaned up session tag {}", tag);
+        let main_tag = format!("run-{}", rid);
+        let _ = oci.delete_manifest(&main_tag).await;
+
+        for sys in [
+            SystemArch::X86_64Linux,
+            SystemArch::Aarch64Linux,
+            SystemArch::X86_64Darwin,
+            SystemArch::Aarch64Darwin,
+            SystemArch::I686Linux,
+            SystemArch::Armv7lLinux,
+            SystemArch::Riscv64Linux,
+        ] {
+            let arch_tag = format!("run-{}-{}", rid, sys.as_str());
+            let _ = oci.delete_manifest(&arch_tag).await;
         }
+        info!("Cleaned up session tags for run-{}", rid);
     }
 
     write_promote_step_summary(

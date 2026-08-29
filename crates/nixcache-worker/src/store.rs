@@ -50,13 +50,10 @@ impl Default for WorkerProxyConfig {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteStatus {
     pub remote_connected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_error: Option<String>,
     pub registry: String,
     pub repo: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_or_pr: Option<String>,
     pub tier0_hot_entries: usize,
     pub tier1_session_entries: usize,
@@ -728,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_v3_data_structures_serialization() {
+    fn test_schema_v4_data_structures_serialization() {
         let mut session = RunSessionManifest {
             run_id: 12345,
             head_sha: "abc".to_string(),

@@ -28,13 +28,10 @@ pub struct AppState {
 #[derive(Serialize)]
 struct StatusResponse {
     remote_connected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     remote_error: Option<String>,
     registry: String,
     repo: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     branch_or_pr: Option<String>,
     tier0_hot_entries: usize,
     tier1_session_entries: usize,
@@ -740,21 +737,30 @@ mod tests {
 
         let app = create_router(state);
 
-        let hash1 = "s66mzxpvicwk07gjbjfw9izjfa797vsw";
-        let payload = serde_json::json!({
-            hash1: {
-                "name": "hot-pkg",
-                "system": "x86_64-linux",
-                "narinfo_meta": {
-                    "store_path": format!("/nix/store/{}-pkg", hash1),
-                    "nar_basename": "hot.nar.xz",
-                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                },
-                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                "nar_size": 42,
-                "added": "2026-08-29T10:00:00Z"
-            }
-        });
+        let hash1_str = "s66mzxpvicwk07gjbjfw9izjfa797vsw";
+        let hash1 = StoreHash::parse(hash1_str).unwrap();
+        let entry = IndexEntry {
+            name: "hot-pkg".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash1_str),
+                nar_basename: "hot.nar.xz".to_string(),
+                nar_hash:
+                    "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                        .to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256(
+                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+            )
+            .unwrap(),
+            nar_size: 42,
+            added: "2026-08-29T10:00:00Z".to_string(),
+            origin_job: None,
+        };
+
+        let mut payload_map = HashMap::new();
+        payload_map.insert(hash1.clone(), entry);
 
         let reg_resp = app
             .clone()
@@ -763,7 +769,7 @@ mod tests {
                     .method("POST")
                     .uri("/_session/register")
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .body(Body::from(serde_json::to_vec(&payload_map).unwrap()))
                     .unwrap(),
             )
             .await

@@ -1,7 +1,7 @@
 use moka::future::Cache;
 use nixcache_core::{
-    CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
-    extract_nar_basename,
+    ArchCacheIndexData, ArchRunSessionManifest, CacheIndexData, IndexEntry, NarDigest,
+    RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
 };
 use nixcache_oci::OciClient;
 use std::{
@@ -12,6 +12,12 @@ use std::{
 };
 use tokio::{fs, sync::RwLock};
 use tracing::{error, info, warn};
+
+pub fn detect_current_system() -> SystemArch {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    SystemArch::from_oci(os, arch, None)
+}
 
 #[derive(Clone, Debug)]
 pub struct CascadingProxyConfig {
@@ -24,6 +30,7 @@ pub struct CascadingProxyConfig {
     pub session_ttl: Duration,
     pub baseline_ttl: Duration,
     pub index_dir: PathBuf,
+    pub target_system: SystemArch,
 }
 
 impl Default for CascadingProxyConfig {
@@ -38,6 +45,7 @@ impl Default for CascadingProxyConfig {
             session_ttl: Duration::from_secs(10),
             baseline_ttl: Duration::from_secs(300),
             index_dir: PathBuf::from("/tmp"),
+            target_system: detect_current_system(),
         }
     }
 }
@@ -72,6 +80,26 @@ impl CachedSession {
             nar_lookup,
         }
     }
+
+    pub fn from_arch_manifest(arch: ArchRunSessionManifest) -> Self {
+        let mut gc_roots = HashMap::new();
+        if !arch.gc_roots.is_empty() {
+            gc_roots.insert(arch.system, arch.gc_roots);
+        }
+        let manifest = RunSessionManifest {
+            version: arch.version,
+            run_id: arch.run_id,
+            head_sha: arch.head_sha,
+            ref_name: arch.ref_name,
+            created_at: arch.created_at,
+            updated_at: arch.updated_at,
+            public_key: arch.public_key,
+            entries: arch.entries,
+            gc_roots,
+            completed_jobs: arch.completed_jobs,
+        };
+        Self::new(manifest)
+    }
 }
 
 /// 带有 O(1) 反向 NAR 映射表的基线缓存模型
@@ -85,6 +113,12 @@ impl CachedBaseline {
     pub fn new(data: CacheIndexData) -> Self {
         let nar_lookup = build_nar_lookup_map(&data.entries);
         Self { data, nar_lookup }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_arch_data(arch_data: ArchCacheIndexData) -> Self {
+        let data = CacheIndexData::from_arch_data(arch_data);
+        Self::new(data)
     }
 }
 
@@ -341,32 +375,37 @@ impl CacheIndex {
 
     pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
-        if let Some(cached) = self.baseline_cache.get(tag).await {
+        let system = &self.config.target_system;
+        let cache_key = format!("{}-{}", tag, system.as_str());
+
+        if let Some(cached) = self.baseline_cache.get(&cache_key).await {
             return cached;
         }
 
         let tag_str = tag.clone();
+        let system_clone = system.clone();
         let res = self
             .baseline_cache
-            .try_get_with(tag_str.clone(), async {
+            .try_get_with(cache_key.clone(), async {
                 info!(
-                    "[nixcache-proxy] Refreshing Tier 3 Baseline Index (Tag: {})...",
-                    tag_str
+                    "[nixcache-proxy] Refreshing Tier 3 Baseline Index (Tag: {}, System: {})...",
+                    tag_str, system_clone
                 );
                 let mut refresh_ok = false;
                 let mut fetched_data = None;
 
-                match self.oci_client.get_cache_index(&tag_str).await {
-                    Ok(Some((index_data, _))) => {
+                match self.oci_client.get_arch_cache_index(&tag_str, &system_clone).await {
+                    Ok(Some((arch_data, _))) => {
                         refresh_ok = true;
                         self.set_remote_status(true, None).await;
 
-                        // 保存本地备份文件
-                        let file_path = self.config.index_dir.join("cache-index.json");
+                        // 保存本地单架构备份文件
+                        let file_name = format!("cache-index-{}.json", system_clone.as_str());
+                        let file_path = self.config.index_dir.join(&file_name);
                         if let Some(parent) = file_path.parent() {
                             let _ = fs::create_dir_all(parent).await;
                         }
-                        if let Ok(bytes) = serde_json::to_vec_pretty(&index_data) {
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&arch_data) {
                             if let Err(e) = fs::write(&file_path, &bytes).await {
                                 error!("[nixcache-proxy] Failed to write backup index: {}", e);
                             } else {
@@ -376,12 +415,12 @@ impl CacheIndex {
                                 );
                             }
                         }
-                        fetched_data = Some(index_data);
+                        fetched_data = Some(CacheIndexData::from_arch_data(arch_data));
                     }
                     Ok(None) => {
                         info!(
-                            "[nixcache-proxy] Baseline tag {} not found on registry.",
-                            tag_str
+                            "[nixcache-proxy] Baseline tag {} not found on registry for system {}.",
+                            tag_str, system_clone
                         );
                         self.set_remote_status(true, None).await;
                     }
@@ -399,19 +438,22 @@ impl CacheIndex {
                 }
 
                 if !refresh_ok {
-                    // 加载本地备份文件
-                    let file_path = self.config.index_dir.join("cache-index.json");
-                    if file_path.exists() {
-                        match fs::read(&file_path).await {
+                    let arch_backup = self
+                        .config
+                        .index_dir
+                        .join(format!("cache-index-{}.json", system_clone.as_str()));
+
+                    if arch_backup.exists() {
+                        match fs::read(&arch_backup).await {
                             Ok(bytes) => {
-                                if let Ok(index_data) =
-                                    serde_json::from_slice::<CacheIndexData>(&bytes)
+                                if let Ok(arch_data) =
+                                    serde_json::from_slice::<ArchCacheIndexData>(&bytes)
                                 {
                                     info!(
-                                        "[nixcache-proxy] Loaded backup cache index from {:?}",
-                                        file_path
+                                        "[nixcache-proxy] Loaded backup arch index from {:?}",
+                                        arch_backup
                                     );
-                                    fetched_data = Some(index_data);
+                                    fetched_data = Some(CacheIndexData::from_arch_data(arch_data));
                                     refresh_ok = true;
                                 }
                             }
@@ -424,8 +466,8 @@ impl CacheIndex {
 
                 if let Some(data) = fetched_data {
                     info!(
-                        "[nixcache-proxy] Baseline index refreshed successfully with {} entries.",
-                        data.entries.len()
+                        "[nixcache-proxy] Baseline index refreshed successfully with {} entries for {}.",
+                        data.entries.len(), system_clone
                     );
                     Ok(Arc::new(CachedBaseline::new(data)))
                 } else if refresh_ok {
@@ -472,6 +514,8 @@ impl CacheIndex {
             }
         }
 
+        let cache_key = format!("{}-{}", self.config.baseline_tag, self.config.target_system.as_str());
+        self.baseline_cache.invalidate(&cache_key).await;
         self.baseline_cache
             .invalidate(&self.config.baseline_tag)
             .await;
@@ -497,22 +541,23 @@ impl CacheIndex {
         }
 
         let tag_str = tag.to_string();
+        let system_clone = self.config.target_system.clone();
         let res = self
             .session_cache
             .try_get_with(tag_str.clone(), async {
                 info!(
-                    "[nixcache-proxy] Refreshing Session Manifest (Tag: {})...",
-                    tag_str
+                    "[nixcache-proxy] Refreshing Session Manifest (Tag: {}, System: {})...",
+                    tag_str, system_clone
                 );
-                match self.oci_client.get_session_manifest(&tag_str).await {
+                match self.oci_client.get_arch_session_manifest(&tag_str, &system_clone).await {
                     Ok(Some((session, _))) => {
                         self.set_remote_status(true, None).await;
-                        Ok(Arc::new(CachedSession::new(session)))
+                        Ok(Arc::new(CachedSession::from_arch_manifest(session)))
                     }
                     Ok(None) => {
                         info!(
-                            "[nixcache-proxy] Session tag {} not found on remote (yet).",
-                            tag_str
+                            "[nixcache-proxy] Session tag {} not found on remote for system {}.",
+                            tag_str, system_clone
                         );
                         self.set_remote_status(true, None).await;
                         Err("Session tag not found on remote".to_string())
@@ -534,12 +579,16 @@ impl CacheIndex {
 
     #[cfg(test)]
     pub async fn update_data_in_memory(&self, new_data: CacheIndexData) {
+        let cache_key = format!(
+            "{}-{}",
+            self.config.baseline_tag,
+            self.config.target_system.as_str()
+        );
+        let baseline = Arc::new(CachedBaseline::new(new_data));
         self.baseline_cache
-            .insert(
-                self.config.baseline_tag.clone(),
-                Arc::new(CachedBaseline::new(new_data)),
-            )
+            .insert(self.config.baseline_tag.clone(), baseline.clone())
             .await;
+        self.baseline_cache.insert(cache_key, baseline).await;
         self.set_remote_status(true, None).await;
     }
 
@@ -574,6 +623,7 @@ mod tests {
             session_ttl: Duration::from_secs(60),
             baseline_ttl: Duration::from_secs(60),
             index_dir: temp_dir.path().to_path_buf(),
+            target_system: SystemArch::X86_64Linux,
         };
 
         let index = CacheIndex::with_config(config, "");

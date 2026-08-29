@@ -102,6 +102,13 @@ struct Args {
     )]
     upstream: String,
 
+    #[arg(
+        long,
+        env = "NIXCACHE_SYSTEM",
+        help = "Target system platform (e.g. x86_64-linux, defaults to current host)"
+    )]
+    system: Option<String>,
+
     #[arg(long, env = "GITHUB_TOKEN", help = "GitHub token for authentication")]
     github_token: Option<String>,
 
@@ -179,11 +186,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| env::var("GITHUB_REF_NAME").ok())
         .or_else(|| env::var("GITHUB_HEAD_REF").ok());
 
+    let target_system = args
+        .system
+        .map(|s| nixcache_core::SystemArch::from(s.as_str()))
+        .unwrap_or_else(index::detect_current_system);
+
     info!(
         "nixcache-proxy starting on http://{}:{}",
         args.listen, args.port
     );
     info!("  Repo: {}", args.repo);
+    info!("  System (Target Platform): {}", target_system);
     info!("  Run ID (Tier 1): {:?}", run_id);
     info!("  Branch/PR (Tier 2): {:?}", branch);
     info!("  Baseline Tag (Tier 3): {}", args.baseline_tag);
@@ -198,10 +211,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_id,
         branch_or_pr: branch,
         baseline_tag: args.baseline_tag,
-        upstream_caches: upstream_caches.clone(),
+        upstream_caches,
         session_ttl: Duration::from_secs(args.session_ttl),
         baseline_ttl: Duration::from_secs(args.index_ttl),
         index_dir,
+        target_system,
     };
 
     let index = CacheIndex::with_config(config, &github_token);

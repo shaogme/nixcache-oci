@@ -11,18 +11,19 @@ pub use lookup::{
 };
 pub use narinfo::NarInfo;
 pub use types::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata,
-    NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
-    SCHEMA_VERSION, StoreHash, SystemArch,
+    ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
+    CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfoMeta, RECEIPT_VERSION,
+    RUN_SESSION_VERSION, RunSessionManifest, SCHEMA_VERSION, StoreHash, SystemArch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry,
-        JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
-        RunSessionManifest, StoreHash, SystemArch, TypeError, build_nar_lookup_map,
-        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
+        ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
+        CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta,
+        RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, StoreHash, SystemArch, TypeError,
+        build_nar_lookup_map, evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash,
+        extract_store_hash_str,
     };
     use chrono::{Duration, Utc};
     use std::collections::HashMap;
@@ -63,6 +64,25 @@ mod tests {
             SystemArch::from("custom-arch"),
             SystemArch::Other("custom-arch".to_string())
         );
+
+        // SystemArch OCI platform mappings
+        assert_eq!(arch.to_oci_platform_tuple(), ("linux", "amd64", None));
+        assert_eq!(
+            SystemArch::Aarch64Linux.to_oci_platform_tuple(),
+            ("linux", "arm64", None)
+        );
+        assert_eq!(
+            SystemArch::Aarch64Darwin.to_oci_platform_tuple(),
+            ("darwin", "arm64", None)
+        );
+        assert_eq!(
+            SystemArch::Armv7lLinux.to_oci_platform_tuple(),
+            ("linux", "arm", Some("v7"))
+        );
+        assert_eq!(SystemArch::from_oci("linux", "amd64", None), SystemArch::X86_64Linux);
+        assert_eq!(SystemArch::from_oci("linux", "arm64", None), SystemArch::Aarch64Linux);
+        assert_eq!(SystemArch::from_oci("darwin", "arm64", None), SystemArch::Aarch64Darwin);
+        assert_eq!(SystemArch::from_oci("linux", "arm", Some("v7")), SystemArch::Armv7lLinux);
     }
 
     #[test]
@@ -321,7 +341,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
-    fn test_types_serialization_and_migration() {
+    fn test_types_serialization() {
         let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let mut index = CacheIndexData {
             repo: "owner/repo".to_string(),
@@ -386,6 +406,32 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(loaded_session.version, RUN_SESSION_VERSION);
         assert_eq!(loaded_session.run_id, 12345);
         assert_eq!(loaded_session.completed_jobs.len(), 1);
+
+        // Arch-scoped session
+        let mut arch_session = ArchRunSessionManifest::new(12345, SystemArch::X86_64Linux);
+        arch_session.completed_jobs.push(JobSummaryMetadata {
+            job_id: "build-x86".to_string(),
+            system: SystemArch::X86_64Linux,
+            uploaded_blobs: 5,
+            uploaded_bytes: 10240,
+            timestamp: "2026-08-29T10:00:00Z".to_string(),
+        });
+        let arch_session_json = serde_json::to_string(&arch_session).unwrap();
+        let loaded_arch_session: ArchRunSessionManifest =
+            serde_json::from_str(&arch_session_json).unwrap();
+        assert_eq!(loaded_arch_session.version, RUN_SESSION_VERSION);
+        assert_eq!(loaded_arch_session.system, SystemArch::X86_64Linux);
+
+        // Arch-scoped cache index
+        let arch_index = ArchCacheIndexData::new(
+            SystemArch::Aarch64Linux,
+            "owner/repo",
+            "ghcr.io",
+        );
+        let arch_index_json = serde_json::to_string(&arch_index).unwrap();
+        let loaded_arch_index: ArchCacheIndexData = serde_json::from_str(&arch_index_json).unwrap();
+        assert_eq!(loaded_arch_index.version, CACHE_INDEX_VERSION);
+        assert_eq!(loaded_arch_index.system, SystemArch::Aarch64Linux);
 
         let root1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let receipt = BuildReceipt::new(

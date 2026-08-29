@@ -5,19 +5,22 @@ pub mod mutation;
 pub mod token;
 pub mod transport;
 
-pub use client::OciClient;
+pub use client::{FetchedOciArtifact, OciClient};
 pub use error::{OciError, TransportError};
 pub use manifest::{
     NIX_CACHE_INDEX_MEDIA_TYPE, NIX_CACHE_SESSION_MEDIA_TYPE, OCI_IMAGE_CONFIG_MEDIA_TYPE,
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageManifest, build_index_manifest,
-    build_index_oci_manifest, build_session_manifest, build_session_oci_manifest,
+    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageIndex,
+    OciImageManifest, OciPlatform, build_arch_index_manifest, build_arch_session_manifest,
+    build_image_index, build_index_manifest, build_index_oci_manifest, build_session_manifest,
+    build_session_oci_manifest,
 };
 pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata,
-    NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
-    SCHEMA_VERSION, StoreHash, SystemArch, build_nar_lookup_map, evaluate_multi_arch_gc,
-    extract_nar_basename, extract_store_hash, extract_store_hash_str,
+    ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
+    CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta,
+    RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, SCHEMA_VERSION, StoreHash,
+    SystemArch, build_nar_lookup_map, evaluate_multi_arch_gc, extract_nar_basename,
+    extract_store_hash, extract_store_hash_str,
 };
 pub use token::TokenManager;
 pub use transport::{BoxBodyStream, OciBlobStream, OciTransport};
@@ -370,13 +373,13 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-12345"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
         Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-12345"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux"))
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;
@@ -420,6 +423,52 @@ mod tests {
 
         let res = client.update_run_session_with_cas(request).await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_image_index_serialization_and_routing() {
+        use super::{OciDescriptor, OciImageIndex, OciPlatform, build_image_index};
+
+        let desc_x86 = OciDescriptor {
+            media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            size: 1024,
+            platform: Some(OciPlatform::from_system(&SystemArch::X86_64Linux)),
+            annotations: Some(HashMap::from([(
+                "org.nixos.nixcache.system".to_string(),
+                "x86_64-linux".to_string(),
+            )])),
+        };
+
+        let desc_arm = OciDescriptor {
+            media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+            size: 1024,
+            platform: Some(OciPlatform::from_system(&SystemArch::Aarch64Linux)),
+            annotations: Some(HashMap::from([(
+                "org.nixos.nixcache.system".to_string(),
+                "aarch64-linux".to_string(),
+            )])),
+        };
+
+        let index = build_image_index(vec![desc_x86, desc_arm], "NixCache Multi-Arch Index");
+        let json_str = index.to_json_string().expect("Serialization should succeed");
+        let parsed: OciImageIndex = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed.media_type, super::OCI_IMAGE_INDEX_MEDIA_TYPE);
+        assert_eq!(parsed.manifests.len(), 2);
+
+        let found_x86 = parsed.find_manifest_for_system(&SystemArch::X86_64Linux);
+        assert!(found_x86.is_some());
+        assert_eq!(
+            found_x86.unwrap().digest,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        let found_darwin = parsed.find_manifest_for_system(&SystemArch::Aarch64Darwin);
+        assert!(found_darwin.is_none());
     }
 
     #[derive(Clone, Default)]

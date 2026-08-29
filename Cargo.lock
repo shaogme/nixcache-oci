@@ -1160,6 +1160,7 @@ name = "nixcache-builder"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "bytes",
  "chrono",
  "clap",
  "futures-util",

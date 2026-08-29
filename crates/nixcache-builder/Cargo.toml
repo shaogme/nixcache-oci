@@ -21,6 +21,7 @@ chrono.workspace = true
 num_cpus.workspace = true
 clap.workspace = true
 async-compression.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

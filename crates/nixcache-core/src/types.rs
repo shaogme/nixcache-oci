@@ -2,10 +2,10 @@ use crate::error::TypeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{borrow::Borrow, collections::HashMap, fmt, ops::Deref, str::FromStr};
 
-pub const SCHEMA_VERSION: u32 = 3;
-pub const CACHE_INDEX_VERSION: u32 = 3;
-pub const RUN_SESSION_VERSION: u32 = 3;
-pub const RECEIPT_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+pub const CACHE_INDEX_VERSION: u32 = 4;
+pub const RUN_SESSION_VERSION: u32 = 4;
+pub const RECEIPT_VERSION: u32 = 4;
 
 /// Nix 32 字符 Base32 散列值 (例如: `s66mzxpvicwk07gjbjfw9izjfa797vsw`)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -261,6 +261,60 @@ impl SystemArch {
             Self::Other(s) => s.as_str(),
         }
     }
+
+    /// 转换为 OCI Platform 标准元组 (os, architecture, optional variant)
+    pub fn to_oci_platform_tuple(&self) -> (&'static str, &'static str, Option<&'static str>) {
+        match self {
+            Self::X86_64Linux => ("linux", "amd64", None),
+            Self::Aarch64Linux => ("linux", "arm64", None),
+            Self::X86_64Darwin => ("darwin", "amd64", None),
+            Self::Aarch64Darwin => ("darwin", "arm64", None),
+            Self::I686Linux => ("linux", "386", None),
+            Self::Armv7lLinux => ("linux", "arm", Some("v7")),
+            Self::Riscv64Linux => ("linux", "riscv64", None),
+            Self::Other(s) => {
+                if let Some((arch, os)) = s.split_once('-') {
+                    if os == "linux" && arch == "x86_64" {
+                        ("linux", "amd64", None)
+                    } else if os == "linux" && arch == "aarch64" {
+                        ("linux", "arm64", None)
+                    } else {
+                        ("unknown", "unknown", None)
+                    }
+                } else {
+                    ("unknown", "unknown", None)
+                }
+            }
+        }
+    }
+
+    /// 从 OCI Platform 属性构建 SystemArch
+    pub fn from_oci(os: &str, architecture: &str, variant: Option<&str>) -> Self {
+        let os = os.trim().to_ascii_lowercase();
+        let arch = architecture.trim().to_ascii_lowercase();
+        let variant = variant.map(|v| v.trim().to_ascii_lowercase());
+
+        match (os.as_str(), arch.as_str(), variant.as_deref()) {
+            ("linux", "amd64" | "x86_64", _) => Self::X86_64Linux,
+            ("linux", "arm64" | "aarch64", _) => Self::Aarch64Linux,
+            ("darwin", "amd64" | "x86_64", _) => Self::X86_64Darwin,
+            ("darwin", "arm64" | "aarch64", _) => Self::Aarch64Darwin,
+            ("linux", "386" | "i686" | "i386", _) => Self::I686Linux,
+            ("linux", "arm", Some("v7") | Some("7")) | ("linux", "armv7l", _) => {
+                Self::Armv7lLinux
+            }
+            ("linux", "riscv64", _) => Self::Riscv64Linux,
+            (os_str, arch_str, _) => {
+                let mapped_arch = match arch_str {
+                    "amd64" => "x86_64",
+                    "arm64" => "aarch64",
+                    "386" => "i686",
+                    other => other,
+                };
+                Self::Other(format!("{}-{}", mapped_arch, os_str))
+            }
+        }
+    }
 }
 
 impl fmt::Display for SystemArch {
@@ -322,20 +376,13 @@ impl<'de> Deserialize<'de> for SystemArch {
 pub struct NarInfoMeta {
     pub store_path: String,
     pub nar_basename: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_size: Option<u64>,
     pub nar_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<StoreHash>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deriver: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
 }
 
@@ -393,14 +440,12 @@ impl NarInfoMeta {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexEntry {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemArch>,
     /// 强类型结构化 NarInfo 元数据
     pub narinfo_meta: NarInfoMeta,
     pub nar_digest: NarDigest,
     pub nar_size: u64,
     pub added: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_job: Option<String>,
 }
 
@@ -439,12 +484,9 @@ pub struct CacheIndexData {
     pub registry: String,
     pub image: String,
     pub generated: String,
-    #[serde(default)]
     pub public_key: String,
     pub entries: HashMap<StoreHash, IndexEntry>,
-    #[serde(default)]
     pub gc_roots: HashMap<SystemArch, Vec<StoreHash>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_promoted_run: Option<u64>,
 }
 
@@ -464,23 +506,159 @@ impl Default for CacheIndexData {
     }
 }
 
+impl CacheIndexData {
+    /// 针对特定系统架构过滤出单架构视图
+    pub fn filter_for_system(&self, system: &SystemArch) -> ArchCacheIndexData {
+        let mut arch_entries = HashMap::new();
+        for (hash, entry) in &self.entries {
+            if entry.system.as_ref() == Some(system) || entry.system.is_none() {
+                arch_entries.insert(hash.clone(), entry.clone());
+            }
+        }
+        let roots = self.gc_roots.get(system).cloned().unwrap_or_default();
+        ArchCacheIndexData {
+            version: self.version,
+            system: system.clone(),
+            repo: self.repo.clone(),
+            registry: self.registry.clone(),
+            generated: self.generated.clone(),
+            public_key: self.public_key.clone(),
+            entries: arch_entries,
+            gc_roots: roots,
+            last_promoted_run: self.last_promoted_run,
+        }
+    }
+
+    /// 将多架构数据按系统架构拆分为各自独立的单架构数据集
+    pub fn into_arch_partitioned(self) -> HashMap<SystemArch, ArchCacheIndexData> {
+        let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> = HashMap::new();
+        for (hash, entry) in self.entries {
+            let sys = entry.system.clone().unwrap_or_default();
+            partitioned_entries.entry(sys).or_default().insert(hash, entry);
+        }
+
+        let mut result = HashMap::new();
+        let mut all_systems: std::collections::HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
+        all_systems.extend(self.gc_roots.keys().cloned());
+
+        for sys in all_systems {
+            let entries = partitioned_entries.remove(&sys).unwrap_or_default();
+            let roots = self.gc_roots.get(&sys).cloned().unwrap_or_default();
+            result.insert(
+                sys.clone(),
+                ArchCacheIndexData {
+                    version: self.version,
+                    system: sys,
+                    repo: self.repo.clone(),
+                    registry: self.registry.clone(),
+                    generated: self.generated.clone(),
+                    public_key: self.public_key.clone(),
+                    entries,
+                    gc_roots: roots,
+                    last_promoted_run: self.last_promoted_run,
+                },
+            );
+        }
+        result
+    }
+
+    /// 从单架构索引数据构造全局多架构容器对象
+    pub fn from_arch_data(arch_data: ArchCacheIndexData) -> Self {
+        let mut gc_roots = HashMap::new();
+        if !arch_data.gc_roots.is_empty() {
+            gc_roots.insert(arch_data.system, arch_data.gc_roots);
+        }
+        Self {
+            version: arch_data.version,
+            repo: arch_data.repo,
+            registry: arch_data.registry,
+            image: String::new(),
+            generated: arch_data.generated,
+            public_key: arch_data.public_key,
+            entries: arch_data.entries,
+            gc_roots,
+            last_promoted_run: arch_data.last_promoted_run,
+        }
+    }
+}
+
+/// 单架构生产基线索引数据 (Schema v4 - Arch-Scoped)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ArchCacheIndexData {
+    pub version: u32,
+    pub system: SystemArch,
+    pub repo: String,
+    pub registry: String,
+    pub generated: String,
+    pub public_key: String,
+    pub entries: HashMap<StoreHash, IndexEntry>,
+    pub gc_roots: Vec<StoreHash>,
+    pub last_promoted_run: Option<u64>,
+}
+
+impl ArchCacheIndexData {
+    pub fn new(system: SystemArch, repo: impl Into<String>, registry: impl Into<String>) -> Self {
+        Self {
+            version: CACHE_INDEX_VERSION,
+            system,
+            repo: repo.into(),
+            registry: registry.into(),
+            generated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            public_key: String::new(),
+            entries: HashMap::new(),
+            gc_roots: Vec::new(),
+            last_promoted_run: None,
+        }
+    }
+}
+
+/// 单架构工作流会话清单 (Schema v4 - Arch-Scoped)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ArchRunSessionManifest {
+    pub version: u32,
+    pub run_id: u64,
+    pub system: SystemArch,
+    pub head_sha: String,
+    pub ref_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub public_key: Option<String>,
+    pub entries: HashMap<StoreHash, IndexEntry>,
+    pub gc_roots: Vec<StoreHash>,
+    pub completed_jobs: Vec<JobSummaryMetadata>,
+}
+
+impl ArchRunSessionManifest {
+    pub fn new(run_id: u64, system: SystemArch) -> Self {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        Self {
+            version: RUN_SESSION_VERSION,
+            run_id,
+            system,
+            head_sha: String::new(),
+            ref_name: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            public_key: None,
+            entries: HashMap::new(),
+            gc_roots: Vec::new(),
+            completed_jobs: Vec::new(),
+        }
+    }
+}
+
 /// 工作流会话清单 (Tier 1 / Tier 2)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RunSessionManifest {
     pub version: u32,
     pub run_id: u64,
-    #[serde(default)]
     pub head_sha: String,
-    #[serde(default)]
     pub ref_name: String,
     pub created_at: String,
     pub updated_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     pub entries: HashMap<StoreHash, IndexEntry>,
-    #[serde(default)]
     pub gc_roots: HashMap<SystemArch, Vec<StoreHash>>,
-    #[serde(default)]
     pub completed_jobs: Vec<JobSummaryMetadata>,
 }
 
@@ -504,15 +682,10 @@ impl Default for RunSessionManifest {
 /// 单个构建节点的统计数据
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BuildStats {
-    #[serde(default)]
     pub discovered_outputs: usize,
-    #[serde(default)]
     pub built_paths: usize,
-    #[serde(default)]
     pub substituted_paths: usize,
-    #[serde(default)]
     pub uploaded_blobs: usize,
-    #[serde(default)]
     pub total_bytes_uploaded: u64,
 }
 
@@ -522,12 +695,9 @@ pub struct BuildReceipt {
     pub version: u32,
     pub system: SystemArch,
     pub repo: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
     pub timestamp: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     pub new_entries: HashMap<StoreHash, IndexEntry>,
     pub active_gc_roots: Vec<StoreHash>,

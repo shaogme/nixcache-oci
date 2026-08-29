@@ -7,11 +7,11 @@ use crate::{
     transport::WorkerFetchTransport,
 };
 use nixcache_core::{IndexEntry, StoreHash};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum RegisterPayload {
     Map(HashMap<StoreHash, IndexEntry>),
@@ -314,7 +314,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::{RegisterPayload, parse_upstream_list};
-    use nixcache_core::StoreHash;
+    use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash};
 
     #[test]
     fn test_worker_upstream_parsing() {
@@ -352,48 +352,50 @@ mod tests {
         let hash2_str = "00000000000000000000000000000002";
         let hash3_str = "00000000000000000000000000000003";
 
-        let map_json = format!(
-            r#"{{
-            "{}": {{
-                "name": "pkg1",
-                "narinfo_meta": {{
-                    "store_path": "/nix/store/{}-pkg1",
-                    "nar_basename": "pkg1.nar.xz",
-                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                }},
-                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                "nar_size": 100,
-                "added": "2026-08-29T10:00:00Z"
-            }}
-        }}"#,
-            hash1_str, hash1_str
-        );
+        let entry1 = IndexEntry {
+            name: "pkg1".to_string(),
+            system: None,
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg1", hash1_str),
+                nar_basename: "pkg1.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 100,
+            added: "2026-08-29T10:00:00Z".to_string(),
+            origin_job: None,
+        };
+
+        let mut map = std::collections::HashMap::new();
+        let sh1 = StoreHash::parse(hash1_str).unwrap();
+        map.insert(sh1.clone(), entry1.clone());
+        let map_json = serde_json::to_string(&map).unwrap();
+
         let payload: RegisterPayload = serde_json::from_str(&map_json).unwrap();
         match payload {
             RegisterPayload::Map(m) => {
                 assert_eq!(m.len(), 1);
-                let sh1 = StoreHash::parse(hash1_str).unwrap();
                 assert_eq!(m.get(&sh1).unwrap().name, "pkg1");
             }
             _ => panic!("Expected Map payload"),
         }
 
-        let list_json = format!(
-            r#"[
-            {{
-                "name": "pkg2",
-                "narinfo_meta": {{
-                    "store_path": "/nix/store/{}-pkg2",
-                    "nar_basename": "pkg2.nar.xz",
-                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                }},
-                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                "nar_size": 200,
-                "added": "2026-08-29T10:00:00Z"
-            }}
-        ]"#,
-            hash2_str
-        );
+        let entry2 = IndexEntry {
+            name: "pkg2".to_string(),
+            system: None,
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg2", hash2_str),
+                nar_basename: "pkg2.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 200,
+            added: "2026-08-29T10:00:00Z".to_string(),
+            origin_job: None,
+        };
+        let list_json = serde_json::to_string(&vec![entry2]).unwrap();
         let payload_list: RegisterPayload = serde_json::from_str(&list_json).unwrap();
         match payload_list {
             RegisterPayload::List(l) => {
@@ -403,29 +405,29 @@ mod tests {
             _ => panic!("Expected List payload"),
         }
 
-        let obj_json = format!(
-            r#"{{
-            "entries": {{
-                "{}": {{
-                    "name": "pkg3",
-                    "narinfo_meta": {{
-                        "store_path": "/nix/store/{}-pkg3",
-                        "nar_basename": "pkg3.nar.xz",
-                        "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    }},
-                    "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                    "nar_size": 300,
-                    "added": "2026-08-29T10:00:00Z"
-                }}
-            }}
-        }}"#,
-            hash3_str, hash3_str
-        );
+        let entry3 = IndexEntry {
+            name: "pkg3".to_string(),
+            system: None,
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg3", hash3_str),
+                nar_basename: "pkg3.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 300,
+            added: "2026-08-29T10:00:00Z".to_string(),
+            origin_job: None,
+        };
+        let mut obj_map = std::collections::HashMap::new();
+        let sh3 = StoreHash::parse(hash3_str).unwrap();
+        obj_map.insert(sh3.clone(), entry3);
+        let obj = RegisterPayload::Object { entries: obj_map };
+        let obj_json = serde_json::to_string(&obj).unwrap();
         let payload_obj: RegisterPayload = serde_json::from_str(&obj_json).unwrap();
         match payload_obj {
             RegisterPayload::Object { entries } => {
                 assert_eq!(entries.len(), 1);
-                let sh3 = StoreHash::parse(hash3_str).unwrap();
                 assert_eq!(entries.get(&sh3).unwrap().name, "pkg3");
             }
             _ => panic!("Expected Object payload"),

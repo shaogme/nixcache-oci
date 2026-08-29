@@ -157,7 +157,7 @@ pub async fn run_session_capture(
     let head_sha = env::var("GITHUB_SHA").ok();
     let ref_name = env::var("GITHUB_REF_NAME").ok();
 
-    // 执行乐观并发 CAS 更新写入 run-<run_id>
+    // 执行单架构无锁乐观并发 CAS 更新写入 run-<run_id>-<system>
     if !new_entries.is_empty() || !active_gc_roots.is_empty() {
         let request = SessionMutationRequest::new(run_id, job_id, system.clone())
             .with_entries(new_entries.clone())
@@ -167,7 +167,7 @@ pub async fn run_session_capture(
             .with_upload_stats(uploaded_count, total_bytes_uploaded)
             .with_max_retries(5);
 
-        oci.update_run_session_with_cas(request).await?;
+        oci.update_arch_session_with_cas(request).await?;
     }
 
     // 热注册到本机 Proxy
@@ -188,7 +188,7 @@ pub async fn run_session_capture(
         );
     }
 
-    // 写入 Schema v3 的 BuildReceipt
+    // 写入 Schema v4 的 BuildReceipt
     if let Some(receipt_path) = output_receipt_path {
         let stats = BuildStats {
             discovered_outputs: candidate_paths.len(),
