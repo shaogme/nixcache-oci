@@ -15,7 +15,7 @@ nixcache-oci = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-worker = { version = "0.8.3", features = ["http"] }
+worker = { version = "0.8.5", features = ["http"] }
 
 # Serialization
 serde = { workspace = true }
@@ -27,5 +27,5 @@ scc = { workspace = true }
 
 # Utilities & Error handling
 base64 = { workspace = true }
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 thiserror = { workspace = true }

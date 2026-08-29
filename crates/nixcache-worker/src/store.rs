@@ -121,7 +121,7 @@ impl CacheStore {
         // 1. Tier 0: In-Memory Hot Registry
         if let Some(entry) = WorkerState::global()
             .hot_entries
-            .read(&parsed_hash, |_, v| (**v).clone())
+            .read_sync(&parsed_hash, |_, v| (**v).clone())
         {
             return Ok(Some(entry.to_narinfo_string()));
         }
@@ -194,7 +194,7 @@ impl CacheStore {
         // 1. Tier 0: In-Memory Hot Registry
         if let Some(digest) = WorkerState::global()
             .hot_nar_lookup
-            .read(normalized, |_, v| v.clone())
+            .read_sync(normalized, |_, v| v.clone())
         {
             return Ok(Some(digest));
         }
@@ -304,7 +304,7 @@ impl CacheStore {
         // 1. L1 Memory Cache
         if let Some(cached) = WorkerState::global()
             .mem_session_cache
-            .read(tag, |_, v| v.clone())
+            .read_sync(tag, |_, v| v.clone())
         {
             if now < cached.2 {
                 return Ok(Some((cached.0.clone(), cached.1.clone())));
@@ -323,7 +323,7 @@ impl CacheStore {
             let session = wrapper.data;
             let nar_lookup = build_nar_lookup_map(&session.entries);
 
-            let _ = WorkerState::global().mem_session_cache.upsert(
+            let _ = WorkerState::global().mem_session_cache.upsert_sync(
                 tag.to_string(),
                 Arc::new((session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
             );
@@ -348,7 +348,7 @@ impl CacheStore {
                         .await;
                 }
 
-                let _ = WorkerState::global().mem_session_cache.upsert(
+                let _ = WorkerState::global().mem_session_cache.upsert_sync(
                     tag.to_string(),
                     Arc::new((session.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
                 );
@@ -507,8 +507,9 @@ impl CacheStore {
     /// 获取完整的状态元信息与各层级统计
     pub async fn get_status(&self, env: &Env) -> RemoteStatus {
         let mut hot_count = 0;
-        WorkerState::global().hot_entries.scan(|_, _| {
+        WorkerState::global().hot_entries.iter_sync(|_, _| {
             hot_count += 1;
+            true
         });
 
         let mut tier1_count = 0;
@@ -564,8 +565,9 @@ impl CacheStore {
             };
 
         let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
-        WorkerState::global().hot_entries.scan(|k, _| {
+        WorkerState::global().hot_entries.iter_sync(|k, _| {
             unique_hashes.insert((*k).clone());
+            true
         });
         if let Some(s) = session_opt {
             unique_hashes.extend(s.entries.keys().cloned());

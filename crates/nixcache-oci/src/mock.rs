@@ -36,7 +36,7 @@ impl MockRouterTransport {
     pub fn add_route(&self, method: &str, url_suffix: &str, resp: MockResponse) {
         let _ = self
             .responses
-            .upsert((method.to_string(), url_suffix.to_string()), resp);
+            .upsert_sync((method.to_string(), url_suffix.to_string()), resp);
     }
 }
 
@@ -47,9 +47,12 @@ impl OciTransport for MockRouterTransport {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "HEAD" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "HEAD" && path.ends_with(suffix) {
                 found = Some(resp.status);
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or(StatusCode::NOT_FOUND))
@@ -63,9 +66,12 @@ impl OciTransport for MockRouterTransport {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "GET" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "GET" && path.ends_with(suffix) {
                 found = Some((resp.status, resp.headers.clone(), resp.body.clone()));
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or((StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())))
@@ -89,9 +95,12 @@ impl OciTransport for MockRouterTransport {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "POST" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "POST" && path.ends_with(suffix) {
                 found = Some((resp.status, resp.headers.clone()));
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or((StatusCode::ACCEPTED, HeaderMap::new())))
@@ -107,9 +116,12 @@ impl OciTransport for MockRouterTransport {
         self.posted_bodies.push((url.to_string(), body.clone()));
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "POST" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "POST" && path.ends_with(suffix) {
                 found = Some((resp.status, resp.headers.clone()));
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or((StatusCode::CREATED, HeaderMap::new())))
@@ -179,9 +191,12 @@ impl OciTransport for MockRouterTransport {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "PUT" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "PUT" && path.ends_with(suffix) {
                 found = Some(resp.status);
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or(StatusCode::CREATED))
@@ -201,9 +216,12 @@ impl OciTransport for MockRouterTransport {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
-        self.responses.scan(|(m, suffix), resp| {
-            if found.is_none() && m == "DELETE" && path.ends_with(suffix) {
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "DELETE" && path.ends_with(suffix) {
                 found = Some(resp.status);
+                false
+            } else {
+                true
             }
         });
         Ok(found.unwrap_or(StatusCode::ACCEPTED))

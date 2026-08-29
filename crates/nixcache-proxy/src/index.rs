@@ -192,10 +192,10 @@ impl CacheIndex {
         let nar_map = build_nar_lookup_map(&entries);
 
         for (key, entry) in entries {
-            let _ = self.hot_entries.upsert(key, Arc::new(entry));
+            let _ = self.hot_entries.upsert_sync(key, Arc::new(entry));
         }
         for (nar_name, digest) in nar_map {
-            let _ = self.hot_nar_lookup.upsert(nar_name, digest);
+            let _ = self.hot_nar_lookup.upsert_sync(nar_name, digest);
         }
         self.hot_count.fetch_add(count, Ordering::Relaxed);
 
@@ -211,7 +211,7 @@ impl CacheIndex {
         let parsed_hash = StoreHash::parse(store_hash).ok()?;
 
         // Tier 0: 内存热注册表
-        if let Some(entry) = self.hot_entries.read(&parsed_hash, |_, v| (**v).clone()) {
+        if let Some(entry) = self.hot_entries.read_sync(&parsed_hash, |_, v| (**v).clone()) {
             return Some(entry);
         }
 
@@ -241,7 +241,7 @@ impl CacheIndex {
         let normalized = extract_nar_basename(nar_basename);
 
         // Tier 0: O(1) 查找
-        if let Some(digest) = self.hot_nar_lookup.read(normalized, |_, v| v.clone()) {
+        if let Some(digest) = self.hot_nar_lookup.read_sync(normalized, |_, v| v.clone()) {
             return Some(digest);
         }
 
@@ -299,7 +299,7 @@ impl CacheIndex {
         let session_count = if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             self.session_cache
-                .read(&tag, |_, v| v.0.manifest.entries.len())
+                .read_sync(&tag, |_, v| v.0.manifest.entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -312,7 +312,7 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             self.session_cache
-                .read(&tag, |_, v| v.0.manifest.entries.len())
+                .read_sync(&tag, |_, v| v.0.manifest.entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -325,21 +325,22 @@ impl CacheIndex {
         );
         let baseline_count = self
             .baseline_cache
-            .read(&cache_key, |_, v| v.0.data.entries.len())
+            .read_sync(&cache_key, |_, v| v.0.data.entries.len())
             .or_else(|| {
                 self.baseline_cache
-                    .read(&self.config.baseline_tag, |_, v| v.0.data.entries.len())
+                    .read_sync(&self.config.baseline_tag, |_, v| v.0.data.entries.len())
             })
             .unwrap_or(0);
 
         let mut all_unique_hashes = HashSet::new();
-        self.hot_entries.scan(|k, _| {
+        self.hot_entries.iter_sync(|k, _| {
             all_unique_hashes.insert((*k).clone());
+            true
         });
 
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
-            if let Some(sess) = self.session_cache.read(&tag, |_, v| v.0.clone()) {
+            if let Some(sess) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
                 all_unique_hashes.extend(sess.manifest.entries.keys().cloned());
             }
         }
@@ -350,16 +351,16 @@ impl CacheIndex {
             } else {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
-            if let Some(branch) = self.session_cache.read(&tag, |_, v| v.0.clone()) {
+            if let Some(branch) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
                 all_unique_hashes.extend(branch.manifest.entries.keys().cloned());
             }
         }
 
-        if let Some(baseline) = self.baseline_cache.read(&cache_key, |_, v| v.0.clone()) {
+        if let Some(baseline) = self.baseline_cache.read_sync(&cache_key, |_, v| v.0.clone()) {
             all_unique_hashes.extend(baseline.data.entries.keys().cloned());
         } else if let Some(baseline) = self
             .baseline_cache
-            .read(&self.config.baseline_tag, |_, v| v.0.clone())
+            .read_sync(&self.config.baseline_tag, |_, v| v.0.clone())
         {
             all_unique_hashes.extend(baseline.data.entries.keys().cloned());
         }
@@ -396,7 +397,7 @@ impl CacheIndex {
 
         if let Some((cached, exp)) = self
             .baseline_cache
-            .read(&cache_key, |_, v| (v.0.clone(), v.1))
+            .read_sync(&cache_key, |_, v| (v.0.clone(), v.1))
             && exp > Instant::now()
         {
             return cached;
@@ -495,7 +496,7 @@ impl CacheIndex {
             Arc::new(CachedBaseline::new(CacheIndexData::default()))
         };
 
-        let _ = self.baseline_cache.upsert(
+        let _ = self.baseline_cache.upsert_sync(
             cache_key,
             (
                 result.clone(),
@@ -515,7 +516,7 @@ impl CacheIndex {
         let mut errs = Vec::new();
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
-            let _ = self.session_cache.remove(&tag);
+            let _ = self.session_cache.remove_sync(&tag);
             if self.fetch_or_get_session(&tag).await.is_none() {
                 errs.push(format!("Session: failed to refresh tag {}", tag));
             }
@@ -526,7 +527,7 @@ impl CacheIndex {
             } else {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
-            let _ = self.session_cache.remove(&tag);
+            let _ = self.session_cache.remove_sync(&tag);
             if self.fetch_or_get_session(&tag).await.is_none() {
                 errs.push(format!("Branch: failed to refresh tag {}", tag));
             }
@@ -537,8 +538,8 @@ impl CacheIndex {
             self.config.baseline_tag,
             self.config.target_system.as_str()
         );
-        let _ = self.baseline_cache.remove(&cache_key);
-        let _ = self.baseline_cache.remove(&self.config.baseline_tag);
+        let _ = self.baseline_cache.remove_sync(&cache_key);
+        let _ = self.baseline_cache.remove_sync(&self.config.baseline_tag);
         let baseline = self.get_baseline_data().await;
         if baseline.data.entries.is_empty() {
             let (_, remote_err) = self.remote_status();
@@ -556,7 +557,7 @@ impl CacheIndex {
     }
 
     async fn fetch_or_get_session(&self, tag: &str) -> Option<Arc<CachedSession>> {
-        if let Some((session, exp)) = self.session_cache.read(tag, |_, v| (v.0.clone(), v.1))
+        if let Some((session, exp)) = self.session_cache.read_sync(tag, |_, v| (v.0.clone(), v.1))
             && exp > Instant::now()
         {
             return Some(session);
@@ -576,7 +577,7 @@ impl CacheIndex {
             Ok(Some((session, _))) => {
                 self.set_remote_status(true, None);
                 let cached = Arc::new(CachedSession::from_arch_manifest(session));
-                let _ = self.session_cache.upsert(
+                let _ = self.session_cache.upsert_sync(
                     tag_str,
                     (
                         cached.clone(),
@@ -612,14 +613,14 @@ impl CacheIndex {
             self.config.target_system.as_str()
         );
         let baseline = Arc::new(CachedBaseline::new(new_data));
-        let _ = self.baseline_cache.upsert(
+        let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
             (
                 baseline.clone(),
                 Instant::now() + Duration::from_secs(3600),
             ),
         );
-        let _ = self.baseline_cache.upsert(
+        let _ = self.baseline_cache.upsert_sync(
             cache_key,
             (
                 baseline,
@@ -631,7 +632,7 @@ impl CacheIndex {
 
     #[cfg(test)]
     pub async fn update_session_in_memory(&self, tag: &str, session: RunSessionManifest) {
-        let _ = self.session_cache.upsert(
+        let _ = self.session_cache.upsert_sync(
             tag.to_string(),
             (
                 Arc::new(CachedSession::new(session)),

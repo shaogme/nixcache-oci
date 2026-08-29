@@ -36,14 +36,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Concurrency & Synchronization
-arc-swap = "1.7"
+arc-swap = "1.9"
 crossbeam-queue = "0.3"
 loom = "0.7"
-scc = "2.3"
+scc = "3.8"
 
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "xz", "zstd"] }
-ruzstd = "0.7"
+ruzstd = "0.9"
 zstd = "0.13"
 
 # Observability
@@ -51,7 +51,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Utilities & Error handling
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 num_cpus = "1.17"

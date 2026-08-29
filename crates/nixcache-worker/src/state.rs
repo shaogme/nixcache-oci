@@ -44,16 +44,16 @@ impl WorkerState {
         }
         let nar_map = build_nar_lookup_map(&entries);
         for (k, v) in entries {
-            let _ = self.hot_entries.upsert(k, Arc::new(v));
+            let _ = self.hot_entries.upsert_sync(k, Arc::new(v));
         }
         for (k, v) in nar_map {
-            let _ = self.hot_nar_lookup.upsert(k, v);
+            let _ = self.hot_nar_lookup.upsert_sync(k, v);
         }
     }
 
     /// 清空所有 L1 内存缓存
     pub fn clear_l1_caches(&self) {
-        self.mem_session_cache.clear();
+        self.mem_session_cache.clear_sync();
         self.mem_baseline_cache.store(None);
     }
 
