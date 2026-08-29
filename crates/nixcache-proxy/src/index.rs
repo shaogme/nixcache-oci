@@ -4,8 +4,9 @@ use nixcache_core::{
     RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
 };
 use nixcache_oci::{
-    CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient, ReqwestTransport,
+    CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient,
 };
+use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -140,7 +141,8 @@ pub struct CacheIndex {
 
 impl CacheIndex {
     pub fn with_config(config: CascadingProxyConfig, github_token: &str) -> Self {
-        let oci_client = OciClient::new(&config.registry, &config.repo, github_token, false);
+        let oci_client =
+            create_tokio_reqwest_client(&config.registry, &config.repo, github_token, false);
         let hot_entries = Cache::builder().build();
         let hot_nar_lookup = Cache::builder().build();
         let session_cache = Cache::builder().time_to_live(config.session_ttl).build();

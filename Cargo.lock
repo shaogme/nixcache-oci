@@ -1168,6 +1168,7 @@ dependencies = [
  "futures-util",
  "nixcache-core",
  "nixcache-oci",
+ "nixcache-oci-backend",
  "num_cpus",
  "reqwest",
  "serde",
@@ -1196,7 +1197,6 @@ dependencies = [
 name = "nixcache-oci"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "base64",
  "bytes",
  "chrono",
@@ -1205,15 +1205,33 @@ dependencies = [
  "http",
  "nixcache-core",
  "nixcache-utils",
- "reqwest",
  "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "nixcache-oci-backend"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "http",
+ "nixcache-core",
+ "nixcache-oci",
+ "nixcache-utils",
+ "reqwest",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
- "web-time",
  "wiremock",
 ]
 
@@ -1228,6 +1246,7 @@ dependencies = [
  "moka",
  "nixcache-core",
  "nixcache-oci",
+ "nixcache-oci-backend",
  "reqwest",
  "serde",
  "serde_json",
@@ -1255,7 +1274,6 @@ dependencies = [
 name = "nixcache-worker"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "base64",
  "bytes",
  "futures-util",

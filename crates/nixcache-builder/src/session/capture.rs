@@ -7,7 +7,8 @@ use chrono::Utc;
 use nixcache_core::{
     BuildReceipt, BuildStats, IndexEntry, NarDigest, NarInfo, StoreHash, SystemArch,
 };
-use nixcache_oci::{OciClient, SessionMutationRequest};
+use nixcache_oci::SessionMutationRequest;
+use nixcache_oci_backend::{OciClientExt, create_tokio_reqwest_client};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -78,7 +79,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         candidate_paths.len()
     );
 
-    let oci = OciClient::new(opts.registry, opts.repo, opts.github_token, true);
+    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
     let temp_dir = tempdir()?;
 
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
@@ -101,7 +102,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
             let size = metadata.len();
 
             info!("  Uploading NAR for {} ({} bytes)", hash, size);
-            match oci.push_blob(&nar_file_path).await {
+            match oci.push_blob_file(&nar_file_path).await {
                 Ok(nar_digest_str) => {
                     if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
                         let name = Path::new(&store_path)

@@ -23,12 +23,6 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-#[cfg(feature = "reqwest")]
-use crate::transport::ReqwestTransport;
-
-#[cfg(feature = "tokio-fs")]
-use std::path::Path;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UploadStrategy {
     /// 自动决策：< 64MB 且已知 Digest 时采用 Monolithic 1-RTT，否则启用 Chunked Resumable
@@ -91,14 +85,6 @@ pub struct OciClient<T: OciTransport> {
     transport: T,
 }
 
-#[cfg(feature = "reqwest")]
-impl OciClient<ReqwestTransport> {
-    pub fn new(registry: &str, repo: &str, github_token: &str, write_access: bool) -> Self {
-        let transport = ReqwestTransport::default();
-        Self::with_transport(registry, repo, github_token, write_access, transport)
-    }
-}
-
 impl<T: OciTransport> OciClient<T> {
     pub fn with_transport(
         registry: &str,
@@ -132,7 +118,7 @@ impl<T: OciTransport> OciClient<T> {
         &self.token_manager
     }
 
-    fn url_scheme(&self) -> &str {
+    pub fn url_scheme(&self) -> &str {
         if self.registry.starts_with("localhost:")
             || self.registry.starts_with("127.0.0.1:")
             || self.registry == "localhost"
@@ -148,7 +134,7 @@ impl<T: OciTransport> OciClient<T> {
         self.token_manager.get_token(&self.transport).await
     }
 
-    async fn get_auth_headers(&self) -> Result<HeaderMap, OciError> {
+    pub async fn get_auth_headers(&self) -> Result<HeaderMap, OciError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Accept",
@@ -362,185 +348,6 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
-    #[cfg(feature = "tokio-fs")]
-    pub async fn push_blob_file_resumable(
-        &self,
-        file_path: &Path,
-        digest: &str,
-        config: &UploadConfig,
-    ) -> Result<String, OciError> {
-        if self.head_blob(digest).await? {
-            info!("Blob {} already exists, skipping upload.", digest);
-            return Ok(digest.to_string());
-        }
-
-        let file_meta = tokio::fs::metadata(file_path).await?;
-        let file_size = file_meta.len();
-
-        if file_size < config.chunk_threshold_bytes
-            && config.strategy != UploadStrategy::ForceChunked
-        {
-            let data = tokio::fs::read(file_path).await?;
-            return self
-                .push_blob_bytes_with_digest(digest, Bytes::from(data))
-                .await;
-        }
-
-        info!(
-            "Initiating resumable chunked upload for blob {} (size: {} bytes, chunk: {} bytes)",
-            digest, file_size, config.chunk_size_bytes
-        );
-
-        let upload_init_url = format!(
-            "{}://{}/v2/{}/nix-cache/blobs/uploads/",
-            self.url_scheme(),
-            self.registry,
-            self.repo
-        );
-
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
-        if !status.is_success() {
-            return Err(OciError::BlobUploadFailed(status));
-        }
-
-        let location = resp_headers
-            .get("Location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
-
-        let mut session_url = if location.starts_with('/') {
-            format!("{}://{}{}", self.url_scheme(), self.registry, location)
-        } else {
-            location.to_string()
-        };
-
-        let mut file = tokio::fs::File::open(file_path).await?;
-        let mut current_offset = 0u64;
-        let chunk_size = config.chunk_size_bytes.max(1024 * 1024) as u64;
-
-        while current_offset < file_size {
-            let end_offset = (current_offset + chunk_size).min(file_size) - 1;
-            let block_len = (end_offset - current_offset + 1) as usize;
-
-            let mut attempts = 0;
-            let mut chunk_succeeded = false;
-            let mut last_err = String::new();
-
-            while attempts < config.max_retry_attempts {
-                attempts += 1;
-                use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                if let Err(e) = file.seek(std::io::SeekFrom::Start(current_offset)).await {
-                    return Err(OciError::Io(e));
-                }
-
-                let mut buf = vec![0u8; block_len];
-                if let Err(e) = file.read_exact(&mut buf).await {
-                    return Err(OciError::Io(e));
-                }
-
-                let headers = match self.get_auth_headers().await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        last_err = e.to_string();
-                        continue;
-                    }
-                };
-
-                match self
-                    .transport
-                    .patch_chunk(
-                        &session_url,
-                        headers,
-                        Bytes::from(buf),
-                        (current_offset, end_offset),
-                    )
-                    .await
-                {
-                    Ok(resp)
-                        if resp.status == StatusCode::ACCEPTED
-                            || resp.status == StatusCode::OK
-                            || resp.status == StatusCode::NO_CONTENT =>
-                    {
-                        if let Some(new_loc) = resp.location {
-                            session_url = if new_loc.starts_with('/') {
-                                format!("{}://{}{}", self.url_scheme(), self.registry, new_loc)
-                            } else {
-                                new_loc
-                            };
-                        }
-                        current_offset = end_offset + 1;
-                        chunk_succeeded = true;
-                        break;
-                    }
-                    Ok(resp) => {
-                        last_err = format!("Server returned unexpected status {}", resp.status);
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                    }
-                }
-
-                warn!(
-                    "Chunk upload [{}-{}] failed on attempt {}/{}: {}. Probing range...",
-                    current_offset, end_offset, attempts, config.max_retry_attempts, last_err
-                );
-
-                let backoff_ms = 100 * (1 << attempts.min(5));
-                self.transport
-                    .sleep(Duration::from_millis(backoff_ms))
-                    .await;
-
-                if let Ok(probe_headers) = self.get_auth_headers().await
-                    && let Ok(Some(last_byte)) = self
-                        .transport
-                        .probe_upload_session(&session_url, probe_headers)
-                        .await
-                    && last_byte + 1 > current_offset
-                {
-                    info!(
-                        "Range probe adjusted current offset from {} to {}",
-                        current_offset,
-                        last_byte + 1
-                    );
-                    current_offset = last_byte + 1;
-                    if current_offset > end_offset {
-                        chunk_succeeded = true;
-                        break;
-                    }
-                }
-            }
-
-            if !chunk_succeeded {
-                return Err(OciError::ResumableUploadFailed {
-                    attempts: config.max_retry_attempts,
-                    last_error: last_err,
-                });
-            }
-        }
-
-        let separator = if session_url.contains('?') { "&" } else { "?" };
-        let finish_url = format!("{}{}digest={}", session_url, separator, digest);
-        let headers = self.get_auth_headers().await?;
-        let finish_status = self
-            .transport
-            .put_chunk_finish(&finish_url, headers, None)
-            .await?;
-
-        if finish_status == StatusCode::CREATED
-            || finish_status == StatusCode::OK
-            || finish_status == StatusCode::ACCEPTED
-        {
-            info!(
-                "Successfully committed resumable upload for blob {}",
-                digest
-            );
-            Ok(digest.to_string())
-        } else {
-            Err(OciError::BlobUploadFailed(finish_status))
-        }
-    }
-
     pub async fn push_blob_streaming_resumable(
         &self,
         stream: T::BodyStream,
@@ -669,21 +476,6 @@ impl<T: OciTransport> OciClient<T> {
             Ok((final_digest, total_size))
         } else {
             Err(OciError::BlobUploadFailed(finish_status))
-        }
-    }
-
-    #[cfg(feature = "tokio-fs")]
-    pub async fn push_blob(&self, file_path: &Path) -> Result<String, OciError> {
-        let meta = tokio::fs::metadata(file_path).await?;
-        let size = meta.len();
-        if size < 64 * 1024 * 1024 {
-            let data = tokio::fs::read(file_path).await?;
-            self.push_blob_bytes(Bytes::from(data)).await
-        } else {
-            let data = tokio::fs::read(file_path).await?;
-            let digest = compute_sha256_digest(&data);
-            self.push_blob_file_resumable(file_path, &digest, &UploadConfig::default())
-                .await
         }
     }
 

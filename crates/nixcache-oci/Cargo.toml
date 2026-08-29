@@ -3,18 +3,13 @@ name = "nixcache-oci"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["reqwest", "tokio-fs"]
-reqwest = ["dep:reqwest", "dep:tokio"]
-tokio-fs = ["dep:tokio", "tokio/fs", "tokio/io-util"]
-
 [dependencies]
 nixcache-core = { workspace = true }
 nixcache-utils = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
+futures-channel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,12 +18,6 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 web-time = { workspace = true }
-futures-channel = { workspace = true }
-
-reqwest = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["time", "sync"], optional = true }
 
 [dev-dependencies]
-wiremock = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

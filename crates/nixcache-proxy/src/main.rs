@@ -1,5 +1,5 @@
 use clap::Parser;
-use nixcache_oci::OciClient;
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let index = CacheIndex::with_config(config, &github_token);
-    let oci_client = OciClient::new(&args.registry, &args.repo, &github_token, false);
+    let oci_client = create_tokio_reqwest_client(&args.registry, &args.repo, &github_token, false);
     let http_client = reqwest::Client::new();
 
     // Trigger pre-fetch of the index in the background

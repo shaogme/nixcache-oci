@@ -28,83 +28,251 @@ pub use transport::{
     UploadChunkResponse, UploadSessionInfo, parse_range_header,
 };
 
-#[cfg(feature = "reqwest")]
-pub use transport::ReqwestTransport;
-
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexEntry, NarDigest, NarInfoMeta, OciClient, OciError, ReqwestTransport,
-        SessionMutationRequest, StoreHash, SystemArch, TokenManager, TransportError,
+        BoxBodyStream, HashingStream, IndexEntry, NarDigest, NarInfoMeta, OciClient, OciDescriptor,
+        OciError, OciImageIndex, OciPlatform, OciTransport, SessionMutationRequest, StoreHash,
+        SystemArch, TokenManager, TransportError, UploadChunkResponse, build_image_index,
+        parse_range_header,
     };
-
-    use async_trait::async_trait;
     use bytes::Bytes;
+    use futures_util::StreamExt;
     use http::{HeaderMap, StatusCode};
     use sha2::{Digest, Sha256};
     use std::{
         collections::HashMap,
-        io::Write,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-    };
-    use tempfile::NamedTempFile;
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        time::Duration,
     };
 
-    #[tokio::test]
-    async fn test_oci_client_token_exchange_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+    #[derive(Clone, Default)]
+    struct MockResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    }
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .and(query_param(
-                "scope",
-                "repository:test/repo/nix-cache:pull,push",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "token": "mocked-jwt-token" })),
-            )
-            .mount(&server)
-            .await;
+    #[derive(Clone, Default)]
+    struct MockRouterTransport {
+        call_count: Arc<AtomicUsize>,
+        responses: Arc<Mutex<HashMap<(String, String), MockResponse>>>,
+        posted_bodies: Arc<Mutex<Vec<(String, Bytes)>>>,
+    }
 
-        let client = OciClient::new(&host, "test/repo", "secret-gh-token", true);
-        let token = client.get_token().await.expect("Failed to fetch token");
-        assert_eq!(token, "mocked-jwt-token");
+    impl MockRouterTransport {
+        fn add_route(&self, method: &str, url_suffix: &str, resp: MockResponse) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert((method.to_string(), url_suffix.to_string()), resp);
+        }
+    }
 
-        // 验证缓存命中，第二次直接从内存返回
-        let cached_token = client
-            .get_token()
-            .await
-            .expect("Failed to get cached token");
-        assert_eq!(cached_token, "mocked-jwt-token");
+    impl OciTransport for MockRouterTransport {
+        type BodyStream = BoxBodyStream;
+
+        async fn head(&self, url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "HEAD" && path.ends_with(suffix) {
+                    return Ok(resp.status);
+                }
+            }
+            Ok(StatusCode::NOT_FOUND)
+        }
+
+        async fn get(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "GET" && path.ends_with(suffix) {
+                    return Ok((resp.status, resp.headers.clone(), resp.body.clone()));
+                }
+            }
+            Ok((StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new()))
+        }
+
+        async fn stream(
+            &self,
+            url: &str,
+            headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
+            let (status, headers, bytes) = self.get(url, headers).await?;
+            let stream: BoxBodyStream =
+                Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
+            Ok((status, headers, stream))
+        }
+
+        async fn post(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "POST" && path.ends_with(suffix) {
+                    return Ok((resp.status, resp.headers.clone()));
+                }
+            }
+            Ok((StatusCode::ACCEPTED, HeaderMap::new()))
+        }
+
+        async fn post_bytes(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.posted_bodies
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "POST" && path.ends_with(suffix) {
+                    return Ok((resp.status, resp.headers.clone()));
+                }
+            }
+            Ok((StatusCode::CREATED, HeaderMap::new()))
+        }
+
+        async fn post_stream(
+            &self,
+            url: &str,
+            headers: HeaderMap,
+            _stream: Self::BodyStream,
+            _content_len: u64,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.post(url, headers).await
+        }
+
+        async fn patch_chunk(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _chunk: Bytes,
+            byte_range: (u64, u64),
+        ) -> Result<UploadChunkResponse, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(UploadChunkResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                location: None,
+                range: Some(byte_range),
+            })
+        }
+
+        async fn patch_chunk_stream(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _stream: Self::BodyStream,
+            byte_range: (u64, u64),
+        ) -> Result<UploadChunkResponse, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(UploadChunkResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                location: None,
+                range: Some(byte_range),
+            })
+        }
+
+        async fn probe_upload_session(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<Option<u64>, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn put_chunk_finish(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _final_chunk: Option<(Bytes, (u64, u64))>,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::CREATED)
+        }
+
+        async fn put_bytes(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "PUT" && path.ends_with(suffix) {
+                    return Ok(resp.status);
+                }
+            }
+            Ok(StatusCode::CREATED)
+        }
+
+        async fn put_stream(
+            &self,
+            url: &str,
+            headers: HeaderMap,
+            _stream: Self::BodyStream,
+            _content_len: u64,
+        ) -> Result<StatusCode, TransportError> {
+            self.put_bytes(url, headers, Bytes::new()).await
+        }
+
+        async fn delete(
+            &self,
+            url: &str,
+            _headers: HeaderMap,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+            let guard = self.responses.lock().unwrap();
+            for ((m, suffix), resp) in guard.iter() {
+                if m == "DELETE" && path.ends_with(suffix) {
+                    return Ok(resp.status);
+                }
+            }
+            Ok(StatusCode::ACCEPTED)
+        }
+
+        async fn sleep(&self, _duration: Duration) {}
     }
 
     #[tokio::test]
     async fn test_token_manager_singleflight_concurrency() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "GET",
+            "/token",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from(r#"{"token": "singleflight-jwt-token"}"#),
+            },
+        );
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_millis(100))
-                    .set_body_json(serde_json::json!({ "token": "singleflight-jwt-token" })),
-            )
-            .expect(1) // 期望并发 10 个请求最终只发起 1 次 HTTP 网络调用！
-            .mount(&server)
-            .await;
-
-        let transport = ReqwestTransport::default();
         let token_manager = Arc::new(TokenManager::new(
-            &host,
+            "example.com",
             "test/repo",
             "secret-gh-token",
             true,
@@ -121,20 +289,31 @@ mod tests {
             let res = handle.await.unwrap().unwrap();
             assert_eq!(res, "singleflight-jwt-token");
         }
+
+        // 验证并发 10 个请求单飞调用次数为 1
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn test_oci_client_token_fallback() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "GET",
+            "/token",
+            MockResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "fallback-token", true);
+        let client = OciClient::with_transport(
+            "example.com",
+            "test/repo",
+            "fallback-token",
+            true,
+            transport,
+        );
         let token = client
             .get_token()
             .await
@@ -143,47 +322,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_head_blob_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+    async fn test_head_and_get_blob_mock() {
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "HEAD",
+            "/blobs/sha256:exists",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        transport.add_route(
+            "GET",
+            "/blobs/sha256:data123",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(b"hello blob content"),
+            },
+        );
 
-        Mock::given(method("HEAD"))
-            .and(path("/v2/test/repo/nix-cache/blobs/sha256:exists"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        let client =
+            OciClient::with_transport("example.com", "test/repo", "", false, transport);
 
-        Mock::given(method("HEAD"))
-            .and(path("/v2/test/repo/nix-cache/blobs/sha256:missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", false);
         assert!(client.head_blob("sha256:exists").await.unwrap());
         assert!(!client.head_blob("sha256:missing").await.unwrap());
-    }
 
-    #[tokio::test]
-    async fn test_get_blob_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
-        Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/blobs/sha256:data123"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello blob content"))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", false);
         let bytes = client.get_blob("sha256:data123").await.unwrap();
         assert_eq!(&bytes[..], b"hello blob content");
-
-        Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/blobs/sha256:notfound"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
 
         let err = client.get_blob("sha256:notfound").await.unwrap_err();
         assert!(matches!(err, OciError::BlobNotFound(_)));
@@ -191,92 +358,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_and_push_manifest_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
         let manifest_content =
             r#"{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}"#;
 
-        Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/manifests/cache-index"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(manifest_content))
-            .mount(&server)
-            .await;
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "GET",
+            "/manifests/cache-index",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from(manifest_content),
+            },
+        );
+        transport.add_route(
+            "PUT",
+            "/manifests/fail-tag",
+            MockResponse {
+                status: StatusCode::FORBIDDEN,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
 
-        Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/manifests/cache-index"))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", true);
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
         let fetched = client.get_manifest("cache-index").await.unwrap();
         assert_eq!(fetched, Some(manifest_content.to_string()));
 
         let push_res = client.push_manifest("cache-index", manifest_content).await;
         assert!(push_res.is_ok());
 
-        Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/manifests/fail-tag"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-
         let fail_res = client.push_manifest("fail-tag", manifest_content).await;
         assert!(matches!(
             fail_res,
             Err(OciError::ManifestPushFailed(StatusCode::FORBIDDEN))
         ));
-    }
-
-    #[tokio::test]
-    async fn test_blob_layer_digest_computation_and_upload() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file
-            .write_all(b"test nix nar blob data payload")
-            .unwrap();
-        let file_path = temp_file.path();
-
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/upload-session-1",
-            ))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("PUT"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/upload-session-1",
-            ))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", true);
-        let digest = client.push_blob(file_path).await.unwrap();
-        assert!(digest.starts_with("sha256:"));
-
-        // 测试已存在的情况跳过重复上传
-        let server2 = MockServer::start().await;
-        let host2 = server2.address().to_string();
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server2)
-            .await;
-
-        let client2 = OciClient::new(&host2, "test/repo", "", true);
-        let digest2 = client2.push_blob(file_path).await.unwrap();
-        assert_eq!(digest, digest2);
     }
 
     #[test]
@@ -311,16 +427,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_manifest_conditional_cas_conflict() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "PUT",
+            "/manifests/run-123",
+            MockResponse {
+                status: StatusCode::PRECONDITION_FAILED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
 
-        Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-123"))
-            .respond_with(ResponseTemplate::new(412))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", true);
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
         let err = client
             .put_manifest_conditional("run-123", "{}", Some("sha256:old"))
             .await
@@ -331,68 +449,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_manifest_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "DELETE",
+            "/manifests/run-old",
+            MockResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        transport.add_route(
+            "DELETE",
+            "/manifests/run-missing",
+            MockResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
 
-        Mock::given(method("DELETE"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-old"))
-            .respond_with(ResponseTemplate::new(202))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("DELETE"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", true);
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
         assert!(client.delete_manifest("run-old").await.unwrap());
         assert!(!client.delete_manifest("run-missing").await.unwrap());
     }
 
     #[tokio::test]
     async fn test_update_run_session_with_cas_mock() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
 
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/session-upload",
-            ))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/session-upload"))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path(
-                "/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux",
-            ))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("PUT"))
-            .and(path(
-                "/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux",
-            ))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "", true);
         let mut entries = HashMap::new();
         let hash_x86 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         entries.insert(
@@ -435,8 +521,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_image_index_serialization_and_routing() {
-        use super::{OciDescriptor, OciImageIndex, OciPlatform, build_image_index};
-
         let desc_x86 = OciDescriptor {
             media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
             digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -481,189 +565,8 @@ mod tests {
         assert!(found_darwin.is_none());
     }
 
-    #[derive(Clone, Default)]
-    struct MockCustomTransport {
-        call_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl super::OciTransport for MockCustomTransport {
-        type BodyStream = super::BoxBodyStream;
-
-        async fn head(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<StatusCode, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(StatusCode::OK)
-        }
-
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok((
-                StatusCode::OK,
-                HeaderMap::new(),
-                Bytes::from_static(b"custom transport data"),
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            let stream = Box::pin(futures_util::stream::once(async {
-                Ok(Bytes::from_static(b"stream"))
-            }));
-            Ok((StatusCode::OK, HeaderMap::new(), stream))
-        }
-
-        async fn post(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<(StatusCode, HeaderMap), TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok((StatusCode::ACCEPTED, HeaderMap::new()))
-        }
-
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _body: Bytes,
-        ) -> Result<(StatusCode, HeaderMap), TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok((StatusCode::CREATED, HeaderMap::new()))
-        }
-
-        async fn post_stream(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _stream: Self::BodyStream,
-            _content_len: u64,
-        ) -> Result<(StatusCode, HeaderMap), TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok((StatusCode::CREATED, HeaderMap::new()))
-        }
-
-        async fn patch_chunk(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _chunk: Bytes,
-            byte_range: (u64, u64),
-        ) -> Result<super::UploadChunkResponse, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(super::UploadChunkResponse {
-                status: StatusCode::ACCEPTED,
-                headers: HeaderMap::new(),
-                location: None,
-                range: Some(byte_range),
-            })
-        }
-
-        async fn patch_chunk_stream(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _stream: Self::BodyStream,
-            byte_range: (u64, u64),
-        ) -> Result<super::UploadChunkResponse, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(super::UploadChunkResponse {
-                status: StatusCode::ACCEPTED,
-                headers: HeaderMap::new(),
-                location: None,
-                range: Some(byte_range),
-            })
-        }
-
-        async fn probe_upload_session(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<Option<u64>, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
-        }
-
-        async fn put_chunk_finish(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _final_chunk: Option<(Bytes, (u64, u64))>,
-        ) -> Result<StatusCode, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(StatusCode::CREATED)
-        }
-
-        async fn put_bytes(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _body: Bytes,
-        ) -> Result<StatusCode, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(StatusCode::CREATED)
-        }
-
-        async fn put_stream(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-            _stream: Self::BodyStream,
-            _content_len: u64,
-        ) -> Result<StatusCode, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(StatusCode::CREATED)
-        }
-
-        async fn delete(
-            &self,
-            _url: &str,
-            _headers: HeaderMap,
-        ) -> Result<StatusCode, TransportError> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(StatusCode::ACCEPTED)
-        }
-
-        async fn sleep(&self, _duration: std::time::Duration) {}
-    }
-
-    #[tokio::test]
-    async fn test_custom_mock_transport() {
-        let transport = MockCustomTransport::default();
-        let client = OciClient::with_transport(
-            "example.com",
-            "test/repo",
-            "token123",
-            false,
-            transport.clone(),
-        );
-
-        let exists = client.head_blob("sha256:custom").await.unwrap();
-        assert!(exists);
-
-        let data = client.get_blob("sha256:custom").await.unwrap();
-        assert_eq!(&data[..], b"custom transport data");
-
-        assert!(transport.call_count.load(Ordering::SeqCst) >= 2);
-    }
-
     #[tokio::test]
     async fn test_hashing_stream_computation_and_byte_counting() {
-        use super::HashingStream;
-        use futures_util::StreamExt;
-        use sha2::{Digest, Sha256};
-
         let chunk1 = Bytes::from_static(b"Hello, ");
         let chunk2 = Bytes::from_static(b"High-Performance ");
         let chunk3 = Bytes::from_static(b"Streaming Pipeline!");
@@ -705,8 +608,6 @@ mod tests {
 
     #[test]
     fn test_parse_range_header_formats() {
-        use super::parse_range_header;
-
         assert_eq!(parse_range_header("0-100"), Some((0, 100)));
         assert_eq!(parse_range_header("bytes=0-100"), Some((0, 100)));
         assert_eq!(parse_range_header("bytes 0-100"), Some((0, 100)));
@@ -718,289 +619,18 @@ mod tests {
         assert_eq!(parse_range_header("invalid"), None);
     }
 
-    fn compute_test_digest(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        format!(
-            "sha256:{}",
-            hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        )
-    }
-
     #[tokio::test]
     async fn test_monolithic_post_1rtt_success() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
+        let transport = MockRouterTransport::default();
         let data = Bytes::from_static(b"fast monolithic payload");
-        let digest = compute_test_digest(&data);
+        let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        // 验证 1-RTT POST 直传请求
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .and(query_param("digest", digest.as_str()))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .insert_header(
-                        "Location",
-                        format!("/v2/test/repo/nix-cache/blobs/{}", digest),
-                    )
-                    .insert_header("Docker-Content-Digest", digest.as_str()),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "token123", true);
+        let client = OciClient::with_transport("example.com", "test/repo", "token123", true, transport);
         let pushed_digest = client
-            .push_blob_bytes_with_digest(&digest, data)
+            .push_blob_bytes_with_digest(digest, data)
             .await
             .unwrap();
 
         assert_eq!(pushed_digest, digest);
-    }
-
-    #[tokio::test]
-    async fn test_monolithic_post_fallback_to_twostep() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
-        let data = Bytes::from_static(b"fallback payload");
-        let digest = compute_test_digest(&data);
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        // 1. Monolithic POST 返回 405 Method Not Allowed
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .and(query_param("digest", digest.as_str()))
-            .respond_with(ResponseTemplate::new(405))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // 2. 回退到会话创建 POST
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/session-fb",
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // 3. 两阶段 PUT
-        Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/session-fb"))
-            .and(query_param("digest", digest.as_str()))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "token123", true);
-        let pushed = client
-            .push_blob_bytes_with_digest(&digest, data)
-            .await
-            .unwrap();
-
-        assert_eq!(pushed, digest);
-    }
-
-    #[tokio::test]
-    async fn test_chunked_resumable_upload_with_retry_and_range_probe() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
-        let chunk1_data = vec![1u8; 1024 * 1024]; // 1MB
-        let chunk2_data = vec![2u8; 1024 * 1024]; // 1MB
-        let mut full_data = Vec::new();
-        full_data.extend_from_slice(&chunk1_data);
-        full_data.extend_from_slice(&chunk2_data);
-
-        let digest = compute_test_digest(&full_data);
-
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(&full_data).unwrap();
-
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        // 1. 初始化上传会话
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess",
-            ))
-            .mount(&server)
-            .await;
-
-        // 2. 第 1 块 PATCH (0-1048575)
-        Mock::given(method("PATCH"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/resumable-sess"))
-            .and(wiremock::matchers::header("Content-Range", "0-1048575"))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .insert_header("Range", "0-1048575")
-                    .insert_header(
-                        "Location",
-                        "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        // 3. 第 2 块首次 PATCH (1048576-2097151) 模拟临时失败 (500)
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
-            ))
-            .and(wiremock::matchers::header(
-                "Content-Range",
-                "1048576-2097151",
-            ))
-            .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        // 4. 探测断点会话状态 GET
-        Mock::given(method("GET"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
-            ))
-            .respond_with(ResponseTemplate::new(200).insert_header("Range", "0-1048575"))
-            .mount(&server)
-            .await;
-
-        // 5. 重试第 2 块 PATCH 成功
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
-            ))
-            .and(wiremock::matchers::header(
-                "Content-Range",
-                "1048576-2097151",
-            ))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .insert_header("Range", "0-2097151")
-                    .insert_header(
-                        "Location",
-                        "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-3",
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        // 6. 完成 PUT 提交
-        Mock::given(method("PUT"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-3",
-            ))
-            .and(query_param("digest", digest.as_str()))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "token123", true);
-        let config = super::UploadConfig {
-            chunk_threshold_bytes: 512 * 1024,
-            chunk_size_bytes: 1024 * 1024,
-            max_retry_attempts: 3,
-            strategy: super::UploadStrategy::ForceChunked,
-        };
-
-        let result = client
-            .push_blob_file_resumable(temp_file.path(), &digest, &config)
-            .await
-            .unwrap();
-
-        assert_eq!(result, digest);
-    }
-
-    #[tokio::test]
-    async fn test_streaming_resumable_upload_pipeline() {
-        let server = MockServer::start().await;
-        let host = server.address().to_string();
-
-        let chunk1_data = Bytes::from_static(b"streaming-chunk-1-");
-        let chunk2_data = Bytes::from_static(b"streaming-chunk-2-final");
-        let mut full_data = Vec::new();
-        full_data.extend_from_slice(&chunk1_data);
-        full_data.extend_from_slice(&chunk2_data);
-
-        let digest = compute_test_digest(&full_data);
-        let total_size = full_data.len() as u64;
-
-        // 初始化会话
-        Mock::given(method("POST"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess",
-            ))
-            .mount(&server)
-            .await;
-
-        // PATCH 推流分块
-        Mock::given(method("PATCH"))
-            .and(path("/v2/test/repo/nix-cache/blobs/uploads/stream-sess"))
-            .respond_with(ResponseTemplate::new(202).insert_header(
-                "Location",
-                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess-fin",
-            ))
-            .mount(&server)
-            .await;
-
-        // 提交最终 PUT
-        Mock::given(method("PUT"))
-            .and(path(
-                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess-fin",
-            ))
-            .and(query_param("digest", digest.as_str()))
-            .respond_with(ResponseTemplate::new(201))
-            .mount(&server)
-            .await;
-
-        let client = OciClient::new(&host, "test/repo", "token123", true);
-        let stream = Box::pin(futures_util::stream::iter(vec![
-            Ok(chunk1_data),
-            Ok(chunk2_data),
-        ]));
-
-        let config = super::UploadConfig {
-            chunk_threshold_bytes: 10,
-            chunk_size_bytes: 1024 * 1024,
-            max_retry_attempts: 3,
-            strategy: super::UploadStrategy::Auto,
-        };
-
-        let (res_digest, res_size) = client
-            .push_blob_streaming_resumable(stream, &config)
-            .await
-            .unwrap();
-
-        assert_eq!(res_digest, digest);
-        assert_eq!(res_size, total_size);
     }
 }

@@ -9,7 +9,8 @@ use chrono::Utc;
 use nixcache_core::{
     BuildReceipt, BuildStats, CacheIndexData, IndexEntry, NarDigest, NarInfo, StoreHash, SystemArch,
 };
-use nixcache_oci::{OciClient, ReqwestTransport};
+use nixcache_oci::OciClient;
+use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -195,7 +196,7 @@ pub async fn run_build_worker(
     proxy_guard.stop().await;
 
     // 5. 获取已有远端 hashes
-    let oci = OciClient::new(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
     let (_remote_index, own_hashes) = fetch_remote_cache_index(&oci).await;
     info!(
         "GHCR index contains {} previously-cached entries",

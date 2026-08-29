@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 nixcache-core = { workspace = true }
-nixcache-oci = { workspace = true, features = ["reqwest", "tokio-fs"] }
+nixcache-oci = { workspace = true }
+nixcache-oci-backend = { workspace = true, features = ["tokio-reqwest"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 reqwest.workspace = true

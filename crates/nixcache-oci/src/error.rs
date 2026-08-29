@@ -4,15 +4,8 @@ use serde_json::Error as JsonError;
 use std::io::Error as IoError;
 use thiserror::Error;
 
-#[cfg(feature = "reqwest")]
-use reqwest::Error as ReqwestError;
-
 #[derive(Error, Debug)]
 pub enum TransportError {
-    #[cfg(feature = "reqwest")]
-    #[error("Reqwest error: {0}")]
-    Reqwest(#[from] ReqwestError),
-
     #[error("IO error: {0}")]
     Io(#[from] IoError),
 
@@ -33,10 +26,6 @@ pub enum TransportError {
 pub enum OciError {
     #[error("Transport error: {0}")]
     Transport(#[from] TransportError),
-
-    #[cfg(feature = "reqwest")]
-    #[error("Reqwest error: {0}")]
-    Reqwest(#[from] ReqwestError),
 
     #[error("IO error: {0}")]
     Io(#[from] IoError),

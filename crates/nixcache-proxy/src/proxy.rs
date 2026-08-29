@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use nixcache_core::{IndexEntry, StoreHash};
-use nixcache_oci::{OciClient, ReqwestTransport};
+use nixcache_oci::OciClient;
+use nixcache_oci_backend::ReqwestTransport;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -268,6 +269,7 @@ mod tests {
     use nixcache_core::{
         CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
     };
+    use nixcache_oci_backend::create_tokio_reqwest_client;
     use std::{collections::HashMap, time::Duration};
     use tower::ServiceExt;
     use wiremock::{
@@ -295,7 +297,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
 
@@ -342,7 +344,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index: index.clone(),
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
 
@@ -369,7 +371,7 @@ mod tests {
         let empty_state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
         let empty_app = create_router(empty_state);
@@ -433,7 +435,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
 
@@ -523,7 +525,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
 
@@ -663,7 +665,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new(&oci_host, "test/repo", "", false),
+            oci_client: create_tokio_reqwest_client(&oci_host, "test/repo", "", false),
             http_client: reqwest::Client::new(),
         };
 
@@ -733,7 +735,7 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
         };
 

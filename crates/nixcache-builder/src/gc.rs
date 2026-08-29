@@ -3,9 +3,10 @@ use bytes::Bytes;
 use chrono::Utc;
 use nixcache_core::{CACHE_INDEX_VERSION, CacheIndexData, evaluate_multi_arch_gc};
 use nixcache_oci::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor, OciPlatform,
-    build_arch_index_manifest, build_image_index,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciPlatform, build_arch_index_manifest,
+    build_image_index,
 };
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::info;
@@ -34,7 +35,7 @@ pub async fn run_gc(
         "Running multi-arch garbage collection for {}/{}",
         registry, repo
     );
-    let oci = OciClient::new(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
 
     let (index_data, _) = match oci.get_cache_index("cache-index").await? {
         Some(pair) => pair,

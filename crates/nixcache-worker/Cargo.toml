@@ -9,7 +9,6 @@ crate-type = ["cdylib"]
 [dependencies]
 nixcache-core = { workspace = true }
 nixcache-oci = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }

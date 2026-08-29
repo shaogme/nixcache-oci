@@ -5,9 +5,10 @@ use nixcache_core::{
     ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor, OciImageManifest,
-    OciPlatform, build_arch_index_manifest, build_image_index,
+    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageManifest, OciPlatform,
+    build_arch_index_manifest, build_image_index,
 };
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -43,7 +44,7 @@ pub async fn run_promote(
         target_tag, registry, repo, run_id
     );
 
-    let oci = OciClient::new(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
 
     // 1. 准备待合并的数据集 (按系统架构分桶)
     let mut session_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();

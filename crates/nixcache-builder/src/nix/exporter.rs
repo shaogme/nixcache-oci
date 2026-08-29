@@ -1,7 +1,8 @@
 use crate::error::BuilderError;
 use async_compression::tokio::write::XzEncoder;
 use futures_util::TryStreamExt;
-use nixcache_oci::{OciClient, ReqwestTransport, TransportError, UploadConfig};
+use nixcache_oci::{OciClient, TransportError, UploadConfig};
+use nixcache_oci_backend::ReqwestTransport;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{

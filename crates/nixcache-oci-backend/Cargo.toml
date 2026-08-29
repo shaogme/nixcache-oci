@@ -1,0 +1,36 @@
+[package]
+name = "nixcache-oci-backend"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["tokio-reqwest"]
+tokio-reqwest = [
+    "dep:reqwest",
+    "dep:tokio",
+    "tokio/fs",
+    "tokio/io-util",
+    "tokio/time",
+    "tokio/sync",
+]
+
+[dependencies]
+nixcache-oci = { workspace = true }
+nixcache-core = { workspace = true }
+nixcache-utils = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+serde_json = { workspace = true }
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

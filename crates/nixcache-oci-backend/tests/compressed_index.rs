@@ -4,10 +4,11 @@ use nixcache_core::{
     JobSummaryMetadata, NarDigest, NarInfoMeta, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    CacheLayerMediaType, IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor,
+    CacheLayerMediaType, IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor,
     OciImageManifest, OciPlatform, build_arch_index_manifest, build_arch_session_manifest,
     build_image_index,
 };
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use wiremock::{
@@ -252,7 +253,7 @@ async fn test_push_zstd_blob_and_fetch_arch_cache_index() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     // Push blob
     let (pushed_digest, comp_size, uncomp_size) = client.push_zstd_blob(&arch_data).await.unwrap();
@@ -328,7 +329,7 @@ async fn test_push_zstd_blob_and_fetch_arch_session_manifest() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     let (pushed_digest, comp_size, _) = client.push_zstd_blob(&session_data).await.unwrap();
     assert_eq!(pushed_digest, blob_digest);
@@ -450,7 +451,7 @@ async fn test_get_multi_arch_cache_index_aggregation() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     let (combined, digest) = client
         .get_cache_index("cache-index")
@@ -504,7 +505,7 @@ async fn test_get_arch_cache_index_rejects_unsupported_media_type() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let err = client
         .get_arch_cache_index("cache-index", &SystemArch::X86_64Linux)
         .await
@@ -545,7 +546,7 @@ async fn test_get_arch_cache_index_rejects_corrupted_blob_data() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let err = client
         .get_arch_cache_index("cache-index", &SystemArch::X86_64Linux)
         .await
@@ -655,7 +656,7 @@ async fn test_get_multi_arch_session_manifest_aggregation() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     let (combined, digest) = client
         .get_session_manifest("run-200")
@@ -711,7 +712,7 @@ async fn test_update_arch_session_with_cas_zstd_roundtrip() {
         .mount(&server)
         .await;
 
-    let client = OciClient::new(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let mut entries = HashMap::new();
     let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
     entries.insert(
