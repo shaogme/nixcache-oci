@@ -15,7 +15,10 @@ use cli::{Cli, Commands, SessionCommands, resolve_github_token};
 use gc::run_gc;
 use nix::BuildConfig;
 use promote::run_promote;
-use session::{run_session_capture, run_session_clean, run_session_init};
+use session::{
+    SessionCaptureOptions, SessionInitOptions, run_session_capture, run_session_clean,
+    run_session_init,
+};
 use worker::run_build_worker;
 
 #[tokio::main]
@@ -42,23 +45,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .signing_key_file
                     .map(|p| p.to_string_lossy().to_string());
 
-                if let Err(e) = run_session_init(
-                    &args.repo,
-                    &args.registry,
+                let init_opts = SessionInitOptions {
+                    repo: &args.repo,
+                    registry: &args.registry,
                     run_id,
                     branch,
-                    args.port,
-                    &args.listen,
-                    &args.upstream,
-                    args.session_ttl,
-                    args.baseline_ttl,
-                    &args.baseline_tag,
-                    &active_token,
-                    signing_key.as_deref(),
-                    Some(&args.snapshot_path),
-                )
-                .await
-                {
+                    port: args.port,
+                    listen: &args.listen,
+                    upstream: &args.upstream,
+                    session_ttl: args.session_ttl,
+                    baseline_ttl: args.baseline_ttl,
+                    baseline_tag: &args.baseline_tag,
+                    github_token: &active_token,
+                    signing_key_file: signing_key.as_deref(),
+                    snapshot_path: Some(&args.snapshot_path),
+                };
+
+                if let Err(e) = run_session_init(&init_opts).await {
                     eprintln!("Session init failed: {}", e);
                     process::exit(1);
                 }
@@ -83,21 +86,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .signing_key_file
                     .map(|p| p.to_string_lossy().to_string());
 
-                if let Err(e) = run_session_capture(
-                    &args.repo,
-                    &args.registry,
+                let capture_opts = SessionCaptureOptions {
+                    repo: &args.repo,
+                    registry: &args.registry,
                     run_id,
-                    &job_id,
-                    args.system.as_deref(),
-                    signing_key.as_deref(),
-                    &active_token,
-                    args.output_receipt.as_deref(),
-                    Some(&args.proxy_url),
-                    Some(&args.snapshot_before),
-                    &args.paths,
-                )
-                .await
-                {
+                    job_id: &job_id,
+                    system_opt: args.system.as_deref(),
+                    signing_key_file: signing_key.as_deref(),
+                    github_token: &active_token,
+                    output_receipt_path: args.output_receipt.as_deref(),
+                    proxy_url: Some(&args.proxy_url),
+                    snapshot_before: Some(&args.snapshot_before),
+                    explicit_paths: &args.paths,
+                };
+
+                if let Err(e) = run_session_capture(&capture_opts).await {
                     eprintln!("Session capture failed: {}", e);
                     process::exit(1);
                 }

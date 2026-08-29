@@ -49,26 +49,28 @@ pub async fn record_store_snapshot(snap_path: &Path) -> Result<(), BuilderError>
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionInitOptions<'a> {
+    pub repo: &'a str,
+    pub registry: &'a str,
+    pub run_id: Option<u64>,
+    pub branch: Option<String>,
+    pub port: u16,
+    pub listen: &'a str,
+    pub upstream: &'a str,
+    pub session_ttl: u64,
+    pub baseline_ttl: u64,
+    pub baseline_tag: &'a str,
+    pub github_token: &'a str,
+    pub signing_key_file: Option<&'a str>,
+    pub snapshot_path: Option<&'a Path>,
+}
+
 /// Session Init: 启动后台 Proxy 守护进程，零侵入注入 NIX_CONFIG，并记录 store 快照
-#[allow(clippy::too_many_arguments)]
-pub async fn run_session_init(
-    repo: &str,
-    registry: &str,
-    run_id: Option<u64>,
-    branch: Option<String>,
-    port: u16,
-    listen: &str,
-    upstream: &str,
-    session_ttl: u64,
-    baseline_ttl: u64,
-    baseline_tag: &str,
-    github_token: &str,
-    signing_key_file: Option<&str>,
-    snapshot_path: Option<&Path>,
-) -> Result<(), BuilderError> {
+pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), BuilderError> {
     info!(
         "Initializing NixCache Session: Run ID: {:?}, Branch: {:?}, Repo: {}/{}",
-        run_id, branch, registry, repo
+        opts.run_id, opts.branch, opts.registry, opts.repo
     );
 
     let proxy_bin = find_proxy_binary();
@@ -76,29 +78,29 @@ pub async fn run_session_init(
 
     let mut proxy_cmd = Command::new(&proxy_bin);
     proxy_cmd
-        .env("NIXCACHE_REPO", repo)
-        .env("NIXCACHE_REGISTRY", registry)
-        .env("NIXCACHE_PORT", port.to_string())
-        .env("NIXCACHE_LISTEN", listen)
-        .env("NIXCACHE_UPSTREAM", upstream)
-        .env("NIXCACHE_SESSION_TTL", session_ttl.to_string())
-        .env("NIXCACHE_INDEX_TTL", baseline_ttl.to_string())
-        .env("NIXCACHE_BASELINE_TAG", baseline_tag)
-        .env("GITHUB_TOKEN", github_token)
+        .env("NIXCACHE_REPO", opts.repo)
+        .env("NIXCACHE_REGISTRY", opts.registry)
+        .env("NIXCACHE_PORT", opts.port.to_string())
+        .env("NIXCACHE_LISTEN", opts.listen)
+        .env("NIXCACHE_UPSTREAM", opts.upstream)
+        .env("NIXCACHE_SESSION_TTL", opts.session_ttl.to_string())
+        .env("NIXCACHE_INDEX_TTL", opts.baseline_ttl.to_string())
+        .env("NIXCACHE_BASELINE_TAG", opts.baseline_tag)
+        .env("GITHUB_TOKEN", opts.github_token)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    if let Some(rid) = run_id {
+    if let Some(rid) = opts.run_id {
         proxy_cmd.env("NIXCACHE_RUN_ID", rid.to_string());
     }
-    if let Some(ref br) = branch {
+    if let Some(ref br) = opts.branch {
         proxy_cmd.env("NIXCACHE_BRANCH", br);
     }
 
     let _child = proxy_cmd.spawn()?;
 
     let client = reqwest::Client::new();
-    let probe_url = format!("http://{}:{}/nix-cache-info", listen, port);
+    let probe_url = format!("http://{}:{}/nix-cache-info", opts.listen, opts.port);
     let mut ready = false;
     for _ in 1..=20 {
         if let Ok(res) = client.get(&probe_url).send().await
@@ -113,14 +115,17 @@ pub async fn run_session_init(
     if !ready {
         return Err(BuilderError::Proxy(format!(
             "Proxy failed to become ready on http://{}:{}",
-            listen, port
+            opts.listen, opts.port
         )));
     }
-    info!("Proxy is running and ready on http://{}:{}", listen, port);
+    info!(
+        "Proxy is running and ready on http://{}:{}",
+        opts.listen, opts.port
+    );
 
-    let proxy_substituter = format!("http://{}:{}", listen, port);
+    let proxy_substituter = format!("http://{}:{}", opts.listen, opts.port);
     let mut keys = Vec::new();
-    let pub_key = get_own_public_key(signing_key_file).await;
+    let pub_key = get_own_public_key(opts.signing_key_file).await;
     if let Some(ref k) = pub_key {
         keys.push(k.as_str());
         info!("Trusted own public key: {}", k);
@@ -133,10 +138,10 @@ pub async fn run_session_init(
     }
     NixEnvInjector::export_to_github_env(&nix_config).await?;
 
-    if let Some(snap) = snapshot_path {
+    if let Some(snap) = opts.snapshot_path {
         record_store_snapshot(snap).await?;
     }
 
-    write_session_init_summary(repo, run_id, branch.as_deref(), port).await;
+    write_session_init_summary(opts.repo, opts.run_id, opts.branch.as_deref(), opts.port).await;
     Ok(())
 }

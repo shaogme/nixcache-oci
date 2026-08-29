@@ -5,7 +5,7 @@ pub mod mutation;
 pub mod token;
 pub mod transport;
 
-pub use client::{FetchedOciArtifact, OciClient};
+pub use client::{FetchedOciArtifact, OciClient, UploadConfig, UploadStrategy};
 pub use error::{OciError, TransportError};
 pub use manifest::{
     NIX_CACHE_INDEX_MEDIA_TYPE, NIX_CACHE_SESSION_MEDIA_TYPE, OCI_IMAGE_CONFIG_MEDIA_TYPE,
@@ -23,7 +23,10 @@ pub use nixcache_core::{
     extract_store_hash, extract_store_hash_str,
 };
 pub use token::TokenManager;
-pub use transport::{BoxBodyStream, OciBlobStream, OciTransport};
+pub use transport::{
+    BoxBodyStream, HashingStream, OciBlobStream, OciTransport, StreamHashState,
+    UploadChunkResponse, UploadSessionInfo, parse_range_header,
+};
 
 #[cfg(feature = "reqwest")]
 pub use transport::ReqwestTransport;
@@ -38,6 +41,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
+    use sha2::{Digest, Sha256};
     use std::{
         collections::HashMap,
         io::Write,
@@ -373,13 +377,17 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux"))
+            .and(path(
+                "/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux",
+            ))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
 
         Mock::given(method("PUT"))
-            .and(path("/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux"))
+            .and(path(
+                "/v2/test/repo/nix-cache/manifests/run-12345-x86_64-linux",
+            ))
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;
@@ -454,7 +462,9 @@ mod tests {
         };
 
         let index = build_image_index(vec![desc_x86, desc_arm], "NixCache Multi-Arch Index");
-        let json_str = index.to_json_string().expect("Serialization should succeed");
+        let json_str = index
+            .to_json_string()
+            .expect("Serialization should succeed");
         let parsed: OciImageIndex = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(parsed.media_type, super::OCI_IMAGE_INDEX_MEDIA_TYPE);
@@ -523,6 +533,78 @@ mod tests {
             Ok((StatusCode::ACCEPTED, HeaderMap::new()))
         }
 
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok((StatusCode::CREATED, HeaderMap::new()))
+        }
+
+        async fn post_stream(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _stream: Self::BodyStream,
+            _content_len: u64,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok((StatusCode::CREATED, HeaderMap::new()))
+        }
+
+        async fn patch_chunk(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _chunk: Bytes,
+            byte_range: (u64, u64),
+        ) -> Result<super::UploadChunkResponse, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(super::UploadChunkResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                location: None,
+                range: Some(byte_range),
+            })
+        }
+
+        async fn patch_chunk_stream(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _stream: Self::BodyStream,
+            byte_range: (u64, u64),
+        ) -> Result<super::UploadChunkResponse, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(super::UploadChunkResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                location: None,
+                range: Some(byte_range),
+            })
+        }
+
+        async fn probe_upload_session(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<Option<u64>, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn put_chunk_finish(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _final_chunk: Option<(Bytes, (u64, u64))>,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::CREATED)
+        }
+
         async fn put_bytes(
             &self,
             _url: &str,
@@ -574,5 +656,351 @@ mod tests {
         assert_eq!(&data[..], b"custom transport data");
 
         assert!(transport.call_count.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_hashing_stream_computation_and_byte_counting() {
+        use super::HashingStream;
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+
+        let chunk1 = Bytes::from_static(b"Hello, ");
+        let chunk2 = Bytes::from_static(b"High-Performance ");
+        let chunk3 = Bytes::from_static(b"Streaming Pipeline!");
+
+        let input_stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TransportError>(chunk1.clone()),
+            Ok::<Bytes, TransportError>(chunk2.clone()),
+            Ok::<Bytes, TransportError>(chunk3.clone()),
+        ]);
+
+        let (mut hashing_stream, hash_state) = HashingStream::new(input_stream);
+
+        let mut collected = Vec::new();
+        while let Some(item) = hashing_stream.next().await {
+            collected.extend_from_slice(&item.unwrap());
+        }
+
+        assert_eq!(
+            collected,
+            b"Hello, High-Performance Streaming Pipeline!".to_vec()
+        );
+        assert_eq!(hash_state.bytes_streamed(), collected.len() as u64);
+
+        let digest = hash_state
+            .digest()
+            .expect("Digest should be finalized at EOF");
+        let mut full_hasher = Sha256::new();
+        full_hasher.update(&collected);
+        let expected_digest = format!(
+            "sha256:{}",
+            full_hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+        assert_eq!(digest, expected_digest);
+    }
+
+    #[test]
+    fn test_parse_range_header_formats() {
+        use super::parse_range_header;
+
+        assert_eq!(parse_range_header("0-100"), Some((0, 100)));
+        assert_eq!(parse_range_header("bytes=0-100"), Some((0, 100)));
+        assert_eq!(parse_range_header("bytes 0-100"), Some((0, 100)));
+        assert_eq!(parse_range_header("bytes 0-100/500"), Some((0, 100)));
+        assert_eq!(
+            parse_range_header("bytes=1048576-2097151"),
+            Some((1048576, 2097151))
+        );
+        assert_eq!(parse_range_header("invalid"), None);
+    }
+
+    fn compute_test_digest(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!(
+            "sha256:{}",
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        )
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_post_1rtt_success() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        let data = Bytes::from_static(b"fast monolithic payload");
+        let digest = compute_test_digest(&data);
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // 验证 1-RTT POST 直传请求
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .and(query_param("digest", digest.as_str()))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(
+                        "Location",
+                        format!("/v2/test/repo/nix-cache/blobs/{}", digest),
+                    )
+                    .insert_header("Docker-Content-Digest", digest.as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "token123", true);
+        let pushed_digest = client
+            .push_blob_bytes_with_digest(&digest, data)
+            .await
+            .unwrap();
+
+        assert_eq!(pushed_digest, digest);
+    }
+
+    #[tokio::test]
+    async fn test_monolithic_post_fallback_to_twostep() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        let data = Bytes::from_static(b"fallback payload");
+        let digest = compute_test_digest(&data);
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // 1. Monolithic POST 返回 405 Method Not Allowed
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .and(query_param("digest", digest.as_str()))
+            .respond_with(ResponseTemplate::new(405))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 2. 回退到会话创建 POST
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/session-fb",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 3. 两阶段 PUT
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/session-fb"))
+            .and(query_param("digest", digest.as_str()))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "token123", true);
+        let pushed = client
+            .push_blob_bytes_with_digest(&digest, data)
+            .await
+            .unwrap();
+
+        assert_eq!(pushed, digest);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_resumable_upload_with_retry_and_range_probe() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        let chunk1_data = vec![1u8; 1024 * 1024]; // 1MB
+        let chunk2_data = vec![2u8; 1024 * 1024]; // 1MB
+        let mut full_data = Vec::new();
+        full_data.extend_from_slice(&chunk1_data);
+        full_data.extend_from_slice(&chunk2_data);
+
+        let digest = compute_test_digest(&full_data);
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&full_data).unwrap();
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/test/repo/nix-cache/blobs/{}", digest)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // 1. 初始化上传会话
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess",
+            ))
+            .mount(&server)
+            .await;
+
+        // 2. 第 1 块 PATCH (0-1048575)
+        Mock::given(method("PATCH"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/resumable-sess"))
+            .and(wiremock::matchers::header("Content-Range", "0-1048575"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Range", "0-1048575")
+                    .insert_header(
+                        "Location",
+                        "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        // 3. 第 2 块首次 PATCH (1048576-2097151) 模拟临时失败 (500)
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
+            ))
+            .and(wiremock::matchers::header(
+                "Content-Range",
+                "1048576-2097151",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // 4. 探测断点会话状态 GET
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
+            ))
+            .respond_with(ResponseTemplate::new(200).insert_header("Range", "0-1048575"))
+            .mount(&server)
+            .await;
+
+        // 5. 重试第 2 块 PATCH 成功
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-2",
+            ))
+            .and(wiremock::matchers::header(
+                "Content-Range",
+                "1048576-2097151",
+            ))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Range", "0-2097151")
+                    .insert_header(
+                        "Location",
+                        "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-3",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        // 6. 完成 PUT 提交
+        Mock::given(method("PUT"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/resumable-sess-3",
+            ))
+            .and(query_param("digest", digest.as_str()))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "token123", true);
+        let config = super::UploadConfig {
+            chunk_threshold_bytes: 512 * 1024,
+            chunk_size_bytes: 1024 * 1024,
+            max_retry_attempts: 3,
+            strategy: super::UploadStrategy::ForceChunked,
+        };
+
+        let result = client
+            .push_blob_file_resumable(temp_file.path(), &digest, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result, digest);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_resumable_upload_pipeline() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        let chunk1_data = Bytes::from_static(b"streaming-chunk-1-");
+        let chunk2_data = Bytes::from_static(b"streaming-chunk-2-final");
+        let mut full_data = Vec::new();
+        full_data.extend_from_slice(&chunk1_data);
+        full_data.extend_from_slice(&chunk2_data);
+
+        let digest = compute_test_digest(&full_data);
+        let total_size = full_data.len() as u64;
+
+        // 初始化会话
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess",
+            ))
+            .mount(&server)
+            .await;
+
+        // PATCH 推流分块
+        Mock::given(method("PATCH"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/stream-sess"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess-fin",
+            ))
+            .mount(&server)
+            .await;
+
+        // 提交最终 PUT
+        Mock::given(method("PUT"))
+            .and(path(
+                "/v2/test/repo/nix-cache/blobs/uploads/stream-sess-fin",
+            ))
+            .and(query_param("digest", digest.as_str()))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "token123", true);
+        let stream = Box::pin(futures_util::stream::iter(vec![
+            Ok(chunk1_data),
+            Ok(chunk2_data),
+        ]));
+
+        let config = super::UploadConfig {
+            chunk_threshold_bytes: 10,
+            chunk_size_bytes: 1024 * 1024,
+            max_retry_attempts: 3,
+            strategy: super::UploadStrategy::Auto,
+        };
+
+        let (res_digest, res_size) = client
+            .push_blob_streaming_resumable(stream, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(res_digest, digest);
+        assert_eq!(res_size, total_size);
     }
 }

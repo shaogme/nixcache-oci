@@ -6,7 +6,7 @@ pub mod exporter;
 
 pub use discovery::discover_outputs;
 pub use driver::{BuildConfig, BuildMode, BuildTarget, NixCli};
-pub use exporter::export_paths_directly;
+pub use exporter::{export_and_upload_path_stream, export_paths_directly};
 
 /// 便捷函数：获取当前系统架构
 pub async fn get_system() -> Result<String, BuilderError> {

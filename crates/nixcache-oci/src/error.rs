@@ -71,6 +71,21 @@ pub enum OciError {
     #[error("CAS optimistic concurrency conflict on tag {0}")]
     CasConflict(String),
 
+    #[error("Monolithic upload rejected by registry (status: {0}), falling back to chunked")]
+    MonolithicUploadRejected(StatusCode),
+
+    #[error("Upload session expired or invalid: {0}")]
+    UploadSessionExpired(String),
+
+    #[error("Upload range mismatch: expected {expected}, registry reported {actual}")]
+    UploadRangeMismatch { expected: u64, actual: u64 },
+
+    #[error("Chunk upload failed after {attempts} attempts: {last_error}")]
+    ResumableUploadFailed { attempts: usize, last_error: String },
+
+    #[error("Digest mismatch after stream upload: expected {expected}, computed {computed}")]
+    StreamDigestMismatch { expected: String, computed: String },
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 

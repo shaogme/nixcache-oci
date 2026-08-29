@@ -115,7 +115,6 @@ impl CachedBaseline {
         Self { data, nar_lookup }
     }
 
-    #[allow(dead_code)]
     pub fn from_arch_data(arch_data: ArchCacheIndexData) -> Self {
         let data = CacheIndexData::from_arch_data(arch_data);
         Self::new(data)
@@ -392,7 +391,7 @@ impl CacheIndex {
                     tag_str, system_clone
                 );
                 let mut refresh_ok = false;
-                let mut fetched_data = None;
+                let mut fetched_baseline = None;
 
                 match self.oci_client.get_arch_cache_index(&tag_str, &system_clone).await {
                     Ok(Some((arch_data, _))) => {
@@ -415,7 +414,7 @@ impl CacheIndex {
                                 );
                             }
                         }
-                        fetched_data = Some(CacheIndexData::from_arch_data(arch_data));
+                        fetched_baseline = Some(CachedBaseline::from_arch_data(arch_data));
                     }
                     Ok(None) => {
                         info!(
@@ -453,7 +452,7 @@ impl CacheIndex {
                                         "[nixcache-proxy] Loaded backup arch index from {:?}",
                                         arch_backup
                                     );
-                                    fetched_data = Some(CacheIndexData::from_arch_data(arch_data));
+                                    fetched_baseline = Some(CachedBaseline::from_arch_data(arch_data));
                                     refresh_ok = true;
                                 }
                             }
@@ -464,12 +463,12 @@ impl CacheIndex {
                     }
                 }
 
-                if let Some(data) = fetched_data {
+                if let Some(baseline) = fetched_baseline {
                     info!(
                         "[nixcache-proxy] Baseline index refreshed successfully with {} entries for {}.",
-                        data.entries.len(), system_clone
+                        baseline.data.entries.len(), system_clone
                     );
-                    Ok(Arc::new(CachedBaseline::new(data)))
+                    Ok(Arc::new(baseline))
                 } else if refresh_ok {
                     Ok(Arc::new(CachedBaseline::new(CacheIndexData::default())))
                 } else {
@@ -514,7 +513,11 @@ impl CacheIndex {
             }
         }
 
-        let cache_key = format!("{}-{}", self.config.baseline_tag, self.config.target_system.as_str());
+        let cache_key = format!(
+            "{}-{}",
+            self.config.baseline_tag,
+            self.config.target_system.as_str()
+        );
         self.baseline_cache.invalidate(&cache_key).await;
         self.baseline_cache
             .invalidate(&self.config.baseline_tag)
@@ -549,7 +552,11 @@ impl CacheIndex {
                     "[nixcache-proxy] Refreshing Session Manifest (Tag: {}, System: {})...",
                     tag_str, system_clone
                 );
-                match self.oci_client.get_arch_session_manifest(&tag_str, &system_clone).await {
+                match self
+                    .oci_client
+                    .get_arch_session_manifest(&tag_str, &system_clone)
+                    .await
+                {
                     Ok(Some((session, _))) => {
                         self.set_remote_status(true, None).await;
                         Ok(Arc::new(CachedSession::from_arch_manifest(session)))

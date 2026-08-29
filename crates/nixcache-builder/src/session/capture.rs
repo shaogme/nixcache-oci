@@ -17,34 +17,36 @@ use tempfile::tempdir;
 use tokio::fs;
 use tracing::{error, info};
 
+#[derive(Debug, Clone)]
+pub struct SessionCaptureOptions<'a> {
+    pub repo: &'a str,
+    pub registry: &'a str,
+    pub run_id: u64,
+    pub job_id: &'a str,
+    pub system_opt: Option<&'a str>,
+    pub signing_key_file: Option<&'a str>,
+    pub github_token: &'a str,
+    pub output_receipt_path: Option<&'a Path>,
+    pub proxy_url: Option<&'a str>,
+    pub snapshot_before: Option<&'a Path>,
+    pub explicit_paths: &'a [String],
+}
+
 /// Session Capture: 捕获本 Job 新构建产物，导出并上传 NAR Blobs，CAS 更新 run-<run_id>，热注册到 Proxy
-#[allow(clippy::too_many_arguments)]
-pub async fn run_session_capture(
-    repo: &str,
-    registry: &str,
-    run_id: u64,
-    job_id: &str,
-    system_opt: Option<&str>,
-    signing_key_file: Option<&str>,
-    github_token: &str,
-    output_receipt_path: Option<&Path>,
-    proxy_url: Option<&str>,
-    snapshot_before: Option<&Path>,
-    explicit_paths: &[String],
-) -> Result<(), BuilderError> {
-    let system = match system_opt {
+pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(), BuilderError> {
+    let system = match opts.system_opt {
         Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
         _ => SystemArch::from(nix::get_system().await?.as_str()),
     };
 
     info!(
         "Capturing session for Job: {} | Run ID: {} | System: {} | Repo: {}/{}",
-        job_id, run_id, system, registry, repo
+        opts.job_id, opts.run_id, system, opts.registry, opts.repo
     );
 
-    let candidate_paths: Vec<String> = if !explicit_paths.is_empty() {
-        explicit_paths.to_vec()
-    } else if let Some(snap_file) = snapshot_before
+    let candidate_paths: Vec<String> = if !opts.explicit_paths.is_empty() {
+        opts.explicit_paths.to_vec()
+    } else if let Some(snap_file) = opts.snapshot_before
         && snap_file.exists()
     {
         let before_content = fs::read_to_string(snap_file).await.unwrap_or_default();
@@ -76,7 +78,7 @@ pub async fn run_session_capture(
         candidate_paths.len()
     );
 
-    let oci = OciClient::new(registry, repo, github_token, true);
+    let oci = OciClient::new(opts.registry, opts.repo, opts.github_token, true);
     let temp_dir = tempdir()?;
 
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
@@ -85,7 +87,8 @@ pub async fn run_session_capture(
 
     if !candidate_paths.is_empty() {
         let exported =
-            nix::export_paths_directly(&candidate_paths, signing_key_file, temp_dir.path()).await?;
+            nix::export_paths_directly(&candidate_paths, opts.signing_key_file, temp_dir.path())
+                .await?;
         for (hash, store_path) in exported {
             let narinfo_path = temp_dir.path().join(format!("{}.narinfo", hash));
             let nar_file_path = temp_dir.path().join("nar").join(format!("{}.nar.xz", hash));
@@ -126,7 +129,7 @@ pub async fn run_session_capture(
                                     nar_size: size.max(nar_size),
                                     added: Utc::now()
                                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                    origin_job: Some(format!("job:{}", job_id)),
+                                    origin_job: Some(format!("job:{}", opts.job_id)),
                                 },
                             );
                             uploaded_count += 1;
@@ -153,13 +156,13 @@ pub async fn run_session_capture(
     active_gc_roots.sort();
     active_gc_roots.dedup();
 
-    let pub_key = get_own_public_key(signing_key_file).await;
+    let pub_key = get_own_public_key(opts.signing_key_file).await;
     let head_sha = env::var("GITHUB_SHA").ok();
     let ref_name = env::var("GITHUB_REF_NAME").ok();
 
     // 执行单架构无锁乐观并发 CAS 更新写入 run-<run_id>-<system>
     if !new_entries.is_empty() || !active_gc_roots.is_empty() {
-        let request = SessionMutationRequest::new(run_id, job_id, system.clone())
+        let request = SessionMutationRequest::new(opts.run_id, opts.job_id, system.clone())
             .with_entries(new_entries.clone())
             .with_roots(active_gc_roots.clone())
             .with_git_info(head_sha, ref_name)
@@ -171,7 +174,7 @@ pub async fn run_session_capture(
     }
 
     // 热注册到本机 Proxy
-    if let Some(purl) = proxy_url
+    if let Some(purl) = opts.proxy_url
         && !new_entries.is_empty()
     {
         let register_endpoint = format!("{}/_session/register", purl.trim_end_matches('/'));
@@ -189,7 +192,7 @@ pub async fn run_session_capture(
     }
 
     // 写入 Schema v4 的 BuildReceipt
-    if let Some(receipt_path) = output_receipt_path {
+    if let Some(receipt_path) = opts.output_receipt_path {
         let stats = BuildStats {
             discovered_outputs: candidate_paths.len(),
             built_paths: candidate_paths.len(),
@@ -200,14 +203,14 @@ pub async fn run_session_capture(
 
         let receipt = BuildReceipt::new(
             system.clone(),
-            repo.to_string(),
+            opts.repo.to_string(),
             Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             pub_key,
             new_entries,
             active_gc_roots,
             stats,
         )
-        .with_run_info(Some(run_id), Some(job_id.to_string()));
+        .with_run_info(Some(opts.run_id), Some(opts.job_id.to_string()));
 
         if let Some(parent) = receipt_path.parent()
             && !parent.as_os_str().is_empty()
@@ -221,7 +224,7 @@ pub async fn run_session_capture(
     }
 
     write_session_capture_summary(
-        job_id,
+        opts.job_id,
         system.as_str(),
         candidate_paths.len(),
         uploaded_count,

@@ -1,17 +1,17 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::Stream;
-use http::{HeaderMap, StatusCode};
-use nixcache_oci::{OciTransport, TransportError};
+use futures_util::{Stream, TryStreamExt};
+use http::{
+    HeaderMap, StatusCode,
+    header::{HeaderName, HeaderValue},
+};
+use nixcache_oci::{OciTransport, TransportError, UploadChunkResponse, parse_range_header};
 use std::{pin::Pin, time::Duration};
+use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 #[derive(Clone, Default)]
 pub struct WorkerFetchTransport;
 
-#[cfg(target_arch = "wasm32")]
-use worker::{Fetch, Headers, Method, Request, RequestInit};
-
-#[cfg(target_arch = "wasm32")]
 fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportError> {
     let worker_headers = Headers::new();
     for (key, val) in headers {
@@ -24,13 +24,12 @@ fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportEr
     Ok(worker_headers)
 }
 
-#[cfg(target_arch = "wasm32")]
 fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, TransportError> {
     let mut http_headers = HeaderMap::new();
     for (key, val) in headers {
         if let (Ok(k), Ok(v)) = (
-            http::header::HeaderName::from_bytes(key.as_bytes()),
-            http::header::HeaderValue::from_str(&val),
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(&val),
         ) {
             http_headers.insert(k, v);
         }
@@ -38,7 +37,6 @@ fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, Transport
     Ok(http_headers)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 impl OciTransport for WorkerFetchTransport {
     type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + 'static>>;
@@ -121,6 +119,140 @@ impl OciTransport for WorkerFetchTransport {
         Ok((status, resp_headers))
     }
 
+    async fn post_bytes(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        let worker_headers = convert_to_worker_headers(&headers)?;
+        let mut req_init = RequestInit::new();
+        req_init.with_method(Method::Post);
+        req_init.with_headers(worker_headers);
+        req_init.with_body(Some(JsValue::from(body.to_vec())));
+
+        let req = Request::new_with_init(url, &req_init)
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+
+        let status = StatusCode::from_u16(resp.status_code())
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let resp_headers = convert_from_worker_headers(resp.headers())?;
+        Ok((status, resp_headers))
+    }
+
+    async fn post_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        _content_len: u64,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        let bytes = stream
+            .try_collect::<Vec<Bytes>>()
+            .await?
+            .into_iter()
+            .flat_map(|b| b.to_vec())
+            .collect::<Vec<u8>>();
+        self.post_bytes(url, headers, Bytes::from(bytes)).await
+    }
+
+    async fn patch_chunk(
+        &self,
+        url: &str,
+        mut headers: HeaderMap,
+        chunk: Bytes,
+        byte_range: (u64, u64),
+    ) -> Result<UploadChunkResponse, TransportError> {
+        let range_str = format!("{}-{}", byte_range.0, byte_range.1);
+        if let Ok(val) = HeaderValue::from_str(&range_str) {
+            headers.insert("Content-Range", val);
+        }
+        let worker_headers = convert_to_worker_headers(&headers)?;
+        let mut req_init = RequestInit::new();
+        req_init.with_method(Method::Patch);
+        req_init.with_headers(worker_headers);
+        req_init.with_body(Some(JsValue::from(chunk.to_vec())));
+
+        let req = Request::new_with_init(url, &req_init)
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| TransportError::Network(e.to_string()))?;
+
+        let status = StatusCode::from_u16(resp.status_code())
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let resp_headers = convert_from_worker_headers(resp.headers())?;
+        let location = resp_headers
+            .get("Location")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let range = resp_headers
+            .get("Range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_header);
+
+        Ok(UploadChunkResponse {
+            status,
+            headers: resp_headers,
+            location,
+            range,
+        })
+    }
+
+    async fn patch_chunk_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        byte_range: (u64, u64),
+    ) -> Result<UploadChunkResponse, TransportError> {
+        let bytes = stream
+            .try_collect::<Vec<Bytes>>()
+            .await?
+            .into_iter()
+            .flat_map(|b| b.to_vec())
+            .collect::<Vec<u8>>();
+        self.patch_chunk(url, headers, Bytes::from(bytes), byte_range)
+            .await
+    }
+
+    async fn probe_upload_session(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<Option<u64>, TransportError> {
+        let (status, resp_headers, _) = self.get(url, headers).await?;
+        if status.is_success()
+            && let Some(range_val) = resp_headers.get("Range").and_then(|v| v.to_str().ok())
+            && let Some((_start, end)) = parse_range_header(range_val)
+        {
+            return Ok(Some(end));
+        }
+        Ok(None)
+    }
+
+    async fn put_chunk_finish(
+        &self,
+        url: &str,
+        mut headers: HeaderMap,
+        final_chunk: Option<(Bytes, (u64, u64))>,
+    ) -> Result<StatusCode, TransportError> {
+        if let Some((bytes, byte_range)) = final_chunk {
+            let range_str = format!("{}-{}", byte_range.0, byte_range.1);
+            if let Ok(val) = HeaderValue::from_str(&range_str) {
+                headers.insert("Content-Range", val);
+            }
+            self.put_bytes(url, headers, bytes).await
+        } else {
+            self.put_bytes(url, headers, Bytes::new()).await
+        }
+    }
+
     async fn put_bytes(
         &self,
         url: &str,
@@ -131,7 +263,7 @@ impl OciTransport for WorkerFetchTransport {
         let mut req_init = RequestInit::new();
         req_init.with_method(Method::Put);
         req_init.with_headers(worker_headers);
-        req_init.with_body(Some(worker::wasm_bindgen::JsValue::from(body.to_vec())));
+        req_init.with_body(Some(JsValue::from(body.to_vec())));
 
         let req = Request::new_with_init(url, &req_init)
             .map_err(|e| TransportError::Network(e.to_string()))?;
@@ -149,7 +281,6 @@ impl OciTransport for WorkerFetchTransport {
         stream: Self::BodyStream,
         _content_len: u64,
     ) -> Result<StatusCode, TransportError> {
-        use futures_util::TryStreamExt;
         let bytes = stream
             .try_collect::<Vec<Bytes>>()
             .await?
@@ -175,67 +306,6 @@ impl OciTransport for WorkerFetchTransport {
     }
 
     async fn sleep(&self, duration: Duration) {
-        worker::Delay::from(duration).await;
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl OciTransport for WorkerFetchTransport {
-    type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send + 'static>>;
-
-    async fn head(&self, _url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn get(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn stream(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn post(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap), TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn put_bytes(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-        _body: Bytes,
-    ) -> Result<StatusCode, TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn put_stream(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-        _stream: Self::BodyStream,
-        _content_len: u64,
-    ) -> Result<StatusCode, TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn delete(&self, _url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
-    }
-
-    async fn sleep(&self, _duration: Duration) {
-        unimplemented!("WorkerFetchTransport only runs in Wasm / Cloudflare Workers environment")
+        Delay::from(duration).await;
     }
 }

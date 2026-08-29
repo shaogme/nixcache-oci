@@ -163,7 +163,8 @@ pub async fn run_promote(
     if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
         for desc in artifact.index.manifests {
             if let Ok(Some((sub_json, _))) = oci.get_manifest_with_digest(&desc.digest).await
-                && let Ok(sub_manifest) = serde_json::from_str::<nixcache_oci::OciImageManifest>(&sub_json)
+                && let Ok(sub_manifest) =
+                    serde_json::from_str::<nixcache_oci::OciImageManifest>(&sub_json)
                 && let Some(blob_digest) = sub_manifest.first_layer_digest()
                 && let Ok(blob_bytes) = oci.get_blob(blob_digest).await
                 && let Ok(arch_data) = serde_json::from_slice::<ArchCacheIndexData>(&blob_bytes)
@@ -186,7 +187,10 @@ pub async fn run_promote(
     // 合并 session 条目到分桶
     for (hash, entry) in session_entries {
         let sys = entry.system.clone().unwrap_or_default();
-        partitioned_entries.entry(sys).or_default().insert(hash, entry);
+        partitioned_entries
+            .entry(sys)
+            .or_default()
+            .insert(hash, entry);
     }
     for (sys, roots) in session_roots {
         let entry_roots = partitioned_roots.entry(sys).or_default();
@@ -200,7 +204,10 @@ pub async fn run_promote(
     // 合并 receipt 条目到分桶
     for (hash, entry) in receipt_entries {
         let sys = entry.system.clone().unwrap_or_default();
-        partitioned_entries.entry(sys).or_default().insert(hash, entry);
+        partitioned_entries
+            .entry(sys)
+            .or_default()
+            .insert(hash, entry);
     }
     for (sys, roots) in receipt_roots {
         let entry_roots = partitioned_roots.entry(sys).or_default();

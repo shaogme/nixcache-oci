@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -208,6 +208,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
             Ok(resp) if resp.status.is_success() => {
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
+                headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 headers.insert(
                     CONTENT_TYPE,
                     HeaderValue::from_static("application/octet-stream"),
@@ -239,6 +240,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
             Ok(resp) if resp.status().is_success() => {
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
+                headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 if let Ok(val) = HeaderValue::from_str(content_type_str) {
                     headers.insert(CONTENT_TYPE, val);
                 }
@@ -745,9 +747,8 @@ mod tests {
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash1_str),
                 nar_basename: "hot.nar.xz".to_string(),
-                nar_hash:
-                    "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                        .to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
                 ..Default::default()
             },
             nar_digest: NarDigest::new_sha256(

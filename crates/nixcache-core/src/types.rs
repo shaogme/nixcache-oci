@@ -300,9 +300,7 @@ impl SystemArch {
             ("darwin", "amd64" | "x86_64", _) => Self::X86_64Darwin,
             ("darwin", "arm64" | "aarch64", _) => Self::Aarch64Darwin,
             ("linux", "386" | "i686" | "i386", _) => Self::I686Linux,
-            ("linux", "arm", Some("v7") | Some("7")) | ("linux", "armv7l", _) => {
-                Self::Armv7lLinux
-            }
+            ("linux", "arm", Some("v7") | Some("7")) | ("linux", "armv7l", _) => Self::Armv7lLinux,
             ("linux", "riscv64", _) => Self::Riscv64Linux,
             (os_str, arch_str, _) => {
                 let mapped_arch = match arch_str {
@@ -531,14 +529,19 @@ impl CacheIndexData {
 
     /// 将多架构数据按系统架构拆分为各自独立的单架构数据集
     pub fn into_arch_partitioned(self) -> HashMap<SystemArch, ArchCacheIndexData> {
-        let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> = HashMap::new();
+        let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
+            HashMap::new();
         for (hash, entry) in self.entries {
             let sys = entry.system.clone().unwrap_or_default();
-            partitioned_entries.entry(sys).or_default().insert(hash, entry);
+            partitioned_entries
+                .entry(sys)
+                .or_default()
+                .insert(hash, entry);
         }
 
         let mut result = HashMap::new();
-        let mut all_systems: std::collections::HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
+        let mut all_systems: std::collections::HashSet<SystemArch> =
+            partitioned_entries.keys().cloned().collect();
         all_systems.extend(self.gc_roots.keys().cloned());
 
         for sys in all_systems {

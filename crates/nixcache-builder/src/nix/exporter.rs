@@ -1,5 +1,7 @@
 use crate::error::BuilderError;
 use async_compression::tokio::write::XzEncoder;
+use futures_util::TryStreamExt;
+use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,7 +18,17 @@ use tokio::{
     process::Command,
     sync::Semaphore,
 };
+use tokio_util::io::ReaderStream;
 use tracing::info;
+
+#[derive(Debug, Clone)]
+pub struct UploadedNarMetadata {
+    pub store_hash: String,
+    pub store_path: String,
+    pub nar_digest: String,
+    pub nar_size: u64,
+    pub narinfo_content: String,
+}
 
 /// 异步哈希与字节计数写入器
 pub struct HashingWriter<W> {
@@ -281,6 +293,194 @@ pub async fn export_paths_directly(
     Ok(results)
 }
 
+/// 端到端流式无盘导出并上传单个 store path (Diskless Streaming Pipe)
+pub async fn export_and_upload_path_stream(
+    store_path: &str,
+    signing_key_file: Option<&str>,
+    oci_client: &OciClient,
+    upload_config: &UploadConfig,
+) -> Result<UploadedNarMetadata, BuilderError> {
+    if let Some(key) = signing_key_file {
+        let mut cmd = Command::new("nix");
+        cmd.args(["store", "sign", "--key-file", key, store_path]);
+        let _ = cmd.status().await;
+    }
+
+    let file_name = Path::new(store_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| BuilderError::Other(format!("Invalid store path: {}", store_path)))?;
+
+    if file_name.len() < 32 {
+        return Err(BuilderError::Other(format!(
+            "Path name too short: {}",
+            file_name
+        )));
+    }
+    let hash = &file_name[..32];
+
+    let mut dump_proc = Command::new("nix-store")
+        .args(["--dump", store_path])
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| BuilderError::Other(format!("Failed to spawn nix-store --dump: {}", e)))?;
+
+    let dump_stdout = dump_proc
+        .stdout
+        .take()
+        .ok_or_else(|| BuilderError::Other("Failed to capture nix-store stdout".to_string()))?;
+
+    let (reader, writer) = tokio::io::duplex(8 * 1024 * 1024);
+
+    let compress_handle = tokio::spawn(async move {
+        let mut encoder = XzEncoder::new(writer);
+        let mut reader = dump_stdout;
+        let res = tokio::io::copy(&mut reader, &mut encoder).await;
+        let shutdown_res = encoder.shutdown().await;
+        if let Err(e) = res {
+            return Err(format!("Compression copy failed: {}", e));
+        }
+        if let Err(e) = shutdown_res {
+            return Err(format!("Encoder shutdown failed: {}", e));
+        }
+        Ok(())
+    });
+
+    let reader_stream = ReaderStream::new(reader);
+    let oci_stream = Box::pin(reader_stream.map_err(TransportError::Io));
+
+    let (nar_digest, nar_size) = oci_client
+        .push_blob_streaming_resumable(oci_stream, upload_config)
+        .await
+        .map_err(|e| BuilderError::Other(format!("Streaming upload failed: {}", e)))?;
+
+    match compress_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(BuilderError::Other(e)),
+        Err(e) => {
+            return Err(BuilderError::Other(format!(
+                "Compression task join error: {}",
+                e
+            )));
+        }
+    }
+
+    let dump_status = dump_proc
+        .wait()
+        .await
+        .map_err(|e| BuilderError::Other(format!("nix-store dump wait failed: {}", e)))?;
+
+    if !dump_status.success() {
+        return Err(BuilderError::Other(format!(
+            "nix-store dump failed for {}",
+            store_path
+        )));
+    }
+
+    let path_info_out = Command::new("nix")
+        .args(["path-info", "--json", store_path])
+        .output()
+        .await
+        .map_err(|e| {
+            BuilderError::Other(format!(
+                "Failed to run nix path-info for {}: {}",
+                store_path, e
+            ))
+        })?;
+
+    if !path_info_out.status.success() {
+        return Err(BuilderError::Other(format!(
+            "nix path-info failed: {}",
+            String::from_utf8_lossy(&path_info_out.stderr)
+        )));
+    }
+
+    let path_info_json = String::from_utf8_lossy(&path_info_out.stdout);
+    let parsed_info = serde_json::from_str::<Value>(&path_info_json)
+        .map_err(|e| BuilderError::Other(format!("Failed to parse path info: {}", e)))?;
+
+    let info = if let Some(arr) = parsed_info.as_array() {
+        arr.first()
+            .ok_or_else(|| BuilderError::Other("Empty path-info array".to_string()))?
+            .clone()
+    } else if let Some(obj) = parsed_info.as_object() {
+        obj.get(store_path)
+            .ok_or_else(|| BuilderError::Other("Path not found in path-info object".to_string()))?
+            .clone()
+    } else {
+        return Err(BuilderError::Other(
+            "Unexpected path-info structure".to_string(),
+        ));
+    };
+
+    let nar_hash = info
+        .get("narHash")
+        .and_then(|h| h.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let original_nar_size = info.get("narSize").and_then(|s| s.as_u64()).unwrap_or(0);
+    let references = info.get("references").and_then(|r| r.as_array());
+    let deriver = info
+        .get("deriver")
+        .and_then(|d| d.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let signatures = info
+        .get("signatures")
+        .or_else(|| info.get("sigs"))
+        .and_then(|s| s.as_array());
+
+    let mut ref_basenames = Vec::new();
+    if let Some(refs_arr) = references {
+        for r_val in refs_arr {
+            if let Some(r_str) = r_val.as_str()
+                && let Some(bname) = Path::new(r_str).file_name().and_then(|n| n.to_str())
+            {
+                ref_basenames.push(bname.to_string());
+            }
+        }
+    }
+    let ref_names = ref_basenames.join(" ");
+
+    let raw_hash = nar_digest.strip_prefix("sha256:").unwrap_or(&nar_digest);
+    let mut lines = vec![
+        format!("StorePath: {}", store_path),
+        format!("URL: nar/{}.nar.xz", hash),
+        "Compression: xz".to_string(),
+        format!("FileHash: sha256:{}", raw_hash),
+        format!("FileSize: {}", nar_size),
+        format!("NarHash: {}", nar_hash),
+        format!("NarSize: {}", original_nar_size),
+    ];
+
+    if !ref_names.is_empty() {
+        lines.push(format!("References: {}", ref_names));
+    }
+    if !deriver.is_empty()
+        && let Some(deriver_bname) = Path::new(&deriver).file_name().and_then(|n| n.to_str())
+    {
+        lines.push(format!("Deriver: {}", deriver_bname));
+    }
+
+    if let Some(sigs_arr) = signatures {
+        for sig_val in sigs_arr {
+            if let Some(sig_str) = sig_val.as_str() {
+                lines.push(format!("Sig: {}", sig_str));
+            }
+        }
+    }
+
+    let narinfo_content = lines.join("\n") + "\n";
+
+    Ok(UploadedNarMetadata {
+        store_hash: hash.to_string(),
+        store_path: store_path.to_string(),
+        nar_digest,
+        nar_size,
+        narinfo_content,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::HashingWriter;
@@ -314,5 +514,24 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(digest_hex, expected_hex);
+    }
+
+    #[test]
+    fn test_uploaded_nar_metadata_structure() {
+        use super::UploadedNarMetadata;
+
+        let meta = UploadedNarMetadata {
+            store_hash: "s66mzxpvicwk07gjbjfw9izjfa797vsw".to_string(),
+            store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
+            nar_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            nar_size: 2048,
+            narinfo_content: "StorePath: /nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test\n"
+                .to_string(),
+        };
+
+        assert_eq!(meta.store_hash, "s66mzxpvicwk07gjbjfw9izjfa797vsw");
+        assert_eq!(meta.nar_size, 2048);
+        assert!(meta.narinfo_content.starts_with("StorePath:"));
     }
 }

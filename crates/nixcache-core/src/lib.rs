@@ -79,10 +79,22 @@ mod tests {
             SystemArch::Armv7lLinux.to_oci_platform_tuple(),
             ("linux", "arm", Some("v7"))
         );
-        assert_eq!(SystemArch::from_oci("linux", "amd64", None), SystemArch::X86_64Linux);
-        assert_eq!(SystemArch::from_oci("linux", "arm64", None), SystemArch::Aarch64Linux);
-        assert_eq!(SystemArch::from_oci("darwin", "arm64", None), SystemArch::Aarch64Darwin);
-        assert_eq!(SystemArch::from_oci("linux", "arm", Some("v7")), SystemArch::Armv7lLinux);
+        assert_eq!(
+            SystemArch::from_oci("linux", "amd64", None),
+            SystemArch::X86_64Linux
+        );
+        assert_eq!(
+            SystemArch::from_oci("linux", "arm64", None),
+            SystemArch::Aarch64Linux
+        );
+        assert_eq!(
+            SystemArch::from_oci("darwin", "arm64", None),
+            SystemArch::Aarch64Darwin
+        );
+        assert_eq!(
+            SystemArch::from_oci("linux", "arm", Some("v7")),
+            SystemArch::Armv7lLinux
+        );
     }
 
     #[test]
@@ -423,11 +435,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(loaded_arch_session.system, SystemArch::X86_64Linux);
 
         // Arch-scoped cache index
-        let arch_index = ArchCacheIndexData::new(
-            SystemArch::Aarch64Linux,
-            "owner/repo",
-            "ghcr.io",
-        );
+        let arch_index = ArchCacheIndexData::new(SystemArch::Aarch64Linux, "owner/repo", "ghcr.io");
         let arch_index_json = serde_json::to_string(&arch_index).unwrap();
         let loaded_arch_index: ArchCacheIndexData = serde_json::from_str(&arch_index_json).unwrap();
         assert_eq!(loaded_arch_index.version, CACHE_INDEX_VERSION);

@@ -16,7 +16,6 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tempfile::tempdir;
 use tokio::{fs, process::Child, time::sleep};
 use tracing::{error, info, warn};
 
@@ -206,70 +205,64 @@ pub async fn run_build_worker(
     // 6. 查找本地新构建的路径
     let upload_list = nix::find_locally_built_paths(&output_paths, &own_hashes_vec).await?;
 
-    let temp_dir = tempdir()?;
-
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
 
     if !upload_list.is_empty() {
         info!("Locally-built paths to upload: {}", upload_list.len());
-        let exported =
-            nix::export_paths_directly(&upload_list, signing_key_file, temp_dir.path()).await?;
+        let upload_config = nixcache_oci::UploadConfig::default();
 
-        for (hash, store_path) in exported {
-            let narinfo_path = temp_dir.path().join(format!("{}.narinfo", hash));
-            let nar_file_path = temp_dir.path().join("nar").join(format!("{}.nar.xz", hash));
+        for store_path in &upload_list {
+            info!("  Streaming export & upload for {}", store_path);
+            match nix::export_and_upload_path_stream(
+                store_path,
+                signing_key_file,
+                &oci,
+                &upload_config,
+            )
+            .await
+            {
+                Ok(meta) => {
+                    let name = Path::new(&meta.store_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|s| s.split_once('-'))
+                        .map(|x| x.1.to_string())
+                        .unwrap_or_else(|| meta.store_hash.clone());
 
-            if !nar_file_path.exists() {
-                error!("NAR file not found for {}", hash);
-                continue;
-            }
+                    if let Ok(narinfo) = NarInfo::parse(&meta.narinfo_content) {
+                        let (narinfo_meta, nar_size) = narinfo.into_meta();
+                        let store_hash = narinfo_meta
+                            .store_hash()
+                            .unwrap_or_else(|| StoreHash::new_unchecked(&meta.store_hash));
+                        let nar_digest = NarDigest::parse(&meta.nar_digest)
+                            .unwrap_or_else(|_| NarDigest::new_unchecked(&meta.nar_digest));
 
-            let metadata = fs::metadata(&nar_file_path).await?;
-            let size = metadata.len();
-
-            info!("  Uploading NAR for {} ({} bytes)", hash, size);
-            match oci.push_blob(&nar_file_path).await {
-                Ok(nar_digest_str) => {
-                    if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
-                        let name = Path::new(&store_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .and_then(|s| s.split_once('-'))
-                            .map(|x| x.1.to_string())
-                            .unwrap_or_else(|| hash.clone());
-
-                        if let Ok(narinfo) = NarInfo::parse(&narinfo_content) {
-                            let (narinfo_meta, nar_size) = narinfo.into_meta();
-                            let store_hash = narinfo_meta
-                                .store_hash()
-                                .unwrap_or_else(|| StoreHash::new_unchecked(&hash));
-                            let nar_digest = NarDigest::parse(&nar_digest_str)
-                                .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest_str));
-
-                            new_entries.insert(
-                                store_hash,
-                                IndexEntry {
-                                    name,
-                                    system: Some(system.clone()),
-                                    narinfo_meta,
-                                    nar_digest,
-                                    nar_size: size.max(nar_size),
-                                    added: Utc::now()
-                                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                    origin_job: env::var("GITHUB_JOB")
-                                        .ok()
-                                        .map(|j| format!("job:{}", j)),
-                                },
-                            );
-                            uploaded_count += 1;
-                            total_bytes_uploaded += size;
-                        }
+                        new_entries.insert(
+                            store_hash,
+                            IndexEntry {
+                                name,
+                                system: Some(system.clone()),
+                                narinfo_meta,
+                                nar_digest,
+                                nar_size: meta.nar_size.max(nar_size),
+                                added: Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                origin_job: env::var("GITHUB_JOB")
+                                    .ok()
+                                    .map(|j| format!("job:{}", j)),
+                            },
+                        );
+                        uploaded_count += 1;
+                        total_bytes_uploaded += meta.nar_size;
                     }
                 }
                 Err(e) => {
-                    error!("Failed to upload NAR for {}: {}", hash, e);
+                    error!(
+                        "Failed to stream export and upload for {}: {}",
+                        store_path, e
+                    );
                 }
             }
         }
