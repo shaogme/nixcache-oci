@@ -97,7 +97,7 @@ active_roots = [
 ]
 
 receipt = {
-    'version': 2,
+    'version': 3,
     'system': sys_name,
     'repo': 'concurrency-test/cache',
     'timestamp': '2026-08-28T00:00:00Z',
@@ -121,13 +121,13 @@ done
 wait "${WORKER_PIDS[@]}"
 echo ">>> All 12 worker receipts written to $RECEIPTS_DIR."
 
-# 4. Run nixcache-builder merge
-echo ">>> Executing nixcache-builder merge across all receipts..."
+# 4. Run nixcache-builder promote
+echo ">>> Executing nixcache-builder promote across all receipts..."
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export NIXCACHE_REPO="concurrency-test/cache"
 export GITHUB_TOKEN="dummy-token"
 
-"$BUILDER_BIN" merge "$RECEIPTS_DIR"
+"$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR"
 
 # 5. Verify merged cache-index in OCI registry
 echo ">>> Fetching and verifying merged cache-index manifest and blob..."
@@ -164,9 +164,9 @@ for sys in ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']:
 "
 echo ">>> GC roots aggregation per system architecture verified."
 
-# 7. Test Merge Idempotency (re-running merge produces identical entry count and no corruption)
-echo ">>> Testing merge idempotency by running merge again..."
-"$BUILDER_BIN" merge "$RECEIPTS_DIR"
+# 7. Test Merge Idempotency (re-running promote produces identical entry count and no corruption)
+echo ">>> Testing merge idempotency by running promote again..."
+"$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR"
 
 MANIFEST_JSON_2=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
 BLOB_DIGEST_2=$(echo "$MANIFEST_JSON_2" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")

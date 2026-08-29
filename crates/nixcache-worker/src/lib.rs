@@ -1,10 +1,12 @@
 mod oci;
+mod state;
 mod store;
 
 use crate::{
     oci::OciClient,
-    store::{CacheStore, IndexEntry, WorkerProxyConfig},
+    store::{CacheStore, WorkerProxyConfig},
 };
+use nixcache_core::IndexEntry;
 use serde::Deserialize;
 use std::collections::HashMap;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};

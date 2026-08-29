@@ -48,6 +48,8 @@ echo ">>> Building nixcache-proxy and nixcache-builder..."
 cargo build --bin nixcache-proxy --bin nixcache-builder
 BUILDER_BIN="./target/debug/nixcache-builder"
 PROXY_BIN="./target/debug/nixcache-proxy"
+PROXY_DIR="$(cd "$(dirname "$PROXY_BIN")" && pwd)"
+export PATH="$PROXY_DIR:$PATH"
 
 export NIXCACHE_REPO="testorg/testrepo"
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"

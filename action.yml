@@ -1,4 +1,4 @@
-name: 'NixCache OCI Publisher (All-in-One)'
+name: 'NixCache OCI Publisher'
 description: 'Build your Nix Flake outputs and publish custom packages as OCI blobs to GHCR'
 inputs:
   system:
@@ -79,6 +79,7 @@ runs:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_FAIL_FAST: ${{ inputs.fail-fast }}
+        NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt.json
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""
@@ -95,4 +96,5 @@ runs:
           fi
           echo ">>> Using fallback version: $REF"
         fi
-        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- all-in-one
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- build
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- promote --receipt "${{ runner.temp }}/receipt.json"

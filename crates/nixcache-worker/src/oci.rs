@@ -1,5 +1,5 @@
-use crate::store::{CacheIndexData, RunSessionManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use nixcache_core::{CacheIndexData, RunSessionManifest};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Mutex;
@@ -241,9 +241,8 @@ impl OciClient {
                     .ok_or_else(|| "Session layer digest missing".to_string())?;
 
                 let blob_bytes = self.get_blob(blob_digest).await?;
-                let mut session: RunSessionManifest =
+                let session: RunSessionManifest =
                     serde_json::from_slice(&blob_bytes).map_err(|e| e.to_string())?;
-                session.rebuild_lookup_table();
                 Ok(Some((session, manifest_digest)))
             }
             None => Ok(None),
@@ -273,10 +272,8 @@ impl OciClient {
                     .ok_or_else(|| "Index layer digest missing".to_string())?;
 
                 let blob_bytes = self.get_blob(blob_digest).await?;
-                let mut index: CacheIndexData =
+                let index: CacheIndexData =
                     serde_json::from_slice(&blob_bytes).map_err(|e| e.to_string())?;
-                index.manifest_digest = manifest_digest.clone();
-                index.rebuild_lookup_table();
                 Ok(Some((index, manifest_digest)))
             }
             None => Ok(None),

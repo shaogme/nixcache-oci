@@ -10,7 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use nixcache_oci::{IndexEntry, OciClient};
+use nixcache_core::IndexEntry;
+use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -271,7 +272,7 @@ mod tests {
     use crate::index::{CacheIndex, CascadingProxyConfig};
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use nixcache_oci::{CacheIndexData, IndexEntry};
+    use nixcache_core::{CacheIndexData, IndexEntry};
     use std::{collections::HashMap, time::Duration};
     use tower::ServiceExt;
     use wiremock::{

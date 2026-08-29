@@ -4,13 +4,26 @@
 
 本项目使用 GitHub Container Registry (GHCR) 作为存储后端 —— NAR 包将作为 OCI blob 存储，并结合单文件索引清单（Index Manifest）实现极速的路径查找。无需运行额外的外部服务器、CDN 或数据库。
 
-## 工作原理
+## 工作原理与核心架构
 
-1. 在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明你需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。
+1. **多架构声明与自动过滤**：在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 GHCR。
 
-2. **GitHub Actions** 会自动构建所有内容，检测并过滤掉 `cache.nixos.org` 上已经存在的 store 路径，然后将仅在本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 GHCR。
+2. **4 级级联缓存与 $O(1)$ 极速解析（Cascading Resolver）**：
+   - **Tier 0（即时内存热缓存）**：流水线当前构建步骤产生的产物，动态注册后 $0\text{ ms}$ 极速穿透供后续步骤使用。
+   - **Tier 1（工作流会话缓存 `run-<run_id>`）**：同一 Workflow Run 中各矩阵并行 Job 共享的会话级缓存。
+   - **Tier 2（分支/PR 会话缓存 `branch-<name>`）**：同分支或 PR 历史迭代的快速增量缓存。
+   - **Tier 3（生产基线缓存 `cache-index`）**：合并发布后的生产全局统一索引清单。
+   - **Upstream（上游透明回退）**：请求不存在于任何 Tier 时，透明重定向并回退至 `cache.nixos.org` 等公共缓存源。
+   - 全链路在内存中维护双向哈希与 NAR Basename 映射表，彻底消除线性扫描，将路径与 NAR Blob 寻址降为 **$O(1)$ 常数时间**。
 
-3. **本地代理服务（Local Proxy）** 会从缓存的索引中提供 `.narinfo` 信息（实现零延迟的本地查找），并在客户端有需求时流式下载 GHCR 中的 NAR blob。如果请求的路径存在于上游缓存（如 `cache.nixos.org`），代理会自动且透明地重定向到上游。
+3. **直通式流传输与零常驻开销**：从 GHCR 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压，内存占用极低。
+
+4. **解耦的 5-Crate 架构体系**：
+   - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（无原生 IO 依赖，Wasm 兼容）。
+   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎与 CAS 并发安全更新器。
+   - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum）。
+   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与安全环境隔离）。
+   - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 GHCR 3 级穿透）。
 
 ## 快速开始
 
@@ -80,17 +93,17 @@ jobs:
   # 阶段 2: 汇聚并原子发布统一缓存索引 (Gather - 单节点合并发布)
   # =========================================================================
   publish-index:
-    name: Merge & Publish Cache Index
+    name: Promote & Publish Cache Index
     needs: build-matrix
     runs-on: ubuntu-latest
     steps:
-      - name: Merge Receipts & Finalize Index
-        uses: shaogme/nixcache-oci/merge@main
+      - name: Promote Receipts & Finalize Index
+        uses: shaogme/nixcache-oci/promote@main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-##### 2. 单机全流程一键发布（All-in-One，适用于单一架构或简易项目）
+##### 2. 单机全流程一键发布（适用于单一架构或简易项目）
 
 在单节点上直接完成编译、NAR 上传与索引发布：
 
@@ -371,9 +384,13 @@ npins update
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | OCI 镜像托管源 |
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
 | `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可对局域网提供服务） |
+| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` / `GITHUB_RUN_ID` | （无） | GitHub Actions 工作流 Run ID（启用 Tier 1 会话级缓存） |
+| `--branch <BRANCH>` | `NIXCACHE_BRANCH` / `GITHUB_REF_NAME` | （无） | 分支名称或 PR 编号（启用 Tier 2 分支级缓存） |
+| `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag（Tier 3 基线缓存） |
+| `--session-ttl <TTL>` | `NIXCACHE_SESSION_TTL` | `10` | Tier 1/Tier 2 会话索引刷新周期（单位：秒） |
+| `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | Tier 3 生产基线索引刷新周期（单位：秒） |
 | `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个以空格分隔） |
 | `--index-dir <DIR>` | `NIXCACHE_INDEX_DIR` | （见下方说明） | 缓存索引存储目录（若未指定，回退至 `CACHE_DIRECTORY` 环境变量或 `~/.cache/nixcache-proxy/...`） |
-| `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | 索引的本地缓存时间（单位：秒） |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | 用于认证 GitHub 接口/私有仓库的 Token |
 
 ---
@@ -382,7 +399,62 @@ npins update
 
 `nixcache-builder` 采用清晰的职责拆分子命令设计：
 
-#### 1. `build` (Matrix Worker 节点专用)
+#### 1. `session` (流水线会话全生命周期与级联协调)
+支持 GitHub Actions 工作流在不同 Job 阶段进行透明级联缓存与原子 CAS 上传：
+
+- **`session init`**：启动本地 `nixcache-proxy` 代理后台守护进程，配置 Nix 客户端 substituters（安全注入 `NIX_CONFIG`），并记录基线 Store 快照。
+- **`session capture`**：自动差异比对基线快照（或显式指定 Store 路径），并发上传 NAR Blobs 到 GHCR，通过 CAS 机制原子更新 `run-<run_id>` 会话清单，并向本地 Proxy 注册热条目。
+- **`session clean`**：清理本地会话快照与临时状态文件。
+
+```bash
+# 1. 在 Job 开始前初始化会话
+nixcache-builder session init --run-id 123456 --branch main
+
+# 2. 在构建步骤后捕获并上传新产物
+nixcache-builder session capture --run-id 123456 --job-id "build-x86"
+
+# 3. 在步骤结束时清理
+nixcache-builder session clean
+```
+
+##### `session init` 参数：
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID（Tier 1 会话） |
+| `--branch <BRANCH>` | `NIXCACHE_BRANCH` | （无） | 分支名称或 PR 编号（Tier 2 会话） |
+| `--port <PORT>` | `NIXCACHE_PORT` | `37515` | Proxy 代理后台守护进程监听端口 |
+| `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | Proxy 代理后台守护进程监听地址 |
+| `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游回退二进制缓存列表 |
+| `--session-ttl <TTL>` | `NIXCACHE_SESSION_TTL` | `10` | 会话索引刷新周期（秒） |
+| `--baseline-ttl <TTL>` | `NIXCACHE_BASELINE_TTL` | `300` | 基线索引刷新周期（秒） |
+| `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线 OCI Tag |
+| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 记录构建前 Store 路径快照的文件路径 |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+##### `session capture` 参数：
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID |
+| `--job-id <JOB_ID>` | `NIXCACHE_JOB_ID` | （无） | 当前 GitHub Actions Job 标识符 |
+| `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台系统架构 |
+| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（可选） |
+| `--proxy-url <URL>` | `NIXCACHE_PROXY_URL` | `http://127.0.0.1:37515` | 本地 Proxy 代理地址（用于热注册新产物） |
+| `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 构建前 Store 路径快照文件路径（用于自动 diff） |
+| `[PATHS...]` | - | （无） | 显式指定要捕获的 Store 路径（位置参数，可选） |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+##### `session clean` 参数：
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 要删除的 Store 路径快照文件路径 |
+
+#### 2. `build` (Matrix Worker 节点构建)
 构建指定平台的 Nix 产物、并发推送 NAR Blobs 到 GHCR，并生成本地轻量构建收据（Build Receipt）：
 ```bash
 nixcache-builder build \
@@ -410,25 +482,36 @@ nixcache-builder build \
 | `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | Proxy 启动失败时是否立即报错退出 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-#### 2. `merge` (Coordinator 汇聚节点专用)
-收集所有 Matrix 节点的 Build Receipts，原子合并全局索引清单并发布到 GHCR：
+#### 3. `promote` (Coordinator 汇聚与晋升发布节点专用)
+收集所有 Matrix 节点的 Build Receipts 或工作流会话（`run-<run_id>`），原子晋升合并全局索引清单并发布到 GHCR：
 ```bash
-nixcache-builder merge \
+# 方式 A：通过 Receipts 目录合并发布
+nixcache-builder promote \
   --receipts-dir ./receipts \
+  --repo owner/repo \
+  --registry ghcr.io
+
+# 方式 B：通过 Workflow Run ID 晋升发布
+nixcache-builder promote \
+  --run-id 123456 \
   --repo owner/repo \
   --registry ghcr.io
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 |---|---|---|---|
+| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | 要晋升的 GitHub Actions Workflow Run ID |
 | `--receipts-dir <DIR>` | `NIXCACHE_RECEIPTS_DIR` | （无） | 存放 BuildReceipt JSON 文件的目录 |
 | `--receipt <FILE...>` | - | （无） | 单独指定的 BuildReceipt JSON 文件路径（可多次指定） |
+| `[PATHS...]` | - | （无） | 位置参数：Receipt 文件或目录路径 |
+| `--target-tag <TAG>` | `NIXCACHE_TARGET_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag |
+| `--cleanup-session` / `--no-cleanup-session` | - | `true` | 晋升成功后是否清理临时 Session Tag |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-#### 3. `gc` (跨平台垃圾回收阶段)
-聚合保留所有平台的活性根（GC Roots），清理失效孤立包：
+#### 4. `gc` (跨平台垃圾回收阶段)
+聚合保留所有平台的活性根（GC Roots），基于纯函数图可达性算法清理失效孤立包：
 ```bash
 nixcache-builder gc \
   --repo owner/repo \
@@ -444,9 +527,6 @@ nixcache-builder gc \
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-#### 4. `all-in-one` (单机全流程命令)
-在单节点直接完成本地构建、NAR 上传与索引更新发布（包含 `build` 与 `merge` 全流程）。
-
 ---
 
 ### 代理如何工作
@@ -459,12 +539,13 @@ nixcache-builder gc \
 
 | 端点路径 | HTTP 方法 | 描述 |
 |---|---|---|
-| `/_status` | GET | 查看远端连接状态 (`remote_connected`)、索引条目、配置和上游缓存状态 |
+| `/_status` | GET | 查看远端连接状态 (`remote_connected`)、各 Tier 索引条目统计、配置和上游缓存状态 |
 | `/_refresh` | POST | 强制立即刷新索引（无需等待 TTL 过期） |
+| `/_session/register` | POST | 动态注册当前会话构建产物热条目（实现 CI 步骤间 0ms 极速热穿透） |
 | `/public-key` | GET | 获取配置的二进制缓存签名公钥（如果已启用签名） |
 
 ```bash
-# 查看状态（包含 remote_connected、registry、repo、index_entries 等）
+# 查看状态（包含 remote_connected、registry、repo、各 Tier 条目统计等）
 curl http://localhost:37515/_status
 
 # 在发布新包后，强制立即刷新本地缓存
@@ -481,24 +562,37 @@ curl -X POST http://localhost:37515/_refresh
 | `remote_error` | `string \| null` | **错误诊断信息**：当 `remote_connected` 为 `false` 时提供具体的错误原因（如网络超时、503 服务不可用、401 鉴权失败等）；正常时省略。 |
 | `registry` | `string` | 当前代理所绑定的 OCI 注册表地址（如 `ghcr.io` 或 `127.0.0.1:5001`）。 |
 | `repo` | `string` | 目标包存储库路径（如 `shaogme/nixcache-oci`）。 |
-| `index_entries` | `number` | 当前已载入内存/KV 的缓存索引条目（包）总数。 |
-| `index_generated` | `string` | 远程构建产物 `cache-index` 的生成时间（ISO 8601 格式，如 `2026-08-29T04:40:00Z`）。 |
-| `manifest_digest` | `string` | 远程 OCI Manifest 镜像清单的 SHA-256 摘要哈希值。 |
-| `index_ttl` | `number` | 索引内存刷新周期（秒），默认 300 秒（仅本地代理提供）。 |
+| `run_id` | `number \| null` | 当前绑定的 GitHub Actions Workflow Run ID（Tier 1 会话）。 |
+| `branch_or_pr` | `string \| null` | 当前绑定的分支名称或 PR 编号（Tier 2 会话）。 |
+| `tier0_hot_entries` | `number` | Tier 0 内存即时热注册的条目数。 |
+| `tier1_session_entries` | `number` | Tier 1 工作流会话（`run-<run_id>`）条目数。 |
+| `tier2_branch_entries` | `number` | Tier 2 分支/PR 会话（`branch-<name>`）条目数。 |
+| `tier3_baseline_entries` | `number` | Tier 3 生产全局基线（`cache-index`）条目数。 |
+| `total_unique_entries` | `number` | 去重后的全局总有效条目数。 |
+| `index_entries` | `number` | 当前已载入内存/KV 的缓存索引总数（等同于 `total_unique_entries`）。 |
+| `session_ttl` | `number` | Tier 1/2 会话刷新周期（秒），默认 10 秒。 |
+| `baseline_ttl` | `number` | Tier 3 基线刷新周期（秒），默认 300 秒。 |
 | `upstream` | `string[]` | 配置的上游回退二进制缓存列表（如 `["https://cache.nixos.org"]`）。 |
 
 ##### 典型响应示例
 
-- **场景 1：正常运行与成功连接远端**
+- **场景 1：正常运行与 4 级级联就绪**
   ```json
   {
     "remote_connected": true,
     "registry": "ghcr.io",
     "repo": "shaogme/nixcache-oci",
-    "index_entries": 42,
-    "index_generated": "2026-08-29T04:40:00Z",
-    "manifest_digest": "sha256:49e9dbdae120e87984582ed2a5fe878bbef13626ce9db3c9714c6cb64fd18dcd",
+    "run_id": 123456,
+    "branch_or_pr": "main",
+    "tier0_hot_entries": 2,
+    "tier1_session_entries": 10,
+    "tier2_branch_entries": 5,
+    "tier3_baseline_entries": 100,
+    "total_unique_entries": 115,
+    "index_entries": 115,
     "index_ttl": 300,
+    "session_ttl": 10,
+    "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
     ]
@@ -512,10 +606,15 @@ curl -X POST http://localhost:37515/_refresh
     "remote_error": "Failed to connect to remote: OCI registry manifest request failed with status: 503 Service Unavailable",
     "registry": "127.0.0.1:5001",
     "repo": "test/cache",
+    "tier0_hot_entries": 0,
+    "tier1_session_entries": 0,
+    "tier2_branch_entries": 0,
+    "tier3_baseline_entries": 12,
+    "total_unique_entries": 12,
     "index_entries": 12,
-    "index_generated": "2026-08-28T12:00:00Z",
-    "manifest_digest": "",
     "index_ttl": 300,
+    "session_ttl": 10,
+    "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
     ]
@@ -528,17 +627,51 @@ curl -X POST http://localhost:37515/_refresh
     "remote_connected": true,
     "registry": "ghcr.io",
     "repo": "user/new-repo",
+    "tier0_hot_entries": 0,
+    "tier1_session_entries": 0,
+    "tier2_branch_entries": 0,
+    "tier3_baseline_entries": 0,
+    "total_unique_entries": 0,
     "index_entries": 0,
-    "index_generated": "",
-    "manifest_digest": "",
     "index_ttl": 300,
+    "session_ttl": 10,
+    "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
     ]
   }
   ```
 
-## 架构
+## 架构与分层设计
+
+### 1. Workspace Crate 拓扑与分层
+
+本项目严格遵循领域驱动与单一职责原则，划分为 5 个清晰解耦的 Crate：
+
+```mermaid
+flowchart TD
+    Core["crates/nixcache-core<br>(纯核心模型 / Schema v3 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
+    OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
+    Proxy["crates/nixcache-proxy<br>(Axum 4 级级联代理 / O(1) 内存双向查找 / 流式转发)"]
+    Builder["crates/nixcache-builder<br>(CI 构建协调 / 会话生命周期 / 安全环境隔离)"]
+    Worker["crates/nixcache-worker<br>(Cloudflare Worker 边缘无服务器代理 / 3 级穿透)"]
+
+    Core --> OCI
+    Core --> Proxy
+    Core --> Worker
+    OCI --> Builder
+    OCI --> Proxy
+```
+
+- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
+- **`crates/nixcache-oci`**：OCI 注册表交互层，提供强类型 Manifest/Descriptor 构建、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
+- **`crates/nixcache-proxy`**：本地反向代理，实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 映射，直通式流传输。
+- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单。
+- **`crates/nixcache-worker`**：极薄的 Cloudflare Worker 适配层，共享 `nixcache-core` 模型，通过内存 -> KV -> GHCR 3 级穿透提供边缘加速。
+
+---
+
+### 2. 多架构 Scatter-Gather 并行构建与原子发布
 
 ```mermaid
 flowchart TD
@@ -559,8 +692,8 @@ flowchart TD
     end
 
     subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
-        Merger["nixcache-builder merge<br>(收集所有 Receipts + 获取旧 cache-index)"]
-        MergedIndex["全局 Cache Index v2<br>(合并 entries + 跨平台 gc_roots)"]
+        Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
+        MergedIndex["全局 Cache Index v3<br>(合并 entries + 跨平台 gc_roots)"]
         TagPush["更新 GHCR tag: cache-index"]
     end
 
@@ -677,15 +810,24 @@ nix-build default.nix -A tests.vmtest --no-out-link
 
 # 3. 模拟 12 节点并发生成 Receipts，验证原子合并的幂等性与多架构 GC 根聚合
 ./test/test-concurrency-merge.sh
+
+# 4. 验证流水线 Session 级联与 CAS 并发冲突退避重试机制
+./test/test-pipeline-session-cas.sh
 ```
 
-#### 端到端（E2E）全流程测试
+#### 端到端（E2E）与替换器测试
 ```bash
-# 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])
+# 1. 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])
 ./test/test-e2e.sh cargo flake
 
-# 多架构 Scatter-Gather 并行构建与汇聚发布 E2E 测试
+# 2. 多架构 Scatter-Gather 并行构建与汇聚发布 E2E 测试
 ./test/test-multiarch-e2e.sh
+
+# 3. 验证 Nix 客户端真实替换器 substituters 下载与完整性链路
+./test/test-substitution.sh
+
+# 4. Cloudflare Worker 边缘代理端到端功能测试
+./test/test-worker.sh
 ```
 
 #### 工作流与 Shell 脚本检查

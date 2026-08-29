@@ -138,11 +138,11 @@ cat "$RECEIPT_2"
 echo ""
 
 # =========================================================================
-# Phase 2: Gather (Merge Coordinator aggregating Receipts & publishing Index)
+# Phase 2: Gather (Promote Coordinator aggregating Receipts & publishing Index)
 # =========================================================================
 
-echo ">>> [Phase 2] Running Merge Coordinator..."
-"$BUILDER_BIN" merge \
+echo ">>> [Phase 2] Running Promote Coordinator..."
+"$BUILDER_BIN" promote \
     --receipts-dir "$RECEIPTS_DIR" \
     --repo "$NIXCACHE_REPO" \
     --registry "$NIXCACHE_REGISTRY"

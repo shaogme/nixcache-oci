@@ -1,15 +1,20 @@
-use crate::nix::{self, BuildConfig};
-use chrono::{DateTime, Utc};
-use nixcache_oci::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, OciClient,
+use crate::{
+    error::BuilderError,
+    nix::{self, BuildConfig},
 };
-use serde_json::{Value, json};
+use chrono::Utc;
+use nixcache_core::{
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry,
+    evaluate_multi_arch_gc,
+};
+use nixcache_oci::{OciClient, build_index_manifest};
 use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     time::Duration,
 };
+use tempfile::NamedTempFile;
 use tokio::{
     fs,
     process::{Child, Command},
@@ -36,7 +41,7 @@ fn find_proxy_binary() -> PathBuf {
 async fn write_nix_conf(
     substituters: &[&str],
     trusted_keys: &[&str],
-) -> Result<Option<(PathBuf, String)>, String> {
+) -> Result<Option<(PathBuf, String)>, BuilderError> {
     let nix_conf_path = PathBuf::from("/etc/nix/nix.conf");
 
     let original_content = if nix_conf_path.exists() {
@@ -87,19 +92,17 @@ async fn write_nix_conf(
                 for key in trusted_keys {
                     user_new.push_str(&format!("extra-trusted-public-keys = {}\n", key));
                 }
-                fs::write(&user_conf_path, user_new)
-                    .await
-                    .map_err(|err| format!("Failed to write user nix.conf: {}", err))?;
+                fs::write(&user_conf_path, user_new).await?;
                 info!("Added self-substituter to {:?}", user_conf_path);
                 Ok(Some((user_conf_path, user_original)))
             } else {
-                Err(format!(
+                Err(BuilderError::Config(format!(
                     "Permission denied for /etc/nix/nix.conf and HOME env is not set: {}",
                     e
-                ))
+                )))
             }
         }
-        Err(e) => Err(format!("Failed to write nix.conf: {}", e)),
+        Err(e) => Err(BuilderError::Io(e)),
     }
 }
 
@@ -160,13 +163,28 @@ impl ProxyGuard {
     }
 }
 
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        if let Some((path, content)) = self.nix_conf_backup.take() {
+            if content.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let _ = std::fs::write(&path, content);
+            }
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 async fn setup_self_substituter(
     repo: &str,
     registry: &str,
     github_token: &str,
     signing_key_file: Option<&str>,
     fail_fast: bool,
-) -> Result<ProxyGuard, String> {
+) -> Result<ProxyGuard, BuilderError> {
     let proxy_bin = find_proxy_binary();
     info!("Starting self-substituter proxy using {:?}", proxy_bin);
 
@@ -201,7 +219,10 @@ async fn setup_self_substituter(
         }
         Err(e) => {
             if fail_fast {
-                return Err(format!("Failed to spawn nixcache-proxy: {}", e));
+                return Err(BuilderError::Proxy(format!(
+                    "Failed to spawn nixcache-proxy: {}",
+                    e
+                )));
             }
             warn!(
                 "Could not spawn nixcache-proxy ({}). Proceeding without self-substituter.",
@@ -226,9 +247,9 @@ async fn setup_self_substituter(
             if let Some(mut child) = proxy_child {
                 let _ = child.kill().await;
             }
-            return Err(
+            return Err(BuilderError::Proxy(
                 "Self-substituter proxy failed to become ready (timed out after 15s)".to_string(),
-            );
+            ));
         }
         info!("Self-substituter failed to respond, proceeding without it");
     }
@@ -243,14 +264,7 @@ async fn fetch_remote_cache_index(oci: &OciClient) -> (CacheIndexData, HashSet<S
     let mut remote_index = CacheIndexData::default();
     let mut own_hashes = HashSet::new();
 
-    if let Ok(Some(manifest_json)) = oci.get_manifest("cache-index").await
-        && let Ok(manifest) = serde_json::from_str::<Value>(&manifest_json)
-        && let Some(layers) = manifest.get("layers").and_then(|l| l.as_array())
-        && !layers.is_empty()
-        && let Some(digest) = layers[0].get("digest").and_then(|d| d.as_str())
-        && let Ok(blob_bytes) = oci.get_blob(digest).await
-        && let Ok(data) = serde_json::from_slice::<CacheIndexData>(&blob_bytes)
-    {
+    if let Ok(Some((data, _))) = oci.get_cache_index("cache-index").await {
         own_hashes = data.entries.keys().cloned().collect();
         remote_index = data;
     }
@@ -261,59 +275,24 @@ async fn fetch_remote_cache_index(oci: &OciClient) -> (CacheIndexData, HashSet<S
 async fn push_cache_index_data(
     oci: &OciClient,
     index: &CacheIndexData,
-    temp_dir: &Path,
     tag: &str,
-) -> Result<(), String> {
-    let index_json = serde_json::to_string_pretty(index)
-        .map_err(|e| format!("Failed to serialize cache index: {}", e))?;
+) -> Result<(), BuilderError> {
+    let (index_digest, index_size) = oci.push_json_blob(index).await?;
 
-    let index_temp_path = temp_dir.join("cache-index.json");
-    fs::write(&index_temp_path, &index_json)
-        .await
-        .map_err(|e| format!("Failed to write index temp: {}", e))?;
+    let empty_config = "{}";
+    let temp_cfg = NamedTempFile::new()?;
+    tokio::fs::write(temp_cfg.path(), empty_config.as_bytes()).await?;
+    let config_digest = oci.push_blob(temp_cfg.path()).await?;
+    let config_size = 2u64;
 
-    let index_digest = oci
-        .push_blob(&index_temp_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let index_size = fs::metadata(&index_temp_path)
-        .await
-        .map_err(|e| format!("Failed to get index size: {}", e))?
-        .len();
+    let manifest = build_index_manifest(&index_digest, index_size, &config_digest, config_size);
+    let manifest_str = manifest.to_json_string()?;
 
-    let config_temp_path = temp_dir.join("config.json");
-    fs::write(&config_temp_path, "{}")
-        .await
-        .map_err(|e| format!("Failed to write config temp: {}", e))?;
-    let config_digest = oci
-        .push_blob(&config_temp_path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let config_size = 2;
-
-    let manifest = json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": config_digest,
-            "size": config_size
-        },
-        "layers": [{
-            "mediaType": "application/vnd.nix.cache.index.v1+json",
-            "digest": index_digest,
-            "size": index_size
-        }]
-    });
-
-    oci.push_manifest(tag, &manifest.to_string())
-        .await
-        .map_err(|e| e.to_string())?;
-
+    oci.push_manifest(tag, &manifest_str).await?;
     Ok(())
 }
 
-async fn record_store_snapshot(snap_path: &Path) -> Result<(), String> {
+async fn record_store_snapshot(snap_path: &Path) -> Result<(), BuilderError> {
     let mut paths = Vec::new();
     if let Ok(mut entries) = fs::read_dir("/nix/store").await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -327,9 +306,7 @@ async fn record_store_snapshot(snap_path: &Path) -> Result<(), String> {
         let _ = fs::create_dir_all(parent).await;
     }
     let content = paths.join("\n");
-    fs::write(snap_path, content)
-        .await
-        .map_err(|e| format!("Failed to write store snapshot to {:?}: {}", snap_path, e))?;
+    fs::write(snap_path, content).await?;
     info!(
         "Recorded store snapshot with {} paths to {:?}",
         paths.len(),
@@ -338,7 +315,7 @@ async fn record_store_snapshot(snap_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Session Init: 启动后台 Proxy 守护进程，配置 nix.conf，并记录 store 快照
+/// Session Init: 启动后台 Proxy 守护进程，配置 nix substituters，并记录 store 快照
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session_init(
     repo: &str,
@@ -354,7 +331,7 @@ pub async fn run_session_init(
     github_token: &str,
     signing_key_file: Option<&str>,
     snapshot_path: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<(), BuilderError> {
     info!(
         "Initializing NixCache Session: Run ID: {:?}, Branch: {:?}, Repo: {}/{}",
         run_id, branch, registry, repo
@@ -384,9 +361,7 @@ pub async fn run_session_init(
         proxy_cmd.env("NIXCACHE_BRANCH", br);
     }
 
-    let _child = proxy_cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn nixcache-proxy: {}", e))?;
+    let _child = proxy_cmd.spawn()?;
 
     let client = reqwest::Client::new();
     let probe_url = format!("http://{}:{}/nix-cache-info", listen, port);
@@ -402,10 +377,10 @@ pub async fn run_session_init(
     }
 
     if !ready {
-        return Err(format!(
+        return Err(BuilderError::Proxy(format!(
             "Proxy failed to become ready on http://{}:{}",
             listen, port
-        ));
+        )));
     }
     info!("Proxy is running and ready on http://{}:{}", listen, port);
 
@@ -440,7 +415,7 @@ pub async fn run_session_capture(
     proxy_url: Option<&str>,
     snapshot_before: Option<&Path>,
     explicit_paths: &[String],
-) -> Result<(), String> {
+) -> Result<(), BuilderError> {
     let system = match system_opt {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => nix::get_system().await?,
@@ -486,7 +461,7 @@ pub async fn run_session_capture(
     );
 
     let oci = OciClient::new(registry, repo, github_token, true);
-    let temp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create tempdir: {}", e))?;
+    let temp_dir = tempfile::tempdir()?;
 
     let mut new_entries = HashMap::new();
     let mut uploaded_count = 0;
@@ -503,9 +478,7 @@ pub async fn run_session_capture(
                 continue;
             }
 
-            let metadata = fs::metadata(&nar_file_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let metadata = fs::metadata(&nar_file_path).await?;
             let size = metadata.len();
 
             info!("  Uploading NAR for {} ({} bytes)", hash, size);
@@ -573,8 +546,7 @@ pub async fn run_session_capture(
             total_bytes_uploaded,
             5,
         )
-        .await
-        .map_err(|e| format!("Failed to update run session with CAS: {}", e))?;
+        .await?;
     }
 
     // 热注册到本机 Proxy
@@ -622,10 +594,8 @@ pub async fn run_session_capture(
             let _ = fs::create_dir_all(parent).await;
         }
 
-        let receipt_json = serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?;
-        fs::write(receipt_path, receipt_json)
-            .await
-            .map_err(|e| e.to_string())?;
+        let receipt_json = serde_json::to_string_pretty(&receipt)?;
+        fs::write(receipt_path, receipt_json).await?;
         info!("Build receipt written to {:?}", receipt_path);
     }
 
@@ -641,7 +611,7 @@ pub async fn run_session_capture(
 }
 
 /// Session Clean: 清理本地快照文件
-pub async fn run_session_clean(snapshot_path: Option<&Path>) -> Result<(), String> {
+pub async fn run_session_clean(snapshot_path: Option<&Path>) -> Result<(), BuilderError> {
     if let Some(path) = snapshot_path
         && path.exists()
     {
@@ -652,7 +622,6 @@ pub async fn run_session_clean(snapshot_path: Option<&Path>) -> Result<(), Strin
 }
 
 /// 阶段 1: 编译构建阶段 (Worker / Matrix 节点)
-/// 负责编译 Nix 目标、上传 NAR Blobs，并输出 BuildReceipt 文件，不发布 cache-index
 pub async fn run_build_worker(
     build_config: &BuildConfig,
     repo: &str,
@@ -661,7 +630,7 @@ pub async fn run_build_worker(
     github_token: &str,
     output_receipt_path: &Path,
     fail_fast: bool,
-) -> Result<(), String> {
+) -> Result<(), BuilderError> {
     let system = match &build_config.system {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => nix::get_system().await?,
@@ -700,8 +669,7 @@ pub async fn run_build_worker(
     // 6. 查找本地新构建的路径
     let upload_list = nix::find_locally_built_paths(&output_paths, &own_hashes_vec).await?;
 
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| format!("Failed to create temporary directory: {}", e))?;
+    let temp_dir = tempfile::tempdir()?;
 
     let mut new_entries = HashMap::new();
     let mut uploaded_count = 0;
@@ -721,9 +689,7 @@ pub async fn run_build_worker(
                 continue;
             }
 
-            let metadata = fs::metadata(&nar_file_path)
-                .await
-                .map_err(|e| format!("Failed to read nar file metadata: {}", e))?;
+            let metadata = fs::metadata(&nar_file_path).await?;
             let size = metadata.len();
 
             info!("  Uploading NAR for {} ({} bytes)", hash, size);
@@ -806,16 +772,11 @@ pub async fn run_build_worker(
     if let Some(parent) = output_receipt_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("Failed to create receipt directory: {}", e))?;
+        fs::create_dir_all(parent).await?;
     }
 
-    let receipt_json = serde_json::to_string_pretty(&receipt)
-        .map_err(|e| format!("Failed to serialize receipt: {}", e))?;
-    fs::write(output_receipt_path, receipt_json)
-        .await
-        .map_err(|e| format!("Failed to write receipt file: {}", e))?;
+    let receipt_json = serde_json::to_string_pretty(&receipt)?;
+    fs::write(output_receipt_path, receipt_json).await?;
 
     info!(
         "Build receipt written to {:?} (system: {}, uploaded: {} blobs)",
@@ -842,7 +803,7 @@ pub async fn run_promote(
     target_tag: &str,
     cleanup_session: bool,
     github_token: &str,
-) -> Result<(), String> {
+) -> Result<(), BuilderError> {
     info!(
         "Promoting cache to tag '{}' for repo: {}/{} (Run ID: {:?})",
         target_tag, registry, repo, run_id
@@ -894,7 +855,7 @@ pub async fn run_promote(
         }
     }
 
-    // 2. 从本地 Receipt 文件合并 (兼容旧版及多架构 artifacts)
+    // 2. 从本地 Receipt 文件合并 (兼容多架构 artifacts)
     for p in receipt_paths {
         if p.is_dir() {
             if let Ok(mut dir_entries) = fs::read_dir(p).await {
@@ -980,9 +941,7 @@ pub async fn run_promote(
     }
 
     // 3. 发布更新后的全局 cache-index
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| format!("Failed to create temporary directory: {}", e))?;
-    push_cache_index_data(&oci, &index, temp_dir.path(), target_tag).await?;
+    push_cache_index_data(&oci, &index, target_tag).await?;
 
     info!(
         "Promote complete! Global cache-index has {} total entries across {} systems.",
@@ -1010,33 +969,14 @@ pub async fn run_promote(
     Ok(())
 }
 
-/// 兼容接口：run_merge_coordinator
-pub async fn run_merge_coordinator(
-    receipt_paths: &[PathBuf],
-    repo: &str,
-    registry: &str,
-    github_token: &str,
-) -> Result<(), String> {
-    run_promote(
-        None,
-        receipt_paths,
-        repo,
-        registry,
-        "cache-index",
-        false,
-        github_token,
-    )
-    .await
-}
-
-/// 阶段 3: 跨平台垃圾回收阶段
+/// 阶段 3: 跨平台垃圾回收阶段 (调用 nixcache_core 纯函数)
 pub async fn run_gc(
     retention_days: u64,
     dry_run: bool,
     repo: &str,
     registry: &str,
     github_token: &str,
-) -> Result<(), String> {
+) -> Result<(), BuilderError> {
     info!(
         "Running multi-arch garbage collection for {}/{}",
         registry, repo
@@ -1049,160 +989,75 @@ pub async fn run_gc(
         return Ok(());
     }
 
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+    let gc_result = evaluate_multi_arch_gc(&index, &cutoff);
+
     info!(
-        "Loaded index with {} total entries across systems: {:?}",
+        "GC Evaluation: Total: {}, Live Roots: {}, Kept: {}, To Delete: {}",
         index.entries.len(),
-        index.gc_roots.keys().collect::<Vec<_>>()
-    );
-
-    // 聚合所有系统的 GC Roots
-    let all_live_roots: HashSet<String> = index
-        .gc_roots
-        .values()
-        .flat_map(|roots| roots.iter().cloned())
-        .collect();
-
-    info!(
-        "Aggregated {} live GC root(s) across all systems",
-        all_live_roots.len()
-    );
-
-    let now = Utc::now();
-    let retention_duration = chrono::Duration::days(retention_days as i64);
-    let cutoff = now - retention_duration;
-
-    info!(
-        "Cutoff date: {}",
-        cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    );
-
-    let mut kept_entries = HashMap::new();
-    let mut to_delete_count = 0;
-
-    for (hash, entry) in index.entries {
-        let is_live = all_live_roots.contains(&hash);
-        let added_dt = DateTime::parse_from_rfc3339(&entry.added)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(now);
-
-        let is_old = added_dt < cutoff;
-
-        if !is_live && is_old {
-            to_delete_count += 1;
-            info!(
-                "DELETE: {} ({}, system={:?}) added={}",
-                hash, entry.name, entry.system, entry.added
-            );
-        } else {
-            kept_entries.insert(hash.clone(), entry);
-            let reason = if is_live { "live" } else { "recent" };
-            info!("KEEP:   {} reason={}", hash, reason);
-        }
-    }
-
-    info!(
-        "\n>>> Multi-Arch GC Total: {} keep, {} delete",
-        kept_entries.len(),
-        to_delete_count
+        gc_result.live_roots.len(),
+        gc_result.kept_entries.len(),
+        gc_result.deleted_hashes.len()
     );
 
     if dry_run {
-        info!(">>> Dry run, no changes written");
+        info!("Dry run complete. No modifications pushed.");
         return Ok(());
     }
 
-    if to_delete_count > 0 {
-        index.entries = kept_entries;
-        // 清理 gc_roots 中已不存在的 hash
-        for roots in index.gc_roots.values_mut() {
-            roots.retain(|h| index.entries.contains_key(h));
-        }
+    index.entries = gc_result.kept_entries;
+    index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| format!("Failed to create temporary directory: {}", e))?;
-
-        push_cache_index_data(&oci, &index, temp_dir.path(), "cache-index").await?;
-        info!(">>> Multi-arch GC complete, index updated");
-    }
-
+    push_cache_index_data(&oci, &index, "cache-index").await?;
+    info!("Successfully updated cache-index after GC.");
     Ok(())
 }
 
-/// 阶段 4: 单机全流程快捷命令 (兼容本地/单一架构项目)
-pub async fn run_all_in_one(
-    build_config: &BuildConfig,
-    repo: &str,
-    registry: &str,
-    signing_key_file: Option<&str>,
-    github_token: &str,
-    fail_fast: bool,
-) -> Result<(), String> {
-    let system = match &build_config.system {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => nix::get_system().await?,
-    };
-
-    info!(
-        "Starting all-in-one build & publish for system: {} | Repo: {}/{}",
-        system, registry, repo
-    );
-
-    let temp_dir =
-        tempfile::tempdir().map_err(|e| format!("Failed to create temporary directory: {}", e))?;
-    let receipt_path = temp_dir.path().join(format!("receipt-{}.json", system));
-
-    // 1. 执行 Worker 构建与上传
-    run_build_worker(
-        build_config,
-        repo,
-        registry,
-        signing_key_file,
-        github_token,
-        &receipt_path,
-        fail_fast,
-    )
-    .await?;
-
-    // 2. 执行 Coordinator 汇聚与发布
-    run_merge_coordinator(&[receipt_path], repo, registry, github_token).await?;
-
-    info!("All-in-one pipeline complete!");
-    Ok(())
-}
-
+// GitHub Actions Summary 报告生成辅助函数
 async fn write_session_init_summary(
     repo: &str,
     run_id: Option<u64>,
     branch: Option<&str>,
     port: u16,
 ) {
-    if let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") {
+    if let Ok(summary_file) = env::var("GITHUB_STEP_SUMMARY") {
         let content = format!(
-            "## NixCache Session Init Summary\n\n| Property | Value |\n|---|---|\n| Repository | `{}` |\n| Run ID (Tier 1) | `{}` |\n| Branch/PR (Tier 2) | `{}` |\n| Proxy Port | `{}` |\n| Status | Ready (Cascading Resolver Active) |\n",
-            repo,
-            run_id
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "N/A".to_string()),
-            branch.unwrap_or("N/A"),
-            port
+            "### 🚀 NixCache Session Initialized\n\n- **Repository:** `{}`\n- **Run ID:** `{:?}`\n- **Branch/PR:** `{:?}`\n- **Proxy Daemon Port:** `{}`\n",
+            repo, run_id, branch, port
         );
-        let _ = fs::write(&summary_path, content).await;
+        let _ = fs::write(&summary_file, content).await;
     }
 }
 
 async fn write_session_capture_summary(
     job_id: &str,
     system: &str,
-    discovered: usize,
-    uploaded: usize,
-    bytes_uploaded: u64,
+    candidate_paths: usize,
+    uploaded_blobs: usize,
+    total_bytes: u64,
 ) {
-    if let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") {
+    if let Ok(summary_file) = env::var("GITHUB_STEP_SUMMARY") {
         let content = format!(
-            "## NixCache Session Capture Summary\n\n| Metric | Value |\n|---|---|\n| Job ID | `{}` |\n| System | `{}` |\n| Candidate Paths Scanned | {} |\n| Blobs Uploaded | {} |\n| Bytes Uploaded | {} bytes |\n",
-            job_id, system, discovered, uploaded, bytes_uploaded
+            "### 📦 NixCache Session Captured\n\n- **Job:** `{}`\n- **System:** `{}`\n- **Candidate Paths:** `{}`\n- **Uploaded Blobs:** `{}`\n- **Uploaded Bytes:** `{}` bytes\n",
+            job_id, system, candidate_paths, uploaded_blobs, total_bytes
         );
-        let _ = fs::write(&summary_path, content).await;
+        let _ = fs::write(&summary_file, content).await;
+    }
+}
+
+async fn write_worker_step_summary(
+    system: &str,
+    discovered: usize,
+    built: usize,
+    to_upload: usize,
+    uploaded: usize,
+) {
+    if let Ok(summary_file) = env::var("GITHUB_STEP_SUMMARY") {
+        let content = format!(
+            "### 🔨 NixCache Worker Build\n\n- **System:** `{}`\n- **Discovered Outputs:** `{}`\n- **Built Outputs:** `{}`\n- **New Paths to Upload:** `{}`\n- **Uploaded Blobs:** `{}`\n",
+            system, discovered, built, to_upload, uploaded
+        );
+        let _ = fs::write(&summary_file, content).await;
     }
 }
 
@@ -1212,95 +1067,22 @@ async fn write_promote_step_summary(
     total_entries: usize,
     promoted_entries: usize,
 ) {
-    if let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") {
+    if let Ok(summary_file) = env::var("GITHUB_STEP_SUMMARY") {
         let content = format!(
-            "## NixCache Promote Summary\n\n| Metric | Value |\n|---|---|\n| Run ID Promoted | `{}` |\n| Target Tag | `{}` |\n| Entries Promoted from Run | {} |\n| Total Global Index Entries | {} |\n",
-            run_id
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "N/A".to_string()),
-            target_tag,
-            promoted_entries,
-            total_entries
+            "### 🌟 NixCache Promotion Complete\n\n- **Run ID:** `{:?}`\n- **Target Tag:** `{}`\n- **Total Index Entries:** `{}`\n- **Promoted New Entries:** `{}`\n",
+            run_id, target_tag, total_entries, promoted_entries
         );
-        let _ = fs::write(&summary_path, content).await;
-    }
-}
-
-async fn write_worker_step_summary(
-    system: &str,
-    discovered: usize,
-    built: usize,
-    upload_candidates: usize,
-    uploaded: usize,
-) {
-    if let Ok(summary_path) = env::var("GITHUB_STEP_SUMMARY") {
-        let content = format!(
-            "## NixCache Build Summary ({})\n\n| Metric | Count |\n|---|---|\n| System Architecture | `{}` |\n| Outputs discovered | {} |\n| Output paths built | {} |\n| New paths to upload | {} |\n| Successfully uploaded | {} |\n",
-            system, system, discovered, built, upload_candidates, uploaded
-        );
-        let _ = fs::write(&summary_path, content).await;
+        let _ = fs::write(&summary_file, content).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use nixcache_oci::{BuildReceipt, BuildStats, CacheIndexData, IndexEntry};
-
-    #[test]
-    fn test_merge_receipts_in_memory() {
-        let mut index = CacheIndexData {
-            version: 3,
-            ..Default::default()
-        };
-
-        let entry1 = IndexEntry {
-            name: "pkg-x86".to_string(),
-            system: Some("x86_64-linux".to_string()),
-            ..Default::default()
-        };
-
-        let receipt1 = BuildReceipt::new(
-            "x86_64-linux".to_string(),
-            "test/repo".to_string(),
-            "2026-08-28T00:00:00Z".to_string(),
-            Some("key-1".to_string()),
-            HashMap::from([("hash-x86-1".to_string(), entry1)]),
-            vec!["hash-x86-root-1".to_string()],
-            BuildStats::default(),
-        );
-
-        let entry2 = IndexEntry {
-            name: "pkg-arm".to_string(),
-            system: Some("aarch64-linux".to_string()),
-            ..Default::default()
-        };
-
-        let receipt2 = BuildReceipt::new(
-            "aarch64-linux".to_string(),
-            "test/repo".to_string(),
-            "2026-08-28T00:00:00Z".to_string(),
-            Some("key-1".to_string()),
-            HashMap::from([("hash-arm-1".to_string(), entry2)]),
-            vec!["hash-arm-root-1".to_string()],
-            BuildStats::default(),
-        );
-
-        let receipts = vec![receipt1, receipt2];
-
-        for r in &receipts {
-            index.entries.extend(r.new_entries.clone());
-            let roots = index.gc_roots.entry(r.system.clone()).or_default();
-            roots.extend(r.active_gc_roots.clone());
-        }
-
-        assert_eq!(index.version, 3);
-        assert_eq!(index.entries.len(), 2);
-        assert!(index.entries.contains_key("hash-x86-1"));
-        assert!(index.entries.contains_key("hash-arm-1"));
-        assert_eq!(index.gc_roots.get("x86_64-linux").unwrap().len(), 1);
-        assert_eq!(index.gc_roots.get("aarch64-linux").unwrap().len(), 1);
-    }
+    use super::{restore_nix_conf, run_session_clean};
+    use nixcache_core::{
+        BuildReceipt, BuildStats, CacheIndexData, IndexEntry, evaluate_multi_arch_gc,
+    };
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_gc_multi_arch_aggregation() {
@@ -1314,27 +1096,32 @@ mod tests {
             vec!["hash-arm-live".to_string()],
         );
 
+        let now = chrono::Utc::now();
+        let sixty_days_ago = (now - chrono::Duration::days(60)).to_rfc3339();
+        let five_days_ago = (now - chrono::Duration::days(5)).to_rfc3339();
+
         let entry_x86_live = IndexEntry {
-            name: "live-x86".to_string(),
-            added: "2020-01-01T00:00:00Z".to_string(),
+            name: "pkg-x86".to_string(),
+            system: Some("x86_64-linux".to_string()),
+            added: sixty_days_ago.clone(),
             ..Default::default()
         };
-
         let entry_arm_live = IndexEntry {
-            name: "live-arm".to_string(),
-            added: "2020-01-01T00:00:00Z".to_string(),
+            name: "pkg-arm".to_string(),
+            system: Some("aarch64-linux".to_string()),
+            added: sixty_days_ago.clone(),
             ..Default::default()
         };
-
         let entry_dead_old = IndexEntry {
-            name: "dead-old".to_string(),
-            added: "2020-01-01T00:00:00Z".to_string(),
+            name: "pkg-dead-old".to_string(),
+            system: Some("x86_64-linux".to_string()),
+            added: sixty_days_ago.clone(),
             ..Default::default()
         };
-
         let entry_dead_recent = IndexEntry {
-            name: "dead-recent".to_string(),
-            added: Utc::now().to_rfc3339(),
+            name: "pkg-dead-recent".to_string(),
+            system: Some("x86_64-linux".to_string()),
+            added: five_days_ago.clone(),
             ..Default::default()
         };
 
@@ -1351,46 +1138,19 @@ mod tests {
             .entries
             .insert("hash-dead-recent".to_string(), entry_dead_recent);
 
-        let all_live_roots: HashSet<String> = index
-            .gc_roots
-            .values()
-            .flat_map(|roots| roots.iter().cloned())
-            .collect();
+        let cutoff = now - chrono::Duration::days(30);
+        let result = evaluate_multi_arch_gc(&index, &cutoff);
 
-        assert_eq!(all_live_roots.len(), 2);
-        assert!(all_live_roots.contains("hash-x86-live"));
-        assert!(all_live_roots.contains("hash-arm-live"));
-
-        let cutoff = Utc::now() - chrono::Duration::days(30);
-
-        let mut kept = HashMap::new();
-        let mut deleted = Vec::new();
-
-        for (hash, entry) in index.entries {
-            let is_live = all_live_roots.contains(&hash);
-            let added_dt = DateTime::parse_from_rfc3339(&entry.added)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let is_old = added_dt < cutoff;
-
-            if !is_live && is_old {
-                deleted.push(hash);
-            } else {
-                kept.insert(hash, entry);
-            }
-        }
-
-        assert_eq!(deleted, vec!["hash-dead-old"]);
-        assert_eq!(kept.len(), 3);
-        assert!(kept.contains_key("hash-x86-live"));
-        assert!(kept.contains_key("hash-arm-live"));
-        assert!(kept.contains_key("hash-dead-recent"));
+        assert_eq!(result.deleted_hashes, vec!["hash-dead-old"]);
+        assert_eq!(result.kept_entries.len(), 3);
+        assert!(result.kept_entries.contains_key("hash-x86-live"));
+        assert!(result.kept_entries.contains_key("hash-arm-live"));
+        assert!(result.kept_entries.contains_key("hash-dead-recent"));
     }
 
     #[test]
     fn test_gc_reachability_graph_algorithm() {
         let mut index = CacheIndexData::default();
-        // 构造三架构共享依赖图
         index.gc_roots.insert(
             "x86_64-linux".to_string(),
             vec![
@@ -1410,7 +1170,7 @@ mod tests {
             vec!["hash-darwin-client".to_string()],
         );
 
-        let now = Utc::now();
+        let now = chrono::Utc::now();
         let ninety_days_ago = (now - chrono::Duration::days(90)).to_rfc3339();
         let one_hour_ago = (now - chrono::Duration::hours(1)).to_rfc3339();
 
@@ -1434,34 +1194,13 @@ mod tests {
             );
         }
 
-        let all_live_roots: HashSet<String> = index
-            .gc_roots
-            .values()
-            .flat_map(|roots| roots.iter().cloned())
-            .collect();
-
         let cutoff = now - chrono::Duration::days(30);
-        let mut kept = HashMap::new();
-        let mut deleted = Vec::new();
+        let result = evaluate_multi_arch_gc(&index, &cutoff);
 
-        for (hash, entry) in index.entries {
-            let is_live = all_live_roots.contains(&hash);
-            let added_dt = DateTime::parse_from_rfc3339(&entry.added)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(now);
-
-            if !is_live && added_dt < cutoff {
-                deleted.push(hash);
-            } else {
-                kept.insert(hash, entry);
-            }
-        }
-
-        // 仅有孤立且超过 30 天的 hash-orphan-ancient 被删除
-        assert_eq!(deleted, vec!["hash-orphan-ancient"]);
-        assert_eq!(kept.len(), 5);
-        assert!(kept.contains_key("hash-shared-libc"));
-        assert!(kept.contains_key("hash-orphan-recent"));
+        assert_eq!(result.deleted_hashes, vec!["hash-orphan-ancient"]);
+        assert_eq!(result.kept_entries.len(), 5);
+        assert!(result.kept_entries.contains_key("hash-shared-libc"));
+        assert!(result.kept_entries.contains_key("hash-orphan-recent"));
     }
 
     #[tokio::test]
@@ -1469,13 +1208,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let test_conf = temp_dir.path().join("nix.conf");
 
-        // 初始写入原有内容
         tokio::fs::write(&test_conf, "sandbox = true\n")
             .await
             .unwrap();
 
         let backup = Some((test_conf.clone(), "sandbox = true\n".to_string()));
-        // 模拟被修改后的内容
         tokio::fs::write(
             &test_conf,
             "sandbox = true\nextra-substituters = http://localhost\n",
@@ -1483,12 +1220,10 @@ mod tests {
         .await
         .unwrap();
 
-        // 恢复
         restore_nix_conf(backup).await;
         let restored = tokio::fs::read_to_string(&test_conf).await.unwrap();
         assert_eq!(restored, "sandbox = true\n");
 
-        // 测试原文件不存在时恢复为删除
         let new_file = temp_dir.path().join("new.conf");
         tokio::fs::write(&new_file, "extra-substituters = test\n")
             .await
@@ -1499,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_receipt_dir_parsing_in_merge() {
+    async fn test_receipt_dir_parsing_in_promote() {
         let temp_dir = tempfile::tempdir().unwrap();
         let receipts_dir = temp_dir.path().join("receipts");
         tokio::fs::create_dir_all(&receipts_dir).await.unwrap();
@@ -1533,7 +1268,6 @@ mod tests {
         tokio::fs::write(receipts_dir.join("receipt-arm.json"), r2_json)
             .await
             .unwrap();
-        // 忽略非 json 文件
         tokio::fs::write(receipts_dir.join("README.txt"), "some notes")
             .await
             .unwrap();
@@ -1568,7 +1302,6 @@ mod tests {
         assert!(res.is_ok());
         assert!(!snap_file.exists());
 
-        // 清理不存在的文件也不会报错
         let res2 = run_session_clean(Some(&snap_file)).await;
         assert!(res2.is_ok());
     }

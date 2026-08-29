@@ -1,5 +1,8 @@
 use moka::future::Cache;
-use nixcache_oci::{CacheIndexData, IndexEntry, OciClient, RunSessionManifest};
+use nixcache_core::{
+    CacheIndexData, IndexEntry, RunSessionManifest, build_nar_lookup_map, extract_nar_basename,
+};
+use nixcache_oci::OciClient;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -53,16 +56,48 @@ struct RemoteStatus {
     error: Option<String>,
 }
 
+/// 带有 O(1) 反向 NAR 映射表的会话缓存模型
+#[derive(Clone, Debug)]
+pub struct CachedSession {
+    pub manifest: RunSessionManifest,
+    pub nar_lookup: HashMap<String, String>,
+}
+
+impl CachedSession {
+    pub fn new(manifest: RunSessionManifest) -> Self {
+        let nar_lookup = build_nar_lookup_map(&manifest.entries);
+        Self {
+            manifest,
+            nar_lookup,
+        }
+    }
+}
+
+/// 带有 O(1) 反向 NAR 映射表的基线缓存模型
+#[derive(Clone, Debug)]
+pub struct CachedBaseline {
+    pub data: CacheIndexData,
+    pub nar_lookup: HashMap<String, String>,
+}
+
+impl CachedBaseline {
+    pub fn new(data: CacheIndexData) -> Self {
+        let nar_lookup = build_nar_lookup_map(&data.entries);
+        Self { data, nar_lookup }
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheIndex {
     config: CascadingProxyConfig,
     oci_client: OciClient,
     // Tier 0: 本地内存热注册表 (In-Memory Hot Registry)
     hot_entries: Cache<String, IndexEntry>,
+    hot_nar_lookup: Cache<String, String>,
     // Tier 1 & Tier 2: 工作流及分支/PR 会话缓存 (key 为 tag 如 "run-123", "branch-main")
-    session_cache: Cache<String, Arc<RunSessionManifest>>,
+    session_cache: Cache<String, Arc<CachedSession>>,
     // Tier 3: 生产主干基线索引缓存 (key 为 config.baseline_tag)
-    baseline_cache: Cache<String, Arc<CacheIndexData>>,
+    baseline_cache: Cache<String, Arc<CachedBaseline>>,
     // 远端连接与错误状态
     remote_status: Arc<RwLock<RemoteStatus>>,
 }
@@ -71,6 +106,7 @@ impl CacheIndex {
     pub fn with_config(config: CascadingProxyConfig, github_token: &str) -> Self {
         let oci_client = OciClient::new(&config.registry, &config.repo, github_token, false);
         let hot_entries = Cache::builder().build();
+        let hot_nar_lookup = Cache::builder().build();
         let session_cache = Cache::builder().time_to_live(config.session_ttl).build();
         let baseline_cache = Cache::builder().time_to_live(config.baseline_ttl).build();
 
@@ -78,6 +114,7 @@ impl CacheIndex {
             config,
             oci_client,
             hot_entries,
+            hot_nar_lookup,
             session_cache,
             baseline_cache,
             remote_status: Arc::new(RwLock::new(RemoteStatus::default())),
@@ -107,12 +144,18 @@ impl CacheIndex {
         status.error = error;
     }
 
-    /// Tier 0: 动态注册新编译完成的条目到内存热表中 (0ms 延迟可用)
+    /// Tier 0: 动态注册新编译完成的条目到内存热表和 NAR 查找表中 (0ms 延迟可用)
     pub async fn register_hot_entries(&self, entries: HashMap<String, IndexEntry>) {
         let count = entries.len();
+        let nar_map = build_nar_lookup_map(&entries);
+
         for (key, entry) in entries {
             self.hot_entries.insert(key, entry).await;
         }
+        for (nar_name, digest) in nar_map {
+            self.hot_nar_lookup.insert(nar_name, digest).await;
+        }
+
         info!(
             "[nixcache-proxy] Registered {} entries into Tier 0 In-Memory Hot Registry (Total: {})",
             count,
@@ -130,7 +173,7 @@ impl CacheIndex {
         // Tier 1: 工作流会话 (run-<run_id>)
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(entry) = session.entries.get(store_hash)
+            && let Some(entry) = session.manifest.entries.get(store_hash)
         {
             return Some(entry.clone());
         }
@@ -138,51 +181,51 @@ impl CacheIndex {
         // Tier 2: 分支/PR 会话
         if self.config.branch_or_pr.is_some()
             && let Some(branch) = self.get_branch_data().await
-            && let Some(entry) = branch.entries.get(store_hash)
+            && let Some(entry) = branch.manifest.entries.get(store_hash)
         {
             return Some(entry.clone());
         }
 
         // Tier 3: 生产主干基线
         let baseline = self.get_baseline_data().await;
-        baseline.entries.get(store_hash).cloned()
+        baseline.data.entries.get(store_hash).cloned()
     }
 
-    /// 级联反向解析 NAR 文件名对应的 Blob Digest
+    /// 级联反向解析 NAR 文件名对应的 Blob Digest (全链路 O(1) 检索)
     pub async fn find_nar_digest(&self, nar_basename: &str) -> Option<String> {
-        // Tier 0
-        for (_, entry) in self.hot_entries.iter() {
-            if let Some(digest) = find_nar_digest_in_entry(&entry, nar_basename) {
-                return Some(digest);
-            }
+        let normalized = extract_nar_basename(nar_basename);
+
+        // Tier 0: O(1) 查找
+        if let Some(digest) = self.hot_nar_lookup.get(normalized).await {
+            return Some(digest);
         }
 
-        // Tier 1
+        // Tier 1: O(1) 查找
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(digest) = find_nar_digest_in_entries(&session.entries, nar_basename)
+            && let Some(digest) = session.nar_lookup.get(normalized)
         {
-            return Some(digest);
+            return Some(digest.clone());
         }
 
-        // Tier 2
+        // Tier 2: O(1) 查找
         if self.config.branch_or_pr.is_some()
             && let Some(branch) = self.get_branch_data().await
-            && let Some(digest) = find_nar_digest_in_entries(&branch.entries, nar_basename)
+            && let Some(digest) = branch.nar_lookup.get(normalized)
         {
-            return Some(digest);
+            return Some(digest.clone());
         }
 
-        // Tier 3
+        // Tier 3: O(1) 查找
         let baseline = self.get_baseline_data().await;
-        find_nar_digest_in_entries(&baseline.entries, nar_basename)
+        baseline.nar_lookup.get(normalized).cloned()
     }
 
     /// 获取有效的签名公钥 (按会话 -> 分支 -> 基线优先级查找)
     pub async fn get_public_key(&self) -> Option<String> {
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(ref pk) = session.public_key
+            && let Some(ref pk) = session.manifest.public_key
             && !pk.is_empty()
         {
             return Some(pk.clone());
@@ -190,15 +233,15 @@ impl CacheIndex {
 
         if self.config.branch_or_pr.is_some()
             && let Some(branch) = self.get_branch_data().await
-            && let Some(ref pk) = branch.public_key
+            && let Some(ref pk) = branch.manifest.public_key
             && !pk.is_empty()
         {
             return Some(pk.clone());
         }
 
         let baseline = self.get_baseline_data().await;
-        if !baseline.public_key.is_empty() {
-            Some(baseline.public_key.clone())
+        if !baseline.data.public_key.is_empty() {
+            Some(baseline.data.public_key.clone())
         } else {
             None
         }
@@ -213,7 +256,7 @@ impl CacheIndex {
             self.session_cache
                 .get(&tag)
                 .await
-                .map(|s| s.entries.len())
+                .map(|s| s.manifest.entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -228,7 +271,7 @@ impl CacheIndex {
             self.session_cache
                 .get(&tag)
                 .await
-                .map(|b| b.entries.len())
+                .map(|b| b.manifest.entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -238,7 +281,7 @@ impl CacheIndex {
             .baseline_cache
             .get(&self.config.baseline_tag)
             .await
-            .map(|b| b.entries.len())
+            .map(|b| b.data.entries.len())
             .unwrap_or(0);
 
         let mut all_unique_hashes = HashSet::new();
@@ -249,7 +292,7 @@ impl CacheIndex {
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             if let Some(sess) = self.session_cache.get(&tag).await {
-                all_unique_hashes.extend(sess.entries.keys().cloned());
+                all_unique_hashes.extend(sess.manifest.entries.keys().cloned());
             }
         }
 
@@ -260,12 +303,12 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             if let Some(branch) = self.session_cache.get(&tag).await {
-                all_unique_hashes.extend(branch.entries.keys().cloned());
+                all_unique_hashes.extend(branch.manifest.entries.keys().cloned());
             }
         }
 
         if let Some(baseline) = self.baseline_cache.get(&self.config.baseline_tag).await {
-            all_unique_hashes.extend(baseline.entries.keys().cloned());
+            all_unique_hashes.extend(baseline.data.entries.keys().cloned());
         }
 
         StatusEntryCounts {
@@ -277,13 +320,13 @@ impl CacheIndex {
         }
     }
 
-    pub async fn get_session_data(&self) -> Option<Arc<RunSessionManifest>> {
+    pub async fn get_session_data(&self) -> Option<Arc<CachedSession>> {
         let run_id = self.config.run_id?;
         let tag = format!("run-{}", run_id);
         self.fetch_or_get_session(&tag).await
     }
 
-    pub async fn get_branch_data(&self) -> Option<Arc<RunSessionManifest>> {
+    pub async fn get_branch_data(&self) -> Option<Arc<CachedSession>> {
         let branch_or_pr = self.config.branch_or_pr.as_ref()?;
         let tag = if branch_or_pr.starts_with("pr-") || branch_or_pr.starts_with("branch-") {
             branch_or_pr.to_string()
@@ -293,10 +336,10 @@ impl CacheIndex {
         self.fetch_or_get_session(&tag).await
     }
 
-    pub async fn get_baseline_data(&self) -> Arc<CacheIndexData> {
+    pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
-        if let Some(data) = self.baseline_cache.get(tag).await {
-            return data;
+        if let Some(cached) = self.baseline_cache.get(tag).await {
+            return cached;
         }
 
         let tag_str = tag.clone();
@@ -381,9 +424,9 @@ impl CacheIndex {
                         "[nixcache-proxy] Baseline index refreshed successfully with {} entries.",
                         data.entries.len()
                     );
-                    Ok(Arc::new(data))
+                    Ok(Arc::new(CachedBaseline::new(data)))
                 } else if refresh_ok {
-                    Ok(Arc::new(CacheIndexData::default()))
+                    Ok(Arc::new(CachedBaseline::new(CacheIndexData::default())))
                 } else {
                     Err(
                         "Failed to refresh baseline index from both remote registry and backup"
@@ -395,12 +438,13 @@ impl CacheIndex {
 
         match res {
             Ok(data) => data,
-            Err(_) => Arc::new(CacheIndexData::default()),
+            Err(_) => Arc::new(CachedBaseline::new(CacheIndexData::default())),
         }
     }
 
     pub async fn get_data(&self) -> Arc<CacheIndexData> {
-        self.get_baseline_data().await
+        let baseline = self.get_baseline_data().await;
+        Arc::new(baseline.data.clone())
     }
 
     /// 强制刷新所有层级的索引
@@ -429,7 +473,7 @@ impl CacheIndex {
             .invalidate(&self.config.baseline_tag)
             .await;
         let baseline = self.get_baseline_data().await;
-        if baseline.entries.is_empty() {
+        if baseline.data.entries.is_empty() {
             let (_, remote_err) = self.remote_status().await;
             if let Some(e) = remote_err {
                 errs.push(format!("Baseline: {}", e));
@@ -444,7 +488,7 @@ impl CacheIndex {
         }
     }
 
-    async fn fetch_or_get_session(&self, tag: &str) -> Option<Arc<RunSessionManifest>> {
+    async fn fetch_or_get_session(&self, tag: &str) -> Option<Arc<CachedSession>> {
         if let Some(manifest) = self.session_cache.get(tag).await {
             return Some(manifest);
         }
@@ -460,7 +504,7 @@ impl CacheIndex {
                 match self.oci_client.get_session_manifest(&tag_str).await {
                     Ok(Some((session, _))) => {
                         self.set_remote_status(true, None).await;
-                        Ok(Arc::new(session))
+                        Ok(Arc::new(CachedSession::new(session)))
                     }
                     Ok(None) => {
                         info!(
@@ -488,7 +532,10 @@ impl CacheIndex {
     #[cfg(test)]
     pub async fn update_data_in_memory(&self, new_data: CacheIndexData) {
         self.baseline_cache
-            .insert(self.config.baseline_tag.clone(), Arc::new(new_data))
+            .insert(
+                self.config.baseline_tag.clone(),
+                Arc::new(CachedBaseline::new(new_data)),
+            )
             .await;
         self.set_remote_status(true, None).await;
     }
@@ -496,38 +543,17 @@ impl CacheIndex {
     #[cfg(test)]
     pub async fn update_session_in_memory(&self, tag: &str, session: RunSessionManifest) {
         self.session_cache
-            .insert(tag.to_string(), Arc::new(session))
+            .insert(tag.to_string(), Arc::new(CachedSession::new(session)))
             .await;
         self.set_remote_status(true, None).await;
     }
 }
 
-fn find_nar_digest_in_entry(entry: &IndexEntry, nar_basename: &str) -> Option<String> {
-    for line in entry.narinfo.lines() {
-        if line.starts_with("URL: ") && line.contains(nar_basename) {
-            return Some(entry.nar_digest.clone());
-        }
-    }
-    None
-}
-
-fn find_nar_digest_in_entries(
-    entries: &HashMap<String, IndexEntry>,
-    nar_basename: &str,
-) -> Option<String> {
-    for entry in entries.values() {
-        if let Some(digest) = find_nar_digest_in_entry(entry, nar_basename) {
-            return Some(digest);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use nixcache_oci::{IndexEntry, RunSessionManifest};
-    use std::collections::HashMap;
+    use super::{CacheIndex, CascadingProxyConfig};
+    use nixcache_core::{CacheIndexData, IndexEntry, RunSessionManifest};
+    use std::{collections::HashMap, time::Duration};
 
     #[tokio::test]
     async fn test_cascading_lookup_tiers() {
@@ -617,7 +643,7 @@ mod tests {
 
         assert!(index.lookup("hash-nonexistent").await.is_none());
 
-        // 5. 验证 NAR Digest 解析
+        // 5. 验证 NAR Digest 解析 (O(1))
         assert_eq!(
             index.find_nar_digest("hot.nar.xz").await,
             Some("sha256:digest-hot".to_string())

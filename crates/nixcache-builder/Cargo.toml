@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nixcache-oci.workspace = true
+nixcache-core = { workspace = true }
+nixcache-oci = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 reqwest.workspace = true
 serde.workspace = true

@@ -81,7 +81,10 @@ TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
-PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" all-in-one
+RECEIPT_FILE="$(mktemp --suffix=.json)"
+PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --output-receipt "$RECEIPT_FILE"
+"$BUILDER_BIN" promote --receipt "$RECEIPT_FILE"
+rm -f "$RECEIPT_FILE"
 
 # 5. Force Worker to refresh its cache index
 echo ">>> Triggering Worker cache index refresh..."

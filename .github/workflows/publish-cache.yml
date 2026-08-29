@@ -59,5 +59,7 @@ jobs:
           fi
 
       - name: Build and publish cache
-        run: nixcache-builder all-in-one
+        run: |
+          nixcache-builder build --output-receipt "$RUNNER_TEMP/receipt.json"
+          nixcache-builder promote --receipt "$RUNNER_TEMP/receipt.json"
 
