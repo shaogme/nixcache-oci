@@ -61,26 +61,98 @@ mod tests {
     use super::SessionContextArgs;
     use std::env;
 
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn capture_and_clear(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|&key| {
+                    let val = env::var(key).ok();
+                    unsafe {
+                        env::remove_var(key);
+                    }
+                    (key, val)
+                })
+                .collect();
+            Self { saved }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+
+        fn remove(&self, key: &str) {
+            unsafe {
+                env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for &(key, ref val) in &self.saved {
+                unsafe {
+                    if let Some(v) = val {
+                        env::set_var(key, v);
+                    } else {
+                        env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_session_context_resolution() {
+        let keys = [
+            "NIXCACHE_RUN_ID",
+            "GITHUB_RUN_ID",
+            "NIXCACHE_BRANCH",
+            "GITHUB_REF_NAME",
+            "GITHUB_HEAD_REF",
+            "NIXCACHE_JOB_ID",
+            "GITHUB_JOB",
+            "NIXCACHE_SYSTEM",
+        ];
+        let guard = EnvGuard::capture_and_clear(&keys);
+
         let empty = SessionContextArgs::default();
         assert_eq!(empty.resolve_run_id(), None);
         assert_eq!(empty.resolve_branch(), None);
         assert_eq!(empty.resolve_job_id("default-job"), "default-job");
         assert_eq!(empty.resolve_system(), None);
 
-        unsafe {
-            env::set_var("GITHUB_RUN_ID", "98765");
-            env::set_var("GITHUB_REF_NAME", "main");
-            env::set_var("GITHUB_JOB", "build-linux");
-            env::set_var("NIXCACHE_SYSTEM", "x86_64-linux");
-        }
+        // 测试 GitHub Actions 默认环境变量回退
+        guard.set("GITHUB_RUN_ID", "98765");
+        guard.set("GITHUB_REF_NAME", "main");
+        guard.set("GITHUB_JOB", "build-linux");
+        guard.set("NIXCACHE_SYSTEM", "x86_64-linux");
 
         assert_eq!(empty.resolve_run_id(), Some(98765));
         assert_eq!(empty.resolve_branch(), Some("main".to_string()));
         assert_eq!(empty.resolve_job_id("default-job"), "build-linux");
         assert_eq!(empty.resolve_system(), Some("x86_64-linux".to_string()));
 
+        // 测试 NIXCACHE_* 优先于 GITHUB_*
+        guard.set("NIXCACHE_RUN_ID", "12345");
+        guard.set("NIXCACHE_BRANCH", "dev");
+        guard.set("NIXCACHE_JOB_ID", "custom-nixcache-job");
+        assert_eq!(empty.resolve_run_id(), Some(12345));
+        assert_eq!(empty.resolve_branch(), Some("dev".to_string()));
+        assert_eq!(empty.resolve_job_id("default-job"), "custom-nixcache-job");
+
+        // 测试 GITHUB_HEAD_REF 回退
+        guard.remove("NIXCACHE_BRANCH");
+        guard.remove("GITHUB_REF_NAME");
+        guard.set("GITHUB_HEAD_REF", "pr-branch");
+        assert_eq!(empty.resolve_branch(), Some("pr-branch".to_string()));
+
+        // 测试显式参数优先级高于环境变量
         let explicit = SessionContextArgs {
             run_id: Some(111),
             branch: Some("feature/pr-1".to_string()),
@@ -92,11 +164,6 @@ mod tests {
         assert_eq!(explicit.resolve_job_id("default-job"), "custom-job");
         assert_eq!(explicit.resolve_system(), Some("aarch64-linux".to_string()));
 
-        unsafe {
-            env::remove_var("GITHUB_RUN_ID");
-            env::remove_var("GITHUB_REF_NAME");
-            env::remove_var("GITHUB_JOB");
-            env::remove_var("NIXCACHE_SYSTEM");
-        }
+        drop(guard);
     }
 }
