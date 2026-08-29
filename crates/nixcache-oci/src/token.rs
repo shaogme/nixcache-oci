@@ -84,9 +84,6 @@ impl TokenManager {
         }
 
         // 3. Follower: 订阅等待 Leader 广播
-        if let Some(cached) = self.storage.load() {
-            return Ok(cached);
-        }
         match self.broadcaster.wait().await {
             Ok(token) => Ok(token),
             Err(_) => {
