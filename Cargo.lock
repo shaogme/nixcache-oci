@@ -1144,8 +1144,12 @@ dependencies = [
 name = "nixcache-oci"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
+ "bytes",
  "chrono",
+ "futures-util",
+ "http",
  "nixcache-core",
  "reqwest",
  "serde",

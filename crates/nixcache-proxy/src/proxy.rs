@@ -208,7 +208,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
     // 1. Try our GHCR cache — stream directly
     if let Some(digest) = state.index.find_nar_digest(&nar_name).await {
         match state.oci_client.stream_blob(digest.as_str()).await {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(resp) if resp.status.is_success() => {
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -222,8 +222,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
                     headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
                 }
 
-                let stream = resp.bytes_stream();
-                let body = Body::from_stream(stream);
+                let body = Body::from_stream(resp.stream);
                 return (StatusCode::OK, headers, body).into_response();
             }
             Err(e) => {
@@ -410,10 +409,15 @@ mod tests {
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg1", hash1),
                     nar_basename: "pkg1.nar.xz".to_string(),
-                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+                nar_digest: NarDigest::new_sha256(
+                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+                )
+                .unwrap(),
                 nar_size: 100,
                 added: "2026-08-28T00:00:00Z".to_string(),
                 origin_job: None,
@@ -479,10 +483,14 @@ mod tests {
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", local_hash),
                 nar_basename: "local.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
                 ..Default::default()
             },
-            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_digest: NarDigest::new_sha256(
+                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+            )
+            .unwrap(),
             nar_size: 1024,
             added: "2026-08-28T00:00:00Z".to_string(),
             origin_job: None,
@@ -630,7 +638,10 @@ mod tests {
 
         // Mock OCI Blob streaming
         Mock::given(method("GET"))
-            .and(path(format!("/v2/test/repo/nix-cache/blobs/sha256:{}", digest_str)))
+            .and(path(format!(
+                "/v2/test/repo/nix-cache/blobs/sha256:{}",
+                digest_str
+            )))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-length", "5")
@@ -773,6 +784,9 @@ mod tests {
 
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = get_resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains(&format!("StorePath: /nix/store/{}-pkg", hash1)));
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains(&format!("StorePath: /nix/store/{}-pkg", hash1))
+        );
     }
 }

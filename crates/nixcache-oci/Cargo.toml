@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 nixcache-core = { workspace = true }
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

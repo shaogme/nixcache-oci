@@ -4,52 +4,78 @@ use crate::{
         OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciImageManifest, build_index_manifest,
         build_session_manifest,
     },
+    mutation::SessionMutationRequest,
     token::TokenManager,
+    transport::{OciBlobStream, OciTransport, ReqwestTransport},
 };
+use bytes::Bytes;
 use chrono::Utc;
-use nixcache_core::{
-    CacheIndexData, IndexEntry, JobSummaryMetadata, RUN_SESSION_VERSION, RunSessionManifest,
-    StoreHash, SystemArch,
-};
-use reqwest::{
-    Client, Response, StatusCode,
-    header::{HeaderMap, HeaderValue, IF_MATCH},
-};
+use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
+use nixcache_core::{CacheIndexData, RUN_SESSION_VERSION, RunSessionManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::Duration,
-};
-use tempfile::NamedTempFile;
-use tokio::{fs::File, io::AsyncReadExt, time::sleep};
-use tokio_util::io::ReaderStream;
+use std::{collections::HashMap, path::Path, time::Duration};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+fn compute_sha256_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    format!(
+        "sha256:{}",
+        hash.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    )
+}
+
 #[derive(Clone)]
-pub struct OciClient {
+pub struct OciClient<T: OciTransport = ReqwestTransport> {
     registry: String,
     repo: String,
     token_manager: TokenManager,
-    client: Client,
+    transport: T,
 }
 
-impl OciClient {
+impl OciClient<ReqwestTransport> {
     pub fn new(registry: &str, repo: &str, github_token: &str, write_access: bool) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let transport = ReqwestTransport::default();
+        Self::with_transport(registry, repo, github_token, write_access, transport)
+    }
+}
 
+impl<T: OciTransport> OciClient<T> {
+    pub fn with_transport(
+        registry: &str,
+        repo: &str,
+        github_token: &str,
+        write_access: bool,
+        transport: T,
+    ) -> Self {
         let token_manager = TokenManager::new(registry, repo, github_token, write_access);
-
         Self {
             registry: registry.to_string(),
             repo: repo.to_string(),
             token_manager,
-            client,
+            transport,
         }
+    }
+
+    pub fn registry(&self) -> &str {
+        &self.registry
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn token_manager(&self) -> &TokenManager {
+        &self.token_manager
     }
 
     fn url_scheme(&self) -> &str {
@@ -65,7 +91,7 @@ impl OciClient {
     }
 
     pub async fn get_token(&self) -> Result<String, OciError> {
-        self.token_manager.get_token(&self.client).await
+        self.token_manager.get_token(&self.transport).await
     }
 
     async fn get_auth_headers(&self) -> Result<HeaderMap, OciError> {
@@ -95,50 +121,29 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.head(&url).headers(headers).send().await?;
+        let status = self.transport.head(&url, headers).await?;
 
-        if resp.status() == StatusCode::OK {
+        if status == StatusCode::OK {
             Ok(true)
-        } else if resp.status() == StatusCode::NOT_FOUND {
+        } else if status == StatusCode::NOT_FOUND {
             Ok(false)
         } else {
             warn!(
                 "Unexpected status when checking blob {}: HTTP {}",
-                digest,
-                resp.status()
+                digest, status
             );
-            Ok(false)
+            Err(OciError::BlobCheckFailed(status))
         }
     }
 
-    pub async fn push_blob(&self, file_path: &Path) -> Result<String, OciError> {
-        let mut file = File::open(file_path).await?;
-        let mut hasher = Sha256::default();
-        let mut buffer = vec![0; 64 * 1024];
-        let mut size = 0u64;
-
-        loop {
-            let n = file.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-            size += n as u64;
-        }
-
-        let hash_result = hasher.finalize();
-        let digest = format!(
-            "sha256:{}",
-            hash_result
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        );
-
-        // Check if blob already exists
-        if self.head_blob(&digest).await? {
+    pub async fn push_blob_bytes_with_digest(
+        &self,
+        digest: &str,
+        bytes: Bytes,
+    ) -> Result<String, OciError> {
+        if self.head_blob(digest).await? {
             info!("Blob {} already exists, skipping upload.", digest);
-            return Ok(digest);
+            return Ok(digest.to_string());
         }
 
         info!("Initiating upload for blob {}", digest);
@@ -150,20 +155,13 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self
-            .client
-            .post(&upload_init_url)
-            .headers(headers)
-            .send()
-            .await?;
+        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
 
-        let status = resp.status();
         if !status.is_success() {
-            return Err(OciError::UploadFailed(status));
+            return Err(OciError::BlobUploadFailed(status));
         }
 
-        let location = resp
-            .headers()
+        let location = resp_headers
             .get("Location")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
@@ -177,56 +175,109 @@ impl OciClient {
         let separator = if put_url.contains('?') { "&" } else { "?" };
         put_url = format!("{}{}digest={}", put_url, separator, digest);
 
-        // Upload file contents
-        let file_stream = File::open(file_path).await?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file_stream));
+        let mut headers = self.get_auth_headers().await?;
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/octet-stream"),
+        );
+
+        let put_status = self.transport.put_bytes(&put_url, headers, bytes).await?;
+
+        if put_status == StatusCode::CREATED
+            || put_status == StatusCode::ACCEPTED
+            || put_status == StatusCode::OK
+        {
+            info!("Successfully uploaded blob: {}", digest);
+            Ok(digest.to_string())
+        } else {
+            Err(OciError::BlobUploadFailed(put_status))
+        }
+    }
+
+    pub async fn push_blob_bytes(&self, bytes: Bytes) -> Result<String, OciError> {
+        let digest = compute_sha256_digest(&bytes);
+        self.push_blob_bytes_with_digest(&digest, bytes).await
+    }
+
+    pub async fn push_blob_stream(
+        &self,
+        digest: &str,
+        stream: T::BodyStream,
+        content_len: u64,
+    ) -> Result<String, OciError> {
+        if self.head_blob(digest).await? {
+            info!("Blob {} already exists, skipping upload.", digest);
+            return Ok(digest.to_string());
+        }
+
+        info!("Initiating stream upload for blob {}", digest);
+        let upload_init_url = format!(
+            "{}://{}/v2/{}/nix-cache/blobs/uploads/",
+            self.url_scheme(),
+            self.registry,
+            self.repo
+        );
+
+        let headers = self.get_auth_headers().await?;
+        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
+
+        if !status.is_success() {
+            return Err(OciError::BlobUploadFailed(status));
+        }
+
+        let location = resp_headers
+            .get("Location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
+
+        let mut put_url = if location.starts_with('/') {
+            format!("{}://{}{}", self.url_scheme(), self.registry, location)
+        } else {
+            location.to_string()
+        };
+
+        let separator = if put_url.contains('?') { "&" } else { "?" };
+        put_url = format!("{}{}digest={}", put_url, separator, digest);
 
         let mut headers = self.get_auth_headers().await?;
         headers.insert(
             "Content-Type",
             HeaderValue::from_static("application/octet-stream"),
         );
-        headers.insert("Content-Length", HeaderValue::from(size));
 
-        let put_resp = self
-            .client
-            .put(&put_url)
-            .headers(headers)
-            .body(body)
-            .send()
+        let put_status = self
+            .transport
+            .put_stream(&put_url, headers, stream, content_len)
             .await?;
 
-        let put_status = put_resp.status();
-        if put_status == StatusCode::CREATED || put_status == StatusCode::ACCEPTED {
-            info!("Successfully uploaded blob: {}", digest);
-            Ok(digest)
+        if put_status == StatusCode::CREATED
+            || put_status == StatusCode::ACCEPTED
+            || put_status == StatusCode::OK
+        {
+            info!("Successfully uploaded blob stream: {}", digest);
+            Ok(digest.to_string())
         } else {
-            Err(OciError::UploadFailed(put_status))
+            Err(OciError::BlobUploadFailed(put_status))
         }
     }
 
-    pub async fn push_json_blob<T: Serialize>(&self, data: &T) -> Result<(String, u64), OciError> {
+    pub async fn push_blob(&self, file_path: &Path) -> Result<String, OciError> {
+        let data = tokio::fs::read(file_path).await?;
+        self.push_blob_bytes(Bytes::from(data)).await
+    }
+
+    pub async fn push_json_blob<S: Serialize>(&self, data: &S) -> Result<(String, u64), OciError> {
         let json_bytes = serde_json::to_vec_pretty(data)?;
         let size = json_bytes.len() as u64;
 
-        let mut hasher = Sha256::new();
-        hasher.update(&json_bytes);
-        let hash_bytes = hasher.finalize();
-        let digest = format!(
-            "sha256:{}",
-            hash_bytes
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        );
+        let digest = compute_sha256_digest(&json_bytes);
 
         if self.head_blob(&digest).await? {
             return Ok((digest, size));
         }
 
-        let temp_file = NamedTempFile::new()?;
-        tokio::fs::write(temp_file.path(), &json_bytes).await?;
-        let pushed_digest = self.push_blob(temp_file.path()).await?;
+        let bytes = Bytes::from(json_bytes);
+        let pushed_digest = self.push_blob_bytes_with_digest(&digest, bytes).await?;
         Ok((pushed_digest, size))
     }
 
@@ -243,37 +294,24 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url).headers(headers).send().await?;
+        let (status, resp_headers, bytes) = self.transport.get(&url, headers).await?;
 
-        if resp.status() == StatusCode::OK {
-            let digest_header = resp
-                .headers()
+        if status == StatusCode::OK {
+            let digest_header = resp_headers
                 .get("Docker-Content-Digest")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            let body = resp.text().await?;
-            let digest = digest_header.unwrap_or_else(|| {
-                let mut hasher = Sha256::new();
-                hasher.update(body.as_bytes());
-                let hash_bytes = hasher.finalize();
-                format!(
-                    "sha256:{}",
-                    hash_bytes
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>()
-                )
-            });
+            let body = String::from_utf8(bytes.to_vec())
+                .map_err(|e| OciError::Other(format!("Invalid UTF-8 manifest: {}", e)))?;
+
+            let digest = digest_header.unwrap_or_else(|| compute_sha256_digest(body.as_bytes()));
 
             Ok(Some((body, digest)))
-        } else if resp.status() == StatusCode::NOT_FOUND {
+        } else if status == StatusCode::NOT_FOUND {
             Ok(None)
         } else {
-            Err(OciError::Other(format!(
-                "OCI registry manifest request failed with status: {}",
-                resp.status()
-            )))
+            Err(OciError::ManifestFetchFailed(status))
         }
     }
 
@@ -360,15 +398,9 @@ impl OciClient {
             headers.insert(IF_MATCH, val);
         }
 
-        let resp = self
-            .client
-            .put(&url)
-            .headers(headers)
-            .body(manifest.to_string())
-            .send()
-            .await?;
+        let bytes = Bytes::copy_from_slice(manifest.as_bytes());
+        let status = self.transport.put_bytes(&url, headers, bytes).await?;
 
-        let status = resp.status();
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
             return Err(OciError::CasConflict(tag.to_string()));
         }
@@ -398,35 +430,32 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.delete(&url).headers(headers).send().await?;
+        let status = self.transport.delete(&url, headers).await?;
 
-        if resp.status().is_success() {
+        if status.is_success() {
             Ok(true)
-        } else if resp.status() == StatusCode::NOT_FOUND {
+        } else if status == StatusCode::NOT_FOUND {
             Ok(false)
         } else {
             Err(OciError::Other(format!(
                 "Failed to delete manifest with status: {}",
-                resp.status()
+                status
             )))
         }
     }
 
-    /// 泛型 CAS 乐观并发重试更新器，自动处理冲突与退避
-    pub async fn update_manifest_cas<T, F>(
+    pub async fn update_manifest_cas<S, F>(
         &self,
         tag: &str,
         max_retries: usize,
         mut mutator: F,
     ) -> Result<(), OciError>
     where
-        T: Serialize + for<'de> Deserialize<'de> + Send,
-        F: FnMut(Option<T>) -> Result<T, OciError>,
+        S: Serialize + for<'de> Deserialize<'de> + Send,
+        F: FnMut(Option<S>) -> Result<S, OciError>,
     {
-        let empty_config = "{}";
-        let temp_cfg = NamedTempFile::new()?;
-        tokio::fs::write(temp_cfg.path(), empty_config.as_bytes()).await?;
-        let config_digest = self.push_blob(temp_cfg.path()).await?;
+        let empty_config = Bytes::from_static(b"{}");
+        let config_digest = self.push_blob_bytes(empty_config).await?;
         let config_size = 2u64;
 
         let mut attempt = 0;
@@ -439,7 +468,7 @@ impl OciClient {
                         OciError::Other("Manifest missing layer digest".to_string())
                     })?;
                     let blob_bytes = self.get_blob(blob_digest).await?;
-                    let data = serde_json::from_slice::<T>(&blob_bytes)?;
+                    let data = serde_json::from_slice::<S>(&blob_bytes)?;
                     (Some(data), Some(digest))
                 }
                 None => (None, None),
@@ -471,29 +500,15 @@ impl OciClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_run_session_with_cas(
         &self,
-        run_id: u64,
-        new_entries: HashMap<StoreHash, IndexEntry>,
-        new_roots: Vec<StoreHash>,
-        system: impl Into<SystemArch>,
-        job_id: &str,
-        head_sha: Option<&str>,
-        ref_name: Option<&str>,
-        public_key: Option<&str>,
-        uploaded_blobs: usize,
-        uploaded_bytes: u64,
-        max_retries: usize,
+        request: SessionMutationRequest,
     ) -> Result<(), OciError> {
-        let tag = format!("run-{}", run_id);
-        let system_arch = system.into();
+        let tag = format!("run-{}", request.run_id);
         let mut attempt = 0;
 
-        let empty_config = "{}";
-        let temp_cfg = NamedTempFile::new()?;
-        tokio::fs::write(temp_cfg.path(), empty_config.as_bytes()).await?;
-        let config_digest = self.push_blob(temp_cfg.path()).await?;
+        let empty_config = Bytes::from_static(b"{}");
+        let config_digest = self.push_blob_bytes(empty_config).await?;
         let config_size = 2u64;
 
         loop {
@@ -503,12 +518,12 @@ impl OciClient {
                 None => (
                     RunSessionManifest {
                         version: RUN_SESSION_VERSION,
-                        run_id,
-                        head_sha: head_sha.unwrap_or_default().to_string(),
-                        ref_name: ref_name.unwrap_or_default().to_string(),
+                        run_id: request.run_id,
+                        head_sha: request.head_sha.clone().unwrap_or_default(),
+                        ref_name: request.ref_name.clone().unwrap_or_default(),
                         created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        public_key: public_key.map(|k| k.to_string()),
+                        public_key: request.public_key.clone(),
                         entries: HashMap::new(),
                         gc_roots: HashMap::new(),
                         completed_jobs: Vec::new(),
@@ -517,39 +532,7 @@ impl OciClient {
                 ),
             };
 
-            if session.head_sha.is_empty()
-                && let Some(sha) = head_sha
-            {
-                session.head_sha = sha.to_string();
-            }
-            if session.ref_name.is_empty()
-                && let Some(rn) = ref_name
-            {
-                session.ref_name = rn.to_string();
-            }
-            if session.public_key.is_none()
-                && let Some(pk) = public_key
-                && !pk.is_empty()
-            {
-                session.public_key = Some(pk.to_string());
-            }
-
-            session.entries.extend(new_entries.clone());
-            let roots_entry = session.gc_roots.entry(system_arch.clone()).or_default();
-            let mut set: HashSet<StoreHash> = roots_entry.iter().cloned().collect();
-            set.extend(new_roots.clone());
-            let mut sorted: Vec<StoreHash> = set.into_iter().collect();
-            sorted.sort();
-            *roots_entry = sorted;
-            session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-            session.completed_jobs.push(JobSummaryMetadata {
-                job_id: job_id.to_string(),
-                system: system_arch.clone(),
-                uploaded_blobs,
-                uploaded_bytes,
-                timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            });
+            request.apply_to(&mut session);
 
             let (session_blob_digest, session_blob_size) = self.push_json_blob(&session).await?;
             let manifest = build_session_manifest(
@@ -557,7 +540,7 @@ impl OciClient {
                 session_blob_size,
                 &config_digest,
                 config_size,
-                run_id,
+                request.run_id,
             );
             let manifest_str = manifest.to_json_string()?;
 
@@ -572,12 +555,12 @@ impl OciClient {
                     );
                     return Ok(());
                 }
-                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
+                Err(OciError::CasConflict(_)) if attempt <= request.max_retries => {
                     let backoff_ms = (500 * (1 << attempt.min(5)))
                         + ((std::process::id() as u64 * 37 + attempt as u64 * 53) % 150);
                     warn!(
                         "CAS conflict on tag {}, retrying in {}ms (attempt {}/{})",
-                        tag, backoff_ms, attempt, max_retries
+                        tag, backoff_ms, attempt, request.max_retries
                     );
                     sleep(Duration::from_millis(backoff_ms)).await;
                 }
@@ -588,8 +571,8 @@ impl OciClient {
                     );
                     let fallback_tag = format!(
                         "run-{}-job-{}",
-                        run_id,
-                        job_id.replace(['/', ':', ' '], "-")
+                        request.run_id,
+                        request.job_id.replace(['/', ':', ' '], "-")
                     );
                     warn!("Falling back to job-specific chunk tag: {}", fallback_tag);
                     self.push_manifest(&fallback_tag, &manifest_str).await?;
@@ -599,7 +582,7 @@ impl OciClient {
         }
     }
 
-    pub async fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
+    pub async fn get_blob(&self, digest: &str) -> Result<Bytes, OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/blobs/{}",
             self.url_scheme(),
@@ -609,17 +592,21 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url).headers(headers).send().await?;
+        let (status, _resp_headers, bytes) = self.transport.get(&url, headers).await?;
 
-        if resp.status().is_success() {
-            let bytes = resp.bytes().await?;
-            Ok(bytes.to_vec())
+        if status.is_success() {
+            Ok(bytes)
+        } else if status == StatusCode::NOT_FOUND {
+            Err(OciError::BlobNotFound(digest.to_string()))
         } else {
-            Err(OciError::UploadFailed(resp.status()))
+            Err(OciError::BlobDownloadFailed(status))
         }
     }
 
-    pub async fn stream_blob(&self, digest: &str) -> Result<Response, OciError> {
+    pub async fn stream_blob(
+        &self,
+        digest: &str,
+    ) -> Result<OciBlobStream<T::BodyStream>, OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/blobs/{}",
             self.url_scheme(),
@@ -629,8 +616,14 @@ impl OciClient {
         );
 
         let headers = self.get_auth_headers().await?;
-        let resp = self.client.get(&url).headers(headers).send().await?;
+        let (status, resp_headers, stream) = self.transport.stream(&url, headers).await?;
 
-        Ok(resp)
+        if status.is_success() {
+            Ok(OciBlobStream::new(status, resp_headers, stream))
+        } else if status == StatusCode::NOT_FOUND {
+            Err(OciError::BlobNotFound(digest.to_string()))
+        } else {
+            Err(OciError::BlobDownloadFailed(status))
+        }
     }
 }

@@ -219,7 +219,10 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
             match store.lookup_nar_digest_cascading(&ctx.env, nar_name).await {
                 Ok(Some(digest)) => {
-                    if let Ok(resp) = store.oci_client().fetch_blob_response(digest.as_str()).await
+                    if let Ok(resp) = store
+                        .oci_client()
+                        .fetch_blob_response(digest.as_str())
+                        .await
                         && resp.status_code() == 200
                     {
                         let headers = Headers::new();
@@ -349,7 +352,8 @@ mod tests {
         let hash2_str = "00000000000000000000000000000002";
         let hash3_str = "00000000000000000000000000000003";
 
-        let map_json = format!(r#"{{
+        let map_json = format!(
+            r#"{{
             "{}": {{
                 "name": "pkg1",
                 "narinfo_meta": {{
@@ -361,7 +365,9 @@ mod tests {
                 "nar_size": 100,
                 "added": "2026-08-29T10:00:00Z"
             }}
-        }}"#, hash1_str, hash1_str);
+        }}"#,
+            hash1_str, hash1_str
+        );
         let payload: RegisterPayload = serde_json::from_str(&map_json).unwrap();
         match payload {
             RegisterPayload::Map(m) => {
@@ -372,7 +378,8 @@ mod tests {
             _ => panic!("Expected Map payload"),
         }
 
-        let list_json = format!(r#"[
+        let list_json = format!(
+            r#"[
             {{
                 "name": "pkg2",
                 "narinfo_meta": {{
@@ -384,7 +391,9 @@ mod tests {
                 "nar_size": 200,
                 "added": "2026-08-29T10:00:00Z"
             }}
-        ]"#, hash2_str);
+        ]"#,
+            hash2_str
+        );
         let payload_list: RegisterPayload = serde_json::from_str(&list_json).unwrap();
         match payload_list {
             RegisterPayload::List(l) => {
@@ -394,7 +403,8 @@ mod tests {
             _ => panic!("Expected List payload"),
         }
 
-        let obj_json = format!(r#"{{
+        let obj_json = format!(
+            r#"{{
             "entries": {{
                 "{}": {{
                     "name": "pkg3",
@@ -408,7 +418,9 @@ mod tests {
                     "added": "2026-08-29T10:00:00Z"
                 }}
             }}
-        }}"#, hash3_str, hash3_str);
+        }}"#,
+            hash3_str, hash3_str
+        );
         let payload_obj: RegisterPayload = serde_json::from_str(&obj_json).unwrap();
         match payload_obj {
             RegisterPayload::Object { entries } => {

@@ -335,10 +335,15 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg1", hash1),
                     nar_basename: "pkg1.nar.xz".to_string(),
-                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+                nar_digest: NarDigest::new_sha256(
+                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+                )
+                .unwrap(),
                 nar_size: 1024,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: Some("job:ci".to_string()),

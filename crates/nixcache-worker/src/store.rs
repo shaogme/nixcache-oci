@@ -624,7 +624,10 @@ mod tests {
     fn test_hot_registration_and_lookup() {
         let mut entries = HashMap::new();
         let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        let digest1 = NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap();
+        let digest1 = NarDigest::new_sha256(
+            "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+        )
+        .unwrap();
 
         entries.insert(
             hash1.clone(),
@@ -634,7 +637,9 @@ mod tests {
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg1", hash1),
                     nar_basename: "pkg1.nar.xz".to_string(),
-                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
                     ..Default::default()
                 },
                 nar_digest: digest1.clone(),
@@ -645,17 +650,17 @@ mod tests {
         );
 
         let nar_map = build_nar_lookup_map(&entries);
-        assert_eq!(
-            nar_map.get("pkg1.nar.xz"),
-            Some(&digest1)
-        );
+        assert_eq!(nar_map.get("pkg1.nar.xz"), Some(&digest1));
     }
 
     #[test]
     fn test_build_nar_lookup_map() {
         let mut entries = HashMap::new();
         let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        let digest1 = NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap();
+        let digest1 = NarDigest::new_sha256(
+            "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+        )
+        .unwrap();
 
         entries.insert(
             hash1.clone(),
@@ -665,7 +670,9 @@ mod tests {
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg1", hash1),
                     nar_basename: "test.nar.xz".to_string(),
-                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
                     ..Default::default()
                 },
                 nar_digest: digest1.clone(),

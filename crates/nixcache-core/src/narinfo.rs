@@ -127,8 +127,7 @@ impl NarInfo {
         }
 
         let store_path = store_path.ok_or(NarInfoParseError::MissingRequiredField("StorePath"))?;
-        let nar_basename =
-            nar_basename.ok_or(NarInfoParseError::MissingRequiredField("URL"))?;
+        let nar_basename = nar_basename.ok_or(NarInfoParseError::MissingRequiredField("URL"))?;
         let nar_hash = nar_hash.ok_or(NarInfoParseError::MissingRequiredField("NarHash"))?;
         let nar_size = nar_size.ok_or(NarInfoParseError::MissingRequiredField("NarSize"))?;
 

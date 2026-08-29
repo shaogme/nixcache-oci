@@ -589,18 +589,20 @@ mod tests {
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash_base),
                 nar_basename: "hash-base.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
                 ..Default::default()
             },
-            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_digest: NarDigest::new_sha256(
+                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+            )
+            .unwrap(),
             nar_size: 100,
             added: "2026-08-29T00:00:00Z".to_string(),
             origin_job: None,
         };
         let mut base_data = CacheIndexData::default();
-        base_data
-            .entries
-            .insert(hash_base.clone(), baseline_entry);
+        base_data.entries.insert(hash_base.clone(), baseline_entry);
         base_data.public_key = "base-pubkey:AAA=".to_string();
         index.update_data_in_memory(base_data).await;
 
@@ -611,10 +613,14 @@ mod tests {
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash_sess),
                 nar_basename: "hash-sess.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
                 ..Default::default()
             },
-            nar_digest: NarDigest::new_sha256("1111111111111111111111111111111111111111111111111111111111111111").unwrap(),
+            nar_digest: NarDigest::new_sha256(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
             nar_size: 200,
             added: "2026-08-29T10:00:00Z".to_string(),
             origin_job: Some("job:vm-test".to_string()),
@@ -624,9 +630,7 @@ mod tests {
             public_key: Some("sess-pubkey:BBB=".to_string()),
             ..Default::default()
         };
-        sess_data
-            .entries
-            .insert(hash_sess.clone(), session_entry);
+        sess_data.entries.insert(hash_sess.clone(), session_entry);
         index
             .update_session_in_memory("run-123456", sess_data)
             .await;
@@ -638,10 +642,14 @@ mod tests {
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash_hot),
                 nar_basename: "hot.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
                 ..Default::default()
             },
-            nar_digest: NarDigest::new_sha256("2222222222222222222222222222222222222222222222222222222222222222").unwrap(),
+            nar_digest: NarDigest::new_sha256(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
             nar_size: 300,
             added: "2026-08-29T10:05:00Z".to_string(),
             origin_job: Some("job:matrix-x86".to_string()),
@@ -651,7 +659,10 @@ mod tests {
         index.register_hot_entries(hot_map).await;
 
         // 4. 验证四级级联查找
-        let e_hot = index.lookup("00000000000000000000000000000003").await.expect("Must find in Tier 0");
+        let e_hot = index
+            .lookup("00000000000000000000000000000003")
+            .await
+            .expect("Must find in Tier 0");
         assert_eq!(e_hot.name, "pkg-hot");
 
         let e_sess = index
@@ -666,20 +677,40 @@ mod tests {
             .expect("Must find in Tier 3");
         assert_eq!(e_base.name, "pkg-baseline");
 
-        assert!(index.lookup("00000000000000000000000000000004").await.is_none());
+        assert!(
+            index
+                .lookup("00000000000000000000000000000004")
+                .await
+                .is_none()
+        );
 
         // 5. 验证 NAR Digest 解析 (O(1))
         assert_eq!(
             index.find_nar_digest("hot.nar.xz").await,
-            Some(NarDigest::new_sha256("2222222222222222222222222222222222222222222222222222222222222222").unwrap())
+            Some(
+                NarDigest::new_sha256(
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                )
+                .unwrap()
+            )
         );
         assert_eq!(
             index.find_nar_digest("hash-sess.nar.xz").await,
-            Some(NarDigest::new_sha256("1111111111111111111111111111111111111111111111111111111111111111").unwrap())
+            Some(
+                NarDigest::new_sha256(
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                )
+                .unwrap()
+            )
         );
         assert_eq!(
             index.find_nar_digest("hash-base.nar.xz").await,
-            Some(NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap())
+            Some(
+                NarDigest::new_sha256(
+                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                )
+                .unwrap()
+            )
         );
 
         // 6. 验证 Public Key 优先级 (Session Key 优先于 Baseline Key)

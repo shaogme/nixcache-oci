@@ -1,12 +1,6 @@
 use crate::error::TypeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{
-    borrow::Borrow,
-    collections::HashMap,
-    fmt,
-    ops::Deref,
-    str::FromStr,
-};
+use std::{borrow::Borrow, collections::HashMap, fmt, ops::Deref, str::FromStr};
 
 pub const SCHEMA_VERSION: u32 = 3;
 pub const CACHE_INDEX_VERSION: u32 = 3;

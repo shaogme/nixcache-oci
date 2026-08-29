@@ -11,6 +11,9 @@ members = [
 [workspace.dependencies]
 nixcache-core = { path = "crates/nixcache-core" }
 nixcache-oci = { path = "crates/nixcache-oci" }
+async-trait = "0.1"
+bytes = "1"
+http = "1"
 axum = { version = "0.8", features = ["http2"] }
 tokio = { version = "1" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }

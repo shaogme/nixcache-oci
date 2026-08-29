@@ -1,15 +1,18 @@
 pub mod client;
 pub mod error;
 pub mod manifest;
+pub mod mutation;
 pub mod token;
+pub mod transport;
 
 pub use client::OciClient;
-pub use error::OciError;
+pub use error::{OciError, TransportError};
 pub use manifest::{
     NIX_CACHE_INDEX_MEDIA_TYPE, NIX_CACHE_SESSION_MEDIA_TYPE, OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageManifest, build_index_manifest,
     build_index_oci_manifest, build_session_manifest, build_session_oci_manifest,
 };
+pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata,
     NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
@@ -17,14 +20,25 @@ pub use nixcache_core::{
     extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use token::TokenManager;
+pub use transport::{BoxBodyStream, OciBlobStream, OciTransport, ReqwestTransport};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexEntry, NarDigest, NarInfoMeta, OciClient, OciError, StoreHash, SystemArch,
+        IndexEntry, NarDigest, NarInfoMeta, OciClient, OciError, ReqwestTransport,
+        SessionMutationRequest, StoreHash, SystemArch, TokenManager, TransportError,
     };
-    use reqwest::StatusCode;
-    use std::{collections::HashMap, io::Write};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use http::{HeaderMap, StatusCode};
+    use std::{
+        collections::HashMap,
+        io::Write,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use tempfile::NamedTempFile;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -59,6 +73,43 @@ mod tests {
             .await
             .expect("Failed to get cached token");
         assert_eq!(cached_token, "mocked-jwt-token");
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_singleflight_concurrency() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({ "token": "singleflight-jwt-token" })),
+            )
+            .expect(1) // 期望并发 10 个请求最终只发起 1 次 HTTP 网络调用！
+            .mount(&server)
+            .await;
+
+        let transport = ReqwestTransport::default();
+        let token_manager = Arc::new(TokenManager::new(
+            &host,
+            "test/repo",
+            "secret-gh-token",
+            true,
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let tm = token_manager.clone();
+            let tr = transport.clone();
+            handles.push(tokio::spawn(async move { tm.get_token(&tr).await }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap().unwrap();
+            assert_eq!(res, "singleflight-jwt-token");
+        }
     }
 
     #[tokio::test]
@@ -115,7 +166,7 @@ mod tests {
 
         let client = OciClient::new(&host, "test/repo", "", false);
         let bytes = client.get_blob("sha256:data123").await.unwrap();
-        assert_eq!(bytes, b"hello blob content");
+        assert_eq!(&bytes[..], b"hello blob content");
 
         Mock::given(method("GET"))
             .and(path("/v2/test/repo/nix-cache/blobs/sha256:notfound"))
@@ -124,7 +175,7 @@ mod tests {
             .await;
 
         let err = client.get_blob("sha256:notfound").await.unwrap_err();
-        assert!(matches!(err, OciError::UploadFailed(StatusCode::NOT_FOUND)));
+        assert!(matches!(err, OciError::BlobNotFound(_)));
     }
 
     #[tokio::test]
@@ -222,8 +273,14 @@ mod tests {
         let err = OciError::AuthFailed;
         assert_eq!(format!("{}", err), "Registry authentication failed");
 
-        let upload_err = OciError::UploadFailed(StatusCode::BAD_REQUEST);
+        let upload_err = OciError::BlobUploadFailed(StatusCode::BAD_REQUEST);
         assert!(format!("{}", upload_err).contains("400"));
+
+        let download_err = OciError::BlobDownloadFailed(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(format!("{}", download_err).contains("500"));
+
+        let not_found_err = OciError::BlobNotFound("sha256:123".to_string());
+        assert_eq!(format!("{}", not_found_err), "Blob not found: sha256:123");
 
         let manifest_err = OciError::ManifestPushFailed(StatusCode::INTERNAL_SERVER_ERROR);
         assert!(format!("{}", manifest_err).contains("500"));
@@ -331,32 +388,136 @@ mod tests {
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg", hash_x86),
                     nar_basename: "pkg-x86.nar.xz".to_string(),
-                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+                nar_digest: NarDigest::new_sha256(
+                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+                )
+                .unwrap(),
                 nar_size: 1024,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: Some("job:vm-tests".to_string()),
             },
         );
 
-        let res = client
-            .update_run_session_with_cas(
-                12345,
-                entries,
-                vec![hash_x86],
-                SystemArch::X86_64Linux,
-                "vm-tests",
-                Some("commit-sha-123"),
-                Some("refs/heads/main"),
-                Some("key:pub"),
-                1,
-                1024,
-                3,
+        let request = SessionMutationRequest::new(12345, "vm-tests", SystemArch::X86_64Linux)
+            .with_entries(entries)
+            .with_roots(vec![hash_x86])
+            .with_git_info(
+                Some("commit-sha-123".to_string()),
+                Some("refs/heads/main".to_string()),
             )
-            .await;
+            .with_public_key(Some("key:pub".to_string()))
+            .with_upload_stats(1, 1024)
+            .with_max_retries(3);
 
+        let res = client.update_run_session_with_cas(request).await;
         assert!(res.is_ok());
+    }
+
+    #[derive(Clone, Default)]
+    struct MockCustomTransport {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl super::OciTransport for MockCustomTransport {
+        type BodyStream = super::BoxBodyStream;
+
+        async fn head(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::OK)
+        }
+
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                StatusCode::OK,
+                HeaderMap::new(),
+                Bytes::from_static(b"custom transport data"),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let stream = Box::pin(futures_util::stream::once(async {
+                Ok(Bytes::from_static(b"stream"))
+            }));
+            Ok((StatusCode::OK, HeaderMap::new(), stream))
+        }
+
+        async fn post(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<(StatusCode, HeaderMap), TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok((StatusCode::ACCEPTED, HeaderMap::new()))
+        }
+
+        async fn put_bytes(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::CREATED)
+        }
+
+        async fn put_stream(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+            _stream: Self::BodyStream,
+            _content_len: u64,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::CREATED)
+        }
+
+        async fn delete(
+            &self,
+            _url: &str,
+            _headers: HeaderMap,
+        ) -> Result<StatusCode, TransportError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StatusCode::ACCEPTED)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_mock_transport() {
+        let transport = MockCustomTransport::default();
+        let client = OciClient::with_transport(
+            "example.com",
+            "test/repo",
+            "token123",
+            false,
+            transport.clone(),
+        );
+
+        let exists = client.head_blob("sha256:custom").await.unwrap();
+        assert!(exists);
+
+        let data = client.get_blob("sha256:custom").await.unwrap();
+        assert_eq!(&data[..], b"custom transport data");
+
+        assert!(transport.call_count.load(Ordering::SeqCst) >= 2);
     }
 }

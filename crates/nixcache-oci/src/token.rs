@@ -1,22 +1,46 @@
-use crate::error::OciError;
+use crate::{error::OciError, transport::OciTransport};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use reqwest::Client;
+use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::Instant};
+use std::{fmt, sync::Arc, time::Duration};
+use tokio::{
+    sync::{Mutex, watch},
+    time::Instant,
+};
 
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+enum InFlightState {
+    Idle,
+    Fetching(watch::Receiver<Option<String>>),
+}
+
+struct InnerTokenManager {
+    cached: Option<(String, Instant)>,
+    in_flight: InFlightState,
+}
+
+#[derive(Clone)]
 pub struct TokenManager {
     registry: String,
     repo: String,
     github_token: String,
     write_access: bool,
-    token_cache: Arc<Mutex<Option<(String, Instant)>>>,
+    state: Arc<Mutex<InnerTokenManager>>,
+}
+
+impl fmt::Debug for TokenManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenManager")
+            .field("registry", &self.registry)
+            .field("repo", &self.repo)
+            .field("write_access", &self.write_access)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TokenManager {
@@ -26,7 +50,10 @@ impl TokenManager {
             repo: repo.to_string(),
             github_token: github_token.to_string(),
             write_access,
-            token_cache: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(InnerTokenManager {
+                cached: None,
+                in_flight: InFlightState::Idle,
+            })),
         }
     }
 
@@ -42,14 +69,58 @@ impl TokenManager {
         }
     }
 
-    pub async fn get_token(&self, http_client: &Client) -> Result<String, OciError> {
-        let mut cache = self.token_cache.lock().await;
-        if let Some((ref token, ref instant)) = *cache
-            && instant.elapsed() < Duration::from_secs(240)
+    pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<String, OciError> {
+        let rx_to_await;
+
         {
-            return Ok(token.clone());
+            let mut state = self.state.lock().await;
+
+            // 1. Fast path: 缓存有效且在 240s 生命周期内直接复用
+            if let Some((ref token, ref instant)) = state.cached
+                && instant.elapsed() < Duration::from_secs(240)
+            {
+                return Ok(token.clone());
+            }
+
+            // 2. Singleflight 防击穿：检查是否已有在途网络请求
+            match &mut state.in_flight {
+                InFlightState::Fetching(rx) => {
+                    rx_to_await = Some(rx.clone());
+                }
+                InFlightState::Idle => {
+                    let (tx, rx) = watch::channel(None);
+                    state.in_flight = InFlightState::Fetching(rx);
+                    drop(state);
+
+                    // 获准成为 Leader 执行网络获取
+                    let token = self.fetch_token_network(transport).await;
+
+                    let mut state = self.state.lock().await;
+                    state.in_flight = InFlightState::Idle;
+                    state.cached = Some((token.clone(), Instant::now()));
+                    let _ = tx.send(Some(token.clone()));
+                    return Ok(token);
+                }
+            }
         }
 
+        // 3. Follower 任务等待 Leader 广播获取结果
+        if let Some(mut rx) = rx_to_await {
+            loop {
+                if let Some(ref token) = *rx.borrow() {
+                    return Ok(token.clone());
+                }
+                if rx.changed().await.is_err() {
+                    // 若 Leader 意外断开 channel，回退重新尝试
+                    return Box::pin(self.get_token(transport)).await;
+                }
+            }
+        }
+
+        Ok(self.github_token.clone())
+    }
+
+    async fn fetch_token_network<T: OciTransport>(&self, transport: &T) -> String {
         let scope = if self.write_access {
             "pull,push"
         } else {
@@ -65,20 +136,19 @@ impl TokenManager {
             self.registry
         );
 
-        let mut req = http_client.get(&token_url);
-
+        let mut headers = HeaderMap::new();
         if !self.github_token.is_empty() {
             let auth_str = format!("token:{}", self.github_token);
             let b64 = STANDARD.encode(auth_str);
-            req = req.header("Authorization", format!("Basic {}", b64));
+            if let Ok(val) = HeaderValue::from_str(&format!("Basic {}", b64)) {
+                headers.insert("Authorization", val);
+            }
         }
 
-        let res = req.send().await;
-        let token = match res {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    if let Ok(data) = serde_json::from_str::<TokenResponse>(&text) {
+        match transport.get(&token_url, headers).await {
+            Ok((status, _resp_headers, bytes)) => {
+                if status.is_success() {
+                    if let Ok(data) = serde_json::from_slice::<TokenResponse>(&bytes) {
                         data.token.unwrap_or_else(|| self.github_token.clone())
                     } else {
                         self.github_token.clone()
@@ -88,15 +158,6 @@ impl TokenManager {
                 }
             }
             Err(_) => self.github_token.clone(),
-        };
-
-        if token.is_empty() && !self.github_token.is_empty() {
-            let fallback = self.github_token.clone();
-            *cache = Some((fallback.clone(), Instant::now()));
-            return Ok(fallback);
         }
-
-        *cache = Some((token.clone(), Instant::now()));
-        Ok(token)
     }
 }
