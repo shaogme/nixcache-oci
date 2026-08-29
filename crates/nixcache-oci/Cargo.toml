@@ -22,6 +22,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 web-time = { workspace = true }
+zstd = { workspace = true }
 
 futures-channel = { workspace = true }
 

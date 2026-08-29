@@ -11,13 +11,6 @@ pub struct GcEvaluationResult {
     pub cutoff_utc: String,
 }
 
-impl GcEvaluationResult {
-    /// 兼容性辅助访问器
-    pub fn live_roots(&self) -> &HashSet<StoreHash> {
-        &self.reachable_roots
-    }
-}
-
 /// 纯函数：多架构可达性依赖图与保留期垃圾回收计算 (基于广度优先遍历传递闭包)
 pub fn evaluate_multi_arch_gc(
     index: &CacheIndexData,

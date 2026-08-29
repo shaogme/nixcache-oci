@@ -1,4 +1,5 @@
 pub mod client;
+pub mod codec;
 pub mod error;
 pub mod manifest;
 pub mod mutation;
@@ -6,13 +7,12 @@ pub mod token;
 pub mod transport;
 
 pub use client::{FetchedOciArtifact, OciClient, UploadConfig, UploadStrategy};
+pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TransportError};
 pub use manifest::{
-    NIX_CACHE_INDEX_MEDIA_TYPE, NIX_CACHE_SESSION_MEDIA_TYPE, OCI_IMAGE_CONFIG_MEDIA_TYPE,
-    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageIndex,
-    OciImageManifest, OciPlatform, build_arch_index_manifest, build_arch_session_manifest,
-    build_image_index, build_index_manifest, build_index_oci_manifest, build_session_manifest,
-    build_session_oci_manifest,
+    CacheLayerMediaType, OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
+    build_arch_index_manifest, build_arch_session_manifest, build_image_index,
 };
 pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{

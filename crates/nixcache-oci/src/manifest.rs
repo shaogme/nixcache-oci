@@ -6,8 +6,45 @@ use std::collections::HashMap;
 pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
-pub const NIX_CACHE_INDEX_MEDIA_TYPE: &str = "application/vnd.nix.cache.index.v1+json";
-pub const NIX_CACHE_SESSION_MEDIA_TYPE: &str = "application/vnd.nix.cache.session.v1+json";
+
+/// 强类型 OCI NixCache Layer 媒体类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheLayerMediaType {
+    IndexV3Zstd,
+    SessionV3Zstd,
+}
+
+impl CacheLayerMediaType {
+    pub const INDEX_V3_ZSTD: &'static str = "application/vnd.nix.cache.index.v3+zstd";
+    pub const SESSION_V3_ZSTD: &'static str = "application/vnd.nix.cache.session.v3+zstd";
+
+    /// 从媒体类型字符串严格解析
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            Self::INDEX_V3_ZSTD => Some(Self::IndexV3Zstd),
+            Self::SESSION_V3_ZSTD => Some(Self::SessionV3Zstd),
+            _ => None,
+        }
+    }
+
+    /// 转换为静态媒体类型字符串
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::IndexV3Zstd => Self::INDEX_V3_ZSTD,
+            Self::SessionV3Zstd => Self::SESSION_V3_ZSTD,
+        }
+    }
+
+    /// 是否为索引类型
+    pub const fn is_index(&self) -> bool {
+        matches!(self, Self::IndexV3Zstd)
+    }
+
+    /// 是否为会话类型
+    pub const fn is_session(&self) -> bool {
+        matches!(self, Self::SessionV3Zstd)
+    }
+}
 
 /// OCI Platform 结构
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
@@ -139,6 +176,7 @@ impl OciImageManifest {
 pub fn build_arch_session_manifest(
     session_blob_digest: &str,
     session_blob_size: u64,
+    uncompressed_size: u64,
     config_digest: &str,
     config_size: u64,
     run_id: u64,
@@ -147,7 +185,15 @@ pub fn build_arch_session_manifest(
     let mut layer_annotations = HashMap::new();
     layer_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
     layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
-    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "4".to_string());
+    layer_annotations.insert(
+        "org.nixos.nixcache.uncompressed_size".to_string(),
+        uncompressed_size.to_string(),
+    );
+    layer_annotations.insert(
+        "org.nixos.nixcache.compression".to_string(),
+        "zstd".to_string(),
+    );
+    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert(
@@ -174,7 +220,7 @@ pub fn build_arch_session_manifest(
             annotations: None,
         },
         layers: vec![OciDescriptor {
-            media_type: NIX_CACHE_SESSION_MEDIA_TYPE.to_string(),
+            media_type: CacheLayerMediaType::SESSION_V3_ZSTD.to_string(),
             digest: session_blob_digest.to_string(),
             size: session_blob_size,
             platform: Some(OciPlatform::from_system(system)),
@@ -184,14 +230,27 @@ pub fn build_arch_session_manifest(
     }
 }
 
-/// 构造强类型的单架构 Baseline Index Image Manifest
+/// 构造强类型的单架构 Baseline Index Image Manifest (强制 V3+Zstd)
 pub fn build_arch_index_manifest(
     index_blob_digest: &str,
     index_blob_size: u64,
+    uncompressed_size: u64,
     config_digest: &str,
     config_size: u64,
     system: &SystemArch,
 ) -> OciImageManifest {
+    let mut layer_annotations = HashMap::new();
+    layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    layer_annotations.insert(
+        "org.nixos.nixcache.uncompressed_size".to_string(),
+        uncompressed_size.to_string(),
+    );
+    layer_annotations.insert(
+        "org.nixos.nixcache.compression".to_string(),
+        "zstd".to_string(),
+    );
+    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
+
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert(
         "org.opencontainers.image.created".to_string(),
@@ -217,11 +276,11 @@ pub fn build_arch_index_manifest(
             annotations: None,
         },
         layers: vec![OciDescriptor {
-            media_type: NIX_CACHE_INDEX_MEDIA_TYPE.to_string(),
+            media_type: CacheLayerMediaType::INDEX_V3_ZSTD.to_string(),
             digest: index_blob_digest.to_string(),
             size: index_blob_size,
             platform: Some(OciPlatform::from_system(system)),
-            annotations: None,
+            annotations: Some(layer_annotations),
         }],
         annotations: Some(manifest_annotations),
     }
@@ -248,119 +307,4 @@ pub fn build_image_index(
         manifests: manifest_descriptors,
         annotations: Some(annotations),
     }
-}
-
-/// 兼容构建函数：构造全局 Session Manifest
-pub fn build_session_manifest(
-    session_blob_digest: &str,
-    session_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-    run_id: u64,
-) -> OciImageManifest {
-    let mut layer_annotations = HashMap::new();
-    layer_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
-    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "4".to_string());
-
-    let mut manifest_annotations = HashMap::new();
-    manifest_annotations.insert(
-        "org.opencontainers.image.created".to_string(),
-        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    );
-    manifest_annotations.insert(
-        "org.opencontainers.image.description".to_string(),
-        "NixCache Workflow Run Session Manifest".to_string(),
-    );
-
-    OciImageManifest {
-        schema_version: 2,
-        media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-        config: OciDescriptor {
-            media_type: OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            digest: config_digest.to_string(),
-            size: config_size,
-            platform: None,
-            annotations: None,
-        },
-        layers: vec![OciDescriptor {
-            media_type: NIX_CACHE_SESSION_MEDIA_TYPE.to_string(),
-            digest: session_blob_digest.to_string(),
-            size: session_blob_size,
-            platform: None,
-            annotations: Some(layer_annotations),
-        }],
-        annotations: Some(manifest_annotations),
-    }
-}
-
-/// 兼容构建函数：构造全局 Baseline Index Manifest
-pub fn build_index_manifest(
-    index_blob_digest: &str,
-    index_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-) -> OciImageManifest {
-    let mut manifest_annotations = HashMap::new();
-    manifest_annotations.insert(
-        "org.opencontainers.image.created".to_string(),
-        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    );
-    manifest_annotations.insert(
-        "org.opencontainers.image.description".to_string(),
-        "NixCache Production Global Index Manifest".to_string(),
-    );
-
-    OciImageManifest {
-        schema_version: 2,
-        media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-        config: OciDescriptor {
-            media_type: OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            digest: config_digest.to_string(),
-            size: config_size,
-            platform: None,
-            annotations: None,
-        },
-        layers: vec![OciDescriptor {
-            media_type: NIX_CACHE_INDEX_MEDIA_TYPE.to_string(),
-            digest: index_blob_digest.to_string(),
-            size: index_blob_size,
-            platform: None,
-            annotations: None,
-        }],
-        annotations: Some(manifest_annotations),
-    }
-}
-
-/// 便捷兼容函数：生成 Session Manifest JSON 字符串
-pub fn build_session_oci_manifest(
-    session_blob_digest: &str,
-    session_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-    run_id: u64,
-) -> String {
-    let manifest = build_session_manifest(
-        session_blob_digest,
-        session_blob_size,
-        config_digest,
-        config_size,
-        run_id,
-    );
-    manifest.to_json_string().unwrap_or_default()
-}
-
-/// 便捷兼容函数：生成 Index Manifest JSON 字符串
-pub fn build_index_oci_manifest(
-    index_blob_digest: &str,
-    index_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-) -> String {
-    let manifest = build_index_manifest(
-        index_blob_digest,
-        index_blob_size,
-        config_digest,
-        config_size,
-    );
-    manifest.to_json_string().unwrap_or_default()
 }

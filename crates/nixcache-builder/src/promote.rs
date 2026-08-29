@@ -5,8 +5,8 @@ use nixcache_core::{
     ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor, OciPlatform,
-    build_arch_index_manifest, build_image_index,
+    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciClient, OciDescriptor, OciImageManifest,
+    OciPlatform, build_arch_index_manifest, build_image_index,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -163,11 +163,11 @@ pub async fn run_promote(
     if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
         for desc in artifact.index.manifests {
             if let Ok(Some((sub_json, _))) = oci.get_manifest_with_digest(&desc.digest).await
-                && let Ok(sub_manifest) =
-                    serde_json::from_str::<nixcache_oci::OciImageManifest>(&sub_json)
-                && let Some(blob_digest) = sub_manifest.first_layer_digest()
-                && let Ok(blob_bytes) = oci.get_blob(blob_digest).await
-                && let Ok(arch_data) = serde_json::from_slice::<ArchCacheIndexData>(&blob_bytes)
+                && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
+                && let Some(layer) = sub_manifest.layers.first()
+                && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
+                && let Ok(arch_data) =
+                    IndexCodec::decode_zstd::<ArchCacheIndexData>(&blob_bytes, &layer.media_type)
             {
                 if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
                     base_pub_key = arch_data.public_key;
@@ -243,11 +243,18 @@ pub async fn run_promote(
         };
 
         // 推送单架构 Index Blob
-        let (blob_digest, blob_size) = oci.push_json_blob(&arch_data).await?;
+        let (blob_digest, compressed_size, uncompressed_size) =
+            oci.push_zstd_blob(&arch_data).await?;
 
         // 构造单架构 Sub-Manifest
-        let sub_manifest =
-            build_arch_index_manifest(&blob_digest, blob_size, &config_digest, config_size, &sys);
+        let sub_manifest = build_arch_index_manifest(
+            &blob_digest,
+            compressed_size,
+            uncompressed_size,
+            &config_digest,
+            config_size,
+            &sys,
+        );
         let sub_manifest_json = sub_manifest.to_json_string()?;
         let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
 

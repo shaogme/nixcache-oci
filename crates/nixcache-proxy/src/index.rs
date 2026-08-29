@@ -3,7 +3,7 @@ use nixcache_core::{
     ArchCacheIndexData, ArchRunSessionManifest, CacheIndexData, IndexEntry, NarDigest,
     RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
 };
-use nixcache_oci::OciClient;
+use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -399,12 +399,14 @@ impl CacheIndex {
                         self.set_remote_status(true, None).await;
 
                         // 保存本地单架构备份文件
-                        let file_name = format!("cache-index-{}.json", system_clone.as_str());
+                        let file_name = format!("cache-index-{}.json.zst", system_clone.as_str());
                         let file_path = self.config.index_dir.join(&file_name);
                         if let Some(parent) = file_path.parent() {
                             let _ = fs::create_dir_all(parent).await;
                         }
-                        if let Ok(bytes) = serde_json::to_vec_pretty(&arch_data) {
+                        if let Ok(bytes) =
+                            IndexCodec::encode_zstd(&arch_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+                        {
                             if let Err(e) = fs::write(&file_path, &bytes).await {
                                 error!("[nixcache-proxy] Failed to write backup index: {}", e);
                             } else {
@@ -440,14 +442,15 @@ impl CacheIndex {
                     let arch_backup = self
                         .config
                         .index_dir
-                        .join(format!("cache-index-{}.json", system_clone.as_str()));
+                        .join(format!("cache-index-{}.json.zst", system_clone.as_str()));
 
                     if arch_backup.exists() {
                         match fs::read(&arch_backup).await {
                             Ok(bytes) => {
-                                if let Ok(arch_data) =
-                                    serde_json::from_slice::<ArchCacheIndexData>(&bytes)
-                                {
+                                if let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                                    &bytes,
+                                    CacheLayerMediaType::INDEX_V3_ZSTD,
+                                ) {
                                     info!(
                                         "[nixcache-proxy] Loaded backup arch index from {:?}",
                                         arch_backup
@@ -610,10 +613,10 @@ impl CacheIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheIndex, CascadingProxyConfig};
+    use super::{CacheIndex, CascadingProxyConfig, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
     use nixcache_core::{
-        CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, RunSessionManifest, StoreHash,
-        SystemArch,
+        ArchCacheIndexData, CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, RunSessionManifest,
+        StoreHash, SystemArch,
     };
     use std::{collections::HashMap, time::Duration};
 
@@ -780,5 +783,74 @@ mod tests {
         assert_eq!(counts.tier1_session_entries, 1);
         assert_eq!(counts.tier3_baseline_entries, 1);
         assert_eq!(counts.total_unique_entries, 3);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_index_backup_zstd_disk_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = CascadingProxyConfig {
+            repo: "test/repo".to_string(),
+            registry: "127.0.0.1:9".to_string(), // Unreachable port to force fallback to local backup
+            run_id: None,
+            branch_or_pr: None,
+            baseline_tag: "cache-index".to_string(),
+            upstream_caches: vec![],
+            session_ttl: Duration::from_secs(60),
+            baseline_ttl: Duration::from_secs(60),
+            index_dir: temp_dir.path().to_path_buf(),
+            target_system: SystemArch::X86_64Linux,
+        };
+
+        let hash_backup = StoreHash::parse("11111111111111111111111111111111").unwrap();
+        let backup_entry = IndexEntry {
+            name: "pkg-from-backup".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_backup),
+                nar_basename: "backup-pkg.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256(
+                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
+            )
+            .unwrap(),
+            nar_size: 512,
+            added: "2026-08-29T00:00:00Z".to_string(),
+            origin_job: None,
+        };
+
+        let mut arch_data = ArchCacheIndexData {
+            version: 1,
+            system: SystemArch::X86_64Linux,
+            repo: "test/repo".to_string(),
+            registry: "ghcr.io".to_string(),
+            generated: "2026-08-29T00:00:00Z".to_string(),
+            public_key: "backup-pubkey:CCC=".to_string(),
+            entries: HashMap::new(),
+            gc_roots: Vec::new(),
+            last_promoted_run: None,
+        };
+        arch_data.entries.insert(hash_backup.clone(), backup_entry);
+
+        // Pre-create cache-index-x86_64-linux.json.zst in the index dir
+        let backup_file = temp_dir.path().join("cache-index-x86_64-linux.json.zst");
+        let compressed = IndexCodec::encode_zstd(&arch_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+            .expect("Compression should succeed");
+        tokio::fs::write(&backup_file, &compressed).await.unwrap();
+
+        let index = CacheIndex::with_config(config, "");
+        index.get_baseline_data().await;
+
+        let entry = index
+            .lookup("11111111111111111111111111111111")
+            .await
+            .expect("Must find entry recovered from zstd backup");
+        assert_eq!(entry.name, "pkg-from-backup");
+        assert_eq!(
+            index.get_public_key().await,
+            Some("backup-pubkey:CCC=".to_string())
+        );
     }
 }

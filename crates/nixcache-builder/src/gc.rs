@@ -86,9 +86,16 @@ pub async fn run_gc(
     let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
 
     for (sys, arch_data) in partitioned {
-        let (blob_digest, blob_size) = oci.push_json_blob(&arch_data).await?;
-        let sub_manifest =
-            build_arch_index_manifest(&blob_digest, blob_size, &config_digest, config_size, &sys);
+        let (blob_digest, compressed_size, uncompressed_size) =
+            oci.push_zstd_blob(&arch_data).await?;
+        let sub_manifest = build_arch_index_manifest(
+            &blob_digest,
+            compressed_size,
+            uncompressed_size,
+            &config_digest,
+            config_size,
+            &sys,
+        );
         let sub_manifest_json = sub_manifest.to_json_string()?;
         let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
 

@@ -1,8 +1,9 @@
 use crate::{
+    codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
         OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciImageIndex, OciImageManifest,
-        build_arch_session_manifest, build_index_manifest,
+        build_arch_session_manifest,
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
@@ -16,7 +17,7 @@ use nixcache_core::{
     ArchCacheIndexData, ArchRunSessionManifest, CACHE_INDEX_VERSION, CacheIndexData,
     RUN_SESSION_VERSION, RunSessionManifest, SystemArch,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -695,19 +696,27 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
-    pub async fn push_json_blob<S: Serialize>(&self, data: &S) -> Result<(String, u64), OciError> {
-        let json_bytes = serde_json::to_vec_pretty(data)?;
-        let size = json_bytes.len() as u64;
+    /// 将数据紧凑序列化并经过 Zstd 压缩后推送至 Registry Blob
+    /// 返回: (blob_digest, compressed_size, uncompressed_size)
+    pub async fn push_zstd_blob<S: Serialize>(
+        &self,
+        data: &S,
+    ) -> Result<(String, u64, u64), OciError> {
+        let raw_json = serde_json::to_vec(data)?;
+        let uncompressed_size = raw_json.len() as u64;
 
-        let digest = compute_sha256_digest(&json_bytes);
+        let compressed_bytes = IndexCodec::encode_zstd(data, DEFAULT_ZSTD_COMPRESSION_LEVEL)?;
+        let compressed_size = compressed_bytes.len() as u64;
+        let digest = compute_sha256_digest(&compressed_bytes);
 
         if self.head_blob(&digest).await? {
-            return Ok((digest, size));
+            return Ok((digest, compressed_size, uncompressed_size));
         }
 
-        let bytes = Bytes::from(json_bytes);
-        let pushed_digest = self.push_blob_bytes_with_digest(&digest, bytes).await?;
-        Ok((pushed_digest, size))
+        let pushed_digest = self
+            .push_blob_bytes_with_digest(&digest, compressed_bytes)
+            .await?;
+        Ok((pushed_digest, compressed_size, uncompressed_size))
     }
 
     pub async fn get_manifest_with_digest(
@@ -798,10 +807,11 @@ impl<T: OciTransport> OciClient<T> {
     ) -> Result<Option<(ArchCacheIndexData, String)>, OciError> {
         let arch_tag = format!("{}-{}", tag, system.as_str());
         if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
-            && let Some(blob_digest) = sub_manifest.first_layer_digest()
+            && let Some(layer) = sub_manifest.layers.first()
         {
-            let blob_bytes = self.get_blob(blob_digest).await?;
-            let arch_data: ArchCacheIndexData = serde_json::from_slice(&blob_bytes)?;
+            let blob_bytes = self.get_blob(&layer.digest).await?;
+            let arch_data: ArchCacheIndexData =
+                IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
             return Ok(Some((arch_data, sub_digest)));
         }
 
@@ -823,12 +833,14 @@ impl<T: OciTransport> OciClient<T> {
             })?;
 
         let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-        let blob_digest = sub_manifest
-            .first_layer_digest()
-            .ok_or_else(|| OciError::Other("Sub-manifest missing layer digest".to_string()))?;
+        let layer = sub_manifest
+            .layers
+            .first()
+            .ok_or_else(|| OciError::Other("Sub-manifest missing layer descriptor".to_string()))?;
 
-        let blob_bytes = self.get_blob(blob_digest).await?;
-        let arch_data: ArchCacheIndexData = serde_json::from_slice(&blob_bytes)?;
+        let blob_bytes = self.get_blob(&layer.digest).await?;
+        let arch_data: ArchCacheIndexData =
+            IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
         Ok(Some((arch_data, artifact.digest)))
     }
 
@@ -840,10 +852,11 @@ impl<T: OciTransport> OciClient<T> {
     ) -> Result<Option<(ArchRunSessionManifest, String)>, OciError> {
         let arch_tag = format!("{}-{}", tag, system.as_str());
         if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
-            && let Some(blob_digest) = sub_manifest.first_layer_digest()
+            && let Some(layer) = sub_manifest.layers.first()
         {
-            let blob_bytes = self.get_blob(blob_digest).await?;
-            let arch_session: ArchRunSessionManifest = serde_json::from_slice(&blob_bytes)?;
+            let blob_bytes = self.get_blob(&layer.digest).await?;
+            let arch_session: ArchRunSessionManifest =
+                IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
             return Ok(Some((arch_session, sub_digest)));
         }
 
@@ -865,12 +878,14 @@ impl<T: OciTransport> OciClient<T> {
             })?;
 
         let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-        let blob_digest = sub_manifest
-            .first_layer_digest()
-            .ok_or_else(|| OciError::Other("Sub-manifest missing layer digest".to_string()))?;
+        let layer = sub_manifest
+            .layers
+            .first()
+            .ok_or_else(|| OciError::Other("Sub-manifest missing layer descriptor".to_string()))?;
 
-        let blob_bytes = self.get_blob(blob_digest).await?;
-        let arch_session: ArchRunSessionManifest = serde_json::from_slice(&blob_bytes)?;
+        let blob_bytes = self.get_blob(&layer.digest).await?;
+        let arch_session: ArchRunSessionManifest =
+            IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
         Ok(Some((arch_session, artifact.digest)))
     }
 
@@ -893,10 +908,12 @@ impl<T: OciTransport> OciClient<T> {
         for desc in &artifact.index.manifests {
             if let Ok(Some((sub_json, _))) = self.get_manifest_with_digest(&desc.digest).await
                 && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
-                && let Some(blob_digest) = sub_manifest.first_layer_digest()
-                && let Ok(blob_bytes) = self.get_blob(blob_digest).await
-                && let Ok(arch_session) =
-                    serde_json::from_slice::<ArchRunSessionManifest>(&blob_bytes)
+                && let Some(layer) = sub_manifest.layers.first()
+                && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                && let Ok(arch_session) = IndexCodec::decode_zstd::<ArchRunSessionManifest>(
+                    &blob_bytes,
+                    &layer.media_type,
+                )
             {
                 combined.run_id = arch_session.run_id;
                 if combined.head_sha.is_empty() {
@@ -943,9 +960,10 @@ impl<T: OciTransport> OciClient<T> {
         for desc in &artifact.index.manifests {
             if let Ok(Some((sub_json, _))) = self.get_manifest_with_digest(&desc.digest).await
                 && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
-                && let Some(blob_digest) = sub_manifest.first_layer_digest()
-                && let Ok(blob_bytes) = self.get_blob(blob_digest).await
-                && let Ok(arch_data) = serde_json::from_slice::<ArchCacheIndexData>(&blob_bytes)
+                && let Some(layer) = sub_manifest.layers.first()
+                && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                && let Ok(arch_data) =
+                    IndexCodec::decode_zstd::<ArchCacheIndexData>(&blob_bytes, &layer.media_type)
             {
                 if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
                     combined.public_key = arch_data.public_key;
@@ -1136,74 +1154,6 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
-    pub async fn update_manifest_cas<S, F>(
-        &self,
-        tag: &str,
-        max_retries: usize,
-        mut mutator: F,
-    ) -> Result<(), OciError>
-    where
-        S: Serialize + for<'de> Deserialize<'de> + Send,
-        F: FnMut(Option<S>) -> Result<S, OciError>,
-    {
-        let empty_config = Bytes::from_static(b"{}");
-        let config_digest = self.push_blob_bytes(empty_config).await?;
-        let config_size = 2u64;
-
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let (existing_data, prev_digest) = match self.get_manifest_with_digest(tag).await? {
-                Some((manifest_json, digest)) => {
-                    let manifest = serde_json::from_str::<OciImageManifest>(&manifest_json)?;
-                    let blob_digest = manifest.first_layer_digest().ok_or_else(|| {
-                        OciError::Other("Manifest missing layer digest".to_string())
-                    })?;
-                    let blob_bytes = self.get_blob(blob_digest).await?;
-                    let data = serde_json::from_slice::<S>(&blob_bytes)?;
-                    (Some(data), Some(digest))
-                }
-                None => (None, None),
-            };
-
-            let updated_data = mutator(existing_data)?;
-            let (blob_digest, blob_size) = self.push_json_blob(&updated_data).await?;
-
-            let manifest =
-                build_index_manifest(&blob_digest, blob_size, &config_digest, config_size);
-            let manifest_str = manifest.to_json_string()?;
-
-            match self
-                .put_manifest_conditional(tag, &manifest_str, prev_digest.as_deref())
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
-                    let pid = {
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            0u64
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            std::process::id() as u64
-                        }
-                    };
-                    let backoff_ms =
-                        (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
-                    warn!(
-                        "CAS conflict on tag {}, retrying in {}ms (attempt {}/{})",
-                        tag, backoff_ms, attempt, max_retries
-                    );
-                    self.transport
-                        .sleep(Duration::from_millis(backoff_ms))
-                        .await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     /// 单架构无锁 CAS 更新会话 (无跨架构竞争)
     pub async fn update_arch_session_with_cas(
         &self,
@@ -1231,11 +1181,12 @@ impl<T: OciTransport> OciClient<T> {
 
             request.apply_to_arch(&mut arch_session);
 
-            let (session_blob_digest, session_blob_size) =
-                self.push_json_blob(&arch_session).await?;
+            let (session_blob_digest, compressed_size, uncompressed_size) =
+                self.push_zstd_blob(&arch_session).await?;
             let manifest = build_arch_session_manifest(
                 &session_blob_digest,
-                session_blob_size,
+                compressed_size,
+                uncompressed_size,
                 &config_digest,
                 config_size,
                 request.run_id,
