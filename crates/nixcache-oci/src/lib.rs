@@ -12,8 +12,9 @@ pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TransportError};
 pub use manifest::{
     CacheLayerMediaType, OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
-    build_arch_index_manifest, build_arch_session_manifest, build_image_index,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciImageIndex,
+    OciImageManifest, OciPlatform, build_arch_index_manifest, build_arch_session_manifest,
+    build_image_index,
 };
 pub use mock::{MockResponse, MockRouterTransport};
 pub use mutation::SessionMutationRequest;

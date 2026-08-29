@@ -124,7 +124,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
                                 store_hash,
                                 IndexEntry {
                                     name,
-                                    system: Some(system.clone()),
+                                    system: Some(system),
                                     narinfo_meta,
                                     nar_digest,
                                     nar_size: size.max(nar_size),
@@ -163,7 +163,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
 
     // 执行单架构无锁乐观并发 CAS 更新写入 run-<run_id>-<system>
     if !new_entries.is_empty() || !active_gc_roots.is_empty() {
-        let request = SessionMutationRequest::new(opts.run_id, opts.job_id, system.clone())
+        let request = SessionMutationRequest::new(opts.run_id, opts.job_id, system)
             .with_entries(new_entries.clone())
             .with_roots(active_gc_roots.clone())
             .with_git_info(head_sha, ref_name)
@@ -203,7 +203,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         };
 
         let receipt = BuildReceipt::new(
-            system.clone(),
+            system,
             opts.repo.to_string(),
             Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             pub_key,

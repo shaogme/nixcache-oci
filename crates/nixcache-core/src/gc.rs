@@ -30,9 +30,9 @@ pub fn evaluate_multi_arch_gc(
         if reachable.insert(current_hash.clone())
             && let Some(entry) = index.entries.get(&current_hash)
         {
-            for dep_hash in &entry.narinfo_meta.references {
-                if !reachable.contains(dep_hash) {
-                    queue.push_back(dep_hash.clone());
+            for dep_hash in entry.narinfo_meta.reference_hashes() {
+                if !reachable.contains(&dep_hash) {
+                    queue.push_back(dep_hash);
                 }
             }
         }

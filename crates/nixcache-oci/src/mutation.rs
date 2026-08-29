@@ -88,7 +88,7 @@ impl SessionMutationRequest {
         }
 
         session.entries.extend(self.new_entries.clone());
-        let roots_entry = session.gc_roots.entry(self.system.clone()).or_default();
+        let roots_entry = session.gc_roots.entry(self.system).or_default();
         let mut set: HashSet<StoreHash> = roots_entry.iter().cloned().collect();
         set.extend(self.new_roots.clone());
         let mut sorted: Vec<StoreHash> = set.into_iter().collect();
@@ -98,7 +98,7 @@ impl SessionMutationRequest {
 
         session.completed_jobs.push(JobSummaryMetadata {
             job_id: self.job_id.clone(),
-            system: self.system.clone(),
+            system: self.system,
             uploaded_blobs: self.uploaded_blobs,
             uploaded_bytes: self.uploaded_bytes,
             timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -133,7 +133,7 @@ impl SessionMutationRequest {
 
         session.completed_jobs.push(JobSummaryMetadata {
             job_id: self.job_id.clone(),
-            system: self.system.clone(),
+            system: self.system,
             uploaded_blobs: self.uploaded_blobs,
             uploaded_bytes: self.uploaded_bytes,
             timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

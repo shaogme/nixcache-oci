@@ -57,13 +57,19 @@ mod tests {
 
         // SystemArch display and parsing
         let arch = SystemArch::X86_64Linux;
+        let arch_copy = arch; // Test Copy semantics
+        assert_eq!(arch, arch_copy);
         assert_eq!(arch.as_str(), "x86_64-linux");
         assert_eq!(format!("{}", arch), "x86_64-linux");
         assert_eq!(SystemArch::from("x86_64-linux"), SystemArch::X86_64Linux);
-        assert_eq!(
-            SystemArch::from("custom-arch"),
-            SystemArch::Other("custom-arch".to_string())
-        );
+        assert_eq!(SystemArch::from("custom-arch"), SystemArch::Unknown);
+
+        // SystemArch VARIANTS and iteration
+        assert!(SystemArch::VARIANTS.contains(&SystemArch::X86_64Linux));
+        assert!(SystemArch::VARIANTS.contains(&SystemArch::Aarch64Linux));
+        let all_systems: Vec<SystemArch> = SystemArch::all().collect();
+        assert!(all_systems.contains(&SystemArch::X86_64Linux));
+        assert!(!all_systems.contains(&SystemArch::Unknown));
 
         // SystemArch OCI platform mappings
         assert_eq!(arch.to_oci_platform_tuple(), ("linux", "amd64", None));
@@ -94,6 +100,10 @@ mod tests {
         assert_eq!(
             SystemArch::from_oci("linux", "arm", Some("v7")),
             SystemArch::Armv7lLinux
+        );
+        assert_eq!(
+            SystemArch::from_oci("linux", "invalid_arch", None),
+            SystemArch::Unknown
         );
     }
 
@@ -128,11 +138,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(parsed.references.len(), 2);
         assert_eq!(
             parsed.references[0],
-            StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap()
+            "s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1"
         );
         assert_eq!(
             parsed.references[1],
-            StoreHash::parse("00000000000000000000000000000000").unwrap()
+            "00000000000000000000000000000000-glibc-2.38"
         );
         assert_eq!(parsed.signatures.len(), 2);
         assert_eq!(
@@ -248,7 +258,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-root-app", root_app),
                     nar_basename: "root-app.nar.xz".to_string(),
-                    references: vec![shared_dep.clone()],
+                    references: vec![format!("{}-shared-dep", shared_dep)],
                     ..Default::default()
                 },
                 nar_digest: NarDigest::new_unchecked("sha256:root-blob"),
@@ -267,7 +277,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-shared-dep", shared_dep),
                     nar_basename: "shared-dep.nar.xz".to_string(),
-                    references: vec![sub_dep.clone()],
+                    references: vec![format!("{}-sub-dep", sub_dep)],
                     ..Default::default()
                 },
                 nar_digest: NarDigest::new_unchecked("sha256:dep-blob"),

@@ -172,6 +172,63 @@ impl OciImageManifest {
     }
 }
 
+/// 强类型 OCI 产物清单枚举 (完整支持 Image Index 与 Image Manifest)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OciArtifactManifest {
+    Index(OciImageIndex),
+    Manifest(OciImageManifest),
+}
+
+impl OciArtifactManifest {
+    /// 序列化为 JSON 字符串
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// 获取底层 Schema Version
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::Index(idx) => idx.schema_version,
+            Self::Manifest(m) => m.schema_version,
+        }
+    }
+
+    /// 获取底层 MediaType
+    pub fn media_type(&self) -> &str {
+        match self {
+            Self::Index(idx) => &idx.media_type,
+            Self::Manifest(m) => &m.media_type,
+        }
+    }
+
+    /// 是否为 Image Index
+    pub fn is_index(&self) -> bool {
+        matches!(self, Self::Index(_))
+    }
+
+    /// 是否为 Image Manifest
+    pub fn is_manifest(&self) -> bool {
+        matches!(self, Self::Manifest(_))
+    }
+
+    /// 提取为 Image Index 引用
+    pub fn as_index(&self) -> Option<&OciImageIndex> {
+        match self {
+            Self::Index(idx) => Some(idx),
+            Self::Manifest(_) => None,
+        }
+    }
+
+    /// 提取为 Image Manifest 引用
+    pub fn as_manifest(&self) -> Option<&OciImageManifest> {
+        match self {
+            Self::Index(_) => None,
+            Self::Manifest(m) => Some(m),
+        }
+    }
+}
+
 /// 构造强类型的单架构 Session Image Manifest
 pub fn build_arch_session_manifest(
     session_blob_digest: &str,

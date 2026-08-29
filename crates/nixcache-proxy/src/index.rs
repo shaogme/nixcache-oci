@@ -408,7 +408,7 @@ impl CacheIndex {
         }
 
         let tag_str = tag.clone();
-        let system_clone = system.clone();
+        let system_clone = *system;
         info!(
             "[nixcache-proxy] Refreshing Tier 3 Baseline Index (Tag: {}, System: {})...",
             tag_str, system_clone
@@ -562,7 +562,7 @@ impl CacheIndex {
         }
 
         let tag_str = tag.to_string();
-        let system_clone = self.config.target_system.clone();
+        let system_clone = self.config.target_system;
         info!(
             "[nixcache-proxy] Refreshing Session Manifest (Tag: {}, System: {})...",
             tag_str, system_clone

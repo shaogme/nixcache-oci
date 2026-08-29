@@ -84,7 +84,11 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
         # GET manifest: /v2/<repo>/nix-cache/manifests/<tag>
         if "/manifests/" in path:
             tag = path.split("/manifests/")[-1]
+            safe_tag = tag.replace(":", "_")
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+            if not os.path.exists(manifest_file):
+                manifest_file = os.path.join(STORAGE_DIR, "manifests", safe_tag)
+
             if os.path.exists(manifest_file):
                 with open(manifest_file, "rb") as f:
                     content = f.read()
@@ -127,7 +131,11 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
 
         if "/manifests/" in path:
             tag = path.split("/manifests/")[-1]
+            safe_tag = tag.replace(":", "_")
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+            if not os.path.exists(manifest_file):
+                manifest_file = os.path.join(STORAGE_DIR, "manifests", safe_tag)
+
             if os.path.exists(manifest_file):
                 with open(manifest_file, "rb") as f:
                     content = f.read()
@@ -151,14 +159,61 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query)
 
         # POST /v2/<repo>/nix-cache/blobs/uploads/
         if "/blobs/uploads" in path:
+            digest = query.get("digest", [None])[0]
+            if digest:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                safe_name = digest.replace(":", "_")
+                blob_file = os.path.join(STORAGE_DIR, "blobs", safe_name)
+                with open(blob_file, "wb") as f:
+                    f.write(body)
+                self.send_response(201)
+                self.send_header("Location", f"/v2/blobs/{digest}")
+                self.send_header("Docker-Content-Digest", digest)
+                self.end_headers()
+                return
+
             upload_id = str(uuid.uuid4())
             location = f"{path.rstrip('/')}/{upload_id}"
+            upload_file = os.path.join(STORAGE_DIR, "uploads", upload_id)
+            open(upload_file, "wb").close()
+
             self.send_response(202)
             self.send_header("Location", location)
             self.send_header("Range", "0-0")
+            self.send_header("Docker-Upload-UUID", upload_id)
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PATCH(self):
+        if self.check_fault_injection():
+            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # PATCH blob upload: /v2/<repo>/nix-cache/blobs/uploads/<upload_id>
+        if "/blobs/uploads/" in path:
+            upload_id = path.split("/blobs/uploads/")[-1].split("?")[0]
+            upload_file = os.path.join(STORAGE_DIR, "uploads", upload_id)
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+
+            with open(upload_file, "ab") as f:
+                f.write(body)
+
+            total_size = os.path.getsize(upload_file)
+            end_range = max(0, total_size - 1)
+
+            self.send_response(202)
+            self.send_header("Location", path)
+            self.send_header("Range", f"0-{end_range}")
             self.send_header("Docker-Upload-UUID", upload_id)
             self.end_headers()
             return
@@ -181,13 +236,23 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+            upload_id = path.split("/blobs/uploads/")[-1].split("?")[0]
+            upload_file = os.path.join(STORAGE_DIR, "uploads", upload_id)
+
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
 
             safe_name = digest.replace(":", "_")
             blob_file = os.path.join(STORAGE_DIR, "blobs", safe_name)
-            with open(blob_file, "wb") as f:
-                f.write(body)
+
+            if os.path.exists(upload_file):
+                if body:
+                    with open(upload_file, "ab") as f:
+                        f.write(body)
+                os.replace(upload_file, blob_file)
+            else:
+                with open(blob_file, "wb") as f:
+                    f.write(body)
 
             self.send_response(201)
             self.send_header("Location", f"/v2/blobs/{digest}")
@@ -218,10 +283,16 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(b"Precondition Failed: CAS digest mismatch\n")
                         return
 
+            computed_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+            safe_digest = computed_digest.replace(":", "_")
+
             with open(manifest_file, "wb") as f:
                 f.write(body)
+            with open(os.path.join(STORAGE_DIR, "manifests", safe_digest), "wb") as f:
+                f.write(body)
+            with open(os.path.join(STORAGE_DIR, "manifests", computed_digest), "wb") as f:
+                f.write(body)
 
-            computed_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
             self.send_response(201)
             self.send_header("Docker-Content-Digest", computed_digest)
             self.send_header("ETag", f'"{computed_digest}"')
@@ -240,9 +311,21 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
         # DELETE manifest: /v2/<repo>/nix-cache/manifests/<tag>
         if "/manifests/" in path:
             tag = path.split("/manifests/")[-1]
+            safe_tag = tag.replace(":", "_")
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+            safe_manifest_file = os.path.join(STORAGE_DIR, "manifests", safe_tag)
+            deleted = False
             if os.path.exists(manifest_file):
                 os.remove(manifest_file)
+                deleted = True
+            if os.path.exists(safe_manifest_file):
+                try:
+                    os.remove(safe_manifest_file)
+                    deleted = True
+                except OSError:
+                    pass
+
+            if deleted:
                 self.send_response(202)
                 self.end_headers()
             else:

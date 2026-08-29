@@ -247,7 +247,7 @@ pub async fn run_build_worker(
                             store_hash,
                             IndexEntry {
                                 name,
-                                system: Some(system.clone()),
+                                system: Some(system),
                                 narinfo_meta,
                                 nar_digest,
                                 nar_size: meta.nar_size.max(nar_size),
@@ -303,7 +303,7 @@ pub async fn run_build_worker(
     let job_id = env::var("GITHUB_JOB").ok();
 
     let receipt = BuildReceipt::new(
-        system.clone(),
+        system,
         repo.to_string(),
         Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         pub_key,

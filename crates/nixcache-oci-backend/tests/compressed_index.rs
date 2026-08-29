@@ -40,7 +40,7 @@ fn sample_arch_index_data(system: SystemArch) -> ArchCacheIndexData {
         hash.clone(),
         IndexEntry {
             name: format!("pkg-{}", system.as_str()),
-            system: Some(system.clone()),
+            system: Some(system),
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash),
                 nar_basename: format!("pkg-{}.nar.xz", system.as_str()),
@@ -60,7 +60,7 @@ fn sample_arch_index_data(system: SystemArch) -> ArchCacheIndexData {
 
     ArchCacheIndexData {
         version: CACHE_INDEX_VERSION,
-        system: system.clone(),
+        system,
         repo: "test/repo".to_string(),
         registry: "ghcr.io".to_string(),
         generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -72,7 +72,7 @@ fn sample_arch_index_data(system: SystemArch) -> ArchCacheIndexData {
 }
 
 fn sample_arch_session_manifest(run_id: u64, system: SystemArch) -> ArchRunSessionManifest {
-    let mut session = ArchRunSessionManifest::new(run_id, system.clone());
+    let mut session = ArchRunSessionManifest::new(run_id, system);
     session.head_sha = "abcd1234efgh5678".to_string();
     session.ref_name = "refs/heads/main".to_string();
     session.public_key = Some("cache.example.com-1:key123".to_string());
@@ -81,7 +81,7 @@ fn sample_arch_session_manifest(run_id: u64, system: SystemArch) -> ArchRunSessi
         hash.clone(),
         IndexEntry {
             name: format!("session-pkg-{}", system.as_str()),
-            system: Some(system.clone()),
+            system: Some(system),
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-session-pkg", hash),
                 nar_basename: format!("session-pkg-{}.nar.xz", system.as_str()),

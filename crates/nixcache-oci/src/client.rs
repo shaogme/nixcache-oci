@@ -2,8 +2,8 @@ use crate::{
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
-        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciImageIndex, OciImageManifest,
-        build_arch_session_manifest,
+        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
+        OciImageIndex, OciImageManifest, build_arch_session_manifest,
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
@@ -71,9 +71,9 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedOciArtifact {
-    pub index: OciImageIndex,
+    pub manifest: OciArtifactManifest,
     pub digest: String,
 }
 
@@ -542,7 +542,7 @@ impl<T: OciTransport> OciClient<T> {
             .map(|opt| opt.map(|(body, _)| body))
     }
 
-    /// 拉取并解析 OCI Image Index
+    /// 拉取并解析 OCI 产物（强类型枚举支持 OciImageIndex 与 OciImageManifest）
     pub async fn fetch_artifact(
         &self,
         tag_or_digest: &str,
@@ -552,8 +552,8 @@ impl<T: OciTransport> OciClient<T> {
             None => return Ok(None),
         };
 
-        let index: OciImageIndex = serde_json::from_str(&body)?;
-        Ok(Some(FetchedOciArtifact { index, digest }))
+        let manifest: OciArtifactManifest = serde_json::from_str(&body)?;
+        Ok(Some(FetchedOciArtifact { manifest, digest }))
     }
 
     pub async fn get_image_manifest(
@@ -588,7 +588,12 @@ impl<T: OciTransport> OciClient<T> {
         tag: &str,
         system: &SystemArch,
     ) -> Result<Option<(ArchCacheIndexData, String)>, OciError> {
-        let arch_tag = format!("{}-{}", tag, system.as_str());
+        let arch_tag = if tag.ends_with(system.as_str()) {
+            tag.to_string()
+        } else {
+            format!("{}-{}", tag, system.as_str())
+        };
+
         if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
             && let Some(layer) = sub_manifest.layers.first()
         {
@@ -603,28 +608,41 @@ impl<T: OciTransport> OciClient<T> {
             None => return Ok(None),
         };
 
-        let descriptor = match artifact.index.find_manifest_for_system(system) {
-            Some(d) => d,
-            None => return Ok(None),
-        };
+        match artifact.manifest {
+            OciArtifactManifest::Index(ref index) => {
+                let descriptor = match index.find_manifest_for_system(system) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
 
-        let (sub_manifest_json, _) = self
-            .get_manifest_with_digest(&descriptor.digest)
-            .await?
-            .ok_or_else(|| {
-                OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
-            })?;
+                let (sub_manifest_json, _) = self
+                    .get_manifest_with_digest(&descriptor.digest)
+                    .await?
+                    .ok_or_else(|| {
+                        OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
+                    })?;
 
-        let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-        let layer = sub_manifest
-            .layers
-            .first()
-            .ok_or_else(|| OciError::Other("Sub-manifest missing layer descriptor".to_string()))?;
+                let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
+                let layer = sub_manifest.layers.first().ok_or_else(|| {
+                    OciError::Other("Sub-manifest missing layer descriptor".to_string())
+                })?;
 
-        let blob_bytes = self.get_blob(&layer.digest).await?;
-        let arch_data: ArchCacheIndexData =
-            IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-        Ok(Some((arch_data, artifact.digest)))
+                let blob_bytes = self.get_blob(&layer.digest).await?;
+                let arch_data: ArchCacheIndexData =
+                    IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                Ok(Some((arch_data, artifact.digest)))
+            }
+            OciArtifactManifest::Manifest(ref sub_manifest) => {
+                if let Some(layer) = sub_manifest.layers.first() {
+                    let blob_bytes = self.get_blob(&layer.digest).await?;
+                    let arch_data: ArchCacheIndexData =
+                        IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                    Ok(Some((arch_data, artifact.digest)))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     /// 针对特定系统架构，按需拉取单架构会话清单数据
@@ -633,7 +651,12 @@ impl<T: OciTransport> OciClient<T> {
         tag: &str,
         system: &SystemArch,
     ) -> Result<Option<(ArchRunSessionManifest, String)>, OciError> {
-        let arch_tag = format!("{}-{}", tag, system.as_str());
+        let arch_tag = if tag.ends_with(system.as_str()) {
+            tag.to_string()
+        } else {
+            format!("{}-{}", tag, system.as_str())
+        };
+
         if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
             && let Some(layer) = sub_manifest.layers.first()
         {
@@ -648,39 +671,47 @@ impl<T: OciTransport> OciClient<T> {
             None => return Ok(None),
         };
 
-        let descriptor = match artifact.index.find_manifest_for_system(system) {
-            Some(d) => d,
-            None => return Ok(None),
-        };
+        match artifact.manifest {
+            OciArtifactManifest::Index(ref index) => {
+                let descriptor = match index.find_manifest_for_system(system) {
+                    Some(d) => d,
+                    None => return Ok(None),
+                };
 
-        let (sub_manifest_json, _) = self
-            .get_manifest_with_digest(&descriptor.digest)
-            .await?
-            .ok_or_else(|| {
-                OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
-            })?;
+                let (sub_manifest_json, _) = self
+                    .get_manifest_with_digest(&descriptor.digest)
+                    .await?
+                    .ok_or_else(|| {
+                        OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
+                    })?;
 
-        let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-        let layer = sub_manifest
-            .layers
-            .first()
-            .ok_or_else(|| OciError::Other("Sub-manifest missing layer descriptor".to_string()))?;
+                let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
+                let layer = sub_manifest.layers.first().ok_or_else(|| {
+                    OciError::Other("Sub-manifest missing layer descriptor".to_string())
+                })?;
 
-        let blob_bytes = self.get_blob(&layer.digest).await?;
-        let arch_session: ArchRunSessionManifest =
-            IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-        Ok(Some((arch_session, artifact.digest)))
+                let blob_bytes = self.get_blob(&layer.digest).await?;
+                let arch_session: ArchRunSessionManifest =
+                    IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                Ok(Some((arch_session, artifact.digest)))
+            }
+            OciArtifactManifest::Manifest(ref sub_manifest) => {
+                if let Some(layer) = sub_manifest.layers.first() {
+                    let blob_bytes = self.get_blob(&layer.digest).await?;
+                    let arch_session: ArchRunSessionManifest =
+                        IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                    Ok(Some((arch_session, artifact.digest)))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     pub async fn get_session_manifest(
         &self,
         tag: &str,
     ) -> Result<Option<(RunSessionManifest, String)>, OciError> {
-        let artifact = match self.fetch_artifact(tag).await? {
-            Some(a) => a,
-            None => return Ok(None),
-        };
-
         let mut combined = RunSessionManifest {
             version: RUN_SESSION_VERSION,
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -688,16 +719,85 @@ impl<T: OciTransport> OciClient<T> {
             ..Default::default()
         };
 
-        for desc in &artifact.index.manifests {
-            if let Ok(Some((sub_json, _))) = self.get_manifest_with_digest(&desc.digest).await
-                && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
-                && let Some(layer) = sub_manifest.layers.first()
-                && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                && let Ok(arch_session) = IndexCodec::decode_zstd::<ArchRunSessionManifest>(
-                    &blob_bytes,
-                    &layer.media_type,
-                )
+        if let Ok(Some(artifact)) = self.fetch_artifact(tag).await {
+            match artifact.manifest {
+                OciArtifactManifest::Index(ref index) => {
+                    for desc in &index.manifests {
+                        if let Ok(Some((sub_json, _))) =
+                            self.get_manifest_with_digest(&desc.digest).await
+                            && let Ok(sub_manifest) =
+                                serde_json::from_str::<OciImageManifest>(&sub_json)
+                            && let Some(layer) = sub_manifest.layers.first()
+                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                            && let Ok(arch_session) = IndexCodec::decode_zstd::<
+                                ArchRunSessionManifest,
+                            >(
+                                &blob_bytes, &layer.media_type
+                            )
+                        {
+                            combined.run_id = arch_session.run_id;
+                            if combined.head_sha.is_empty() {
+                                combined.head_sha = arch_session.head_sha;
+                            }
+                            if combined.ref_name.is_empty() {
+                                combined.ref_name = arch_session.ref_name;
+                            }
+                            if combined.public_key.is_none() {
+                                combined.public_key = arch_session.public_key;
+                            }
+                            combined.entries.extend(arch_session.entries);
+                            if !arch_session.gc_roots.is_empty() {
+                                combined
+                                    .gc_roots
+                                    .entry(arch_session.system)
+                                    .or_default()
+                                    .extend(arch_session.gc_roots);
+                            }
+                            combined.completed_jobs.extend(arch_session.completed_jobs);
+                        }
+                    }
+                    if !combined.entries.is_empty() || !combined.gc_roots.is_empty() {
+                        return Ok(Some((combined, artifact.digest)));
+                    }
+                }
+                OciArtifactManifest::Manifest(ref sub_manifest) => {
+                    if let Some(layer) = sub_manifest.layers.first()
+                        && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                        && let Ok(arch_session) = IndexCodec::decode_zstd::<ArchRunSessionManifest>(
+                            &blob_bytes,
+                            &layer.media_type,
+                        )
+                    {
+                        combined.run_id = arch_session.run_id;
+                        combined.head_sha = arch_session.head_sha;
+                        combined.ref_name = arch_session.ref_name;
+                        combined.public_key = arch_session.public_key;
+                        combined.entries.extend(arch_session.entries);
+                        if !arch_session.gc_roots.is_empty() {
+                            combined
+                                .gc_roots
+                                .entry(arch_session.system)
+                                .or_default()
+                                .extend(arch_session.gc_roots);
+                        }
+                        combined.completed_jobs.extend(arch_session.completed_jobs);
+                        return Ok(Some((combined, artifact.digest)));
+                    }
+                }
+            }
+        }
+
+        let mut found_any = false;
+        let mut first_digest = String::new();
+
+        for sys in SystemArch::all() {
+            if let Ok(Some((arch_session, digest))) =
+                self.get_arch_session_manifest(tag, &sys).await
             {
+                found_any = true;
+                if first_digest.is_empty() {
+                    first_digest = digest;
+                }
                 combined.run_id = arch_session.run_id;
                 if combined.head_sha.is_empty() {
                     combined.head_sha = arch_session.head_sha;
@@ -719,18 +819,18 @@ impl<T: OciTransport> OciClient<T> {
                 combined.completed_jobs.extend(arch_session.completed_jobs);
             }
         }
-        Ok(Some((combined, artifact.digest)))
+
+        if found_any {
+            Ok(Some((combined, first_digest)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn get_cache_index(
         &self,
         tag: &str,
     ) -> Result<Option<(CacheIndexData, String)>, OciError> {
-        let artifact = match self.fetch_artifact(tag).await? {
-            Some(a) => a,
-            None => return Ok(None),
-        };
-
         let mut combined = CacheIndexData {
             version: CACHE_INDEX_VERSION,
             repo: self.repo.clone(),
@@ -740,14 +840,82 @@ impl<T: OciTransport> OciClient<T> {
             ..Default::default()
         };
 
-        for desc in &artifact.index.manifests {
-            if let Ok(Some((sub_json, _))) = self.get_manifest_with_digest(&desc.digest).await
-                && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
-                && let Some(layer) = sub_manifest.layers.first()
-                && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                && let Ok(arch_data) =
-                    IndexCodec::decode_zstd::<ArchCacheIndexData>(&blob_bytes, &layer.media_type)
-            {
+        if let Ok(Some(artifact)) = self.fetch_artifact(tag).await {
+            match artifact.manifest {
+                OciArtifactManifest::Index(ref index) => {
+                    for desc in &index.manifests {
+                        if let Ok(Some((sub_json, _))) =
+                            self.get_manifest_with_digest(&desc.digest).await
+                            && let Ok(sub_manifest) =
+                                serde_json::from_str::<OciImageManifest>(&sub_json)
+                            && let Some(layer) = sub_manifest.layers.first()
+                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                            && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                                &blob_bytes,
+                                &layer.media_type,
+                            )
+                        {
+                            if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
+                                combined.public_key = arch_data.public_key;
+                            }
+                            if combined.last_promoted_run.is_none()
+                                && arch_data.last_promoted_run.is_some()
+                            {
+                                combined.last_promoted_run = arch_data.last_promoted_run;
+                            }
+                            combined.entries.extend(arch_data.entries);
+                            if !arch_data.gc_roots.is_empty() {
+                                combined
+                                    .gc_roots
+                                    .entry(arch_data.system)
+                                    .or_default()
+                                    .extend(arch_data.gc_roots);
+                            }
+                        }
+                    }
+                    if !combined.entries.is_empty() || !combined.gc_roots.is_empty() {
+                        return Ok(Some((combined, artifact.digest)));
+                    }
+                }
+                OciArtifactManifest::Manifest(ref sub_manifest) => {
+                    if let Some(layer) = sub_manifest.layers.first()
+                        && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                        && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                            &blob_bytes,
+                            &layer.media_type,
+                        )
+                    {
+                        if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
+                            combined.public_key = arch_data.public_key;
+                        }
+                        if combined.last_promoted_run.is_none()
+                            && arch_data.last_promoted_run.is_some()
+                        {
+                            combined.last_promoted_run = arch_data.last_promoted_run;
+                        }
+                        combined.entries.extend(arch_data.entries);
+                        if !arch_data.gc_roots.is_empty() {
+                            combined
+                                .gc_roots
+                                .entry(arch_data.system)
+                                .or_default()
+                                .extend(arch_data.gc_roots);
+                        }
+                        return Ok(Some((combined, artifact.digest)));
+                    }
+                }
+            }
+        }
+
+        let mut found_any = false;
+        let mut first_digest = String::new();
+
+        for sys in SystemArch::all() {
+            if let Ok(Some((arch_data, digest))) = self.get_arch_cache_index(tag, &sys).await {
+                found_any = true;
+                if first_digest.is_empty() {
+                    first_digest = digest;
+                }
                 if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
                     combined.public_key = arch_data.public_key;
                 }
@@ -764,7 +932,12 @@ impl<T: OciTransport> OciClient<T> {
                 }
             }
         }
-        Ok(Some((combined, artifact.digest)))
+
+        if found_any {
+            Ok(Some((combined, first_digest)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn put_manifest_conditional(
@@ -901,7 +1074,7 @@ impl<T: OciTransport> OciClient<T> {
         loop {
             attempt += 1;
             let (existing_index, prev_digest) = match self.fetch_artifact(tag).await? {
-                Some(artifact) => (Some(artifact.index), Some(artifact.digest)),
+                Some(artifact) => (artifact.manifest.as_index().cloned(), Some(artifact.digest)),
                 None => (None, None),
             };
 
@@ -948,7 +1121,7 @@ impl<T: OciTransport> OciClient<T> {
             {
                 Some((data, digest)) => (data, Some(digest)),
                 None => (
-                    ArchRunSessionManifest::new(request.run_id, request.system.clone()),
+                    ArchRunSessionManifest::new(request.run_id, request.system),
                     None,
                 ),
             };

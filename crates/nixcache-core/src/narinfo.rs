@@ -97,19 +97,12 @@ impl NarInfo {
                             if item.is_empty() {
                                 continue;
                             }
-                            let hash_candidate = if let Some(pos) = item.rfind('/') {
+                            let bname = if let Some(pos) = item.rfind('/') {
                                 &item[pos + 1..]
                             } else {
                                 item
                             };
-                            let hash_str = if hash_candidate.len() >= 32 {
-                                &hash_candidate[..32]
-                            } else {
-                                hash_candidate
-                            };
-                            let store_hash = StoreHash::parse(hash_str)
-                                .unwrap_or_else(|_| StoreHash::new_unchecked(hash_str));
-                            references.push(store_hash);
+                            references.push(bname.to_string());
                         }
                     }
                     "Deriver" if !value.is_empty() => {

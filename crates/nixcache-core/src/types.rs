@@ -9,6 +9,7 @@ use std::{
     path::Path,
     str::FromStr,
 };
+use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
 pub const SCHEMA_VERSION: u32 = 4;
 pub const CACHE_INDEX_VERSION: u32 = 4;
@@ -243,7 +244,9 @@ impl<'de> Deserialize<'de> for NarDigest {
 }
 
 /// 系统架构强类型
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, EnumIter, VariantArray,
+)]
 pub enum SystemArch {
     #[default]
     X86_64Linux,
@@ -252,12 +255,36 @@ pub enum SystemArch {
     Aarch64Darwin,
     I686Linux,
     Armv7lLinux,
+    Armv6lLinux,
     Riscv64Linux,
-    Other(String),
+    Aarch64Freebsd,
+    X86_64Freebsd,
+    I686Freebsd,
+    X86_64Netbsd,
+    X86_64Openbsd,
+    Mips64elLinux,
+    Powerpc64leLinux,
+    S390xLinux,
+    Wasm32Wasi,
+    Unknown,
 }
 
 impl SystemArch {
-    pub fn as_str(&self) -> &str {
+    /// 所有支持的系统架构静态变体列表
+    pub const VARIANTS: &'static [Self] = <Self as VariantArray>::VARIANTS;
+
+    /// 返回所有标准系统架构迭代器 (排除 Unknown)
+    pub fn all() -> impl Iterator<Item = Self> {
+        <Self as IntoEnumIterator>::iter().filter(|s| *s != Self::Unknown)
+    }
+
+    /// 是否为已知支持的架构
+    pub const fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// 获取 Nix 标准架构字符串
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::X86_64Linux => "x86_64-linux",
             Self::Aarch64Linux => "aarch64-linux",
@@ -265,13 +292,25 @@ impl SystemArch {
             Self::Aarch64Darwin => "aarch64-darwin",
             Self::I686Linux => "i686-linux",
             Self::Armv7lLinux => "armv7l-linux",
+            Self::Armv6lLinux => "armv6l-linux",
             Self::Riscv64Linux => "riscv64-linux",
-            Self::Other(s) => s.as_str(),
+            Self::Aarch64Freebsd => "aarch64-freebsd",
+            Self::X86_64Freebsd => "x86_64-freebsd",
+            Self::I686Freebsd => "i686-freebsd",
+            Self::X86_64Netbsd => "x86_64-netbsd",
+            Self::X86_64Openbsd => "x86_64-openbsd",
+            Self::Mips64elLinux => "mips64el-linux",
+            Self::Powerpc64leLinux => "powerpc64le-linux",
+            Self::S390xLinux => "s390x-linux",
+            Self::Wasm32Wasi => "wasm32-wasi",
+            Self::Unknown => "unknown",
         }
     }
 
     /// 转换为 OCI Platform 标准元组 (os, architecture, optional variant)
-    pub fn to_oci_platform_tuple(&self) -> (&'static str, &'static str, Option<&'static str>) {
+    pub const fn to_oci_platform_tuple(
+        &self,
+    ) -> (&'static str, &'static str, Option<&'static str>) {
         match self {
             Self::X86_64Linux => ("linux", "amd64", None),
             Self::Aarch64Linux => ("linux", "arm64", None),
@@ -279,20 +318,18 @@ impl SystemArch {
             Self::Aarch64Darwin => ("darwin", "arm64", None),
             Self::I686Linux => ("linux", "386", None),
             Self::Armv7lLinux => ("linux", "arm", Some("v7")),
+            Self::Armv6lLinux => ("linux", "arm", Some("v6")),
             Self::Riscv64Linux => ("linux", "riscv64", None),
-            Self::Other(s) => {
-                if let Some((arch, os)) = s.split_once('-') {
-                    if os == "linux" && arch == "x86_64" {
-                        ("linux", "amd64", None)
-                    } else if os == "linux" && arch == "aarch64" {
-                        ("linux", "arm64", None)
-                    } else {
-                        ("unknown", "unknown", None)
-                    }
-                } else {
-                    ("unknown", "unknown", None)
-                }
-            }
+            Self::Aarch64Freebsd => ("freebsd", "arm64", None),
+            Self::X86_64Freebsd => ("freebsd", "amd64", None),
+            Self::I686Freebsd => ("freebsd", "386", None),
+            Self::X86_64Netbsd => ("netbsd", "amd64", None),
+            Self::X86_64Openbsd => ("openbsd", "amd64", None),
+            Self::Mips64elLinux => ("linux", "mips64le", None),
+            Self::Powerpc64leLinux => ("linux", "ppc64le", None),
+            Self::S390xLinux => ("linux", "s390x", None),
+            Self::Wasm32Wasi => ("wasip1", "wasm", None),
+            Self::Unknown => ("unknown", "unknown", None),
         }
     }
 
@@ -309,16 +346,18 @@ impl SystemArch {
             ("darwin", "arm64" | "aarch64", _) => Self::Aarch64Darwin,
             ("linux", "386" | "i686" | "i386", _) => Self::I686Linux,
             ("linux", "arm", Some("v7") | Some("7")) | ("linux", "armv7l", _) => Self::Armv7lLinux,
+            ("linux", "arm", Some("v6") | Some("6")) | ("linux", "armv6l", _) => Self::Armv6lLinux,
             ("linux", "riscv64", _) => Self::Riscv64Linux,
-            (os_str, arch_str, _) => {
-                let mapped_arch = match arch_str {
-                    "amd64" => "x86_64",
-                    "arm64" => "aarch64",
-                    "386" => "i686",
-                    other => other,
-                };
-                Self::Other(format!("{}-{}", mapped_arch, os_str))
-            }
+            ("freebsd", "arm64" | "aarch64", _) => Self::Aarch64Freebsd,
+            ("freebsd", "amd64" | "x86_64", _) => Self::X86_64Freebsd,
+            ("freebsd", "386" | "i686" | "i386", _) => Self::I686Freebsd,
+            ("netbsd", "amd64" | "x86_64", _) => Self::X86_64Netbsd,
+            ("openbsd", "amd64" | "x86_64", _) => Self::X86_64Openbsd,
+            ("linux", "mips64le" | "mips64el", _) => Self::Mips64elLinux,
+            ("linux", "ppc64le" | "powerpc64le", _) => Self::Powerpc64leLinux,
+            ("linux", "s390x", _) => Self::S390xLinux,
+            ("wasi" | "wasip1", "wasm" | "wasm32", _) => Self::Wasm32Wasi,
+            _ => Self::Unknown,
         }
     }
 }
@@ -346,8 +385,18 @@ impl From<&str> for SystemArch {
             "aarch64-darwin" => Self::Aarch64Darwin,
             "i686-linux" => Self::I686Linux,
             "armv7l-linux" => Self::Armv7lLinux,
+            "armv6l-linux" => Self::Armv6lLinux,
             "riscv64-linux" => Self::Riscv64Linux,
-            other => Self::Other(other.to_string()),
+            "aarch64-freebsd" => Self::Aarch64Freebsd,
+            "x86_64-freebsd" => Self::X86_64Freebsd,
+            "i686-freebsd" => Self::I686Freebsd,
+            "x86_64-netbsd" => Self::X86_64Netbsd,
+            "x86_64-openbsd" => Self::X86_64Openbsd,
+            "mips64el-linux" => Self::Mips64elLinux,
+            "powerpc64le-linux" => Self::Powerpc64leLinux,
+            "s390x-linux" => Self::S390xLinux,
+            "wasm32-wasi" => Self::Wasm32Wasi,
+            _ => Self::Unknown,
         }
     }
 }
@@ -386,7 +435,7 @@ pub struct NarInfoMeta {
     pub file_hash: Option<String>,
     pub file_size: Option<u64>,
     pub nar_hash: String,
-    pub references: Vec<StoreHash>,
+    pub references: Vec<String>,
     pub deriver: Option<String>,
     pub signatures: Vec<String>,
     pub ca: Option<String>,
@@ -403,6 +452,25 @@ impl NarInfoMeta {
         } else {
             None
         }
+    }
+
+    /// 提取引用中的有效 StoreHash 迭代器
+    pub fn reference_hashes(&self) -> impl Iterator<Item = StoreHash> + '_ {
+        self.references.iter().filter_map(|r| {
+            let candidate = if let Some(pos) = r.rfind('/') {
+                &r[pos + 1..]
+            } else {
+                r.as_str()
+            };
+            if candidate.len() >= 32 {
+                Some(
+                    StoreHash::parse(&candidate[..32])
+                        .unwrap_or_else(|_| StoreHash::new_unchecked(&candidate[..32])),
+                )
+            } else {
+                None
+            }
+        })
     }
 
     /// 渲染为标准 Nix .narinfo 文本
@@ -425,8 +493,7 @@ impl NarInfoMeta {
         lines.push(format!("NarSize: {}", nar_size));
 
         if !self.references.is_empty() {
-            let refs: Vec<&str> = self.references.iter().map(|r| r.as_str()).collect();
-            lines.push(format!("References: {}", refs.join(" ")));
+            lines.push(format!("References: {}", self.references.join(" ")));
         }
         if let Some(ref drv) = self.deriver {
             lines.push(format!("Deriver: {}", drv));
@@ -524,7 +591,7 @@ impl CacheIndexData {
         let roots = self.gc_roots.get(system).cloned().unwrap_or_default();
         ArchCacheIndexData {
             version: self.version,
-            system: system.clone(),
+            system: *system,
             repo: self.repo.clone(),
             registry: self.registry.clone(),
             generated: self.generated.clone(),
@@ -540,7 +607,7 @@ impl CacheIndexData {
         let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
             HashMap::new();
         for (hash, entry) in self.entries {
-            let sys = entry.system.clone().unwrap_or_default();
+            let sys = entry.system.unwrap_or_default();
             partitioned_entries
                 .entry(sys)
                 .or_default()
@@ -555,7 +622,7 @@ impl CacheIndexData {
             let entries = partitioned_entries.remove(&sys).unwrap_or_default();
             let roots = self.gc_roots.get(&sys).cloned().unwrap_or_default();
             result.insert(
-                sys.clone(),
+                sys,
                 ArchCacheIndexData {
                     version: self.version,
                     system: sys,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-pipeline-session-cas.sh — End-to-end integration test for Schema v3 Session CAS & Cascading Proxy
+# test-pipeline-session-cas.sh — End-to-end integration test for Schema v4 Session CAS & Cascading Proxy
 
 set -euo pipefail
 
@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-echo "=== Starting NixCache Schema v3 Pipeline Session CAS & Cascading Test ==="
+echo "=== Starting NixCache Schema v4 Pipeline Session CAS & Cascading Test ==="
 
 REGISTRY_PORT=5003
 PROXY_PORT=37515
@@ -102,11 +102,25 @@ done
 wait "${WORKER_PIDS[@]}"
 echo ">>> All concurrent worker session captures completed."
 
-# 5. Verify RunSessionManifest in OCI Registry (run-<run_id>)
+# 5. Verify ArchRunSessionManifest in OCI Registry (run-<run_id>-x86_64-linux)
 echo ">>> Verifying session manifest in OCI registry..."
-SESSION_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}")
+SESSION_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
 echo "Session Manifest:"
 echo "$SESSION_MANIFEST"
+
+python3 -c "
+import json, subprocess
+manifest = json.loads('''$SESSION_MANIFEST''')
+layer_digest = manifest['layers'][0]['digest']
+layer_safe = layer_digest.replace(':', '_')
+blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+session_data = json.loads(decompressed)
+assert session_data['version'] == 4, f'Expected version 4, got {session_data[\"version\"]}'
+assert session_data['run_id'] == $RUN_ID, f'Expected run_id $RUN_ID, got {session_data[\"run_id\"]}'
+assert len(session_data['entries']) == 4, f'Expected 4 entries from 4 workers, got {len(session_data[\"entries\"])}'
+print('>>> Session manifest verified: Schema v4, 4 entries merged via CAS.')
+"
 
 # 6. Test Cascading Proxy Tier 0 (Hot Registry) & Tier 1 (run-<run_id>)
 echo ">>> Testing Cascading Proxy status..."
@@ -121,26 +135,34 @@ echo ">>> Running nixcache-builder promote for run-${RUN_ID}..."
 
 # 8. Verify Promoted Baseline cache-index
 echo ">>> Verifying promoted baseline cache-index..."
-BASE_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/cache-index")
-BLOB_DIGEST=$(echo "$BASE_MANIFEST" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
-BLOB_SAFE_NAME=$(echo "$BLOB_DIGEST" | tr ':' '_')
-INDEX_JSON=$(cat "/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME")
-
-echo "Index JSON:"
-echo "$INDEX_JSON"
+BASE_INDEX=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/cache-index")
+echo "Base Index Manifest:"
+echo "$BASE_INDEX"
 
 python3 -c "
-import json
-with open('/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME') as f:
-    idx = json.load(f)
-assert idx['version'] == 3, f'Expected version 3, got {idx[\"version\"]}'
+import json, subprocess
+manifest_index = json.loads('''$BASE_INDEX''')
+sub_manifest_digest = manifest_index['manifests'][0]['digest']
+sub_safe = sub_manifest_digest.replace(':', '_')
+
+with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
+    sub_manifest = json.load(f)
+
+layer_digest = sub_manifest['layers'][0]['digest']
+layer_safe = layer_digest.replace(':', '_')
+blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+
+decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+idx = json.loads(decompressed)
+assert idx['version'] == 4, f'Expected version 4, got {idx[\"version\"]}'
 assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx[\"last_promoted_run\"]}'
+assert len(idx['entries']) == 4, f'Expected 4 promoted entries, got {len(idx[\"entries\"])}'
+print('>>> Promoted cache-index verified (Schema v4, last_promoted_run & 4 entries).')
 "
-echo ">>> Promoted cache-index verified (Schema v3 & last_promoted_run)."
 
 # 9. Verify ephemeral session tag cleanup
-echo ">>> Verifying session tag run-${RUN_ID} was cleaned up..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}")
+echo ">>> Verifying session tag run-${RUN_ID}-x86_64-linux was cleaned up..."
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
 if [[ "$HTTP_CODE" -ne 404 ]]; then
     echo "!!! Expected 404 for deleted session tag, got $HTTP_CODE"
     exit 1
@@ -156,4 +178,4 @@ if [[ -f "$SNAPSHOT_FILE" ]]; then
 fi
 echo ">>> Session clean verified."
 
-echo "=== ALL SCHEMA V3 PIPELINE CAS & CASCADING TESTS PASSED ==="
+echo "=== ALL SCHEMA V4 PIPELINE CAS & CASCADING TESTS PASSED ==="

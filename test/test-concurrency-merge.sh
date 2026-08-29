@@ -63,41 +63,53 @@ worker_id = int(sys.argv[1])
 sys_name = sys.argv[2]
 receipt_file = sys.argv[3]
 
-entries = {
-    'hash-shared-libc': {
-        'name': 'glibc-common',
+sys_codes = {
+    'x86_64-linux': '11111111',
+    'aarch64-linux': '22222222',
+    'x86_64-darwin': '33333333',
+    'aarch64-darwin': '44444444'
+}
+
+hash_shared = '00000000000000000000000000000099'
+hash_base = f'000000000000000000000000{sys_codes[sys_name]}'
+hash_worker = f'000000000000000000000000000000{worker_id:02d}'
+
+def make_entry(h, name, size):
+    return {
+        'name': name,
         'system': sys_name,
-        'narinfo': 'StorePath: /nix/store/hash-shared-libc-glibc\n',
-        'nar_digest': 'sha256:digest-libc',
-        'nar_size': 5000,
-        'added': '2026-08-28T00:00:00Z'
-    },
-    f'hash-{sys_name}-base': {
-        'name': f'{sys_name}-base',
-        'system': sys_name,
-        'narinfo': f'StorePath: /nix/store/hash-{sys_name}-base\n',
-        'nar_digest': f'sha256:digest-{sys_name}-base',
-        'nar_size': 10000,
-        'added': '2026-08-28T00:00:00Z'
-    },
-    f'hash-pkg-worker-{worker_id}': {
-        'name': f'pkg-worker-{worker_id}',
-        'system': sys_name,
-        'narinfo': f'StorePath: /nix/store/hash-pkg-worker-{worker_id}\n',
-        'nar_digest': f'sha256:digest-worker-{worker_id}',
-        'nar_size': 2000,
-        'added': '2026-08-28T00:00:00Z'
+        'narinfo_meta': {
+            'store_path': f'/nix/store/{h}-{name}',
+            'nar_basename': f'{name}.nar.xz',
+            'compression': 'xz',
+            'file_hash': 'sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0',
+            'file_size': size,
+            'nar_hash': 'sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0',
+            'references': [],
+            'deriver': None,
+            'signatures': ['test-concurrency-key:AAAA='],
+            'ca': None
+        },
+        'nar_digest': 'sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0',
+        'nar_size': size,
+        'added': '2026-08-28T00:00:00Z',
+        'origin_job': None
     }
+
+entries = {
+    hash_shared: make_entry(hash_shared, 'glibc-common', 5000),
+    hash_base: make_entry(hash_base, f'{sys_name}-base', 10000),
+    hash_worker: make_entry(hash_worker, f'pkg-worker-{worker_id}', 2000),
 }
 
 active_roots = [
-    'hash-shared-libc',
-    f'hash-{sys_name}-base',
-    f'hash-pkg-worker-{worker_id}'
+    hash_shared,
+    hash_base,
+    hash_worker,
 ]
 
 receipt = {
-    'version': 3,
+    'version': 4,
     'system': sys_name,
     'repo': 'concurrency-test/cache',
     'timestamp': '2026-08-28T00:00:00Z',
@@ -108,7 +120,8 @@ receipt = {
         'discovered_outputs': 3,
         'built_paths': 3,
         'uploaded_blobs': 3,
-        'total_bytes_uploaded': 17000
+        'total_bytes_uploaded': 17000,
+        'substituted_paths': 0
     }
 }
 
@@ -130,54 +143,81 @@ export GITHUB_TOKEN="dummy-token"
 "$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR"
 
 # 5. Verify merged cache-index in OCI registry
-echo ">>> Fetching and verifying merged cache-index manifest and blob..."
-MANIFEST_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
-BLOB_DIGEST=$(echo "$MANIFEST_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
-BLOB_SAFE_NAME=$(echo "$BLOB_DIGEST" | tr ':' '_')
-INDEX_JSON=$(cat "/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME")
+echo ">>> Fetching and verifying merged cache-index manifest and blobs..."
+MANIFEST_INDEX_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
 
-# Total unique packages expected: 1 shared-libc + 4 sys-base + 12 worker pkgs = 17 entries
-ENTRY_COUNT=$(echo "$INDEX_JSON" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['entries']))")
-echo ">>> Merged cache index contains $ENTRY_COUNT entries."
-
-if [[ "$ENTRY_COUNT" -ne 17 ]]; then
-    echo "!!! Expected 17 entries in merged index, but got: $ENTRY_COUNT"
-    exit 1
-fi
-echo ">>> Entry count and deduplication verified (17 unique entries)."
-
-# 6. Verify GC Roots per architecture
-echo ">>> Verifying GC roots aggregated per system architecture..."
 python3 -c "
-import json
-with open('/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME') as f:
-    index = json.load(f)
+import json, subprocess, sys
 
-gc_roots = index['gc_roots']
-for sys in ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']:
-    assert sys in gc_roots, f'Missing gc_roots for {sys}'
-    roots = gc_roots[sys]
-    # Each system should have shared-libc, sys-base, and 3 worker pkgs (12 / 4 = 3) -> 5 roots
-    assert len(roots) == 5, f'Expected 5 roots for {sys}, got {len(roots)}: {roots}'
-    assert 'hash-shared-libc' in roots
-    assert f'hash-{sys}-base' in roots
+manifest_index = json.loads('''$MANIFEST_INDEX_JSON''')
+manifests = manifest_index.get('manifests', [])
+assert len(manifests) >= 4, f'Expected at least 4 architecture manifests, got {len(manifests)}'
+
+all_entries = {}
+gc_roots = {}
+
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_safe = sub_manifest_digest.replace(':', '_')
+    with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
+        sub_manifest = json.load(f)
+    
+    layer_digest = sub_manifest['layers'][0]['digest']
+    layer_safe = layer_digest.replace(':', '_')
+    blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+    
+    # Decompress zstd blob
+    decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+    arch_data = json.loads(decompressed)
+    assert arch_data['version'] == 4, f'Expected version 4, got {arch_data[\"version\"]}'
+    
+    sys_name = arch_data['system']
+    gc_roots[sys_name] = arch_data['gc_roots']
+    for k, v in arch_data['entries'].items():
+        all_entries[k] = v
+
+print(f'>>> Merged cache index contains {len(all_entries)} unique entries across all architectures.')
+assert len(all_entries) == 17, f'Expected 17 entries, got {len(all_entries)}'
+
+for sys_name in ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']:
+    assert sys_name in gc_roots, f'Missing gc_roots for {sys_name}'
+    roots = gc_roots[sys_name]
+    assert len(roots) == 5, f'Expected 5 roots for {sys_name}, got {len(roots)}: {roots}'
+    assert '00000000000000000000000000000099' in roots
 "
-echo ">>> GC roots aggregation per system architecture verified."
+echo ">>> Entry count, deduplication and GC roots aggregation verified."
 
 # 7. Test Merge Idempotency (re-running promote produces identical entry count and no corruption)
 echo ">>> Testing merge idempotency by running promote again..."
 "$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR"
 
-MANIFEST_JSON_2=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
-BLOB_DIGEST_2=$(echo "$MANIFEST_JSON_2" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
-BLOB_SAFE_NAME_2=$(echo "$BLOB_DIGEST_2" | tr ':' '_')
-INDEX_JSON_2=$(cat "/tmp/mock-oci-registry/blobs/$BLOB_SAFE_NAME_2")
-ENTRY_COUNT_2=$(echo "$INDEX_JSON_2" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['entries']))")
+MANIFEST_INDEX_JSON_2=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/cache-index")
 
-if [[ "$ENTRY_COUNT_2" -ne 17 ]]; then
-    echo "!!! Idempotency failed: Expected 17 entries, got $ENTRY_COUNT_2"
-    exit 1
-fi
+python3 -c "
+import json, subprocess, sys
+
+manifest_index = json.loads('''$MANIFEST_INDEX_JSON_2''')
+manifests = manifest_index.get('manifests', [])
+assert len(manifests) >= 4, f'Expected at least 4 architecture manifests, got {len(manifests)}'
+
+all_entries = {}
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_safe = sub_manifest_digest.replace(':', '_')
+    with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
+        sub_manifest = json.load(f)
+    
+    layer_digest = sub_manifest['layers'][0]['digest']
+    layer_safe = layer_digest.replace(':', '_')
+    blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+    
+    decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+    arch_data = json.loads(decompressed)
+    for k, v in arch_data['entries'].items():
+        all_entries[k] = v
+
+assert len(all_entries) == 17, f'Expected 17 entries on idempotency check, got {len(all_entries)}'
+"
 echo ">>> Idempotency verified."
 
 # 8. Test Multi-Arch GC dry run

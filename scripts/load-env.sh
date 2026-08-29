@@ -48,7 +48,7 @@ load_nixcache_env() {
         fi
         if [[ "$example_mode" == "flake" ]]; then
             load_env_file "$PROJECT_DIR/env/flake.example.env"
-        elif [[ "$example_mode" == "legacy" ]]; then
+        elif [[ "$example_mode" == "legacy" || "$example_mode" == "non-flake" ]]; then
             load_env_file "$PROJECT_DIR/env/legacy.example.env"
         fi
     fi

@@ -5,8 +5,8 @@ use nixcache_core::{
     ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciImageManifest, OciPlatform,
-    build_arch_index_manifest, build_image_index,
+    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor,
+    OciImageManifest, OciPlatform, build_arch_index_manifest, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
@@ -102,7 +102,7 @@ pub async fn run_promote(
                                     }
                                     receipt_entries.extend(receipt.new_entries);
                                     receipt_roots
-                                        .entry(receipt.system.clone())
+                                        .entry(receipt.system)
                                         .or_default()
                                         .extend(receipt.active_gc_roots);
                                 }
@@ -134,7 +134,7 @@ pub async fn run_promote(
                         }
                         receipt_entries.extend(receipt.new_entries);
                         receipt_roots
-                            .entry(receipt.system.clone())
+                            .entry(receipt.system)
                             .or_default()
                             .extend(receipt.active_gc_roots);
                     }
@@ -162,32 +162,61 @@ pub async fn run_promote(
     let mut base_pub_key = session_pub_key.or(receipt_pub_key).unwrap_or_default();
 
     if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
-        for desc in artifact.index.manifests {
-            if let Ok(Some((sub_json, _))) = oci.get_manifest_with_digest(&desc.digest).await
-                && let Ok(sub_manifest) = serde_json::from_str::<OciImageManifest>(&sub_json)
-                && let Some(layer) = sub_manifest.layers.first()
-                && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
-                && let Ok(arch_data) =
-                    IndexCodec::decode_zstd::<ArchCacheIndexData>(&blob_bytes, &layer.media_type)
-            {
-                if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
-                    base_pub_key = arch_data.public_key;
+        match artifact.manifest {
+            OciArtifactManifest::Index(index) => {
+                for desc in index.manifests {
+                    if let Ok(Some((sub_json, _))) =
+                        oci.get_manifest_with_digest(&desc.digest).await
+                        && let Ok(sub_manifest) =
+                            serde_json::from_str::<OciImageManifest>(&sub_json)
+                        && let Some(layer) = sub_manifest.layers.first()
+                        && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
+                        && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                            &blob_bytes,
+                            &layer.media_type,
+                        )
+                    {
+                        if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
+                            base_pub_key = arch_data.public_key;
+                        }
+                        partitioned_entries
+                            .entry(arch_data.system)
+                            .or_default()
+                            .extend(arch_data.entries);
+                        partitioned_roots
+                            .entry(arch_data.system)
+                            .or_default()
+                            .extend(arch_data.gc_roots);
+                    }
                 }
-                partitioned_entries
-                    .entry(arch_data.system.clone())
-                    .or_default()
-                    .extend(arch_data.entries);
-                partitioned_roots
-                    .entry(arch_data.system)
-                    .or_default()
-                    .extend(arch_data.gc_roots);
+            }
+            OciArtifactManifest::Manifest(sub_manifest) => {
+                if let Some(layer) = sub_manifest.layers.first()
+                    && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
+                    && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                        &blob_bytes,
+                        &layer.media_type,
+                    )
+                {
+                    if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
+                        base_pub_key = arch_data.public_key;
+                    }
+                    partitioned_entries
+                        .entry(arch_data.system)
+                        .or_default()
+                        .extend(arch_data.entries);
+                    partitioned_roots
+                        .entry(arch_data.system)
+                        .or_default()
+                        .extend(arch_data.gc_roots);
+                }
             }
         }
     }
 
     // 合并 session 条目到分桶
     for (hash, entry) in session_entries {
-        let sys = entry.system.clone().unwrap_or_default();
+        let sys = entry.system.unwrap_or_default();
         partitioned_entries
             .entry(sys)
             .or_default()
@@ -204,7 +233,7 @@ pub async fn run_promote(
 
     // 合并 receipt 条目到分桶
     for (hash, entry) in receipt_entries {
-        let sys = entry.system.clone().unwrap_or_default();
+        let sys = entry.system.unwrap_or_default();
         partitioned_entries
             .entry(sys)
             .or_default()
@@ -225,7 +254,8 @@ pub async fn run_promote(
     let config_size = 2u64;
 
     let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
-    let all_systems: Vec<SystemArch> = partitioned_entries.keys().cloned().collect();
+    let mut all_systems: HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
+    all_systems.extend(partitioned_roots.keys().cloned());
 
     for sys in all_systems {
         let entries = partitioned_entries.remove(&sys).unwrap_or_default();
@@ -233,7 +263,7 @@ pub async fn run_promote(
 
         let arch_data = ArchCacheIndexData {
             version: CACHE_INDEX_VERSION,
-            system: sys.clone(),
+            system: sys,
             repo: repo.to_string(),
             registry: registry.to_string(),
             generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

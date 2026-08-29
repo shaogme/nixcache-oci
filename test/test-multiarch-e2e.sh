@@ -45,6 +45,9 @@ cleanup() {
     if [[ -n "${PROXY_PID:-}" ]]; then
         kill -9 "$PROXY_PID" 2>/dev/null || true
     fi
+    if [[ -n "${PROXY_ARM_PID:-}" ]]; then
+        kill -9 "$PROXY_ARM_PID" 2>/dev/null || true
+    fi
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
@@ -147,23 +150,51 @@ echo ">>> [Phase 2] Running Promote Coordinator..."
     --repo "$NIXCACHE_REPO" \
     --registry "$NIXCACHE_REGISTRY"
 
-echo ">>> Fetching published cache-index from local registry to verify Schema v3..."
-INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
-INDEX_DIGEST=$(echo "$INDEX_MANIFEST" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
-INDEX_JSON=$(curl -fsSL "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/blobs/${INDEX_DIGEST}")
+echo ">>> Fetching published cache-index from local registry to verify Schema v4..."
+INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
 
-echo ">>> Published Cache Index v3 Content:"
-echo "$INDEX_JSON" | python3 -m json.tool
+echo ">>> Published Cache Index Manifest:"
+echo "$INDEX_MANIFEST" | python3 -m json.tool
 
-# Verify Schema v3 and multi-arch entries
-echo "$INDEX_JSON" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-assert data['version'] == 3, f'Expected version 3, got {data[\"version\"]}'
-assert len(data['entries']) >= 2, f'Expected at least 2 entries, got {len(data[\"entries\"])}'
-assert 'x86_64-linux' in data['gc_roots'], f'Missing x86_64-linux in gc_roots: {data[\"gc_roots\"]}'
-assert 'aarch64-linux' in data['gc_roots'], f'Missing aarch64-linux in gc_roots: {data[\"gc_roots\"]}'
-print('>>> Schema v3 and Multi-Arch verification SUCCESS!')
+# Verify Schema v4 and multi-arch entries
+python3 -c "
+import json, subprocess, sys
+
+manifest_index = json.loads('''$INDEX_MANIFEST''')
+manifests = manifest_index.get('manifests', [])
+assert len(manifests) >= 2, f'Expected at least 2 architecture manifests, got {len(manifests)}'
+
+all_entries = {}
+gc_roots = {}
+
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_manifest_json = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
+    ]).decode('utf-8')
+    sub_manifest = json.loads(sub_manifest_json)
+    layer_digest = sub_manifest['layers'][0]['digest']
+    
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{layer_digest}'
+    ])
+    
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
+    arch_data = json.loads(decompressed)
+    assert arch_data['version'] == 4, f'Expected version 4, got {arch_data[\"version\"]}'
+    
+    sys_name = arch_data['system']
+    gc_roots[sys_name] = arch_data['gc_roots']
+    for k, v in arch_data['entries'].items():
+        all_entries[k] = v
+
+print(f'>>> Aggregated {len(all_entries)} entries across {len(gc_roots)} architectures.')
+assert len(all_entries) >= 2, f'Expected at least 2 entries, got {len(all_entries)}'
+assert 'x86_64-linux' in gc_roots, f'Missing x86_64-linux in gc_roots: {gc_roots}'
+assert 'aarch64-linux' in gc_roots, f'Missing aarch64-linux in gc_roots: {gc_roots}'
+print('>>> Schema v4 and Multi-Arch verification SUCCESS!')
 "
 
 # =========================================================================
@@ -191,7 +222,6 @@ done
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "!!! Proxy failed to start"
     exit 1
-
 fi
 
 echo ">>> Testing public key endpoint on proxy..."
@@ -203,16 +233,32 @@ if [[ "$FETCHED_PUBKEY" != "$EXPECTED_PUBKEY"* ]]; then
 fi
 echo ">>> Public key verified on proxy."
 
-# Fetch each entry hash and verify narinfo endpoint
-TEST_HASHES=$(echo "$INDEX_JSON" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for h in data['entries'].keys():
-    print(h)
+# Fetch x86_64 entries and verify on x86_64 proxy
+X86_HASHES=$(python3 -c "
+import json, subprocess
+manifest_index = json.loads('''$INDEX_MANIFEST''')
+manifests = manifest_index.get('manifests', [])
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_manifest_json = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
+    ]).decode('utf-8')
+    sub_manifest = json.loads(sub_manifest_json)
+    layer_digest = sub_manifest['layers'][0]['digest']
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{layer_digest}'
+    ])
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
+    arch_data = json.loads(decompressed)
+    if arch_data['system'] == 'x86_64-linux':
+        for h in arch_data['entries'].keys():
+            print(h)
 ")
 
-for HASH in $TEST_HASHES; do
-    echo ">>> Testing .narinfo query for hash: $HASH"
+for HASH in $X86_HASHES; do
+    echo ">>> Testing .narinfo query for x86_64-linux hash: $HASH"
     NARINFO=$(curl -fs "http://127.0.0.1:37516/${HASH}.narinfo")
     echo "$NARINFO"
     if ! echo "$NARINFO" | grep -q "StorePath:"; then
@@ -221,14 +267,76 @@ for HASH in $TEST_HASHES; do
     fi
 done
 
+# Start aarch64-linux proxy on port 37517 and verify aarch64-linux entries
+echo ">>> Starting nixcache-proxy for aarch64-linux on port 37517..."
+"$PROXY_BIN" --port 37517 --system aarch64-linux &
+PROXY_ARM_PID=$!
+
+for _ in {1..10}; do
+    if curl -fs http://127.0.0.1:37517/nix-cache-info >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+ARM_HASHES=$(python3 -c "
+import json, subprocess
+manifest_index = json.loads('''$INDEX_MANIFEST''')
+manifests = manifest_index.get('manifests', [])
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_manifest_json = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
+    ]).decode('utf-8')
+    sub_manifest = json.loads(sub_manifest_json)
+    layer_digest = sub_manifest['layers'][0]['digest']
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{layer_digest}'
+    ])
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
+    arch_data = json.loads(decompressed)
+    if arch_data['system'] == 'aarch64-linux':
+        for h in arch_data['entries'].keys():
+            print(h)
+")
+
+for HASH in $ARM_HASHES; do
+    echo ">>> Testing .narinfo query for aarch64-linux hash on ARM proxy: $HASH"
+    NARINFO=$(curl -fs "http://127.0.0.1:37517/${HASH}.narinfo")
+    echo "$NARINFO"
+    if ! echo "$NARINFO" | grep -q "StorePath:"; then
+        echo "!!! Invalid narinfo for hash $HASH"
+        exit 1
+    fi
+done
+
+kill -9 "$PROXY_ARM_PID" 2>/dev/null || true
+unset PROXY_ARM_PID
+
 # Perform full Nix substitution on one of the store paths
-SAMPLE_STORE_PATH=$(echo "$INDEX_JSON" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for entry in data['entries'].values():
-    for line in entry['narinfo'].splitlines():
-        if line.startswith('StorePath: '):
-            print(line.split('StorePath: ')[1].strip())
+SAMPLE_STORE_PATH=$(python3 -c "
+import json, subprocess, sys
+manifest_index = json.loads('''$INDEX_MANIFEST''')
+manifests = manifest_index.get('manifests', [])
+for m in manifests:
+    sub_manifest_digest = m['digest']
+    sub_manifest_json = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/manifests/{sub_manifest_digest}'
+    ]).decode('utf-8')
+    sub_manifest = json.loads(sub_manifest_json)
+    layer_digest = sub_manifest['layers'][0]['digest']
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{layer_digest}'
+    ])
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
+    arch_data = json.loads(decompressed)
+    if arch_data['system'] == 'x86_64-linux':
+        for entry in arch_data['entries'].values():
+            print(entry['narinfo_meta']['store_path'])
             sys.exit(0)
 ")
 
