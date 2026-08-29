@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
     sync::Semaphore,
 };
@@ -80,6 +80,30 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<W> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// 原生流式单向复制数据并写入压缩编码器。
+///
+/// 避免使用通用 `tokio::io::copy`，因为其在 Reader 返回 `Poll::Pending` 时会默认调用
+/// `writer.poll_flush()`，而 `liblzma` 在 `LZMA_SYNC_FLUSH` 后无法无缝切换回 `LZMA_RUN`，
+/// 进而导致 `liblzma internal error`。本函数采用 64KB 缓冲区进行流式传输，
+/// 仅在流完全结束（EOF）后由调用方执行最终的 `shutdown`。
+pub async fn copy_nar_stream<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total_bytes = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).await?;
+        total_bytes += n as u64;
+    }
+    Ok(total_bytes)
 }
 
 /// 原生流式导出 store paths 并生成 .nar.xz 与 .narinfo
@@ -155,7 +179,7 @@ pub async fn export_paths_directly(
             let hashing_writer = HashingWriter::new(nar_file);
             let mut encoder = XzEncoder::new(hashing_writer);
 
-            tokio::io::copy(&mut dump_stdout, &mut encoder)
+            copy_nar_stream(&mut dump_stdout, &mut encoder)
                 .await
                 .map_err(|e| format!("Failed to compress NAR stream: {}", e))?;
 
@@ -336,7 +360,7 @@ pub async fn export_and_upload_path_stream(
     let compress_handle = tokio::spawn(async move {
         let mut encoder = XzEncoder::new(writer);
         let mut reader = dump_stdout;
-        let res = tokio::io::copy(&mut reader, &mut encoder).await;
+        let res = copy_nar_stream(&mut reader, &mut encoder).await;
         let shutdown_res = encoder.shutdown().await;
         if let Err(e) = res {
             return Err(format!("Compression copy failed: {}", e));
@@ -484,10 +508,18 @@ pub async fn export_and_upload_path_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::HashingWriter;
+    use super::{HashingWriter, UploadedNarMetadata, copy_nar_stream, export_paths_directly};
+    use async_compression::tokio::{bufread::XzDecoder, write::XzEncoder};
     use sha2::{Digest, Sha256};
-    use std::io::Cursor;
-    use tokio::io::AsyncWriteExt;
+    use std::{
+        io::{self, Cursor},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::{
+        fs,
+        io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
+    };
 
     #[tokio::test]
     async fn test_hashing_writer_computes_sha256_and_size() {
@@ -519,8 +551,6 @@ mod tests {
 
     #[test]
     fn test_uploaded_nar_metadata_structure() {
-        use super::UploadedNarMetadata;
-
         let meta = UploadedNarMetadata {
             store_hash: "s66mzxpvicwk07gjbjfw9izjfa797vsw".to_string(),
             store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
@@ -534,5 +564,99 @@ mod tests {
         assert_eq!(meta.store_hash, "s66mzxpvicwk07gjbjfw9izjfa797vsw");
         assert_eq!(meta.nar_size, 2048);
         assert!(meta.narinfo_content.starts_with("StorePath:"));
+    }
+
+    /// 模拟在数据块之间不断返回 `Poll::Pending` 的异步 Reader
+    struct IntermittentPendingReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+        yielded_pending: bool,
+    }
+
+    impl AsyncRead for IntermittentPendingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.index >= self.chunks.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            if !self.yielded_pending {
+                self.yielded_pending = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            self.yielded_pending = false;
+            let chunk = &self.chunks[self.index];
+            buf.put_slice(chunk);
+            self.index += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_nar_stream_prevents_liblzma_flush_conflict_regression() {
+        // 构建由多个数据块组成的原始数据，块间模拟 Pending 中断
+        let mut original_data = Vec::new();
+        let mut chunks = Vec::new();
+        for i in 0..10 {
+            let chunk = format!("Chunk data payload section {} - {}\n", i, "X".repeat(1024)).into_bytes();
+            original_data.extend_from_slice(&chunk);
+            chunks.push(chunk);
+        }
+
+        let mut pending_reader = IntermittentPendingReader {
+            chunks,
+            index: 0,
+            yielded_pending: false,
+        };
+
+        let compressed_buf = Vec::new();
+        let mut encoder = XzEncoder::new(compressed_buf);
+
+        let copied_bytes = copy_nar_stream(&mut pending_reader, &mut encoder)
+            .await
+            .expect("copy_nar_stream should succeed without liblzma error");
+        assert_eq!(copied_bytes, original_data.len() as u64);
+
+        encoder.shutdown().await.expect("Encoder shutdown should succeed");
+
+        let compressed = encoder.into_inner();
+        assert!(!compressed.is_empty());
+
+        // 解压并验证数据一致性
+        let mut decoder = XzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).await.expect("Decompression should succeed");
+        assert_eq!(decompressed, original_data);
+    }
+
+    #[tokio::test]
+    async fn test_export_paths_directly_real_store() {
+        let mut paths = Vec::new();
+        if let Ok(mut entries) = fs::read_dir("/nix/store").await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str()
+                    && !name.ends_with(".drv")
+                    && !name.ends_with(".lock")
+                {
+                    paths.push(format!("/nix/store/{}", name));
+                    if paths.len() >= 15 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if paths.is_empty() {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let res = export_paths_directly(&paths, None, temp_dir.path()).await;
+        assert!(res.is_ok(), "export_paths_directly failed: {:?}", res);
     }
 }
