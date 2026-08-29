@@ -12,6 +12,7 @@ Supports basic OCI distribution spec:
 - GET /v2/<repo>/nix-cache/manifests/<tag>
 """
 
+import hashlib
 import http.server
 import json
 import os
@@ -85,12 +86,16 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
             tag = path.split("/manifests/")[-1]
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
             if os.path.exists(manifest_file):
+                with open(manifest_file, "rb") as f:
+                    content = f.read()
+                digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-                self.send_header("Content-Length", str(os.path.getsize(manifest_file)))
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Docker-Content-Digest", digest)
+                self.send_header("ETag", f'"{digest}"')
                 self.end_headers()
-                with open(manifest_file, "rb") as f:
-                    self.wfile.write(f.read())
+                self.wfile.write(content)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -114,6 +119,24 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(os.path.getsize(blob_file)))
                 self.send_header("Docker-Content-Digest", digest)
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
+        if "/manifests/" in path:
+            tag = path.split("/manifests/")[-1]
+            manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+            if os.path.exists(manifest_file):
+                with open(manifest_file, "rb") as f:
+                    content = f.read()
+                digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Docker-Content-Digest", digest)
+                self.send_header("ETag", f'"{digest}"')
                 self.end_headers()
             else:
                 self.send_response(404)
@@ -150,7 +173,6 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-
         # PUT blob upload: /v2/<repo>/nix-cache/blobs/uploads/<upload_id>?digest=<digest>
         if "/blobs/uploads/" in path:
             digest = query.get("digest", [None])[0]
@@ -180,12 +202,66 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
 
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+
+            # CAS optimistic concurrency check via If-Match header
+            if_match = self.headers.get("If-Match")
+            if if_match:
+                if_match = if_match.strip('"')
+                if os.path.exists(manifest_file):
+                    with open(manifest_file, "rb") as f:
+                        existing_content = f.read()
+                    existing_digest = f"sha256:{hashlib.sha256(existing_content).hexdigest()}"
+                    if if_match != existing_digest and if_match != f'"{existing_digest}"':
+                        self.send_response(412)
+                        self.send_header("Content-Type", "text/plain")
+                        self.end_headers()
+                        self.wfile.write(b"Precondition Failed: CAS digest mismatch\n")
+                        return
+
             with open(manifest_file, "wb") as f:
                 f.write(body)
 
+            computed_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
             self.send_response(201)
-            self.send_header("Docker-Content-Digest", f"sha256:{tag}")
+            self.send_header("Docker-Content-Digest", computed_digest)
+            self.send_header("ETag", f'"{computed_digest}"')
             self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_DELETE(self):
+        if self.check_fault_injection():
+            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # DELETE manifest: /v2/<repo>/nix-cache/manifests/<tag>
+        if "/manifests/" in path:
+            tag = path.split("/manifests/")[-1]
+            manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
+            if os.path.exists(manifest_file):
+                os.remove(manifest_file)
+                self.send_response(202)
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
+        # DELETE blob: /v2/<repo>/nix-cache/blobs/<digest>
+        if "/blobs/" in path:
+            digest = path.split("/blobs/")[-1]
+            safe_name = digest.replace(":", "_")
+            blob_file = os.path.join(STORAGE_DIR, "blobs", safe_name)
+            if os.path.exists(blob_file):
+                os.remove(blob_file)
+                self.send_response(202)
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
             return
 
         self.send_response(404)

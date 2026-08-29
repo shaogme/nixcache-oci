@@ -1,19 +1,28 @@
 mod types;
 
 pub use types::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, RECEIPT_VERSION,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata,
+    RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use chrono::Utc;
 use reqwest::{
     Client, Response, StatusCode,
-    header::{HeaderMap, HeaderValue},
+    header::{HeaderMap, HeaderValue, IF_MATCH},
 };
-use serde::Deserialize;
-use std::{path::Path, sync::Arc, time::Duration};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt, sync::Mutex, time::Instant};
-use tracing::info;
+use tracing::{error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum OciError {
@@ -35,6 +44,9 @@ pub enum OciError {
     #[error("Manifest push failed with status: {0}")]
     ManifestPushFailed(StatusCode),
 
+    #[error("CAS optimistic concurrency conflict on tag {0}")]
+    CasConflict(String),
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
@@ -45,6 +57,69 @@ pub enum OciError {
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
+}
+
+pub fn build_session_oci_manifest(
+    session_blob_digest: &str,
+    session_blob_size: u64,
+    config_digest: &str,
+    config_size: u64,
+    run_id: u64,
+) -> String {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_size
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.nix.cache.session.v1+json",
+                "digest": session_blob_digest,
+                "size": session_blob_size,
+                "annotations": {
+                    "org.nixos.nixcache.run_id": run_id.to_string(),
+                    "org.nixos.nixcache.schema": "3"
+                }
+            }
+        ],
+        "annotations": {
+            "org.opencontainers.image.created": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "org.opencontainers.image.description": "NixCache Workflow Run Session Manifest"
+        }
+    })
+    .to_string()
+}
+
+pub fn build_index_oci_manifest(
+    index_blob_digest: &str,
+    index_blob_size: u64,
+    config_digest: &str,
+    config_size: u64,
+) -> String {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_size
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.nix.cache.index.v1+json",
+                "digest": index_blob_digest,
+                "size": index_blob_size
+            }
+        ],
+        "annotations": {
+            "org.opencontainers.image.created": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "org.opencontainers.image.description": "NixCache Production Global Index Manifest"
+        }
+    })
+    .to_string()
 }
 
 #[derive(Clone)]
@@ -178,14 +253,18 @@ impl OciClient {
         } else if resp.status() == StatusCode::NOT_FOUND {
             Ok(false)
         } else {
-            // Some registries return 400 or 401 for invalid scope, let's treat it as not found or handle error
+            warn!(
+                "Unexpected status when checking blob {}: HTTP {}",
+                digest,
+                resp.status()
+            );
             Ok(false)
         }
     }
 
     pub async fn push_blob(&self, file_path: &Path) -> Result<String, OciError> {
         let mut file = File::open(file_path).await?;
-        let mut hasher = sha2::Sha256::default();
+        let mut hasher = Sha256::default();
         let mut buffer = vec![0; 64 * 1024];
         let mut size = 0u64;
 
@@ -194,12 +273,10 @@ impl OciClient {
             if n == 0 {
                 break;
             }
-            use sha2::Digest;
             hasher.update(&buffer[..n]);
             size += n as u64;
         }
 
-        use sha2::Digest;
         let hash_result = hasher.finalize();
         let digest = format!(
             "sha256:{}",
@@ -279,7 +356,35 @@ impl OciClient {
         }
     }
 
-    pub async fn get_manifest(&self, tag: &str) -> Result<Option<String>, OciError> {
+    pub async fn push_json_blob<T: Serialize>(&self, data: &T) -> Result<(String, u64), OciError> {
+        let json_bytes = serde_json::to_vec_pretty(data)?;
+        let size = json_bytes.len() as u64;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&json_bytes);
+        let hash_bytes = hasher.finalize();
+        let digest = format!(
+            "sha256:{}",
+            hash_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+
+        if self.head_blob(&digest).await? {
+            return Ok((digest, size));
+        }
+
+        let temp_file = tempfile::NamedTempFile::new()?;
+        tokio::fs::write(temp_file.path(), &json_bytes).await?;
+        let pushed_digest = self.push_blob(temp_file.path()).await?;
+        Ok((pushed_digest, size))
+    }
+
+    pub async fn get_manifest_with_digest(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(String, String)>, OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
@@ -292,8 +397,27 @@ impl OciClient {
         let resp = self.client.get(&url).headers(headers).send().await?;
 
         if resp.status() == StatusCode::OK {
+            let digest_header = resp
+                .headers()
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             let body = resp.text().await?;
-            Ok(Some(body))
+            let digest = digest_header.unwrap_or_else(|| {
+                let mut hasher = Sha256::new();
+                hasher.update(body.as_bytes());
+                let hash_bytes = hasher.finalize();
+                format!(
+                    "sha256:{}",
+                    hash_bytes
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
+                )
+            });
+
+            Ok(Some((body, digest)))
         } else if resp.status() == StatusCode::NOT_FOUND {
             Ok(None)
         } else {
@@ -304,7 +428,78 @@ impl OciClient {
         }
     }
 
-    pub async fn push_manifest(&self, tag: &str, manifest: &str) -> Result<(), OciError> {
+    pub async fn get_manifest(&self, tag: &str) -> Result<Option<String>, OciError> {
+        self.get_manifest_with_digest(tag)
+            .await
+            .map(|opt| opt.map(|(body, _)| body))
+    }
+
+    pub async fn get_session_manifest(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(RunSessionManifest, String)>, OciError> {
+        match self.get_manifest_with_digest(tag).await? {
+            Some((manifest_json, manifest_digest)) => {
+                let manifest = serde_json::from_str::<Value>(&manifest_json)?;
+                let layers = manifest
+                    .get("layers")
+                    .and_then(|l| l.as_array())
+                    .ok_or_else(|| {
+                        OciError::Other("Session manifest missing layers".to_string())
+                    })?;
+
+                if layers.is_empty() {
+                    return Err(OciError::Other("Session manifest layers empty".to_string()));
+                }
+
+                let blob_digest = layers[0]
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .ok_or_else(|| OciError::Other("Session layer digest missing".to_string()))?;
+
+                let blob_bytes = self.get_blob(blob_digest).await?;
+                let session: RunSessionManifest = serde_json::from_slice(&blob_bytes)?;
+                Ok(Some((session, manifest_digest)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_cache_index(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(CacheIndexData, String)>, OciError> {
+        match self.get_manifest_with_digest(tag).await? {
+            Some((manifest_json, manifest_digest)) => {
+                let manifest = serde_json::from_str::<Value>(&manifest_json)?;
+                let layers = manifest
+                    .get("layers")
+                    .and_then(|l| l.as_array())
+                    .ok_or_else(|| OciError::Other("Index manifest missing layers".to_string()))?;
+
+                if layers.is_empty() {
+                    return Err(OciError::Other("Index manifest layers empty".to_string()));
+                }
+
+                let blob_digest = layers[0]
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .ok_or_else(|| OciError::Other("Index layer digest missing".to_string()))?;
+
+                let blob_bytes = self.get_blob(blob_digest).await?;
+                let index: CacheIndexData = serde_json::from_slice(&blob_bytes)?;
+                Ok(Some((index, manifest_digest)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn put_manifest_conditional(
+        &self,
+        tag: &str,
+        manifest: &str,
+        previous_digest: Option<&str>,
+    ) -> Result<(), OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
@@ -319,6 +514,12 @@ impl OciClient {
             HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
         );
 
+        if let Some(prev) = previous_digest
+            && let Ok(val) = HeaderValue::from_str(prev)
+        {
+            headers.insert(IF_MATCH, val);
+        }
+
         let resp = self
             .client
             .put(&url)
@@ -328,6 +529,10 @@ impl OciClient {
             .await?;
 
         let status = resp.status();
+        if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
+            return Err(OciError::CasConflict(tag.to_string()));
+        }
+
         if status == StatusCode::OK
             || status == StatusCode::CREATED
             || status == StatusCode::ACCEPTED
@@ -336,6 +541,160 @@ impl OciClient {
             Ok(())
         } else {
             Err(OciError::ManifestPushFailed(status))
+        }
+    }
+
+    pub async fn push_manifest(&self, tag: &str, manifest: &str) -> Result<(), OciError> {
+        self.put_manifest_conditional(tag, manifest, None).await
+    }
+
+    pub async fn delete_manifest(&self, tag_or_digest: &str) -> Result<bool, OciError> {
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag_or_digest
+        );
+
+        let headers = self.get_auth_headers().await?;
+        let resp = self.client.delete(&url).headers(headers).send().await?;
+
+        if resp.status().is_success() {
+            Ok(true)
+        } else if resp.status() == StatusCode::NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(OciError::Other(format!(
+                "Failed to delete manifest with status: {}",
+                resp.status()
+            )))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_run_session_with_cas(
+        &self,
+        run_id: u64,
+        new_entries: HashMap<String, IndexEntry>,
+        new_roots: Vec<String>,
+        system: &str,
+        job_id: &str,
+        head_sha: Option<&str>,
+        ref_name: Option<&str>,
+        public_key: Option<&str>,
+        uploaded_blobs: usize,
+        uploaded_bytes: u64,
+        max_retries: usize,
+    ) -> Result<(), OciError> {
+        let tag = format!("run-{}", run_id);
+        let mut attempt = 0;
+
+        let empty_config = "{}";
+        let temp_cfg = tempfile::NamedTempFile::new()?;
+        tokio::fs::write(temp_cfg.path(), empty_config.as_bytes()).await?;
+        let config_digest = self.push_blob(temp_cfg.path()).await?;
+        let config_size = 2u64;
+
+        loop {
+            attempt += 1;
+            let (mut session, previous_digest) = match self.get_session_manifest(&tag).await? {
+                Some((data, digest)) => (data, Some(digest)),
+                None => (
+                    RunSessionManifest {
+                        version: RUN_SESSION_VERSION,
+                        run_id,
+                        head_sha: head_sha.unwrap_or_default().to_string(),
+                        ref_name: ref_name.unwrap_or_default().to_string(),
+                        created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        public_key: public_key.map(|k| k.to_string()),
+                        entries: HashMap::new(),
+                        gc_roots: HashMap::new(),
+                        completed_jobs: Vec::new(),
+                    },
+                    None,
+                ),
+            };
+
+            if session.head_sha.is_empty()
+                && let Some(sha) = head_sha
+            {
+                session.head_sha = sha.to_string();
+            }
+            if session.ref_name.is_empty()
+                && let Some(rn) = ref_name
+            {
+                session.ref_name = rn.to_string();
+            }
+            if session.public_key.is_none()
+                && let Some(pk) = public_key
+                && !pk.is_empty()
+            {
+                session.public_key = Some(pk.to_string());
+            }
+
+            session.entries.extend(new_entries.clone());
+            let roots_entry = session.gc_roots.entry(system.to_string()).or_default();
+            let mut set: HashSet<String> = roots_entry.iter().cloned().collect();
+            set.extend(new_roots.clone());
+            let mut sorted: Vec<String> = set.into_iter().collect();
+            sorted.sort();
+            *roots_entry = sorted;
+            session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+            session.completed_jobs.push(JobSummaryMetadata {
+                job_id: job_id.to_string(),
+                system: system.to_string(),
+                uploaded_blobs,
+                uploaded_bytes,
+                timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            });
+
+            let (session_blob_digest, session_blob_size) = self.push_json_blob(&session).await?;
+            let manifest = build_session_oci_manifest(
+                &session_blob_digest,
+                session_blob_size,
+                &config_digest,
+                config_size,
+                run_id,
+            );
+
+            match self
+                .put_manifest_conditional(&tag, &manifest, previous_digest.as_deref())
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Successfully updated session tag {} on attempt {}",
+                        tag, attempt
+                    );
+                    return Ok(());
+                }
+                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
+                    let backoff_ms = (500 * (1 << attempt.min(5)))
+                        + ((std::process::id() as u64 * 37 + attempt as u64 * 53) % 150);
+                    warn!(
+                        "CAS conflict on tag {}, retrying in {}ms (attempt {}/{})",
+                        tag, backoff_ms, attempt, max_retries
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to update session tag {} after {} attempts: {}",
+                        tag, attempt, e
+                    );
+                    let fallback_tag = format!(
+                        "run-{}-job-{}",
+                        run_id,
+                        job_id.replace(['/', ':', ' '], "-")
+                    );
+                    warn!("Falling back to job-specific chunk tag: {}", fallback_tag);
+                    self.push_manifest(&fallback_tag, &manifest).await?;
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -586,5 +945,124 @@ mod tests {
 
         let url_err = OciError::InvalidUrl("invalid".to_string());
         assert_eq!(format!("{}", url_err), "Invalid URL: invalid");
+
+        let cas_err = OciError::CasConflict("run-123".to_string());
+        assert_eq!(
+            format!("{}", cas_err),
+            "CAS optimistic concurrency conflict on tag run-123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_manifest_conditional_cas_conflict() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-123"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "", true);
+        let err = client
+            .put_manifest_conditional("run-123", "{}", Some("sha256:old"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, OciError::CasConflict(t) if t == "run-123"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_mock() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        Mock::given(method("DELETE"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-old"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "", true);
+        assert!(client.delete_manifest("run-old").await.unwrap());
+        assert!(!client.delete_manifest("run-missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_update_run_session_with_cas_mock() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/session-upload",
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/session-upload"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-12345"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/repo/nix-cache/manifests/run-12345"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let client = OciClient::new(&host, "test/repo", "", true);
+        let mut entries = HashMap::new();
+        entries.insert(
+            "hash-x86".to_string(),
+            IndexEntry {
+                name: "pkg-x86".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/hash-x86-pkg\n".to_string(),
+                nar_digest: "sha256:digest-x86".to_string(),
+                nar_size: 1024,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: Some("job:vm-tests".to_string()),
+            },
+        );
+
+        let res = client
+            .update_run_session_with_cas(
+                12345,
+                entries,
+                vec!["hash-x86".to_string()],
+                "x86_64-linux",
+                "vm-tests",
+                Some("commit-sha-123"),
+                Some("refs/heads/main"),
+                Some("key:pub"),
+                1,
+                1024,
+                3,
+            )
+            .await;
+
+        assert!(res.is_ok());
     }
 }

@@ -1,6 +1,6 @@
 use crate::index::CacheIndex;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Path, State},
     http::{
@@ -10,16 +10,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use nixcache_oci::OciClient;
-use serde::Serialize;
+use nixcache_oci::{IndexEntry, OciClient};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use tracing::error;
 
 #[derive(Clone)]
 pub struct AppState {
     pub repo: String,
-    pub index_ttl: u64,
-    pub upstream_caches: Vec<String>,
     pub index: CacheIndex,
     pub oci_client: OciClient,
     pub http_client: reqwest::Client,
@@ -32,10 +31,30 @@ struct StatusResponse {
     remote_error: Option<String>,
     registry: String,
     repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_or_pr: Option<String>,
+    tier0_hot_entries: usize,
+    tier1_session_entries: usize,
+    tier2_branch_entries: usize,
+    tier3_baseline_entries: usize,
+    total_unique_entries: usize,
     index_entries: usize,
-    index_generated: String,
     index_ttl: u64,
+    session_ttl: u64,
+    baseline_ttl: u64,
     upstream: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum RegisterPayload {
+    Map(HashMap<String, IndexEntry>),
+    List(Vec<IndexEntry>),
+    Object {
+        entries: HashMap<String, IndexEntry>,
+    },
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -44,6 +63,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/public-key", get(serve_public_key))
         .route("/_status", get(serve_status))
         .route("/_refresh", post(handle_refresh))
+        .route("/_session/register", post(handle_register_session))
         .route("/{hash_ext}", get(serve_narinfo))
         .route("/nar/{nar_name}", get(serve_nar))
         .with_state(state)
@@ -60,29 +80,41 @@ async fn serve_cache_info() -> impl IntoResponse {
 }
 
 async fn serve_public_key(State(state): State<AppState>) -> impl IntoResponse {
-    let index_data = state.index.get_data().await;
-    if index_data.public_key.is_empty() {
-        (StatusCode::NOT_FOUND, "No public key configured\n").into_response()
-    } else {
+    if let Some(pubkey) = state.index.get_public_key().await {
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        let body = format!("{}\n", index_data.public_key);
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/x-nix-public-key"),
+        );
+        let body = format!("{}\n", pubkey);
         (StatusCode::OK, headers, body).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No public key configured\n").into_response()
     }
 }
 
 async fn serve_status(State(state): State<AppState>) -> impl IntoResponse {
-    let index_data = state.index.get_data().await;
     let (remote_connected, remote_error) = state.index.remote_status().await;
+    let counts = state.index.get_entry_counts().await;
+    let config = state.index.config();
+
     let status = StatusResponse {
         remote_connected,
         remote_error,
         registry: state.index.registry().to_string(),
         repo: state.repo.clone(),
-        index_entries: index_data.entries.len(),
-        index_generated: index_data.generated.clone(),
-        index_ttl: state.index_ttl,
-        upstream: state.upstream_caches.clone(),
+        run_id: config.run_id,
+        branch_or_pr: config.branch_or_pr.clone(),
+        tier0_hot_entries: counts.tier0_hot_entries,
+        tier1_session_entries: counts.tier1_session_entries,
+        tier2_branch_entries: counts.tier2_branch_entries,
+        tier3_baseline_entries: counts.tier3_baseline_entries,
+        total_unique_entries: counts.total_unique_entries,
+        index_entries: counts.total_unique_entries,
+        index_ttl: config.baseline_ttl.as_secs(),
+        session_ttl: config.session_ttl.as_secs(),
+        baseline_ttl: config.baseline_ttl.as_secs(),
+        upstream: state.index.upstream_caches().to_vec(),
     };
     (StatusCode::OK, axum::Json(status))
 }
@@ -106,6 +138,39 @@ async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn handle_register_session(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterPayload>,
+) -> impl IntoResponse {
+    let map: HashMap<String, IndexEntry> = match payload {
+        RegisterPayload::Map(m) => m,
+        RegisterPayload::List(list) => {
+            let mut m = HashMap::new();
+            for entry in list {
+                for line in entry.narinfo.lines() {
+                    if let Some(rest) = line.strip_prefix("StorePath: /nix/store/")
+                        && rest.len() >= 32
+                    {
+                        m.insert(rest[..32].to_string(), entry.clone());
+                        break;
+                    }
+                }
+            }
+            m
+        }
+        RegisterPayload::Object { entries } => entries,
+    };
+
+    let count = map.len();
+    state.index.register_hot_entries(map).await;
+
+    let res = json!({
+        "status": "ok",
+        "registered": count
+    });
+    (StatusCode::OK, axum::Json(res))
+}
+
 async fn serve_narinfo(State(state): State<AppState>, Path(hash_ext): Path<String>) -> Response {
     if !hash_ext.ends_with(".narinfo") {
         return StatusCode::NOT_FOUND.into_response();
@@ -120,7 +185,7 @@ async fn serve_narinfo(State(state): State<AppState>, Path(hash_ext): Path<Strin
     }
 
     // 2. Fallback to upstream
-    for cache_url in &state.upstream_caches {
+    for cache_url in state.index.upstream_caches() {
         let upstream_url = format!("{}/{}.narinfo", cache_url, store_hash);
         match state.http_client.get(&upstream_url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -176,7 +241,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
     }
 
     // 2. Fallback to upstream — stream directly
-    for cache_url in &state.upstream_caches {
+    for cache_url in state.index.upstream_caches() {
         let upstream_url = format!("{}/nar/{}", cache_url, nar_name);
         match state.http_client.get(&upstream_url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -203,10 +268,11 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{CacheIndex, CascadingProxyConfig};
     use axum::http::Request;
     use http_body_util::BodyExt;
     use nixcache_oci::{CacheIndexData, IndexEntry};
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{collections::HashMap, time::Duration};
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -215,8 +281,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_info_endpoint() {
-        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                repo: "test/repo".to_string(),
+                upstream_caches: vec!["https://cache.nixos.org".to_string()],
+                ..Default::default()
+            },
+            "",
+        );
         let index_data = CacheIndexData {
+            generated: "2026-08-28T00:00:00Z".to_string(),
             public_key: "test-key-1:abcd".to_string(),
             ..Default::default()
         };
@@ -224,8 +298,6 @@ mod tests {
 
         let state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec!["https://cache.nixos.org".to_string()],
             index,
             oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
@@ -257,7 +329,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_public_key_endpoint_present_and_missing() {
-        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                repo: "test/repo".to_string(),
+                upstream_caches: vec![],
+                ..Default::default()
+            },
+            "",
+        );
         let index_data = CacheIndexData {
             public_key: "test-key-1:abcd".to_string(),
             ..Default::default()
@@ -266,8 +345,6 @@ mod tests {
 
         let state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec![],
             index: index.clone(),
             oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
@@ -295,8 +372,6 @@ mod tests {
         index.update_data_in_memory(CacheIndexData::default()).await;
         let empty_state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec![],
             index,
             oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
@@ -318,7 +393,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_endpoint() {
-        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                repo: "test/repo".to_string(),
+                upstream_caches: vec!["https://cache.nixos.org".to_string()],
+                baseline_ttl: Duration::from_secs(300),
+                ..Default::default()
+            },
+            "",
+        );
         let mut entries = HashMap::new();
         entries.insert(
             "hash1".to_string(),
@@ -329,6 +412,7 @@ mod tests {
                 nar_digest: "sha256:digest1".to_string(),
                 nar_size: 100,
                 added: "2026-08-28T00:00:00Z".to_string(),
+                origin_job: None,
             },
         );
 
@@ -341,8 +425,6 @@ mod tests {
 
         let state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec!["https://cache.nixos.org".to_string()],
             index,
             oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
@@ -376,7 +458,14 @@ mod tests {
         let upstream_server = MockServer::start().await;
         let upstream_url = upstream_server.uri();
 
-        let index = CacheIndex::new("ghcr.io", "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                repo: "test/repo".to_string(),
+                upstream_caches: vec![upstream_url],
+                ..Default::default()
+            },
+            "",
+        );
 
         let local_narinfo = "StorePath: /nix/store/localhash-pkg\nURL: nar/local.nar.xz\n";
         let mut entries = HashMap::new();
@@ -389,6 +478,7 @@ mod tests {
                 nar_digest: "sha256:localdigest".to_string(),
                 nar_size: 1024,
                 added: "2026-08-28T00:00:00Z".to_string(),
+                origin_job: None,
             },
         );
 
@@ -417,8 +507,6 @@ mod tests {
 
         let state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec![upstream_url],
             index,
             oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
             http_client: reqwest::Client::new(),
@@ -495,7 +583,15 @@ mod tests {
         let upstream_server = MockServer::start().await;
         let upstream_url = upstream_server.uri();
 
-        let index = CacheIndex::new(&oci_host, "test/repo", "", PathBuf::from("/tmp"), 300);
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                registry: oci_host.clone(),
+                repo: "test/repo".to_string(),
+                upstream_caches: vec![upstream_url],
+                ..Default::default()
+            },
+            "",
+        );
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -507,6 +603,7 @@ mod tests {
                 nar_digest: "sha256:localdigest123".to_string(),
                 nar_size: 5,
                 added: "2026-08-28T00:00:00Z".to_string(),
+                origin_job: None,
             },
         );
 
@@ -540,8 +637,6 @@ mod tests {
 
         let state = AppState {
             repo: "test/repo".to_string(),
-            index_ttl: 300,
-            upstream_caches: vec![upstream_url],
             index,
             oci_client: OciClient::new(&oci_host, "test/repo", "", false),
             http_client: reqwest::Client::new(),
@@ -588,7 +683,6 @@ mod tests {
             .to_bytes();
         assert_eq!(body, b"WORLD"[..]);
 
-        // 3. Not found anywhere -> 404
         let miss_resp = app
             .oneshot(
                 Request::builder()
@@ -599,5 +693,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_register_session_endpoint() {
+        let index = CacheIndex::with_config(
+            CascadingProxyConfig {
+                repo: "test/repo".to_string(),
+                upstream_caches: vec![],
+                ..Default::default()
+            },
+            "",
+        );
+        let state = AppState {
+            repo: "test/repo".to_string(),
+            index,
+            oci_client: OciClient::new("ghcr.io", "test/repo", "", true),
+            http_client: reqwest::Client::new(),
+        };
+
+        let app = create_router(state);
+
+        let payload = serde_json::json!({
+            "hot123": {
+                "name": "hot-pkg",
+                "system": "x86_64-linux",
+                "narinfo": "StorePath: /nix/store/hot123-pkg\nURL: nar/hot.nar.xz\n",
+                "nar_digest": "sha256:hotdigest",
+                "nar_size": 42,
+                "added": "2026-08-29T10:00:00Z"
+            }
+        });
+
+        let reg_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_session/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reg_resp.status(), StatusCode::OK);
+
+        // 验证注册后立即可以通过 /{hash}.narinfo 查询到
+        let get_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hot123.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = get_resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("StorePath: /nix/store/hot123-pkg"));
     }
 }

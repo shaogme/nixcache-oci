@@ -1,22 +1,30 @@
-name: 'NixCache OCI Merge Coordinator'
-description: 'Download Build Receipts from matrix workers, merge index entries & GC roots, and publish the global cache-index to GHCR'
+name: 'NixCache OCI Promote Coordinator'
+description: 'Promote workflow run session and build receipts into the production baseline cache-index on GHCR'
 inputs:
   registry:
-    description: 'OCI Registry to push cache-index to'
+    description: 'OCI Registry'
     required: false
     default: 'ghcr.io'
   repo:
     description: 'Target repository name (owner/repo)'
     required: false
     default: ${{ github.repository }}
-  receipts-dir:
-    description: 'Directory where build receipts are downloaded'
-    required: false
-    default: ''
   run-id:
     description: 'Workflow run ID to promote'
     required: false
     default: ${{ github.run_id }}
+  target-tag:
+    description: 'Target OCI tag for production baseline'
+    required: false
+    default: 'cache-index'
+  cleanup-session:
+    description: 'Clean up workflow run session tag after promotion'
+    required: false
+    default: 'true'
+  receipts-dir:
+    description: 'Directory containing Build Receipts'
+    required: false
+    default: ''
   github-token:
     description: 'GitHub token with package write permissions'
     required: false
@@ -37,7 +45,7 @@ runs:
       run: |
         echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
 
-    - name: Download Build Receipt Artifacts
+    - name: Download Build Receipt Artifacts (optional)
       uses: actions/download-artifact@v4
       continue-on-error: true
       with:
@@ -45,27 +53,24 @@ runs:
         pattern: 'nixcache-receipt-*'
         merge-multiple: true
 
-    - name: Merge Receipts & Publish Global Index
+    - name: Promote Session & Receipts to Baseline
       shell: bash
       env:
+        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_RECEIPTS_DIR: ${{ inputs.receipts-dir != '' && inputs.receipts-dir || format('{0}/receipts', runner.temp) }}
+        NIXCACHE_TARGET_TAG: ${{ inputs.target-tag }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
-        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""
         if [[ -f .nixcache-version ]]; then
           REF=$(cat .nixcache-version | tr -d '[:space:]')
-          if [[ -n "$REF" ]]; then
-            echo ">>> Found .nixcache-version file, using version: $REF"
-          fi
         fi
         if [[ -z "$REF" ]]; then
           REF="${{ github.action_ref }}"
           if [[ -z "$REF" ]]; then
             REF="main"
           fi
-          echo ">>> Using fallback version: $REF"
         fi
         nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- promote

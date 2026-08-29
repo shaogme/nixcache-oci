@@ -177,6 +177,11 @@ jobs:
           chmod +x test/test-concurrency-merge.sh
           ./test/test-concurrency-merge.sh
 
+      - name: Run Schema v3 Session CAS & Cascading Pipeline Test
+        run: |
+          chmod +x test/test-pipeline-session-cas.sh
+          ./test/test-pipeline-session-cas.sh
+
   test-worker:
     name: 8. Cloudflare Worker E2E Test
     runs-on: ubuntu-latest

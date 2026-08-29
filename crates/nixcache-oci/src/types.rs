@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const CACHE_INDEX_VERSION: u32 = 2;
-pub const RECEIPT_VERSION: u32 = 2;
+pub const CACHE_INDEX_VERSION: u32 = 3;
+pub const RUN_SESSION_VERSION: u32 = 3;
+pub const RECEIPT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -13,6 +14,53 @@ pub struct IndexEntry {
     pub nar_digest: String,
     pub nar_size: u64,
     pub added: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_job: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobSummaryMetadata {
+    pub job_id: String,
+    pub system: String,
+    pub uploaded_blobs: usize,
+    pub uploaded_bytes: u64,
+    pub timestamp: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RunSessionManifest {
+    pub version: u32,
+    pub run_id: u64,
+    #[serde(default)]
+    pub head_sha: String,
+    #[serde(default)]
+    pub ref_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    pub entries: HashMap<String, IndexEntry>,
+    #[serde(default, deserialize_with = "deserialize_gc_roots")]
+    pub gc_roots: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub completed_jobs: Vec<JobSummaryMetadata>,
+}
+
+impl Default for RunSessionManifest {
+    fn default() -> Self {
+        Self {
+            version: RUN_SESSION_VERSION,
+            run_id: 0,
+            head_sha: String::new(),
+            ref_name: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            public_key: None,
+            entries: HashMap::new(),
+            gc_roots: HashMap::new(),
+            completed_jobs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -27,6 +75,8 @@ pub struct CacheIndexData {
     pub entries: HashMap<String, IndexEntry>,
     #[serde(default, deserialize_with = "deserialize_gc_roots")]
     pub gc_roots: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_promoted_run: Option<u64>,
 }
 
 pub fn deserialize_gc_roots<'de, D>(
@@ -83,15 +133,22 @@ impl Default for CacheIndexData {
             public_key: String::new(),
             entries: HashMap::new(),
             gc_roots: HashMap::new(),
+            last_promoted_run: None,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BuildStats {
+    #[serde(default)]
     pub discovered_outputs: usize,
+    #[serde(default)]
     pub built_paths: usize,
+    #[serde(default)]
+    pub substituted_paths: usize,
+    #[serde(default)]
     pub uploaded_blobs: usize,
+    #[serde(default)]
     pub total_bytes_uploaded: u64,
 }
 
@@ -100,6 +157,10 @@ pub struct BuildReceipt {
     pub version: u32,
     pub system: String,
     pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
@@ -122,6 +183,8 @@ impl BuildReceipt {
             version: RECEIPT_VERSION,
             system,
             repo,
+            run_id: None,
+            job_id: None,
             timestamp,
             public_key,
             new_entries,
@@ -129,12 +192,19 @@ impl BuildReceipt {
             stats,
         }
     }
+
+    pub fn with_run_info(mut self, run_id: Option<u64>, job_id: Option<String>) -> Self {
+        self.run_id = run_id;
+        self.job_id = job_id;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, RECEIPT_VERSION,
+        BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry,
+        JobSummaryMetadata, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -142,9 +212,10 @@ mod tests {
     fn test_cache_index_default_and_serialization() {
         let mut index = CacheIndexData::default();
         assert_eq!(index.version, CACHE_INDEX_VERSION);
-        assert_eq!(index.version, 2);
+        assert_eq!(index.version, 3);
 
         index.repo = "owner/repo".to_string();
+        index.last_promoted_run = Some(123456789);
         index.gc_roots.insert(
             "x86_64-linux".to_string(),
             vec!["root-hash-1".to_string(), "root-hash-2".to_string()],
@@ -158,24 +229,76 @@ mod tests {
                 nar_digest: "sha256:1111".to_string(),
                 nar_size: 1024,
                 added: "2026-08-28T00:00:00Z".to_string(),
+                origin_job: Some("job:vm-tests".to_string()),
             },
         );
 
         let json = serde_json::to_string(&index).expect("serialization failed");
         let parsed: CacheIndexData = serde_json::from_str(&json).expect("deserialization failed");
 
-        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.version, 3);
         assert_eq!(parsed.repo, "owner/repo");
+        assert_eq!(parsed.last_promoted_run, Some(123456789));
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.gc_roots.get("x86_64-linux").unwrap().len(), 2);
-        assert_eq!(
-            parsed.entries.get("hash1").unwrap().system,
-            Some("x86_64-linux".to_string())
-        );
+        let entry = parsed.entries.get("hash1").unwrap();
+        assert_eq!(entry.system, Some("x86_64-linux".to_string()));
+        assert_eq!(entry.origin_job, Some("job:vm-tests".to_string()));
     }
 
     #[test]
-    fn test_schema_v1_to_v2_migration() {
+    fn test_run_session_manifest_serialization() {
+        let mut session = RunSessionManifest {
+            run_id: 987654321,
+            head_sha: "abc1234def5678".to_string(),
+            ref_name: "refs/pull/42/merge".to_string(),
+            created_at: "2026-08-29T10:00:00Z".to_string(),
+            updated_at: "2026-08-29T10:05:00Z".to_string(),
+            public_key: Some("cache-key-pub:ABCD".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(session.version, RUN_SESSION_VERSION);
+        assert_eq!(session.version, 3);
+
+        session.entries.insert(
+            "hash-session-1".to_string(),
+            IndexEntry {
+                name: "session-pkg-1".to_string(),
+                system: Some("x86_64-linux".to_string()),
+                narinfo: "StorePath: /nix/store/hash-session-1-session-pkg-1\n".to_string(),
+                nar_digest: "sha256:sessiondigest1".to_string(),
+                nar_size: 2048,
+                added: "2026-08-29T10:05:00Z".to_string(),
+                origin_job: Some("job:nixos-vm-tests".to_string()),
+            },
+        );
+        session.gc_roots.insert(
+            "x86_64-linux".to_string(),
+            vec!["hash-session-1".to_string()],
+        );
+        session.completed_jobs.push(JobSummaryMetadata {
+            job_id: "nixos-vm-tests".to_string(),
+            system: "x86_64-linux".to_string(),
+            uploaded_blobs: 1,
+            uploaded_bytes: 2048,
+            timestamp: "2026-08-29T10:05:00Z".to_string(),
+        });
+
+        let json = serde_json::to_string(&session).expect("session serialization failed");
+        let parsed: RunSessionManifest =
+            serde_json::from_str(&json).expect("session deserialization failed");
+
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.run_id, 987654321);
+        assert_eq!(parsed.head_sha, "abc1234def5678");
+        assert_eq!(parsed.ref_name, "refs/pull/42/merge");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.completed_jobs.len(), 1);
+        assert_eq!(parsed.completed_jobs[0].job_id, "nixos-vm-tests");
+    }
+
+    #[test]
+    fn test_schema_v1_to_v3_migration() {
         let v1_json = r#"{
             "version": 1,
             "repo": "owner/legacy-repo",
@@ -205,19 +328,20 @@ mod tests {
         let legacy_entry = index.entries.get("hash_legacy_1").unwrap();
         assert_eq!(legacy_entry.name, "legacy-pkg-1");
         assert_eq!(legacy_entry.system, None);
+        assert_eq!(legacy_entry.origin_job, None);
 
-        // 升级至 Schema v2
+        // 升级至 Schema v3
         index.version = CACHE_INDEX_VERSION;
         index.gc_roots.insert(
             "x86_64-linux".to_string(),
             vec!["hash_legacy_1".to_string()],
         );
 
-        let upgraded_json = serde_json::to_string(&index).expect("Failed to serialize v2 index");
+        let upgraded_json = serde_json::to_string(&index).expect("Failed to serialize v3 index");
         let reloaded: CacheIndexData =
-            serde_json::from_str(&upgraded_json).expect("Failed to reload v2 index");
+            serde_json::from_str(&upgraded_json).expect("Failed to reload v3 index");
 
-        assert_eq!(reloaded.version, 2);
+        assert_eq!(reloaded.version, 3);
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(
             reloaded.gc_roots.get("x86_64-linux").unwrap(),
@@ -244,6 +368,7 @@ mod tests {
                         nar_digest: "sha256:shared-digest".to_string(),
                         nar_size: 1000,
                         added: "2026-08-28T00:00:00Z".to_string(),
+                        origin_job: None,
                     },
                 ),
                 (
@@ -255,6 +380,7 @@ mod tests {
                         nar_digest: "sha256:x86-digest".to_string(),
                         nar_size: 2000,
                         added: "2026-08-28T00:00:00Z".to_string(),
+                        origin_job: None,
                     },
                 ),
             ]),
@@ -262,10 +388,12 @@ mod tests {
             BuildStats {
                 discovered_outputs: 2,
                 built_paths: 2,
+                substituted_paths: 0,
                 uploaded_blobs: 2,
                 total_bytes_uploaded: 3000,
             },
-        );
+        )
+        .with_run_info(Some(12345), Some("build-x86".to_string()));
 
         let receipt_arm = BuildReceipt::new(
             "aarch64-linux".to_string(),
@@ -281,12 +409,14 @@ mod tests {
                     nar_digest: "sha256:arm-digest".to_string(),
                     nar_size: 2500,
                     added: "2026-08-28T01:00:00Z".to_string(),
+                    origin_job: None,
                 },
             )]),
             vec!["hash-arm-app".to_string(), "hash-arm-app".to_string()], // 包含重复项
             BuildStats {
                 discovered_outputs: 1,
                 built_paths: 1,
+                substituted_paths: 0,
                 uploaded_blobs: 1,
                 total_bytes_uploaded: 2500,
             },
@@ -330,6 +460,7 @@ mod tests {
                 nar_digest: "sha256:arm-digest".to_string(),
                 nar_size: 2048,
                 added: "2026-08-28T12:00:00Z".to_string(),
+                origin_job: Some("job:build-arm".to_string()),
             },
         );
 
@@ -343,21 +474,28 @@ mod tests {
             BuildStats {
                 discovered_outputs: 2,
                 built_paths: 2,
+                substituted_paths: 1,
                 uploaded_blobs: 1,
                 total_bytes_uploaded: 2048,
             },
-        );
+        )
+        .with_run_info(Some(123456), Some("job:build-arm".to_string()));
 
         assert_eq!(receipt.version, RECEIPT_VERSION);
+        assert_eq!(receipt.version, 3);
         assert_eq!(receipt.system, "aarch64-linux");
+        assert_eq!(receipt.run_id, Some(123456));
+        assert_eq!(receipt.job_id, Some("job:build-arm".to_string()));
         assert_eq!(receipt.stats.uploaded_blobs, 1);
+        assert_eq!(receipt.stats.substituted_paths, 1);
 
         let json = serde_json::to_string(&receipt).expect("receipt serialize failed");
         let parsed: BuildReceipt = serde_json::from_str(&json).expect("receipt deserialize failed");
 
-        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.version, 3);
         assert_eq!(parsed.system, "aarch64-linux");
         assert_eq!(parsed.active_gc_roots, vec!["root-arm-1"]);
         assert_eq!(parsed.public_key, Some("key:pub".to_string()));
+        assert_eq!(parsed.run_id, Some(123456));
     }
 }

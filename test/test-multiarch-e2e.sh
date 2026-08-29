@@ -147,23 +147,23 @@ echo ">>> [Phase 2] Running Merge Coordinator..."
     --repo "$NIXCACHE_REPO" \
     --registry "$NIXCACHE_REGISTRY"
 
-echo ">>> Fetching published cache-index from local registry to verify Schema v2..."
+echo ">>> Fetching published cache-index from local registry to verify Schema v3..."
 INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
 INDEX_DIGEST=$(echo "$INDEX_MANIFEST" | python3 -c "import sys, json; print(json.load(sys.stdin)['layers'][0]['digest'])")
 INDEX_JSON=$(curl -fsSL "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/blobs/${INDEX_DIGEST}")
 
-echo ">>> Published Cache Index v2 Content:"
+echo ">>> Published Cache Index v3 Content:"
 echo "$INDEX_JSON" | python3 -m json.tool
 
-# Verify Schema v2 and multi-arch entries
+# Verify Schema v3 and multi-arch entries
 echo "$INDEX_JSON" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-assert data['version'] == 2, f'Expected version 2, got {data[\"version\"]}'
+assert data['version'] == 3, f'Expected version 3, got {data[\"version\"]}'
 assert len(data['entries']) >= 2, f'Expected at least 2 entries, got {len(data[\"entries\"])}'
 assert 'x86_64-linux' in data['gc_roots'], f'Missing x86_64-linux in gc_roots: {data[\"gc_roots\"]}'
 assert 'aarch64-linux' in data['gc_roots'], f'Missing aarch64-linux in gc_roots: {data[\"gc_roots\"]}'
-print('>>> Schema v2 and Multi-Arch verification SUCCESS!')
+print('>>> Schema v3 and Multi-Arch verification SUCCESS!')
 "
 
 # =========================================================================

@@ -1,0 +1,92 @@
+name: 'NixCache OCI Setup & Session Init'
+description: 'Initialize local NixCache cascading proxy daemon, configure nix.conf, and snapshot store state'
+inputs:
+  registry:
+    description: 'OCI Registry to fetch/push cache'
+    required: false
+    default: 'ghcr.io'
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  run-id:
+    description: 'Workflow run ID for Tier 1 session'
+    required: false
+    default: ${{ github.run_id }}
+  branch:
+    description: 'Branch name or PR number for Tier 2 session'
+    required: false
+    default: ${{ github.ref_name }}
+  signing-key:
+    description: 'Nix secret key used to sign store paths'
+    required: false
+    default: ''
+  session-ttl:
+    description: 'Session index TTL in seconds'
+    required: false
+    default: '10'
+  baseline-ttl:
+    description: 'Baseline index TTL in seconds'
+    required: false
+    default: '300'
+  baseline-tag:
+    description: 'Baseline production tag'
+    required: false
+    default: 'cache-index'
+  upstream:
+    description: 'Upstream binary cache URLs'
+    required: false
+    default: 'https://cache.nixos.org'
+  github-token:
+    description: 'GitHub token with package read/write permissions'
+    required: false
+    default: ${{ github.token }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Setup signing key
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.signing-key }}" ]]; then
+          echo "${{ inputs.signing-key }}" > "$RUNNER_TEMP/signing-key"
+          echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          echo ">>> Nix signing key configured"
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Initialize NixCache Session & Proxy
+      shell: bash
+      env:
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
+        NIXCACHE_BRANCH: ${{ inputs.branch }}
+        NIXCACHE_SESSION_TTL: ${{ inputs.session-ttl }}
+        NIXCACHE_BASELINE_TTL: ${{ inputs.baseline-ttl }}
+        NIXCACHE_BASELINE_TAG: ${{ inputs.baseline-tag }}
+        NIXCACHE_UPSTREAM: ${{ inputs.upstream }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+        fi
+        if [[ -z "$REF" ]]; then
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+        fi
+        nix run "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session init

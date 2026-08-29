@@ -1,5 +1,7 @@
+use crate::store::{CacheIndexData, RunSessionManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Mutex;
 use worker::{Fetch, Headers, Method, Request, RequestInit, Response, js_sys::Date};
 
@@ -214,5 +216,70 @@ impl OciClient {
             .map_err(|e| e.to_string())?;
 
         Ok(resp)
+    }
+
+    pub async fn get_session_manifest(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(RunSessionManifest, String)>, String> {
+        match self.get_manifest_with_digest(tag).await? {
+            Some((manifest_json, manifest_digest)) => {
+                let manifest =
+                    serde_json::from_str::<Value>(&manifest_json).map_err(|e| e.to_string())?;
+                let layers = manifest
+                    .get("layers")
+                    .and_then(|l| l.as_array())
+                    .ok_or_else(|| "Session manifest missing layers".to_string())?;
+
+                if layers.is_empty() {
+                    return Err("Session manifest layers empty".to_string());
+                }
+
+                let blob_digest = layers[0]
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .ok_or_else(|| "Session layer digest missing".to_string())?;
+
+                let blob_bytes = self.get_blob(blob_digest).await?;
+                let mut session: RunSessionManifest =
+                    serde_json::from_slice(&blob_bytes).map_err(|e| e.to_string())?;
+                session.rebuild_lookup_table();
+                Ok(Some((session, manifest_digest)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_cache_index(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(CacheIndexData, String)>, String> {
+        match self.get_manifest_with_digest(tag).await? {
+            Some((manifest_json, manifest_digest)) => {
+                let manifest =
+                    serde_json::from_str::<Value>(&manifest_json).map_err(|e| e.to_string())?;
+                let layers = manifest
+                    .get("layers")
+                    .and_then(|l| l.as_array())
+                    .ok_or_else(|| "Index manifest missing layers".to_string())?;
+
+                if layers.is_empty() {
+                    return Err("Index manifest layers empty".to_string());
+                }
+
+                let blob_digest = layers[0]
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .ok_or_else(|| "Index layer digest missing".to_string())?;
+
+                let blob_bytes = self.get_blob(blob_digest).await?;
+                let mut index: CacheIndexData =
+                    serde_json::from_slice(&blob_bytes).map_err(|e| e.to_string())?;
+                index.manifest_digest = manifest_digest.clone();
+                index.rebuild_lookup_table();
+                Ok(Some((index, manifest_digest)))
+            }
+            None => Ok(None),
+        }
     }
 }
