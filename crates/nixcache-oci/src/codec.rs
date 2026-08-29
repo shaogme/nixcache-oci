@@ -1,10 +1,8 @@
 use crate::{error::OciError, manifest::CacheLayerMediaType};
 use bytes::Bytes;
+use nixcache_utils::ZstdCodec;
+pub use nixcache_utils::DEFAULT_ZSTD_COMPRESSION_LEVEL;
 use serde::{Serialize, de::DeserializeOwned};
-use std::io::{Read, Write};
-
-/// Zstd 压缩默认等级
-pub const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 /// 强类型索引与清单编解码器
 pub struct IndexCodec;
@@ -15,18 +13,9 @@ impl IndexCodec {
         // 1. 紧凑 JSON 序列化
         let json_bytes = serde_json::to_vec(data)?;
 
-        // 2. Zstd 内存流式压缩
-        let mut encoder =
-            zstd::stream::Encoder::new(Vec::with_capacity(json_bytes.len() / 4), level)
-                .map_err(|e| OciError::CompressionError(e.to_string()))?;
-        encoder
-            .write_all(&json_bytes)
-            .map_err(|e| OciError::CompressionError(e.to_string()))?;
-        let compressed = encoder
-            .finish()
-            .map_err(|e| OciError::CompressionError(e.to_string()))?;
-
-        Ok(Bytes::from(compressed))
+        // 2. 统一底层跨平台 Zstd 压缩
+        ZstdCodec::compress(&json_bytes, level)
+            .map_err(|e| OciError::CompressionError(e.to_string()))
     }
 
     /// 严格通过 Zstd 解压并反序列化
@@ -46,12 +35,8 @@ impl IndexCodec {
             )));
         }
 
-        // 3. 解压并反序列化
-        let mut decoder = zstd::stream::Decoder::new(raw_bytes)
-            .map_err(|e| OciError::CompressionError(e.to_string()))?;
-        let mut uncompressed = Vec::new();
-        decoder
-            .read_to_end(&mut uncompressed)
+        // 3. 统一底层跨平台解压并反序列化
+        let uncompressed = ZstdCodec::decompress(raw_bytes)
             .map_err(|e| OciError::CompressionError(e.to_string()))?;
         let parsed: T = serde_json::from_slice(&uncompressed)?;
         Ok(parsed)
@@ -59,7 +44,7 @@ impl IndexCodec {
 
     /// 探测并校验 Zstd Magic Number
     pub fn is_valid_zstd_magic(bytes: &[u8]) -> bool {
-        bytes.len() >= 4 && bytes[0..4] == [0x28, 0xB5, 0x2F, 0xFD]
+        ZstdCodec::is_valid_magic(bytes)
     }
 }
 

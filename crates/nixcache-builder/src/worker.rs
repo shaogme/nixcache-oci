@@ -9,7 +9,7 @@ use chrono::Utc;
 use nixcache_core::{
     BuildReceipt, BuildStats, CacheIndexData, IndexEntry, NarDigest, NarInfo, StoreHash, SystemArch,
 };
-use nixcache_oci::OciClient;
+use nixcache_oci::{OciClient, ReqwestTransport};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -145,7 +145,9 @@ pub async fn setup_self_substituter(
     })
 }
 
-pub async fn fetch_remote_cache_index(oci: &OciClient) -> (CacheIndexData, HashSet<StoreHash>) {
+pub async fn fetch_remote_cache_index(
+    oci: &OciClient<ReqwestTransport>,
+) -> (CacheIndexData, HashSet<StoreHash>) {
     let mut remote_index = CacheIndexData::default();
     let mut own_hashes = HashSet::new();
 

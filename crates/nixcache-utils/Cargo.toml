@@ -1,0 +1,14 @@
+[package]
+name = "nixcache-utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ruzstd = { workspace = true }

@@ -3,7 +3,9 @@ use nixcache_core::{
     ArchCacheIndexData, ArchRunSessionManifest, CacheIndexData, IndexEntry, NarDigest,
     RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
 };
-use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
+use nixcache_oci::{
+    CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient, ReqwestTransport,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -124,7 +126,7 @@ impl CachedBaseline {
 #[derive(Clone)]
 pub struct CacheIndex {
     config: CascadingProxyConfig,
-    oci_client: OciClient,
+    oci_client: OciClient<ReqwestTransport>,
     // Tier 0: 本地内存热注册表 (In-Memory Hot Registry)
     hot_entries: Cache<StoreHash, IndexEntry>,
     hot_nar_lookup: Cache<String, NarDigest>,

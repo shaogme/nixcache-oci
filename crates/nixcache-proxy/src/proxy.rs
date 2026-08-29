@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use nixcache_core::{IndexEntry, StoreHash};
-use nixcache_oci::OciClient;
+use nixcache_oci::{OciClient, ReqwestTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use tracing::error;
 pub struct AppState {
     pub repo: String,
     pub index: CacheIndex,
-    pub oci_client: OciClient,
+    pub oci_client: OciClient<ReqwestTransport>,
     pub http_client: reqwest::Client,
 }
 

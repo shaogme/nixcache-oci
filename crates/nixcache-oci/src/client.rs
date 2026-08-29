@@ -17,6 +17,7 @@ use nixcache_core::{
     ArchCacheIndexData, ArchRunSessionManifest, CACHE_INDEX_VERSION, CacheIndexData,
     RUN_SESSION_VERSION, RunSessionManifest, SystemArch,
 };
+use nixcache_utils::get_process_id;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -82,16 +83,6 @@ pub struct FetchedOciArtifact {
     pub digest: String,
 }
 
-#[cfg(feature = "reqwest")]
-#[derive(Clone)]
-pub struct OciClient<T: OciTransport = ReqwestTransport> {
-    registry: String,
-    repo: String,
-    token_manager: TokenManager,
-    transport: T,
-}
-
-#[cfg(not(feature = "reqwest"))]
 #[derive(Clone)]
 pub struct OciClient<T: OciTransport> {
     registry: String,
@@ -1129,16 +1120,7 @@ impl<T: OciTransport> OciClient<T> {
             {
                 Ok(_) => return Ok(()),
                 Err(OciError::CasConflict(_)) if attempt <= max_retries => {
-                    let pid = {
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            0u64
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            std::process::id() as u64
-                        }
-                    };
+                    let pid = get_process_id();
                     let backoff_ms =
                         (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
                     warn!(
@@ -1206,16 +1188,7 @@ impl<T: OciTransport> OciClient<T> {
                     return Ok(());
                 }
                 Err(OciError::CasConflict(_)) if attempt <= request.max_retries => {
-                    let pid = {
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            0u64
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            std::process::id() as u64
-                        }
-                    };
+                    let pid = get_process_id();
                     let backoff_ms =
                         (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
                     warn!(

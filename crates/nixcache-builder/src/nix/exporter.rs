@@ -1,7 +1,7 @@
 use crate::error::BuilderError;
 use async_compression::tokio::write::XzEncoder;
 use futures_util::TryStreamExt;
-use nixcache_oci::{OciClient, TransportError, UploadConfig};
+use nixcache_oci::{OciClient, ReqwestTransport, TransportError, UploadConfig};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -297,7 +297,7 @@ pub async fn export_paths_directly(
 pub async fn export_and_upload_path_stream(
     store_path: &str,
     signing_key_file: Option<&str>,
-    oci_client: &OciClient,
+    oci_client: &OciClient<ReqwestTransport>,
     upload_config: &UploadConfig,
 ) -> Result<UploadedNarMetadata, BuilderError> {
     if let Some(key) = signing_key_file {
