@@ -9,6 +9,7 @@ use crate::{
 use chrono::Utc;
 use nixcache_core::{
     CacheIndexData, IndexEntry, JobSummaryMetadata, RUN_SESSION_VERSION, RunSessionManifest,
+    StoreHash, SystemArch,
 };
 use reqwest::{
     Client, Response, StatusCode,
@@ -474,9 +475,9 @@ impl OciClient {
     pub async fn update_run_session_with_cas(
         &self,
         run_id: u64,
-        new_entries: HashMap<String, IndexEntry>,
-        new_roots: Vec<String>,
-        system: &str,
+        new_entries: HashMap<StoreHash, IndexEntry>,
+        new_roots: Vec<StoreHash>,
+        system: impl Into<SystemArch>,
         job_id: &str,
         head_sha: Option<&str>,
         ref_name: Option<&str>,
@@ -486,6 +487,7 @@ impl OciClient {
         max_retries: usize,
     ) -> Result<(), OciError> {
         let tag = format!("run-{}", run_id);
+        let system_arch = system.into();
         let mut attempt = 0;
 
         let empty_config = "{}";
@@ -533,17 +535,17 @@ impl OciClient {
             }
 
             session.entries.extend(new_entries.clone());
-            let roots_entry = session.gc_roots.entry(system.to_string()).or_default();
-            let mut set: HashSet<String> = roots_entry.iter().cloned().collect();
+            let roots_entry = session.gc_roots.entry(system_arch.clone()).or_default();
+            let mut set: HashSet<StoreHash> = roots_entry.iter().cloned().collect();
             set.extend(new_roots.clone());
-            let mut sorted: Vec<String> = set.into_iter().collect();
+            let mut sorted: Vec<StoreHash> = set.into_iter().collect();
             sorted.sort();
             *roots_entry = sorted;
             session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
             session.completed_jobs.push(JobSummaryMetadata {
                 job_id: job_id.to_string(),
-                system: system.to_string(),
+                system: system_arch.clone(),
                 uploaded_blobs,
                 uploaded_bytes,
                 timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

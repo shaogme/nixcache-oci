@@ -6,7 +6,7 @@ use crate::{
     oci::OciClient,
     store::{CacheStore, WorkerProxyConfig},
 };
-use nixcache_core::IndexEntry;
+use nixcache_core::{IndexEntry, StoreHash};
 use serde::Deserialize;
 use std::collections::HashMap;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
@@ -14,10 +14,10 @@ use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum RegisterPayload {
-    Map(HashMap<String, IndexEntry>),
+    Map(HashMap<StoreHash, IndexEntry>),
     List(Vec<IndexEntry>),
     Object {
-        entries: HashMap<String, IndexEntry>,
+        entries: HashMap<StoreHash, IndexEntry>,
     },
 }
 
@@ -179,18 +179,13 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 Err(e) => return Response::error(format!("Invalid register payload: {}", e), 400),
             };
 
-            let map: HashMap<String, IndexEntry> = match payload {
+            let map: HashMap<StoreHash, IndexEntry> = match payload {
                 RegisterPayload::Map(m) => m,
                 RegisterPayload::List(list) => {
                     let mut m = HashMap::new();
                     for entry in list {
-                        for line in entry.narinfo.lines() {
-                            if let Some(rest) = line.strip_prefix("StorePath: /nix/store/")
-                                && rest.len() >= 32
-                            {
-                                m.insert(rest[..32].to_string(), entry.clone());
-                                break;
-                            }
+                        if let Some(sh) = entry.store_hash() {
+                            m.insert(sh, entry);
                         }
                     }
                     m
@@ -224,7 +219,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
             match store.lookup_nar_digest_cascading(&ctx.env, nar_name).await {
                 Ok(Some(digest)) => {
-                    if let Ok(resp) = store.oci_client().fetch_blob_response(&digest).await
+                    if let Ok(resp) = store.oci_client().fetch_blob_response(digest.as_str()).await
                         && resp.status_code() == 200
                     {
                         let headers = Headers::new();
@@ -316,6 +311,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::{RegisterPayload, parse_upstream_list};
+    use nixcache_core::StoreHash;
 
     #[test]
     fn test_worker_upstream_parsing() {
@@ -349,34 +345,47 @@ mod tests {
 
     #[test]
     fn test_register_payload_deserialization() {
-        let map_json = r#"{
-            "hash1": {
+        let hash1_str = "00000000000000000000000000000001";
+        let hash2_str = "00000000000000000000000000000002";
+        let hash3_str = "00000000000000000000000000000003";
+
+        let map_json = format!(r#"{{
+            "{}": {{
                 "name": "pkg1",
-                "narinfo": "StorePath: /nix/store/hash1-pkg1\nURL: nar/pkg1.nar.xz\n",
-                "nar_digest": "sha256:digest1",
+                "narinfo_meta": {{
+                    "store_path": "/nix/store/{}-pkg1",
+                    "nar_basename": "pkg1.nar.xz",
+                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                }},
+                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
                 "nar_size": 100,
                 "added": "2026-08-29T10:00:00Z"
-            }
-        }"#;
-        let payload: RegisterPayload = serde_json::from_str(map_json).unwrap();
+            }}
+        }}"#, hash1_str, hash1_str);
+        let payload: RegisterPayload = serde_json::from_str(&map_json).unwrap();
         match payload {
             RegisterPayload::Map(m) => {
                 assert_eq!(m.len(), 1);
-                assert_eq!(m.get("hash1").unwrap().name, "pkg1");
+                let sh1 = StoreHash::parse(hash1_str).unwrap();
+                assert_eq!(m.get(&sh1).unwrap().name, "pkg1");
             }
             _ => panic!("Expected Map payload"),
         }
 
-        let list_json = r#"[
-            {
+        let list_json = format!(r#"[
+            {{
                 "name": "pkg2",
-                "narinfo": "StorePath: /nix/store/hash22222222222222222222222222222222-pkg2\nURL: nar/pkg2.nar.xz\n",
-                "nar_digest": "sha256:digest2",
+                "narinfo_meta": {{
+                    "store_path": "/nix/store/{}-pkg2",
+                    "nar_basename": "pkg2.nar.xz",
+                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                }},
+                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
                 "nar_size": 200,
                 "added": "2026-08-29T10:00:00Z"
-            }
-        ]"#;
-        let payload_list: RegisterPayload = serde_json::from_str(list_json).unwrap();
+            }}
+        ]"#, hash2_str);
+        let payload_list: RegisterPayload = serde_json::from_str(&list_json).unwrap();
         match payload_list {
             RegisterPayload::List(l) => {
                 assert_eq!(l.len(), 1);
@@ -385,22 +394,27 @@ mod tests {
             _ => panic!("Expected List payload"),
         }
 
-        let obj_json = r#"{
-            "entries": {
-                "hash3": {
+        let obj_json = format!(r#"{{
+            "entries": {{
+                "{}": {{
                     "name": "pkg3",
-                    "narinfo": "StorePath: /nix/store/hash3-pkg3\nURL: nar/pkg3.nar.xz\n",
-                    "nar_digest": "sha256:digest3",
+                    "narinfo_meta": {{
+                        "store_path": "/nix/store/{}-pkg3",
+                        "nar_basename": "pkg3.nar.xz",
+                        "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    }},
+                    "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
                     "nar_size": 300,
                     "added": "2026-08-29T10:00:00Z"
-                }
-            }
-        }"#;
-        let payload_obj: RegisterPayload = serde_json::from_str(obj_json).unwrap();
+                }}
+            }}
+        }}"#, hash3_str, hash3_str);
+        let payload_obj: RegisterPayload = serde_json::from_str(&obj_json).unwrap();
         match payload_obj {
             RegisterPayload::Object { entries } => {
                 assert_eq!(entries.len(), 1);
-                assert_eq!(entries.get("hash3").unwrap().name, "pkg3");
+                let sh3 = StoreHash::parse(hash3_str).unwrap();
+                assert_eq!(entries.get(&sh3).unwrap().name, "pkg3");
             }
             _ => panic!("Expected Object payload"),
         }

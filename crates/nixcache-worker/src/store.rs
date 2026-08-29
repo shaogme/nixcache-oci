@@ -3,7 +3,8 @@ use crate::{
     state::{DEBOUNCE_THRESHOLD_MS, L1_MEM_TTL_MS, WorkerState},
 };
 use nixcache_core::{
-    CacheIndexData, IndexEntry, RunSessionManifest, build_nar_lookup_map, extract_nar_basename,
+    CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
+    extract_nar_basename,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -96,7 +97,7 @@ impl CacheStore {
     }
 
     /// 动态注册新编译完成的条目到 Tier 0 内存热表中 (0ms 延迟可用)
-    pub fn register_hot_entries(entries: HashMap<String, IndexEntry>) {
+    pub fn register_hot_entries(entries: HashMap<StoreHash, IndexEntry>) {
         if let Ok(mut state) = WorkerState::global().lock() {
             state.register_hot(entries);
         }
@@ -108,20 +109,25 @@ impl CacheStore {
         env: &Env,
         store_hash: &str,
     ) -> Result<Option<String>, String> {
+        let parsed_hash = match StoreHash::parse(store_hash) {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+
         // 1. Tier 0: In-Memory Hot Registry
         if let Ok(state) = WorkerState::global().lock()
-            && let Some(entry) = state.hot_entries.get(store_hash)
+            && let Some(entry) = state.hot_entries.get(&parsed_hash)
         {
-            return Ok(Some(entry.narinfo.clone()));
+            return Ok(Some(entry.to_narinfo_string()));
         }
 
         // 2. Tier 1: Workflow Run Session (run-<run_id>)
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
-                && let Some(entry) = session.entries.get(store_hash)
+                && let Some(entry) = session.entries.get(&parsed_hash)
             {
-                return Ok(Some(entry.narinfo.clone()));
+                return Ok(Some(entry.to_narinfo_string()));
             }
         }
 
@@ -133,17 +139,17 @@ impl CacheStore {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             if let Ok(Some((branch_sess, _))) = self.get_session_data(env, &tag).await
-                && let Some(entry) = branch_sess.entries.get(store_hash)
+                && let Some(entry) = branch_sess.entries.get(&parsed_hash)
             {
-                return Ok(Some(entry.narinfo.clone()));
+                return Ok(Some(entry.to_narinfo_string()));
             }
         }
 
         // 4. Tier 3: Baseline Global Index
         if let Ok((baseline, _)) = self.get_baseline_data(env).await
-            && let Some(entry) = baseline.entries.get(store_hash)
+            && let Some(entry) = baseline.entries.get(&parsed_hash)
         {
-            return Ok(Some(entry.narinfo.clone()));
+            return Ok(Some(entry.to_narinfo_string()));
         }
 
         // 5. Miss: Debounced Read-Through to GHCR
@@ -165,15 +171,15 @@ impl CacheStore {
             if let Some(run_id) = self.config.run_id {
                 let tag = format!("run-{}", run_id);
                 if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
-                    && let Some(entry) = session.entries.get(store_hash)
+                    && let Some(entry) = session.entries.get(&parsed_hash)
                 {
-                    return Ok(Some(entry.narinfo.clone()));
+                    return Ok(Some(entry.to_narinfo_string()));
                 }
             }
             if let Ok((baseline, _)) = self.get_baseline_data(env).await
-                && let Some(entry) = baseline.entries.get(store_hash)
+                && let Some(entry) = baseline.entries.get(&parsed_hash)
             {
-                return Ok(Some(entry.narinfo.clone()));
+                return Ok(Some(entry.to_narinfo_string()));
             }
         }
 
@@ -185,7 +191,7 @@ impl CacheStore {
         &self,
         env: &Env,
         nar_basename: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<NarDigest>, String> {
         let normalized = extract_nar_basename(nar_basename);
 
         // 1. Tier 0: In-Memory Hot Registry
@@ -302,7 +308,7 @@ impl CacheStore {
         &self,
         env: &Env,
         tag: &str,
-    ) -> Result<Option<(RunSessionManifest, HashMap<String, String>)>, String> {
+    ) -> Result<Option<(RunSessionManifest, HashMap<String, NarDigest>)>, String> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
@@ -382,7 +388,7 @@ impl CacheStore {
     pub async fn get_baseline_data(
         &self,
         env: &Env,
-    ) -> Result<(CacheIndexData, HashMap<String, String>), String> {
+    ) -> Result<(CacheIndexData, HashMap<String, NarDigest>), String> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
@@ -432,7 +438,7 @@ impl CacheStore {
     async fn refresh_baseline_from_ghcr(
         &self,
         env: &Env,
-    ) -> Result<(CacheIndexData, HashMap<String, String>), String> {
+    ) -> Result<(CacheIndexData, HashMap<String, NarDigest>), String> {
         let now = Date::now();
         let (index_data, manifest_digest) = match self
             .oci_client
@@ -567,7 +573,7 @@ impl CacheStore {
                 }
             };
 
-        let mut unique_hashes = HashSet::new();
+        let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
         if let Ok(state) = WorkerState::global().lock() {
             unique_hashes.extend(state.hot_entries.keys().cloned());
         }
@@ -608,40 +614,30 @@ impl CacheStore {
 mod tests {
     use super::{RemoteStatus, WorkerProxyConfig};
     use nixcache_core::{
-        CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata, RUN_SESSION_VERSION,
-        RunSessionManifest, build_nar_lookup_map,
+        CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest,
+        NarInfoMeta, RUN_SESSION_VERSION, RunSessionManifest, StoreHash, SystemArch,
+        build_nar_lookup_map,
     };
     use std::collections::HashMap;
 
     #[test]
-    fn test_gc_roots_compatibility() {
-        let v1_json = r#"{
-            "version": 1,
-            "repo": "owner/repo",
-            "registry": "ghcr.io",
-            "image": "ghcr.io/owner/repo/nix-cache",
-            "generated": "2026-08-29T00:00:00Z",
-            "entries": {},
-            "gc_roots": ["root1", "root2"]
-        }"#;
-
-        let index: CacheIndexData = serde_json::from_str(v1_json).unwrap();
-        assert_eq!(
-            index.gc_roots.get("default").unwrap(),
-            &vec!["root1".to_string(), "root2".to_string()]
-        );
-    }
-
-    #[test]
     fn test_hot_registration_and_lookup() {
         let mut entries = HashMap::new();
+        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let digest1 = NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap();
+
         entries.insert(
-            "hash1".to_string(),
+            hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: "StorePath: /nix/store/hash1-pkg1\nURL: nar/pkg1.nar.xz\n".to_string(),
-                nar_digest: "sha256:digest1".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", hash1),
+                    nar_basename: "pkg1.nar.xz".to_string(),
+                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: digest1.clone(),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -651,20 +647,28 @@ mod tests {
         let nar_map = build_nar_lookup_map(&entries);
         assert_eq!(
             nar_map.get("pkg1.nar.xz"),
-            Some(&"sha256:digest1".to_string())
+            Some(&digest1)
         );
     }
 
     #[test]
     fn test_build_nar_lookup_map() {
         let mut entries = HashMap::new();
+        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let digest1 = NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap();
+
         entries.insert(
-            "hash1".to_string(),
+            hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: "StorePath: /nix/store/hash1-pkg1\nURL: nar/test.nar.xz\n".to_string(),
-                nar_digest: "sha256:digest1".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", hash1),
+                    nar_basename: "test.nar.xz".to_string(),
+                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: digest1.clone(),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -672,7 +676,7 @@ mod tests {
         );
 
         let map = build_nar_lookup_map(&entries);
-        assert_eq!(map.get("test.nar.xz"), Some(&"sha256:digest1".to_string()));
+        assert_eq!(map.get("test.nar.xz"), Some(&digest1));
     }
 
     #[test]
@@ -722,7 +726,7 @@ mod tests {
         };
         session.completed_jobs.push(JobSummaryMetadata {
             job_id: "job1".to_string(),
-            system: "x86_64-linux".to_string(),
+            system: SystemArch::X86_64Linux,
             uploaded_blobs: 1,
             uploaded_bytes: 1024,
             timestamp: "2026-08-29T10:00:00Z".to_string(),

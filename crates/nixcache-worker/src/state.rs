@@ -1,4 +1,6 @@
-use nixcache_core::{CacheIndexData, IndexEntry, RunSessionManifest, build_nar_lookup_map};
+use nixcache_core::{
+    CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
+};
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
@@ -9,10 +11,10 @@ pub const DEBOUNCE_THRESHOLD_MS: f64 = 500.0;
 
 /// 收敛的 Worker 全局内存状态
 pub struct WorkerState {
-    pub hot_entries: HashMap<String, IndexEntry>,
-    pub hot_nar_lookup: HashMap<String, String>,
-    pub mem_session_cache: HashMap<String, (RunSessionManifest, HashMap<String, String>, f64)>,
-    pub mem_baseline_cache: Option<(CacheIndexData, HashMap<String, String>, f64)>,
+    pub hot_entries: HashMap<StoreHash, IndexEntry>,
+    pub hot_nar_lookup: HashMap<String, NarDigest>,
+    pub mem_session_cache: HashMap<String, (RunSessionManifest, HashMap<String, NarDigest>, f64)>,
+    pub mem_baseline_cache: Option<(CacheIndexData, HashMap<String, NarDigest>, f64)>,
     pub last_ghcr_check: f64,
 }
 
@@ -45,7 +47,7 @@ impl WorkerState {
     }
 
     /// 动态注册 Tier 0 热条目
-    pub fn register_hot(&mut self, entries: HashMap<String, IndexEntry>) {
+    pub fn register_hot(&mut self, entries: HashMap<StoreHash, IndexEntry>) {
         if entries.is_empty() {
             return;
         }

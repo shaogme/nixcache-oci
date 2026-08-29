@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use nixcache_core::IndexEntry;
+use nixcache_core::{IndexEntry, StoreHash};
 use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -51,10 +51,10 @@ struct StatusResponse {
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum RegisterPayload {
-    Map(HashMap<String, IndexEntry>),
+    Map(HashMap<StoreHash, IndexEntry>),
     List(Vec<IndexEntry>),
     Object {
-        entries: HashMap<String, IndexEntry>,
+        entries: HashMap<StoreHash, IndexEntry>,
     },
 }
 
@@ -143,18 +143,13 @@ async fn handle_register_session(
     State(state): State<AppState>,
     Json(payload): Json<RegisterPayload>,
 ) -> impl IntoResponse {
-    let map: HashMap<String, IndexEntry> = match payload {
+    let map: HashMap<StoreHash, IndexEntry> = match payload {
         RegisterPayload::Map(m) => m,
         RegisterPayload::List(list) => {
             let mut m = HashMap::new();
             for entry in list {
-                for line in entry.narinfo.lines() {
-                    if let Some(rest) = line.strip_prefix("StorePath: /nix/store/")
-                        && rest.len() >= 32
-                    {
-                        m.insert(rest[..32].to_string(), entry.clone());
-                        break;
-                    }
+                if let Some(sh) = entry.store_hash() {
+                    m.insert(sh, entry);
                 }
             }
             m
@@ -182,7 +177,7 @@ async fn serve_narinfo(State(state): State<AppState>, Path(hash_ext): Path<Strin
     if let Some(entry) = state.index.lookup(store_hash).await {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/x-nix-narinfo"));
-        return (StatusCode::OK, headers, entry.narinfo).into_response();
+        return (StatusCode::OK, headers, entry.to_narinfo_string()).into_response();
     }
 
     // 2. Fallback to upstream
@@ -212,7 +207,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
 
     // 1. Try our GHCR cache — stream directly
     if let Some(digest) = state.index.find_nar_digest(&nar_name).await {
-        match state.oci_client.stream_blob(&digest).await {
+        match state.oci_client.stream_blob(digest.as_str()).await {
             Ok(resp) if resp.status().is_success() => {
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
@@ -272,7 +267,9 @@ mod tests {
     use crate::index::{CacheIndex, CascadingProxyConfig};
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use nixcache_core::{CacheIndexData, IndexEntry};
+    use nixcache_core::{
+        CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
+    };
     use std::{collections::HashMap, time::Duration};
     use tower::ServiceExt;
     use wiremock::{
@@ -404,13 +401,19 @@ mod tests {
             "",
         );
         let mut entries = HashMap::new();
+        let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         entries.insert(
-            "hash1".to_string(),
+            hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: "StorePath: /nix/store/hash1-pkg1\n".to_string(),
-                nar_digest: "sha256:digest1".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", hash1),
+                    nar_basename: "pkg1.nar.xz".to_string(),
+                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
                 nar_size: 100,
                 added: "2026-08-28T00:00:00Z".to_string(),
                 origin_job: None,
@@ -468,20 +471,24 @@ mod tests {
             "",
         );
 
-        let local_narinfo = "StorePath: /nix/store/localhash-pkg\nURL: nar/local.nar.xz\n";
+        let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(
-            "localhash".to_string(),
-            IndexEntry {
-                name: "local-pkg".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: local_narinfo.to_string(),
-                nar_digest: "sha256:localdigest".to_string(),
-                nar_size: 1024,
-                added: "2026-08-28T00:00:00Z".to_string(),
-                origin_job: None,
+        let entry = IndexEntry {
+            name: "local-pkg".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", local_hash),
+                nar_basename: "local.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
             },
-        );
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 1024,
+            added: "2026-08-28T00:00:00Z".to_string(),
+            origin_job: None,
+        };
+        let local_rendered = entry.to_narinfo_string();
+        entries.insert(local_hash.clone(), entry);
 
         let index_data = CacheIndexData {
             entries,
@@ -489,9 +496,9 @@ mod tests {
         };
         index.update_data_in_memory(index_data).await;
 
-        let upstream_narinfo = "StorePath: /nix/store/upstreamhash-pkg\nURL: nar/upstream.nar.xz\n";
+        let upstream_narinfo = "StorePath: /nix/store/11111111111111111111111111111111-pkg\nURL: nar/upstream.nar.xz\nNarHash: sha256:000\nNarSize: 10\n";
         Mock::given(method("GET"))
-            .and(path("/upstreamhash.narinfo"))
+            .and(path("/11111111111111111111111111111111.narinfo"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/x-nix-narinfo")
@@ -501,7 +508,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/notfoundhash.narinfo"))
+            .and(path("/22222222222222222222222222222222.narinfo"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&upstream_server)
             .await;
@@ -520,7 +527,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/localhash.narinfo")
+                    .uri(format!("/{}.narinfo", local_hash))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -528,14 +535,14 @@ mod tests {
             .unwrap();
         assert_eq!(local_resp.status(), StatusCode::OK);
         let local_body = local_resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(String::from_utf8_lossy(&local_body), local_narinfo);
+        assert_eq!(String::from_utf8_lossy(&local_body), local_rendered);
 
         // 2. Upstream fallback hit
         let upstream_resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/upstreamhash.narinfo")
+                    .uri("/11111111111111111111111111111111.narinfo")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -555,7 +562,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/notfoundhash.narinfo")
+                    .uri("/22222222222222222222222222222222.narinfo")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -567,7 +574,7 @@ mod tests {
         let invalid_resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/localhash.notnarinfo")
+                    .uri(format!("/{}.notnarinfo", local_hash))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -594,14 +601,21 @@ mod tests {
             "",
         );
 
+        let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let digest_str = "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0";
         let mut entries = HashMap::new();
         entries.insert(
-            "localhash".to_string(),
+            local_hash.clone(),
             IndexEntry {
                 name: "local-pkg".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: "StorePath: /nix/store/localhash-pkg\nURL: nar/local.nar.xz\n".to_string(),
-                nar_digest: "sha256:localdigest123".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg", local_hash),
+                    nar_basename: "local.nar.xz".to_string(),
+                    nar_hash: format!("sha256:{}", digest_str),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_sha256(digest_str).unwrap(),
                 nar_size: 5,
                 added: "2026-08-28T00:00:00Z".to_string(),
                 origin_job: None,
@@ -616,7 +630,7 @@ mod tests {
 
         // Mock OCI Blob streaming
         Mock::given(method("GET"))
-            .and(path("/v2/test/repo/nix-cache/blobs/sha256:localdigest123"))
+            .and(path(format!("/v2/test/repo/nix-cache/blobs/sha256:{}", digest_str)))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-length", "5")
@@ -715,12 +729,17 @@ mod tests {
 
         let app = create_router(state);
 
+        let hash1 = "s66mzxpvicwk07gjbjfw9izjfa797vsw";
         let payload = serde_json::json!({
-            "hot123": {
+            hash1: {
                 "name": "hot-pkg",
                 "system": "x86_64-linux",
-                "narinfo": "StorePath: /nix/store/hot123-pkg\nURL: nar/hot.nar.xz\n",
-                "nar_digest": "sha256:hotdigest",
+                "narinfo_meta": {
+                    "store_path": format!("/nix/store/{}-pkg", hash1),
+                    "nar_basename": "hot.nar.xz",
+                    "nar_hash": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                },
+                "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
                 "nar_size": 42,
                 "added": "2026-08-29T10:00:00Z"
             }
@@ -745,7 +764,7 @@ mod tests {
         let get_resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/hot123.narinfo")
+                    .uri(format!("/{}.narinfo", hash1))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -754,6 +773,6 @@ mod tests {
 
         assert_eq!(get_resp.status(), StatusCode::OK);
         let body = get_resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("StorePath: /nix/store/hot123-pkg"));
+        assert!(String::from_utf8_lossy(&body).contains(&format!("StorePath: /nix/store/{}-pkg", hash1)));
     }
 }

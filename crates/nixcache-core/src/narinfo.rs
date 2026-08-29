@@ -1,20 +1,29 @@
-use crate::error::NarInfoParseError;
-use std::path::Path;
+use crate::{
+    error::NarInfoParseError,
+    lookup::extract_nar_basename,
+    types::{NarInfoMeta, StoreHash},
+};
+use std::ops::{Deref, DerefMut};
 
 /// 强类型 NARInfo 描述结构体
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct NarInfo {
-    pub store_path: String,
-    pub url: String,
-    pub compression: Option<String>,
-    pub file_hash: Option<String>,
-    pub file_size: Option<u64>,
-    pub nar_hash: String,
+    pub meta: NarInfoMeta,
     pub nar_size: u64,
-    pub references: Vec<String>,
-    pub deriver: Option<String>,
-    pub signatures: Vec<String>,
-    pub ca: Option<String>,
+}
+
+impl Deref for NarInfo {
+    type Target = NarInfoMeta;
+
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl DerefMut for NarInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.meta
+    }
 }
 
 impl NarInfo {
@@ -26,7 +35,7 @@ impl NarInfo {
         }
 
         let mut store_path = None;
-        let mut url = None;
+        let mut nar_basename = None;
         let mut compression = None;
         let mut file_hash = None;
         let mut file_size = None;
@@ -49,7 +58,12 @@ impl NarInfo {
 
                 match key {
                     "StorePath" => store_path = Some(value.to_string()),
-                    "URL" => url = Some(value.to_string()),
+                    "URL" => {
+                        let extracted = extract_nar_basename(value);
+                        if !extracted.is_empty() {
+                            nar_basename = Some(extracted.to_string());
+                        }
+                    }
                     "Compression" => {
                         if !value.is_empty() && value != "none" {
                             compression = Some(value.to_string());
@@ -78,11 +92,25 @@ impl NarInfo {
                         nar_size = Some(parsed);
                     }
                     "References" => {
-                        references = value
-                            .split_whitespace()
-                            .map(|s| s.to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        for token in value.split_whitespace() {
+                            let item = token.trim();
+                            if item.is_empty() {
+                                continue;
+                            }
+                            let hash_candidate = if let Some(pos) = item.rfind('/') {
+                                &item[pos + 1..]
+                            } else {
+                                item
+                            };
+                            let hash_str = if hash_candidate.len() >= 32 {
+                                &hash_candidate[..32]
+                            } else {
+                                hash_candidate
+                            };
+                            let store_hash = StoreHash::parse(hash_str)
+                                .unwrap_or_else(|_| StoreHash::new_unchecked(hash_str));
+                            references.push(store_hash);
+                        }
                     }
                     "Deriver" if !value.is_empty() => {
                         deriver = Some(value.to_string());
@@ -99,80 +127,49 @@ impl NarInfo {
         }
 
         let store_path = store_path.ok_or(NarInfoParseError::MissingRequiredField("StorePath"))?;
-        let url = url.ok_or(NarInfoParseError::MissingRequiredField("URL"))?;
+        let nar_basename =
+            nar_basename.ok_or(NarInfoParseError::MissingRequiredField("URL"))?;
         let nar_hash = nar_hash.ok_or(NarInfoParseError::MissingRequiredField("NarHash"))?;
         let nar_size = nar_size.ok_or(NarInfoParseError::MissingRequiredField("NarSize"))?;
 
-        Ok(Self {
+        let meta = NarInfoMeta {
             store_path,
-            url,
+            nar_basename,
             compression,
             file_hash,
             file_size,
             nar_hash,
-            nar_size,
             references,
             deriver,
             signatures,
             ca,
-        })
+        };
+
+        Ok(Self { meta, nar_size })
     }
 
     /// 序列化为标准 Nix .narinfo 文本表示
     pub fn to_narinfo_string(&self) -> String {
-        let mut lines = Vec::with_capacity(12);
-        lines.push(format!("StorePath: {}", self.store_path));
-        lines.push(format!("URL: {}", self.url));
+        self.meta.render(self.nar_size)
+    }
 
-        if let Some(ref comp) = self.compression {
-            lines.push(format!("Compression: {}", comp));
-        }
-        if let Some(ref fh) = self.file_hash {
-            lines.push(format!("FileHash: {}", fh));
-        }
-        if let Some(fs) = self.file_size {
-            lines.push(format!("FileSize: {}", fs));
-        }
-
-        lines.push(format!("NarHash: {}", self.nar_hash));
-        lines.push(format!("NarSize: {}", self.nar_size));
-
-        if !self.references.is_empty() {
-            lines.push(format!("References: {}", self.references.join(" ")));
-        }
-        if let Some(ref drv) = self.deriver {
-            lines.push(format!("Deriver: {}", drv));
-        }
-        for sig in &self.signatures {
-            lines.push(format!("Sig: {}", sig));
-        }
-        if let Some(ref ca) = self.ca {
-            lines.push(format!("CA: {}", ca));
-        }
-
-        lines.join("\n") + "\n"
+    /// 提取 NAR 文件的 URL 路径
+    pub fn url(&self) -> String {
+        format!("nar/{}", self.meta.nar_basename)
     }
 
     /// 提取 NAR 文件的基本名称 (如 "12345.nar.xz")
     pub fn nar_basename(&self) -> &str {
-        if let Some(rest) = self.url.strip_prefix("nar/") {
-            rest.split_whitespace().next().unwrap_or(rest)
-        } else if let Some(pos) = self.url.rfind('/') {
-            &self.url[pos + 1..]
-        } else {
-            &self.url
-        }
+        &self.meta.nar_basename
     }
 
     /// 提取 Store Path 中的 32 字符 Nix 散列值
-    pub fn store_hash(&self) -> Option<&str> {
-        let name = Path::new(&self.store_path)
-            .file_name()
-            .and_then(|n| n.to_str())?;
-        if name.len() >= 32 {
-            Some(&name[..32])
-        } else {
-            None
-        }
+    pub fn store_hash(&self) -> Option<StoreHash> {
+        self.meta.store_hash()
+    }
+
+    /// 拆分为元数据与 NAR 大小
+    pub fn into_meta(self) -> (NarInfoMeta, u64) {
+        (self.meta, self.nar_size)
     }
 }

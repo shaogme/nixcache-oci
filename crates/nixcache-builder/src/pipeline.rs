@@ -4,8 +4,8 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry,
-    evaluate_multi_arch_gc,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, NarDigest, NarInfo,
+    StoreHash, SystemArch, evaluate_multi_arch_gc,
 };
 use nixcache_oci::{OciClient, build_index_manifest};
 use std::{
@@ -260,7 +260,7 @@ async fn setup_self_substituter(
     })
 }
 
-async fn fetch_remote_cache_index(oci: &OciClient) -> (CacheIndexData, HashSet<String>) {
+async fn fetch_remote_cache_index(oci: &OciClient) -> (CacheIndexData, HashSet<StoreHash>) {
     let mut remote_index = CacheIndexData::default();
     let mut own_hashes = HashSet::new();
 
@@ -417,8 +417,8 @@ pub async fn run_session_capture(
     explicit_paths: &[String],
 ) -> Result<(), BuilderError> {
     let system = match system_opt {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => nix::get_system().await?,
+        Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
+        _ => SystemArch::from(nix::get_system().await?.as_str()),
     };
 
     info!(
@@ -463,7 +463,7 @@ pub async fn run_session_capture(
     let oci = OciClient::new(registry, repo, github_token, true);
     let temp_dir = tempfile::tempdir()?;
 
-    let mut new_entries = HashMap::new();
+    let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
 
@@ -483,7 +483,7 @@ pub async fn run_session_capture(
 
             info!("  Uploading NAR for {} ({} bytes)", hash, size);
             match oci.push_blob(&nar_file_path).await {
-                Ok(nar_digest) => {
+                Ok(nar_digest_str) => {
                     if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
                         let name = Path::new(&store_path)
                             .file_name()
@@ -492,21 +492,30 @@ pub async fn run_session_capture(
                             .map(|x| x.1.to_string())
                             .unwrap_or(hash.clone());
 
-                        new_entries.insert(
-                            hash.clone(),
-                            IndexEntry {
-                                name,
-                                system: Some(system.clone()),
-                                narinfo: narinfo_content,
-                                nar_digest,
-                                nar_size: size,
-                                added: Utc::now()
-                                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                origin_job: Some(format!("job:{}", job_id)),
-                            },
-                        );
-                        uploaded_count += 1;
-                        total_bytes_uploaded += size;
+                        if let Ok(narinfo) = NarInfo::parse(&narinfo_content) {
+                            let (narinfo_meta, nar_size) = narinfo.into_meta();
+                            let store_hash = narinfo_meta
+                                .store_hash()
+                                .unwrap_or_else(|| StoreHash::new_unchecked(&hash));
+                            let nar_digest = NarDigest::parse(&nar_digest_str)
+                                .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest_str));
+
+                            new_entries.insert(
+                                store_hash,
+                                IndexEntry {
+                                    name,
+                                    system: Some(system.clone()),
+                                    narinfo_meta,
+                                    nar_digest,
+                                    nar_size: size.max(nar_size),
+                                    added: Utc::now()
+                                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                    origin_job: Some(format!("job:{}", job_id)),
+                                },
+                            );
+                            uploaded_count += 1;
+                            total_bytes_uploaded += size;
+                        }
                     }
                 }
                 Err(e) => {
@@ -516,12 +525,13 @@ pub async fn run_session_capture(
         }
     }
 
-    let mut active_gc_roots = Vec::new();
+    let mut active_gc_roots: Vec<StoreHash> = Vec::new();
     for p in &candidate_paths {
         if let Some(file_name) = Path::new(p).file_name().and_then(|n| n.to_str())
             && file_name.len() >= 32
+            && let Ok(sh) = StoreHash::parse(&file_name[..32])
         {
-            active_gc_roots.push(file_name[..32].to_string());
+            active_gc_roots.push(sh);
         }
     }
     active_gc_roots.sort();
@@ -537,7 +547,7 @@ pub async fn run_session_capture(
             run_id,
             new_entries.clone(),
             active_gc_roots.clone(),
-            &system,
+            system.clone(),
             job_id,
             head_sha.as_deref(),
             ref_name.as_deref(),
@@ -601,7 +611,7 @@ pub async fn run_session_capture(
 
     write_session_capture_summary(
         job_id,
-        &system,
+        system.as_str(),
         candidate_paths.len(),
         uploaded_count,
         total_bytes_uploaded,
@@ -632,8 +642,8 @@ pub async fn run_build_worker(
     fail_fast: bool,
 ) -> Result<(), BuilderError> {
     let system = match &build_config.system {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => nix::get_system().await?,
+        Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
+        _ => SystemArch::from(nix::get_system().await?.as_str()),
     };
 
     info!(
@@ -664,14 +674,14 @@ pub async fn run_build_worker(
         own_hashes.len()
     );
 
-    let own_hashes_vec: Vec<String> = own_hashes.into_iter().collect();
+    let own_hashes_vec: Vec<String> = own_hashes.into_iter().map(|h| h.into_inner()).collect();
 
     // 6. 查找本地新构建的路径
     let upload_list = nix::find_locally_built_paths(&output_paths, &own_hashes_vec).await?;
 
     let temp_dir = tempfile::tempdir()?;
 
-    let mut new_entries = HashMap::new();
+    let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
 
@@ -694,7 +704,7 @@ pub async fn run_build_worker(
 
             info!("  Uploading NAR for {} ({} bytes)", hash, size);
             match oci.push_blob(&nar_file_path).await {
-                Ok(nar_digest) => {
+                Ok(nar_digest_str) => {
                     if let Ok(narinfo_content) = fs::read_to_string(&narinfo_path).await {
                         let name = Path::new(&store_path)
                             .file_name()
@@ -703,23 +713,32 @@ pub async fn run_build_worker(
                             .map(|x| x.1.to_string())
                             .unwrap_or(hash.clone());
 
-                        new_entries.insert(
-                            hash.clone(),
-                            IndexEntry {
-                                name,
-                                system: Some(system.clone()),
-                                narinfo: narinfo_content,
-                                nar_digest,
-                                nar_size: size,
-                                added: Utc::now()
-                                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                origin_job: env::var("GITHUB_JOB")
-                                    .ok()
-                                    .map(|j| format!("job:{}", j)),
-                            },
-                        );
-                        uploaded_count += 1;
-                        total_bytes_uploaded += size;
+                        if let Ok(narinfo) = NarInfo::parse(&narinfo_content) {
+                            let (narinfo_meta, nar_size) = narinfo.into_meta();
+                            let store_hash = narinfo_meta
+                                .store_hash()
+                                .unwrap_or_else(|| StoreHash::new_unchecked(&hash));
+                            let nar_digest = NarDigest::parse(&nar_digest_str)
+                                .unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest_str));
+
+                            new_entries.insert(
+                                store_hash,
+                                IndexEntry {
+                                    name,
+                                    system: Some(system.clone()),
+                                    narinfo_meta,
+                                    nar_digest,
+                                    nar_size: size.max(nar_size),
+                                    added: Utc::now()
+                                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                    origin_job: env::var("GITHUB_JOB")
+                                        .ok()
+                                        .map(|j| format!("job:{}", j)),
+                                },
+                            );
+                            uploaded_count += 1;
+                            total_bytes_uploaded += size;
+                        }
                     }
                 }
                 Err(e) => {
@@ -732,12 +751,13 @@ pub async fn run_build_worker(
     }
 
     // 7. 提取 active_gc_roots
-    let mut active_gc_roots = Vec::new();
+    let mut active_gc_roots: Vec<StoreHash> = Vec::new();
     for p in &output_paths {
         if let Some(file_name) = Path::new(p).file_name().and_then(|n| n.to_str())
             && file_name.len() >= 32
+            && let Ok(sh) = StoreHash::parse(&file_name[..32])
         {
-            active_gc_roots.push(file_name[..32].to_string());
+            active_gc_roots.push(sh);
         }
     }
     active_gc_roots.sort();
@@ -784,7 +804,7 @@ pub async fn run_build_worker(
     );
 
     write_worker_step_summary(
-        &system,
+        system.as_str(),
         discovered.len(),
         output_paths.len(),
         upload_list.len(),
@@ -846,9 +866,9 @@ pub async fn run_promote(
 
             for (sys, roots) in session.gc_roots {
                 let system_roots = index.gc_roots.entry(sys).or_default();
-                let mut set: HashSet<String> = system_roots.iter().cloned().collect();
+                let mut set: HashSet<StoreHash> = system_roots.iter().cloned().collect();
                 set.extend(roots);
-                let mut sorted: Vec<String> = set.into_iter().collect();
+                let mut sorted: Vec<StoreHash> = set.into_iter().collect();
                 sorted.sort();
                 *system_roots = sorted;
             }
@@ -882,10 +902,10 @@ pub async fn run_promote(
                                     index.entries.extend(receipt.new_entries);
                                     let system_roots =
                                         index.gc_roots.entry(receipt.system.clone()).or_default();
-                                    let mut set: HashSet<String> =
+                                    let mut set: HashSet<StoreHash> =
                                         system_roots.iter().cloned().collect();
                                     set.extend(receipt.active_gc_roots);
-                                    let mut sorted: Vec<String> = set.into_iter().collect();
+                                    let mut sorted: Vec<StoreHash> = set.into_iter().collect();
                                     sorted.sort();
                                     *system_roots = sorted;
                                 }
@@ -919,9 +939,9 @@ pub async fn run_promote(
                         index.entries.extend(receipt.new_entries);
                         let system_roots =
                             index.gc_roots.entry(receipt.system.clone()).or_default();
-                        let mut set: HashSet<String> = system_roots.iter().cloned().collect();
+                        let mut set: HashSet<StoreHash> = system_roots.iter().cloned().collect();
                         set.extend(receipt.active_gc_roots);
-                        let mut sorted: Vec<String> = set.into_iter().collect();
+                        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
                         sorted.sort();
                         *system_roots = sorted;
                     }
@@ -995,7 +1015,7 @@ pub async fn run_gc(
     info!(
         "GC Evaluation: Total: {}, Live Roots: {}, Kept: {}, To Delete: {}",
         index.entries.len(),
-        gc_result.live_roots.len(),
+        gc_result.reachable_roots.len(),
         gc_result.kept_entries.len(),
         gc_result.deleted_hashes.len()
     );
@@ -1080,20 +1100,26 @@ async fn write_promote_step_summary(
 mod tests {
     use super::{restore_nix_conf, run_session_clean};
     use nixcache_core::{
-        BuildReceipt, BuildStats, CacheIndexData, IndexEntry, evaluate_multi_arch_gc,
+        BuildReceipt, BuildStats, CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, StoreHash,
+        SystemArch, evaluate_multi_arch_gc,
     };
     use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_gc_multi_arch_aggregation() {
+        let hash_x86_live = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let hash_arm_live = StoreHash::parse("00000000000000000000000000000002").unwrap();
+        let hash_dead_old = StoreHash::parse("00000000000000000000000000000003").unwrap();
+        let hash_dead_recent = StoreHash::parse("00000000000000000000000000000004").unwrap();
+
         let mut index = CacheIndexData::default();
         index.gc_roots.insert(
-            "x86_64-linux".to_string(),
-            vec!["hash-x86-live".to_string()],
+            SystemArch::X86_64Linux,
+            vec![hash_x86_live.clone()],
         );
         index.gc_roots.insert(
-            "aarch64-linux".to_string(),
-            vec!["hash-arm-live".to_string()],
+            SystemArch::Aarch64Linux,
+            vec![hash_arm_live.clone()],
         );
 
         let now = chrono::Utc::now();
@@ -1102,72 +1128,111 @@ mod tests {
 
         let entry_x86_live = IndexEntry {
             name: "pkg-x86".to_string(),
-            system: Some("x86_64-linux".to_string()),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_x86_live),
+                nar_basename: "pkg-x86.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 100,
             added: sixty_days_ago.clone(),
-            ..Default::default()
+            origin_job: None,
         };
         let entry_arm_live = IndexEntry {
             name: "pkg-arm".to_string(),
-            system: Some("aarch64-linux".to_string()),
+            system: Some(SystemArch::Aarch64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_arm_live),
+                nar_basename: "pkg-arm.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 100,
             added: sixty_days_ago.clone(),
-            ..Default::default()
+            origin_job: None,
         };
         let entry_dead_old = IndexEntry {
             name: "pkg-dead-old".to_string(),
-            system: Some("x86_64-linux".to_string()),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_dead_old),
+                nar_basename: "pkg-dead-old.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 100,
             added: sixty_days_ago.clone(),
-            ..Default::default()
+            origin_job: None,
         };
         let entry_dead_recent = IndexEntry {
             name: "pkg-dead-recent".to_string(),
-            system: Some("x86_64-linux".to_string()),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_dead_recent),
+                nar_basename: "pkg-dead-recent.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+            nar_size: 100,
             added: five_days_ago.clone(),
-            ..Default::default()
+            origin_job: None,
         };
 
         index
             .entries
-            .insert("hash-x86-live".to_string(), entry_x86_live);
+            .insert(hash_x86_live.clone(), entry_x86_live);
         index
             .entries
-            .insert("hash-arm-live".to_string(), entry_arm_live);
+            .insert(hash_arm_live.clone(), entry_arm_live);
         index
             .entries
-            .insert("hash-dead-old".to_string(), entry_dead_old);
+            .insert(hash_dead_old.clone(), entry_dead_old);
         index
             .entries
-            .insert("hash-dead-recent".to_string(), entry_dead_recent);
+            .insert(hash_dead_recent.clone(), entry_dead_recent);
 
         let cutoff = now - chrono::Duration::days(30);
         let result = evaluate_multi_arch_gc(&index, &cutoff);
 
-        assert_eq!(result.deleted_hashes, vec!["hash-dead-old"]);
+        assert_eq!(result.deleted_hashes, vec![hash_dead_old]);
         assert_eq!(result.kept_entries.len(), 3);
-        assert!(result.kept_entries.contains_key("hash-x86-live"));
-        assert!(result.kept_entries.contains_key("hash-arm-live"));
-        assert!(result.kept_entries.contains_key("hash-dead-recent"));
+        assert!(result.kept_entries.contains_key(&hash_x86_live));
+        assert!(result.kept_entries.contains_key(&hash_arm_live));
+        assert!(result.kept_entries.contains_key(&hash_dead_recent));
     }
 
     #[test]
     fn test_gc_reachability_graph_algorithm() {
+        let hash_shared_libc = StoreHash::parse("00000000000000000000000000000010").unwrap();
+        let hash_x86_server = StoreHash::parse("00000000000000000000000000000011").unwrap();
+        let hash_arm_server = StoreHash::parse("00000000000000000000000000000012").unwrap();
+        let hash_darwin_client = StoreHash::parse("00000000000000000000000000000013").unwrap();
+        let hash_orphan_ancient = StoreHash::parse("00000000000000000000000000000014").unwrap();
+        let hash_orphan_recent = StoreHash::parse("00000000000000000000000000000015").unwrap();
+
         let mut index = CacheIndexData::default();
         index.gc_roots.insert(
-            "x86_64-linux".to_string(),
+            SystemArch::X86_64Linux,
             vec![
-                "hash-shared-libc".to_string(),
-                "hash-x86-server".to_string(),
+                hash_shared_libc.clone(),
+                hash_x86_server.clone(),
             ],
         );
         index.gc_roots.insert(
-            "aarch64-linux".to_string(),
+            SystemArch::Aarch64Linux,
             vec![
-                "hash-shared-libc".to_string(),
-                "hash-arm-server".to_string(),
+                hash_shared_libc.clone(),
+                hash_arm_server.clone(),
             ],
         );
         index.gc_roots.insert(
-            "aarch64-darwin".to_string(),
-            vec!["hash-darwin-client".to_string()],
+            SystemArch::Aarch64Darwin,
+            vec![hash_darwin_client.clone()],
         );
 
         let now = chrono::Utc::now();
@@ -1175,21 +1240,30 @@ mod tests {
         let one_hour_ago = (now - chrono::Duration::hours(1)).to_rfc3339();
 
         let entries_def = vec![
-            ("hash-shared-libc", "glibc", ninety_days_ago.clone()),
-            ("hash-x86-server", "server-x86", ninety_days_ago.clone()),
-            ("hash-arm-server", "server-arm", ninety_days_ago.clone()),
-            ("hash-darwin-client", "client-mac", ninety_days_ago.clone()),
-            ("hash-orphan-ancient", "old-tool", ninety_days_ago.clone()),
-            ("hash-orphan-recent", "ci-temp", one_hour_ago),
+            (hash_shared_libc.clone(), "glibc", ninety_days_ago.clone()),
+            (hash_x86_server.clone(), "server-x86", ninety_days_ago.clone()),
+            (hash_arm_server.clone(), "server-arm", ninety_days_ago.clone()),
+            (hash_darwin_client.clone(), "client-mac", ninety_days_ago.clone()),
+            (hash_orphan_ancient.clone(), "old-tool", ninety_days_ago.clone()),
+            (hash_orphan_recent.clone(), "ci-temp", one_hour_ago),
         ];
 
         for (h, name, added) in entries_def {
             index.entries.insert(
-                h.to_string(),
+                h.clone(),
                 IndexEntry {
                     name: name.to_string(),
+                    system: Some(SystemArch::X86_64Linux),
+                    narinfo_meta: NarInfoMeta {
+                        store_path: format!("/nix/store/{}-{}", h, name),
+                        nar_basename: format!("{}.nar.xz", name),
+                        nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                        ..Default::default()
+                    },
+                    nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
+                    nar_size: 100,
                     added,
-                    ..Default::default()
+                    origin_job: None,
                 },
             );
         }
@@ -1197,10 +1271,10 @@ mod tests {
         let cutoff = now - chrono::Duration::days(30);
         let result = evaluate_multi_arch_gc(&index, &cutoff);
 
-        assert_eq!(result.deleted_hashes, vec!["hash-orphan-ancient"]);
+        assert_eq!(result.deleted_hashes, vec![hash_orphan_ancient]);
         assert_eq!(result.kept_entries.len(), 5);
-        assert!(result.kept_entries.contains_key("hash-shared-libc"));
-        assert!(result.kept_entries.contains_key("hash-orphan-recent"));
+        assert!(result.kept_entries.contains_key(&hash_shared_libc));
+        assert!(result.kept_entries.contains_key(&hash_orphan_recent));
     }
 
     #[tokio::test]
@@ -1239,23 +1313,26 @@ mod tests {
         let receipts_dir = temp_dir.path().join("receipts");
         tokio::fs::create_dir_all(&receipts_dir).await.unwrap();
 
+        let root1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let root2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
+
         let receipt1 = BuildReceipt::new(
-            "x86_64-linux".to_string(),
+            SystemArch::X86_64Linux,
             "test/repo".to_string(),
             "2026-08-28T00:00:00Z".to_string(),
             Some("key:pub".to_string()),
             HashMap::new(),
-            vec!["root1".to_string()],
+            vec![root1],
             BuildStats::default(),
         );
 
         let receipt2 = BuildReceipt::new(
-            "aarch64-linux".to_string(),
+            SystemArch::Aarch64Linux,
             "test/repo".to_string(),
             "2026-08-28T00:00:00Z".to_string(),
             Some("key:pub".to_string()),
             HashMap::new(),
-            vec!["root2".to_string()],
+            vec![root2],
             BuildStats::default(),
         );
 
@@ -1284,9 +1361,9 @@ mod tests {
         }
 
         assert_eq!(loaded.len(), 2);
-        let systems: HashSet<String> = loaded.into_iter().map(|r| r.system).collect();
-        assert!(systems.contains("x86_64-linux"));
-        assert!(systems.contains("aarch64-linux"));
+        let systems: HashSet<SystemArch> = loaded.into_iter().map(|r| r.system).collect();
+        assert!(systems.contains(&SystemArch::X86_64Linux));
+        assert!(systems.contains(&SystemArch::Aarch64Linux));
     }
 
     #[tokio::test]

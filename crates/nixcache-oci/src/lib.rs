@@ -12,15 +12,17 @@ pub use manifest::{
 };
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheIndexData, IndexEntry, JobSummaryMetadata,
-    NarInfo, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, SCHEMA_VERSION,
-    build_nar_lookup_map, deserialize_gc_roots, evaluate_multi_arch_gc, extract_nar_basename,
-    extract_store_hash,
+    NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest,
+    SCHEMA_VERSION, StoreHash, SystemArch, build_nar_lookup_map, evaluate_multi_arch_gc,
+    extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use token::TokenManager;
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexEntry, OciClient, OciError};
+    use super::{
+        IndexEntry, NarDigest, NarInfoMeta, OciClient, OciError, StoreHash, SystemArch,
+    };
     use reqwest::StatusCode;
     use std::{collections::HashMap, io::Write};
     use tempfile::NamedTempFile;
@@ -320,13 +322,19 @@ mod tests {
 
         let client = OciClient::new(&host, "test/repo", "", true);
         let mut entries = HashMap::new();
+        let hash_x86 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         entries.insert(
-            "hash-x86".to_string(),
+            hash_x86.clone(),
             IndexEntry {
                 name: "pkg-x86".to_string(),
-                system: Some("x86_64-linux".to_string()),
-                narinfo: "StorePath: /nix/store/hash-x86-pkg\n".to_string(),
-                nar_digest: "sha256:digest-x86".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg", hash_x86),
+                    nar_basename: "pkg-x86.nar.xz".to_string(),
+                    nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
                 nar_size: 1024,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: Some("job:vm-tests".to_string()),
@@ -337,8 +345,8 @@ mod tests {
             .update_run_session_with_cas(
                 12345,
                 entries,
-                vec!["hash-x86".to_string()],
-                "x86_64-linux",
+                vec![hash_x86],
+                SystemArch::X86_64Linux,
                 "vm-tests",
                 Some("commit-sha-123"),
                 Some("refs/heads/main"),

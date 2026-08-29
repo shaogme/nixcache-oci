@@ -1,6 +1,7 @@
 use moka::future::Cache;
 use nixcache_core::{
-    CacheIndexData, IndexEntry, RunSessionManifest, build_nar_lookup_map, extract_nar_basename,
+    CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
+    extract_nar_basename,
 };
 use nixcache_oci::OciClient;
 use std::{
@@ -60,7 +61,7 @@ struct RemoteStatus {
 #[derive(Clone, Debug)]
 pub struct CachedSession {
     pub manifest: RunSessionManifest,
-    pub nar_lookup: HashMap<String, String>,
+    pub nar_lookup: HashMap<String, NarDigest>,
 }
 
 impl CachedSession {
@@ -77,7 +78,7 @@ impl CachedSession {
 #[derive(Clone, Debug)]
 pub struct CachedBaseline {
     pub data: CacheIndexData,
-    pub nar_lookup: HashMap<String, String>,
+    pub nar_lookup: HashMap<String, NarDigest>,
 }
 
 impl CachedBaseline {
@@ -92,8 +93,8 @@ pub struct CacheIndex {
     config: CascadingProxyConfig,
     oci_client: OciClient,
     // Tier 0: 本地内存热注册表 (In-Memory Hot Registry)
-    hot_entries: Cache<String, IndexEntry>,
-    hot_nar_lookup: Cache<String, String>,
+    hot_entries: Cache<StoreHash, IndexEntry>,
+    hot_nar_lookup: Cache<String, NarDigest>,
     // Tier 1 & Tier 2: 工作流及分支/PR 会话缓存 (key 为 tag 如 "run-123", "branch-main")
     session_cache: Cache<String, Arc<CachedSession>>,
     // Tier 3: 生产主干基线索引缓存 (key 为 config.baseline_tag)
@@ -145,7 +146,7 @@ impl CacheIndex {
     }
 
     /// Tier 0: 动态注册新编译完成的条目到内存热表和 NAR 查找表中 (0ms 延迟可用)
-    pub async fn register_hot_entries(&self, entries: HashMap<String, IndexEntry>) {
+    pub async fn register_hot_entries(&self, entries: HashMap<StoreHash, IndexEntry>) {
         let count = entries.len();
         let nar_map = build_nar_lookup_map(&entries);
 
@@ -165,15 +166,17 @@ impl CacheIndex {
 
     /// 级联查询 Store Hash 对应的 IndexEntry (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
     pub async fn lookup(&self, store_hash: &str) -> Option<IndexEntry> {
+        let parsed_hash = StoreHash::parse(store_hash).ok()?;
+
         // Tier 0: 内存热注册表
-        if let Some(entry) = self.hot_entries.get(store_hash).await {
+        if let Some(entry) = self.hot_entries.get(&parsed_hash).await {
             return Some(entry);
         }
 
         // Tier 1: 工作流会话 (run-<run_id>)
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(entry) = session.manifest.entries.get(store_hash)
+            && let Some(entry) = session.manifest.entries.get(&parsed_hash)
         {
             return Some(entry.clone());
         }
@@ -181,18 +184,18 @@ impl CacheIndex {
         // Tier 2: 分支/PR 会话
         if self.config.branch_or_pr.is_some()
             && let Some(branch) = self.get_branch_data().await
-            && let Some(entry) = branch.manifest.entries.get(store_hash)
+            && let Some(entry) = branch.manifest.entries.get(&parsed_hash)
         {
             return Some(entry.clone());
         }
 
         // Tier 3: 生产主干基线
         let baseline = self.get_baseline_data().await;
-        baseline.data.entries.get(store_hash).cloned()
+        baseline.data.entries.get(&parsed_hash).cloned()
     }
 
     /// 级联反向解析 NAR 文件名对应的 Blob Digest (全链路 O(1) 检索)
-    pub async fn find_nar_digest(&self, nar_basename: &str) -> Option<String> {
+    pub async fn find_nar_digest(&self, nar_basename: &str) -> Option<NarDigest> {
         let normalized = extract_nar_basename(nar_basename);
 
         // Tier 0: O(1) 查找
@@ -552,7 +555,10 @@ impl CacheIndex {
 #[cfg(test)]
 mod tests {
     use super::{CacheIndex, CascadingProxyConfig};
-    use nixcache_core::{CacheIndexData, IndexEntry, RunSessionManifest};
+    use nixcache_core::{
+        CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, RunSessionManifest, StoreHash,
+        SystemArch,
+    };
     use std::{collections::HashMap, time::Duration};
 
     #[tokio::test]
@@ -572,12 +578,21 @@ mod tests {
 
         let index = CacheIndex::with_config(config, "");
 
+        let hash_base = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let hash_sess = StoreHash::parse("00000000000000000000000000000002").unwrap();
+        let hash_hot = StoreHash::parse("00000000000000000000000000000003").unwrap();
+
         // 1. 设置 Tier 3 Baseline 产物
         let baseline_entry = IndexEntry {
             name: "pkg-baseline".to_string(),
-            system: Some("x86_64-linux".to_string()),
-            narinfo: "StorePath: /nix/store/hash-base-pkg\nURL: nar/hash-base.nar.xz\n".to_string(),
-            nar_digest: "sha256:digest-base".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_base),
+                nar_basename: "hash-base.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
             nar_size: 100,
             added: "2026-08-29T00:00:00Z".to_string(),
             origin_job: None,
@@ -585,16 +600,21 @@ mod tests {
         let mut base_data = CacheIndexData::default();
         base_data
             .entries
-            .insert("hash-base".to_string(), baseline_entry);
+            .insert(hash_base.clone(), baseline_entry);
         base_data.public_key = "base-pubkey:AAA=".to_string();
         index.update_data_in_memory(base_data).await;
 
         // 2. 设置 Tier 1 Run Session 产物
         let session_entry = IndexEntry {
             name: "pkg-session".to_string(),
-            system: Some("x86_64-linux".to_string()),
-            narinfo: "StorePath: /nix/store/hash-sess-pkg\nURL: nar/hash-sess.nar.xz\n".to_string(),
-            nar_digest: "sha256:digest-sess".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_sess),
+                nar_basename: "hash-sess.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("1111111111111111111111111111111111111111111111111111111111111111").unwrap(),
             nar_size: 200,
             added: "2026-08-29T10:00:00Z".to_string(),
             origin_job: Some("job:vm-test".to_string()),
@@ -606,7 +626,7 @@ mod tests {
         };
         sess_data
             .entries
-            .insert("hash-sess".to_string(), session_entry);
+            .insert(hash_sess.clone(), session_entry);
         index
             .update_session_in_memory("run-123456", sess_data)
             .await;
@@ -614,47 +634,52 @@ mod tests {
         // 3. 动态注入 Tier 0 Hot Entry
         let hot_entry = IndexEntry {
             name: "pkg-hot".to_string(),
-            system: Some("x86_64-linux".to_string()),
-            narinfo: "StorePath: /nix/store/hash-hot-pkg\nURL: nar/hot.nar.xz\n".to_string(),
-            nar_digest: "sha256:digest-hot".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{}-pkg", hash_hot),
+                nar_basename: "hot.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0".to_string(),
+                ..Default::default()
+            },
+            nar_digest: NarDigest::new_sha256("2222222222222222222222222222222222222222222222222222222222222222").unwrap(),
             nar_size: 300,
             added: "2026-08-29T10:05:00Z".to_string(),
             origin_job: Some("job:matrix-x86".to_string()),
         };
         let mut hot_map = HashMap::new();
-        hot_map.insert("hash-hot".to_string(), hot_entry);
+        hot_map.insert(hash_hot.clone(), hot_entry);
         index.register_hot_entries(hot_map).await;
 
         // 4. 验证四级级联查找
-        let e_hot = index.lookup("hash-hot").await.expect("Must find in Tier 0");
+        let e_hot = index.lookup("00000000000000000000000000000003").await.expect("Must find in Tier 0");
         assert_eq!(e_hot.name, "pkg-hot");
 
         let e_sess = index
-            .lookup("hash-sess")
+            .lookup("00000000000000000000000000000002")
             .await
             .expect("Must find in Tier 1");
         assert_eq!(e_sess.name, "pkg-session");
 
         let e_base = index
-            .lookup("hash-base")
+            .lookup("00000000000000000000000000000001")
             .await
             .expect("Must find in Tier 3");
         assert_eq!(e_base.name, "pkg-baseline");
 
-        assert!(index.lookup("hash-nonexistent").await.is_none());
+        assert!(index.lookup("00000000000000000000000000000004").await.is_none());
 
         // 5. 验证 NAR Digest 解析 (O(1))
         assert_eq!(
             index.find_nar_digest("hot.nar.xz").await,
-            Some("sha256:digest-hot".to_string())
+            Some(NarDigest::new_sha256("2222222222222222222222222222222222222222222222222222222222222222").unwrap())
         );
         assert_eq!(
             index.find_nar_digest("hash-sess.nar.xz").await,
-            Some("sha256:digest-sess".to_string())
+            Some(NarDigest::new_sha256("1111111111111111111111111111111111111111111111111111111111111111").unwrap())
         );
         assert_eq!(
             index.find_nar_digest("hash-base.nar.xz").await,
-            Some("sha256:digest-base".to_string())
+            Some(NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap())
         );
 
         // 6. 验证 Public Key 优先级 (Session Key 优先于 Baseline Key)
