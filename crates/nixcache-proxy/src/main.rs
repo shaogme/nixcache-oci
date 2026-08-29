@@ -6,7 +6,6 @@ use nixcache_cli::{
 };
 use nixcache_core::SystemArch;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use nixcache_utils::Env;
 use std::{error::Error, net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -45,9 +44,6 @@ struct Args {
 
     #[command(flatten)]
     cache: CachePolicyArgs,
-
-    #[arg(long, help = "Target system architecture [env: NIXCACHE_SYSTEM]")]
-    system: Option<String>,
 }
 
 async fn shutdown_signal() {
@@ -96,12 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let index_ttl = args.cache.resolve_baseline_ttl();
     let baseline_tag = args.cache.resolve_baseline_tag();
 
-    let system_arch_opt = args
-        .system
-        .as_deref()
-        .and_then(Env::non_empty_str)
-        .map(|s| s.to_string())
-        .or_else(|| args.session.resolve_system());
+    let system_arch_opt = args.session.resolve_system();
 
     let target_system = match system_arch_opt {
         Some(ref s) => SystemArch::from(s.as_str()),
@@ -154,4 +145,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_args_clap_debug_assert() {
+        Args::command().debug_assert();
+    }
 }

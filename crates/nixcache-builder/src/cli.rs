@@ -399,3 +399,14 @@ impl GcArgs {
             .unwrap_or(30)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_cli_clap_debug_assert() {
+        Cli::command().debug_assert();
+    }
+}
