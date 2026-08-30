@@ -2,33 +2,21 @@ use crate::{error::BuilderError, summary::write_promote_step_summary};
 use chrono::Utc;
 use futures_util::future::{join_all, try_join_all};
 use nixcache_core::{
-    ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
+    BuildReceipt, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V5,
+    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    partition_entries_by_shard,
 };
 use nixcache_oci::{
-    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-    OciArtifactManifest, OciDescriptor, OciImageManifest, OciPlatform, build_arch_index_manifest,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciPlatform,
     build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
 use tokio::fs;
 use tracing::{info, warn};
-
-fn compute_sha256_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let hash = hasher.finalize();
-    format!(
-        "sha256:{}",
-        hash.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    )
-}
 
 async fn collect_receipt_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -64,7 +52,7 @@ async fn collect_receipt_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Promote: 汇聚多架构会话清单与 Receipts，分架构生成 Sub-Manifest，并原子发布顶层 OCI Image Index
+/// Promote: 汇聚多架构会话清单与 Receipts，分架构局部压实 (Partial Shard Compaction)，并原子发布顶层 OCI Image Index
 pub async fn run_promote(
     run_id: Option<u64>,
     receipt_paths: &[PathBuf],
@@ -82,37 +70,57 @@ pub async fn run_promote(
     let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
 
     // 1. 准备待合并的数据集 (按系统架构分桶)
-    let mut session_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
-    let mut session_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
-    let mut session_pub_key: Option<String> = None;
+    let mut incoming_entries_by_sys: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
+        HashMap::new();
+    let mut incoming_roots_by_sys: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
+    let mut base_pub_key = String::new();
     let mut session_found = false;
 
+    // 1.1 远端 Session Delta Manifests 收集
     if let Some(rid) = run_id {
-        let tag = format!("run-{}", rid);
-        if let Ok(Some((session, _))) = oci.get_session_manifest(&tag).await {
+        for sys in SystemArch::all() {
+            let arch_tag = format!("run-{}-{}", rid, sys.as_str());
+            if let Ok(Some((delta, _))) = oci.get_delta_patch_manifest(&arch_tag).await {
+                info!(
+                    "Found remote DeltaPatchData for tag {} with {} new entries",
+                    arch_tag,
+                    delta.new_entries.len()
+                );
+                session_found = true;
+                incoming_entries_by_sys
+                    .entry(sys)
+                    .or_default()
+                    .extend(delta.new_entries);
+                incoming_roots_by_sys
+                    .entry(sys)
+                    .or_default()
+                    .extend(delta.active_gc_roots);
+            }
+        }
+
+        let main_tag = format!("run-{}", rid);
+        if let Ok(Some((main_delta, _))) = oci.get_delta_patch_manifest(&main_tag).await {
             info!(
-                "Found remote RunSessionManifest for tag {} with {} entries",
-                tag,
-                session.entries.len()
+                "Found remote DeltaPatchData for tag {} with {} entries",
+                main_tag,
+                main_delta.new_entries.len()
             );
             session_found = true;
-            if let Some(ref pk) = session.public_key
-                && !pk.is_empty()
-            {
-                session_pub_key = Some(pk.clone());
+            for (hash, entry) in main_delta.new_entries {
+                let sys = entry.system.unwrap_or(main_delta.system);
+                incoming_entries_by_sys
+                    .entry(sys)
+                    .or_default()
+                    .insert(hash, entry);
             }
-            session_entries.extend(session.entries);
-            for (sys, roots) in session.gc_roots {
-                session_roots.entry(sys).or_default().extend(roots);
-            }
+            incoming_roots_by_sys
+                .entry(main_delta.system)
+                .or_default()
+                .extend(main_delta.active_gc_roots);
         }
     }
 
-    let mut receipt_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
-    let mut receipt_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
-    let mut receipt_pub_key: Option<String> = None;
-
-    // 2. 从本地 Receipt 文件/目录加载（支持单文件、目录及多级子目录递归扫描）
+    // 1.2 本地 Receipt 文件/目录加载（支持单文件、目录及多级子目录递归扫描）
     let receipt_files = collect_receipt_files(receipt_paths).await;
     for file_path in receipt_files {
         match fs::read_to_string(&file_path).await {
@@ -124,13 +132,17 @@ pub async fn run_promote(
                         receipt.system,
                         receipt.new_entries.len()
                     );
-                    if let Some(ref pk) = receipt.public_key
+                    if base_pub_key.is_empty()
+                        && let Some(ref pk) = receipt.public_key
                         && !pk.is_empty()
                     {
-                        receipt_pub_key = Some(pk.clone());
+                        base_pub_key = pk.clone();
                     }
-                    receipt_entries.extend(receipt.new_entries);
-                    receipt_roots
+                    incoming_entries_by_sys
+                        .entry(receipt.system)
+                        .or_default()
+                        .extend(receipt.new_entries);
+                    incoming_roots_by_sys
                         .entry(receipt.system)
                         .or_default()
                         .extend(receipt.active_gc_roots);
@@ -145,175 +157,177 @@ pub async fn run_promote(
         }
     }
 
-    let total_promoted_entries = session_entries.len() + receipt_entries.len();
+    let total_promoted_entries: usize = incoming_entries_by_sys.values().map(|e| e.len()).sum();
 
     if !session_found && receipt_paths.is_empty() && total_promoted_entries == 0 {
         info!("No session manifest or receipts found to promote. Merging with existing baseline.");
     }
 
-    // 3. 拉取现存 Baseline 数据并按 SystemArch 分桶
-    let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
-        HashMap::new();
-    let mut partitioned_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
-    let mut base_pub_key = session_pub_key.or(receipt_pub_key).unwrap_or_default();
+    // 2. 探查现存 Baseline 数据涉及的所有架构
+    let mut target_systems: HashSet<SystemArch> = incoming_entries_by_sys.keys().copied().collect();
+    target_systems.extend(incoming_roots_by_sys.keys().copied());
 
     if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
         match artifact.manifest {
             OciArtifactManifest::Index(index) => {
-                let fetch_futures = index.manifests.into_iter().map(|desc| {
-                    let oci = oci.clone();
-                    async move {
-                        if let Ok(Some((sub_json, _))) =
-                            oci.get_manifest_with_digest(&desc.digest).await
-                            && let Ok(sub_manifest) =
-                                serde_json::from_str::<OciImageManifest>(&sub_json)
-                            && let Some(layer) = sub_manifest.layers.first()
-                            && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
-                            && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
-                                &blob_bytes,
-                                &layer.media_type,
-                            )
-                        {
-                            Some(arch_data)
-                        } else {
-                            None
+                for desc in index.manifests {
+                    if let Some(ref plat) = desc.platform {
+                        let sys = SystemArch::from_oci(
+                            &plat.os,
+                            &plat.architecture,
+                            plat.variant.as_deref(),
+                        );
+                        if sys.is_known() {
+                            target_systems.insert(sys);
                         }
                     }
-                });
-                let fetched = join_all(fetch_futures).await;
-                for arch_data in fetched.into_iter().flatten() {
-                    if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
-                        base_pub_key = arch_data.public_key;
-                    }
-                    partitioned_entries
-                        .entry(arch_data.system)
-                        .or_default()
-                        .extend(arch_data.entries);
-                    partitioned_roots
-                        .entry(arch_data.system)
-                        .or_default()
-                        .extend(arch_data.gc_roots);
                 }
             }
-            OciArtifactManifest::Manifest(sub_manifest) => {
-                if let Some(layer) = sub_manifest.layers.first()
-                    && let Ok(blob_bytes) = oci.get_blob(&layer.digest).await
-                    && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
-                        &blob_bytes,
-                        &layer.media_type,
-                    )
-                {
-                    if base_pub_key.is_empty() && !arch_data.public_key.is_empty() {
-                        base_pub_key = arch_data.public_key;
-                    }
-                    partitioned_entries
-                        .entry(arch_data.system)
-                        .or_default()
-                        .extend(arch_data.entries);
-                    partitioned_roots
-                        .entry(arch_data.system)
-                        .or_default()
-                        .extend(arch_data.gc_roots);
+            OciArtifactManifest::Manifest(_) => {
+                let detected = SystemArch::detect_current();
+                if detected.is_known() {
+                    target_systems.insert(detected);
                 }
             }
         }
     }
 
-    // 合并 session 条目到分桶
-    for (hash, entry) in session_entries {
-        let sys = entry.system.unwrap_or_default();
-        partitioned_entries
-            .entry(sys)
-            .or_default()
-            .insert(hash, entry);
-    }
-    for (sys, roots) in session_roots {
-        let entry_roots = partitioned_roots.entry(sys).or_default();
-        entry_roots.extend(roots);
-        entry_roots.sort_unstable();
-        entry_roots.dedup();
+    if target_systems.is_empty() {
+        let detected = SystemArch::detect_current();
+        if detected.is_known() {
+            target_systems.insert(detected);
+        } else {
+            target_systems.insert(SystemArch::X86_64Linux);
+        }
     }
 
-    // 合并 receipt 条目到分桶
-    for (hash, entry) in receipt_entries {
-        let sys = entry.system.unwrap_or_default();
-        partitioned_entries
-            .entry(sys)
-            .or_default()
-            .insert(hash, entry);
-    }
-    for (sys, roots) in receipt_roots {
-        let entry_roots = partitioned_roots.entry(sys).or_default();
-        entry_roots.extend(roots);
-        entry_roots.sort_unstable();
-        entry_roots.dedup();
-    }
+    let mut target_systems_vec: Vec<SystemArch> = target_systems.into_iter().collect();
+    target_systems_vec.sort();
 
-    // 4. 为每个系统架构并发构建并推送 Sub-Manifest 与 Index Blob
-    let config_digest = EMPTY_CONFIG_DIGEST.to_string();
-    let config_size = EMPTY_CONFIG_SIZE;
-
-    let mut all_systems: HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
-    all_systems.extend(partitioned_roots.keys().cloned());
-    let mut all_systems_vec: Vec<SystemArch> = all_systems.into_iter().collect();
-    all_systems_vec.sort();
-
-    let push_futures = all_systems_vec.into_iter().map(|sys| {
+    // 3. 为每个系统架构并发执行分片局部压实 (Partial Compaction) 并推送 Sub-Manifest
+    let push_futures = target_systems_vec.into_iter().map(|sys| {
         let oci = oci.clone();
-        let entries = partitioned_entries.remove(&sys).unwrap_or_default();
-        let roots = partitioned_roots.remove(&sys).unwrap_or_default();
+        let new_entries = incoming_entries_by_sys.remove(&sys).unwrap_or_default();
+        let new_roots = incoming_roots_by_sys.remove(&sys).unwrap_or_default();
         let repo = repo.to_string();
         let registry = registry.to_string();
         let base_pub_key = base_pub_key.clone();
-        let config_digest = config_digest.clone();
         let target_tag = target_tag.to_string();
 
         async move {
-            let arch_data = ArchCacheIndexData {
-                version: CACHE_INDEX_VERSION,
-                system: sys,
-                repo,
-                registry,
-                generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                public_key: base_pub_key,
-                entries,
-                gc_roots: roots,
-                last_promoted_run: run_id,
-            };
+            // 3.1 获取现存该架构的 Root Index 或新建空白结构
+            let (mut root_index, _prev_digest) =
+                match oci.get_sharded_root_index(&target_tag, &sys).await? {
+                    Some((data, digest)) => (data, Some(digest)),
+                    None => (ShardedArchCacheIndexData::new(sys, &repo, &registry), None),
+                };
 
-            // 推送单架构 Index Blob
-            let (blob_digest, compressed_size, uncompressed_size) =
-                oci.push_zstd_blob(&arch_data).await?;
+            if root_index.shards.len() != NUM_SHARDS {
+                root_index.shards = (0..NUM_SHARDS as u16).map(ShardDescriptor::empty).collect();
+            }
 
-            // 构造单架构 Sub-Manifest
-            let sub_manifest = build_arch_index_manifest(
-                &blob_digest,
-                compressed_size,
-                uncompressed_size,
-                &config_digest,
-                config_size,
-                &sys,
-            );
-            let sub_manifest_json = sub_manifest.to_json_string()?;
-            let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
+            if !base_pub_key.is_empty() && root_index.public_key.is_empty() {
+                root_index.public_key = base_pub_key.clone();
+            }
 
-            // 推送架构特定 Tag (如 cache-index-x86_64-linux)
+            // 3.2 将新增条目按 1024 分片桶分区
+            let mut partitioned_incoming = partition_entries_by_shard(new_entries);
+
+            // 3.3 遍历 1024 个分片执行局部压实
+            for shard_id in 0..NUM_SHARDS as u16 {
+                if let Some(incoming_shard_entries) = partitioned_incoming.remove(&shard_id)
+                    && !incoming_shard_entries.is_empty()
+                {
+                    let existing_desc = &root_index.shards[shard_id as usize];
+                    let mut shard_payload =
+                        if existing_desc.entry_count > 0 && !existing_desc.blob_digest.is_empty() {
+                            match oci.get_shard_data(&existing_desc.blob_digest).await {
+                                Ok(payload) => payload,
+                                Err(_) => ShardDataPayload::new(shard_id),
+                            }
+                        } else {
+                            ShardDataPayload::new(shard_id)
+                        };
+
+                    shard_payload.entries.extend(incoming_shard_entries);
+
+                    let (new_blob_digest, comp_size, uncomp_size) =
+                        oci.push_shard_data(&shard_payload).await?;
+
+                    let desc = &mut root_index.shards[shard_id as usize];
+                    desc.blob_digest = new_blob_digest;
+                    desc.compressed_size = comp_size;
+                    desc.uncompressed_size = uncomp_size;
+                    desc.entry_count = shard_payload.len();
+                    desc.merkle_hash = shard_payload.compute_merkle_hash();
+                }
+                // 未发生变更的分片：完全复用原有 blob_digest、compressed_size 与 merkle_hash (零开销)
+            }
+
+            // 3.4 合并 GC Roots 并重算全局 Merkle Root
+            root_index.gc_roots.extend(new_roots);
+            root_index.gc_roots.sort_unstable();
+            root_index.gc_roots.dedup();
+            root_index.recalculate_merkle_root();
+
+            // 3.5 构建/更新紧凑布隆过滤器
+            let total_entries = root_index.total_entries();
+            let mut bloom_filter =
+                FastBlockedBloomFilter::new_with_defaults(total_entries.max(100));
+
+            // 从各个非空分片并发收集全量 hashes 以生成精准 Bloom Filter
+            let non_empty_shards: Vec<_> = root_index
+                .shards
+                .iter()
+                .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
+                .map(|s| s.blob_digest.clone())
+                .collect();
+
+            let shard_futures = non_empty_shards.into_iter().map(|digest| {
+                let oci = oci.clone();
+                async move { oci.get_shard_data(&digest).await.ok() }
+            });
+            let payloads = join_all(shard_futures).await;
+            for payload in payloads.into_iter().flatten() {
+                for hash in payload.entries.keys() {
+                    bloom_filter.insert(hash);
+                }
+            }
+
+            let bf_manifest = oci.push_bloom_filter(&bloom_filter).await?;
+            root_index.bloom_filter = bf_manifest.clone();
+            root_index.version = SCHEMA_VERSION_V5;
+            root_index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            root_index.last_promoted_run = run_id;
+
+            // 3.6 推送架构专属 Sub-Manifest (如 cache-index-x86_64-linux)
             let arch_tag = format!("{}-{}", target_tag, sys.as_str());
-            oci.push_manifest(&arch_tag, &sub_manifest_json).await?;
+            let sub_manifest_digest = oci
+                .push_sharded_root_index(
+                    &arch_tag,
+                    &root_index,
+                    &bf_manifest.blob_digest,
+                    bf_manifest.compressed_size,
+                    None,
+                )
+                .await?;
 
             info!(
-                "Pushed Sub-Manifest for architecture: {} (tag: {})",
-                sys, arch_tag
+                "Pushed Sharded Sub-Manifest for {}: digest {} (tag: {})",
+                sys, sub_manifest_digest, arch_tag
             );
 
-            // 生成挂载到顶层 Image Index 的 Descriptor
             let mut desc_annotations = HashMap::new();
             desc_annotations.insert("org.nixos.nixcache.system".to_string(), sys.to_string());
+            desc_annotations.insert(
+                "org.nixos.nixcache.merkle_root".to_string(),
+                root_index.merkle_root.clone(),
+            );
 
             let descriptor = OciDescriptor {
                 media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
                 digest: sub_manifest_digest,
-                size: sub_manifest_json.len() as u64,
+                size: 0,
                 platform: Some(OciPlatform::from_system(&sys)),
                 annotations: Some(desc_annotations),
             };
@@ -324,7 +338,7 @@ pub async fn run_promote(
 
     let manifest_descriptors: Vec<OciDescriptor> = try_join_all(push_futures).await?;
 
-    // 5. 组装并原子发布顶层 OCI Image Index (cache-index)
+    // 4. 组装并原子发布顶层 OCI Image Index (cache-index)
     let final_descriptors = manifest_descriptors;
     oci.update_image_index_cas(target_tag, 5, |_existing| {
         let mut index = build_image_index(
@@ -341,20 +355,12 @@ pub async fn run_promote(
         target_tag
     );
 
-    // 6. 清理会话标签 (包括全局会话与各架构专属会话)
+    // 5. 清理会话标签 (包括全局会话与各架构专属会话)
     if cleanup_session && let Some(rid) = run_id {
         let main_tag = format!("run-{}", rid);
         let mut delete_tags = vec![main_tag];
 
-        for sys in [
-            SystemArch::X86_64Linux,
-            SystemArch::Aarch64Linux,
-            SystemArch::X86_64Darwin,
-            SystemArch::Aarch64Darwin,
-            SystemArch::I686Linux,
-            SystemArch::Armv7lLinux,
-            SystemArch::Riscv64Linux,
-        ] {
+        for sys in SystemArch::all() {
             delete_tags.push(format!("run-{}-{}", rid, sys.as_str()));
         }
 
@@ -385,33 +391,18 @@ mod tests {
     use tokio::fs;
 
     #[test]
-    fn test_compute_sha256_digest() {
-        let digest = compute_sha256_digest(b"hello nixcache-oci");
-        assert!(digest.starts_with("sha256:"));
-        assert_eq!(digest.len(), 71); // "sha256:" (7) + 64 hex chars
-    }
-
-    #[test]
     fn test_promote_gc_roots_in_place_merge() {
         let root1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
         let root2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
         let root3 = StoreHash::parse("00000000000000000000000000000003").unwrap();
 
-        let mut partitioned_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
-        partitioned_roots.insert(SystemArch::X86_64Linux, vec![root3.clone(), root1.clone()]);
-
+        let mut roots = vec![root3.clone(), root1.clone()];
         let incoming_roots = vec![root2.clone(), root1.clone()];
-        let entry_roots = partitioned_roots
-            .entry(SystemArch::X86_64Linux)
-            .or_default();
-        entry_roots.extend(incoming_roots);
-        entry_roots.sort_unstable();
-        entry_roots.dedup();
+        roots.extend(incoming_roots);
+        roots.sort_unstable();
+        roots.dedup();
 
-        assert_eq!(
-            partitioned_roots.get(&SystemArch::X86_64Linux).unwrap(),
-            &vec![root1, root2, root3]
-        );
+        assert_eq!(roots, vec![root1, root2, root3]);
     }
 
     #[tokio::test]
@@ -494,5 +485,39 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&file1));
         assert!(files.contains(&file2));
+    }
+
+    #[test]
+    fn test_partial_shard_compaction_logic() {
+        let h1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let h2 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+
+        let mut root =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        assert_eq!(root.shards.len(), NUM_SHARDS);
+        let initial_root_hash = root.merkle_root.clone();
+
+        // 模拟 shard 0 写入条目
+        let sid1 = h1.shard_id() as usize;
+        root.shards[sid1].entry_count = 1;
+        root.shards[sid1].blob_digest = "sha256:blob_shard_0".to_string();
+        root.shards[sid1].merkle_hash = "sha256:merkle_shard_0".to_string();
+        root.recalculate_merkle_root();
+
+        let intermediate_root_hash = root.merkle_root.clone();
+        assert_ne!(initial_root_hash, intermediate_root_hash);
+
+        // 模拟 shard s6 写入条目，shard 0 保持不变（未被修改）
+        let sid2 = h2.shard_id() as usize;
+        let shard0_desc_before = root.shards[sid1].clone();
+
+        root.shards[sid2].entry_count = 1;
+        root.shards[sid2].blob_digest = "sha256:blob_shard_s6".to_string();
+        root.shards[sid2].merkle_hash = "sha256:merkle_shard_s6".to_string();
+        root.recalculate_merkle_root();
+
+        // shard 0 完全保持一致（零开销复用）
+        assert_eq!(root.shards[sid1], shard0_desc_before);
+        assert_ne!(intermediate_root_hash, root.merkle_root);
     }
 }

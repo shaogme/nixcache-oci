@@ -19,19 +19,21 @@ pub use client::{DeletionSummary, FetchedOciArtifact, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TransportError};
 pub use manifest::{
-    CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_CONFIG_MEDIA_TYPE,
-    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor,
-    OciImageIndex, OciImageManifest, OciPlatform, build_arch_index_manifest,
-    build_arch_session_manifest, build_image_index,
+    CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
+    OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
+    build_delta_patch_manifest, build_image_index, build_sharded_arch_index_manifest,
 };
 pub use mock::{MockResponse, MockRouterTransport};
 pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{
-    ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-    CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta,
-    RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, SCHEMA_VERSION, StoreHash,
-    SystemArch, build_nar_lookup_map, evaluate_multi_arch_gc, extract_nar_basename,
-    extract_store_hash, extract_store_hash_str,
+    BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
+    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, JobSummaryMetadata, NUM_SHARDS, NarDigest,
+    NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION, SCHEMA_VERSION_V5,
+    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    build_nar_lookup_map, calculate_shard_id, compute_merkle_root, compute_shard_merkle_hash,
+    diff_shard_descriptors, evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash,
+    extract_store_hash_str, partition_entries_by_shard, shard_id_to_prefix,
 };
 pub use token::TokenManager;
 pub use transport::{
@@ -43,11 +45,13 @@ pub use upload::{BlobPayload, UploadConfig};
 #[cfg(test)]
 mod tests {
     use super::{
-        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
-        GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
-        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
-        RegistryDeletionStrategy, RegistryKind, SessionMutationRequest, StoreHash, StreamHashState,
-        SystemArch, TransportError, UploadConfig, build_image_index, parse_range_header,
+        AwsEcrDriver, BlobUploadStrategy, BloomFilterManifest, DockerHubDriver,
+        EMPTY_CONFIG_DIGEST, FastBlockedBloomFilter, GenericOciDriver, GhcrDriver, HashingStream,
+        IndexEntry, MockResponse, MockRouterTransport, NarDigest, NarInfoMeta, OciClient,
+        OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryDeletionStrategy,
+        RegistryKind, SessionMutationRequest, ShardDataPayload, ShardedArchCacheIndexData,
+        StoreHash, StreamHashState, SystemArch, TransportError, UploadConfig, build_image_index,
+        parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -483,6 +487,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sharded_root_index_and_shard_data_flow_mock() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        // 1. ShardDataPayload
+        let mut shard_payload = ShardDataPayload::new(42);
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        shard_payload
+            .entries
+            .insert(h1.clone(), IndexEntry::default());
+
+        let (shard_digest, comp_size, uncomp_size) = client
+            .push_shard_data(&shard_payload)
+            .await
+            .expect("Push shard data should succeed");
+        assert!(shard_digest.starts_with("sha256:"));
+        assert!(comp_size > 0);
+        assert!(uncomp_size > 0);
+
+        let retrieved_shard = client
+            .get_shard_data(&shard_digest)
+            .await
+            .expect("Get shard data should succeed");
+        assert_eq!(retrieved_shard.shard_id, 42);
+        assert_eq!(retrieved_shard.entries.len(), 1);
+
+        // 2. Bloom filter
+        let mut bloom = FastBlockedBloomFilter::new_with_defaults(100);
+        bloom.insert(&h1);
+        let bf_manifest: BloomFilterManifest = client
+            .push_bloom_filter(&bloom)
+            .await
+            .expect("Push bloom filter should succeed");
+
+        let retrieved_bloom = client
+            .get_bloom_filter(
+                &bf_manifest.blob_digest,
+                bf_manifest.num_entries,
+                bf_manifest.num_hashes,
+            )
+            .await
+            .expect("Get bloom filter should succeed");
+        assert!(retrieved_bloom.contains(&h1));
+
+        // 3. ShardedArchCacheIndexData
+        let mut root_index =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
+        root_index.bloom_filter = bf_manifest.clone();
+        root_index.shards[42].blob_digest = shard_digest.clone();
+        root_index.shards[42].entry_count = 1;
+        root_index.shards[42].merkle_hash = shard_payload.compute_merkle_hash();
+        root_index.recalculate_merkle_root();
+
+        let manifest_digest = client
+            .push_sharded_root_index(
+                "cache-index-x86_64-linux",
+                &root_index,
+                &bf_manifest.blob_digest,
+                bf_manifest.compressed_size,
+                None,
+            )
+            .await
+            .expect("Push sharded root index should succeed");
+        assert!(manifest_digest.starts_with("sha256:"));
+
+        let (fetched_root, fetched_digest) = client
+            .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+            .await
+            .expect("Get sharded root index should succeed")
+            .expect("Sharded root index should exist");
+
+        assert_eq!(fetched_digest, manifest_digest);
+        assert_eq!(fetched_root.system, SystemArch::X86_64Linux);
+        assert_eq!(fetched_root.shards[42].blob_digest, shard_digest);
+        assert_eq!(fetched_root.total_entries(), 1);
+    }
+
+    #[tokio::test]
     async fn test_image_index_serialization_and_routing() {
         let desc_x86 = OciDescriptor {
             media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
@@ -741,5 +823,178 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{}", invalid_err).contains("Invalid UTF-8 manifest"));
+    }
+
+    #[tokio::test]
+    async fn test_delta_patch_manifest_roundtrip_mock() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        let mut delta = super::DeltaPatchData::new(8888, "build-job", SystemArch::Aarch64Linux);
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        delta.new_entries.insert(h1.clone(), IndexEntry::default());
+        delta.active_gc_roots.push(h1.clone());
+
+        let manifest_digest = client
+            .push_delta_patch_manifest("run-8888-aarch64-linux", &delta, None)
+            .await
+            .expect("Push delta patch manifest should succeed");
+        assert!(manifest_digest.starts_with("sha256:"));
+
+        let (fetched_delta, fetched_digest) = client
+            .get_delta_patch_manifest("run-8888-aarch64-linux")
+            .await
+            .expect("Get delta patch manifest should succeed")
+            .expect("Delta patch should exist");
+
+        assert_eq!(fetched_digest, manifest_digest);
+        assert_eq!(fetched_delta.run_id, 8888);
+        assert_eq!(fetched_delta.job_id, "build-job");
+        assert_eq!(fetched_delta.system, SystemArch::Aarch64Linux);
+        assert_eq!(fetched_delta.new_entries.len(), 1);
+        assert_eq!(fetched_delta.active_gc_roots, vec![h1]);
+    }
+
+    #[tokio::test]
+    async fn test_update_sharded_arch_index_cas_mock() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let mut filter = FastBlockedBloomFilter::new_with_defaults(10);
+        filter.insert(&h1);
+        let bf_manifest = client.push_bloom_filter(&filter).await.unwrap();
+
+        let res = client
+            .update_sharded_arch_index_cas(
+                "cache-index-x86_64-linux",
+                &SystemArch::X86_64Linux,
+                3,
+                |existing| {
+                    let mut root = existing.unwrap_or_else(|| {
+                        ShardedArchCacheIndexData::new(
+                            SystemArch::X86_64Linux,
+                            "test/repo",
+                            "example.com",
+                        )
+                    });
+                    root.bloom_filter = bf_manifest.clone();
+                    root.shards[42].entry_count = 5;
+                    root.recalculate_merkle_root();
+                    Ok((
+                        root,
+                        bf_manifest.blob_digest.clone(),
+                        bf_manifest.compressed_size,
+                    ))
+                },
+            )
+            .await;
+
+        assert!(res.is_ok());
+
+        let (fetched_root, _) = client
+            .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_root.shards[42].entry_count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_root_index_multi_arch_index_routing_mock() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        // 1. x86_64-linux root
+        let mut filter_x86 = FastBlockedBloomFilter::new_with_defaults(10);
+        let h_x86 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        filter_x86.insert(&h_x86);
+        let bf_x86 = client.push_bloom_filter(&filter_x86).await.unwrap();
+
+        let mut root_x86 =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
+        root_x86.bloom_filter = bf_x86.clone();
+        let digest_x86 = client
+            .push_sharded_root_index(
+                "sub-manifest-x86",
+                &root_x86,
+                &bf_x86.blob_digest,
+                bf_x86.compressed_size,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 2. aarch64-linux root
+        let mut filter_arm = FastBlockedBloomFilter::new_with_defaults(10);
+        let h_arm = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        filter_arm.insert(&h_arm);
+        let bf_arm = client.push_bloom_filter(&filter_arm).await.unwrap();
+
+        let mut root_arm =
+            ShardedArchCacheIndexData::new(SystemArch::Aarch64Linux, "test/repo", "example.com");
+        root_arm.bloom_filter = bf_arm.clone();
+        let digest_arm = client
+            .push_sharded_root_index(
+                "sub-manifest-arm",
+                &root_arm,
+                &bf_arm.blob_digest,
+                bf_arm.compressed_size,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 3. 构造 top-level Image Index
+        let desc_x86 = OciDescriptor {
+            media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: digest_x86.clone(),
+            size: 1024,
+            platform: Some(OciPlatform::from_system(&SystemArch::X86_64Linux)),
+            annotations: Some(HashMap::from([(
+                "org.nixos.nixcache.system".to_string(),
+                "x86_64-linux".to_string(),
+            )])),
+        };
+        let desc_arm = OciDescriptor {
+            media_type: super::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: digest_arm.clone(),
+            size: 1024,
+            platform: Some(OciPlatform::from_system(&SystemArch::Aarch64Linux)),
+            annotations: Some(HashMap::from([(
+                "org.nixos.nixcache.system".to_string(),
+                "aarch64-linux".to_string(),
+            )])),
+        };
+
+        let index = build_image_index(vec![desc_x86, desc_arm], "Multi-Arch Baseline Index");
+        client
+            .push_image_index("cache-index", &index)
+            .await
+            .unwrap();
+
+        // 4. 查询 x86_64-linux
+        let (resolved_x86, res_digest_x86) = client
+            .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+            .await
+            .unwrap()
+            .expect("Should resolve x86 root");
+        assert_eq!(resolved_x86.system, SystemArch::X86_64Linux);
+        assert_eq!(res_digest_x86.len(), 71); // sha256:...
+
+        // 5. 查询 aarch64-linux
+        let (resolved_arm, _) = client
+            .get_sharded_root_index("cache-index", &SystemArch::Aarch64Linux)
+            .await
+            .unwrap()
+            .expect("Should resolve arm root");
+        assert_eq!(resolved_arm.system, SystemArch::Aarch64Linux);
+
+        // 6. 查询不存在的 aarch64-darwin
+        let resolved_darwin = client
+            .get_sharded_root_index("cache-index", &SystemArch::Aarch64Darwin)
+            .await
+            .unwrap();
+        assert!(resolved_darwin.is_none());
     }
 }

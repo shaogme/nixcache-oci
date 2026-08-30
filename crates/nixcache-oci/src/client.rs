@@ -6,9 +6,10 @@ use crate::{
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
-        EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
-        OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciImageIndex, OciImageManifest,
-        build_arch_session_manifest,
+        CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
+        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
+        OciImageIndex, OciImageManifest, build_delta_patch_manifest,
+        build_sharded_arch_index_manifest,
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
@@ -16,12 +17,11 @@ use crate::{
     upload::UploadConfig,
 };
 use bytes::{Bytes, BytesMut};
-use chrono::Utc;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{
-    ArchCacheIndexData, ArchRunSessionManifest, CACHE_INDEX_VERSION, CacheIndexData, NarDigest,
-    RUN_SESSION_VERSION, RunSessionManifest, SystemArch,
+    BloomFilterManifest, DeltaPatchData, FastBlockedBloomFilter, NarDigest, ShardDataPayload,
+    ShardedArchCacheIndexData, SystemArch,
 };
 use nixcache_utils::get_process_id;
 use serde::Serialize;
@@ -671,12 +671,12 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 针对特定系统架构，按需拉取单架构基线索引数据
-    pub async fn get_arch_cache_index(
+    /// 针对特定系统架构，按需拉取单架构 Schema v5 分片根索引目录数据
+    pub async fn get_sharded_root_index(
         &self,
         tag: &str,
         system: &SystemArch,
-    ) -> Result<Option<(ArchCacheIndexData, String)>, OciError> {
+    ) -> Result<Option<(ShardedArchCacheIndexData, String)>, OciError> {
         let arch_tag = if tag.ends_with(system.as_str()) {
             tag.to_string()
         } else {
@@ -684,12 +684,20 @@ impl<T: OciTransport + Clone> OciClient<T> {
         };
 
         if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
-            && let Some(layer) = sub_manifest.layers.first()
+            && let Some(layer) = sub_manifest
+                .layers
+                .iter()
+                .find(|l| {
+                    l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
+                        || CacheLayerMediaType::parse(&l.media_type)
+                            .is_some_and(|m| m.is_root_index())
+                })
+                .or_else(|| sub_manifest.layers.first())
         {
             let blob_bytes = self.get_blob(&layer.digest).await?;
-            let arch_data: ArchCacheIndexData =
+            let root_data: ShardedArchCacheIndexData =
                 IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-            return Ok(Some((arch_data, sub_digest)));
+            return Ok(Some((root_data, sub_digest)));
         }
 
         let artifact = match self.fetch_artifact(tag).await? {
@@ -712,21 +720,39 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     })?;
 
                 let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-                let layer = sub_manifest.layers.first().ok_or_else(|| {
-                    OciError::Other("Sub-manifest missing layer descriptor".to_string())
-                })?;
+                let layer = sub_manifest
+                    .layers
+                    .iter()
+                    .find(|l| {
+                        l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
+                            || CacheLayerMediaType::parse(&l.media_type)
+                                .is_some_and(|m| m.is_root_index())
+                    })
+                    .or_else(|| sub_manifest.layers.first())
+                    .ok_or_else(|| {
+                        OciError::Other("Sub-manifest missing layer descriptor".to_string())
+                    })?;
 
                 let blob_bytes = self.get_blob(&layer.digest).await?;
-                let arch_data: ArchCacheIndexData =
+                let root_data: ShardedArchCacheIndexData =
                     IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-                Ok(Some((arch_data, artifact.digest)))
+                Ok(Some((root_data, artifact.digest)))
             }
             OciArtifactManifest::Manifest(ref sub_manifest) => {
-                if let Some(layer) = sub_manifest.layers.first() {
+                if let Some(layer) = sub_manifest
+                    .layers
+                    .iter()
+                    .find(|l| {
+                        l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
+                            || CacheLayerMediaType::parse(&l.media_type)
+                                .is_some_and(|m| m.is_root_index())
+                    })
+                    .or_else(|| sub_manifest.layers.first())
+                {
                     let blob_bytes = self.get_blob(&layer.digest).await?;
-                    let arch_data: ArchCacheIndexData =
+                    let root_data: ShardedArchCacheIndexData =
                         IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-                    Ok(Some((arch_data, artifact.digest)))
+                    Ok(Some((root_data, artifact.digest)))
                 } else {
                     Ok(None)
                 }
@@ -734,299 +760,142 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 针对特定系统架构，按需拉取单架构会话清单数据
-    pub async fn get_arch_session_manifest(
+    /// 推送单架构 Schema v5 分片根索引目录清单 (包含 Root Index 与 Bloom Filter Layers)
+    pub async fn push_sharded_root_index(
         &self,
         tag: &str,
-        system: &SystemArch,
-    ) -> Result<Option<(ArchRunSessionManifest, String)>, OciError> {
-        let arch_tag = if tag.ends_with(system.as_str()) {
-            tag.to_string()
-        } else {
-            format!("{}-{}", tag, system.as_str())
-        };
+        root_data: &ShardedArchCacheIndexData,
+        bloom_blob_digest: &str,
+        bloom_blob_size: u64,
+        previous_digest: Option<&str>,
+    ) -> Result<String, OciError> {
+        let (root_blob_digest, root_compressed_size, _) = self.push_zstd_blob(root_data).await?;
 
-        if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
-            && let Some(layer) = sub_manifest.layers.first()
-        {
-            let blob_bytes = self.get_blob(&layer.digest).await?;
-            let arch_session: ArchRunSessionManifest =
-                IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-            return Ok(Some((arch_session, sub_digest)));
+        let manifest = build_sharded_arch_index_manifest(
+            &root_blob_digest,
+            root_compressed_size,
+            bloom_blob_digest,
+            bloom_blob_size,
+            EMPTY_CONFIG_DIGEST,
+            EMPTY_CONFIG_SIZE,
+            &root_data.system,
+            &root_data.merkle_root,
+        );
+
+        let manifest_str = manifest.to_json_string()?;
+        self.put_manifest_conditional(tag, &manifest_str, previous_digest)
+            .await?;
+        let manifest_digest = compute_sha256_digest(manifest_str.as_bytes());
+        Ok(manifest_digest)
+    }
+
+    /// 下载并恢复指定 Blob Digest 的布隆过滤器
+    pub async fn get_bloom_filter(
+        &self,
+        bloom_blob_digest: &str,
+        num_entries: usize,
+        num_hashes: u8,
+    ) -> Result<FastBlockedBloomFilter, OciError> {
+        let raw_bytes = self.get_blob(bloom_blob_digest).await?;
+        IndexCodec::decode_bloom_filter(&raw_bytes, num_entries, num_hashes)
+    }
+
+    /// 压缩并推送布隆过滤器 Blob，返回对应的 BloomFilterManifest
+    pub async fn push_bloom_filter(
+        &self,
+        filter: &FastBlockedBloomFilter,
+    ) -> Result<BloomFilterManifest, OciError> {
+        let compressed_bytes =
+            IndexCodec::encode_bloom_filter(filter, DEFAULT_ZSTD_COMPRESSION_LEVEL)?;
+        let blob_digest = compute_sha256_digest(&compressed_bytes);
+        let compressed_size = compressed_bytes.len() as u64;
+
+        if !self.head_blob(&blob_digest).await? {
+            self.push_blob_bytes_with_digest(&blob_digest, compressed_bytes)
+                .await?;
         }
 
-        let artifact = match self.fetch_artifact(tag).await? {
-            Some(a) => a,
+        Ok(BloomFilterManifest::new(
+            filter.num_entries(),
+            filter.num_bits(),
+            filter.num_hashes(),
+            blob_digest,
+            compressed_size,
+        ))
+    }
+
+    /// 下载并解压指定 Blob Digest 的单分片数据 Payload
+    pub async fn get_shard_data(&self, blob_digest: &str) -> Result<ShardDataPayload, OciError> {
+        let blob_bytes = self.get_blob(blob_digest).await?;
+        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV5::SHARD_DATA_V5_ZSTD)
+    }
+
+    /// 压缩并推送单分片数据 Payload
+    pub async fn push_shard_data(
+        &self,
+        payload: &ShardDataPayload,
+    ) -> Result<(String, u64, u64), OciError> {
+        self.push_zstd_blob(payload).await
+    }
+
+    /// 下载并解压指定 Blob Digest 的增量 Delta Patch
+    pub async fn get_delta_patch(&self, blob_digest: &str) -> Result<DeltaPatchData, OciError> {
+        let blob_bytes = self.get_blob(blob_digest).await?;
+        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV5::DELTA_PATCH_V5_ZSTD)
+    }
+
+    /// 压缩并推送增量 Delta Patch Blob
+    pub async fn push_delta_patch(
+        &self,
+        delta: &DeltaPatchData,
+    ) -> Result<(String, u64, u64), OciError> {
+        self.push_zstd_blob(delta).await
+    }
+
+    /// 按 Tag 获取 Delta Patch Manifest 并下载反序列化
+    pub async fn get_delta_patch_manifest(
+        &self,
+        tag: &str,
+    ) -> Result<Option<(DeltaPatchData, String)>, OciError> {
+        let (manifest_json, manifest_digest) = match self.get_manifest_with_digest(tag).await? {
+            Some(res) => res,
             None => return Ok(None),
         };
 
-        match artifact.manifest {
-            OciArtifactManifest::Index(ref index) => {
-                let descriptor = match index.find_manifest_for_system(system) {
-                    Some(d) => d,
-                    None => return Ok(None),
-                };
-
-                let (sub_manifest_json, _) = self
-                    .get_manifest_with_digest(&descriptor.digest)
-                    .await?
-                    .ok_or_else(|| {
-                        OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
-                    })?;
-
-                let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
-                let layer = sub_manifest.layers.first().ok_or_else(|| {
-                    OciError::Other("Sub-manifest missing layer descriptor".to_string())
-                })?;
-
-                let blob_bytes = self.get_blob(&layer.digest).await?;
-                let arch_session: ArchRunSessionManifest =
-                    IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-                Ok(Some((arch_session, artifact.digest)))
-            }
-            OciArtifactManifest::Manifest(ref sub_manifest) => {
-                if let Some(layer) = sub_manifest.layers.first() {
-                    let blob_bytes = self.get_blob(&layer.digest).await?;
-                    let arch_session: ArchRunSessionManifest =
-                        IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-                    Ok(Some((arch_session, artifact.digest)))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
-    }
-
-    pub async fn get_session_manifest(
-        &self,
-        tag: &str,
-    ) -> Result<Option<(RunSessionManifest, String)>, OciError> {
-        let mut combined = RunSessionManifest {
-            version: RUN_SESSION_VERSION,
-            created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            ..Default::default()
+        let manifest: OciImageManifest = serde_json::from_str(&manifest_json)?;
+        let layer = match manifest.layers.first() {
+            Some(l) => l,
+            None => return Ok(None),
         };
 
-        if let Ok(Some(artifact)) = self.fetch_artifact(tag).await {
-            match artifact.manifest {
-                OciArtifactManifest::Index(ref index) => {
-                    for desc in &index.manifests {
-                        if let Ok(Some((sub_json, _))) =
-                            self.get_manifest_with_digest(&desc.digest).await
-                            && let Ok(sub_manifest) =
-                                serde_json::from_str::<OciImageManifest>(&sub_json)
-                            && let Some(layer) = sub_manifest.layers.first()
-                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                            && let Ok(arch_session) = IndexCodec::decode_zstd::<
-                                ArchRunSessionManifest,
-                            >(
-                                &blob_bytes, &layer.media_type
-                            )
-                        {
-                            combined.run_id = arch_session.run_id;
-                            if combined.head_sha.is_empty() {
-                                combined.head_sha = arch_session.head_sha;
-                            }
-                            if combined.ref_name.is_empty() {
-                                combined.ref_name = arch_session.ref_name;
-                            }
-                            if combined.public_key.is_none() {
-                                combined.public_key = arch_session.public_key;
-                            }
-                            combined.entries.extend(arch_session.entries);
-                            if !arch_session.gc_roots.is_empty() {
-                                combined
-                                    .gc_roots
-                                    .entry(arch_session.system)
-                                    .or_default()
-                                    .extend(arch_session.gc_roots);
-                            }
-                            combined.completed_jobs.extend(arch_session.completed_jobs);
-                        }
-                    }
-                    if !combined.entries.is_empty() || !combined.gc_roots.is_empty() {
-                        return Ok(Some((combined, artifact.digest)));
-                    }
-                }
-                OciArtifactManifest::Manifest(ref sub_manifest) => {
-                    if let Some(layer) = sub_manifest.layers.first()
-                        && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                        && let Ok(arch_session) = IndexCodec::decode_zstd::<ArchRunSessionManifest>(
-                            &blob_bytes,
-                            &layer.media_type,
-                        )
-                    {
-                        combined.run_id = arch_session.run_id;
-                        combined.head_sha = arch_session.head_sha;
-                        combined.ref_name = arch_session.ref_name;
-                        combined.public_key = arch_session.public_key;
-                        combined.entries.extend(arch_session.entries);
-                        if !arch_session.gc_roots.is_empty() {
-                            combined
-                                .gc_roots
-                                .entry(arch_session.system)
-                                .or_default()
-                                .extend(arch_session.gc_roots);
-                        }
-                        combined.completed_jobs.extend(arch_session.completed_jobs);
-                        return Ok(Some((combined, artifact.digest)));
-                    }
-                }
-            }
-        }
-
-        let mut found_any = false;
-        let mut first_digest = String::new();
-
-        for sys in SystemArch::all() {
-            if let Ok(Some((arch_session, digest))) =
-                self.get_arch_session_manifest(tag, &sys).await
-            {
-                found_any = true;
-                if first_digest.is_empty() {
-                    first_digest = digest;
-                }
-                combined.run_id = arch_session.run_id;
-                if combined.head_sha.is_empty() {
-                    combined.head_sha = arch_session.head_sha;
-                }
-                if combined.ref_name.is_empty() {
-                    combined.ref_name = arch_session.ref_name;
-                }
-                if combined.public_key.is_none() {
-                    combined.public_key = arch_session.public_key;
-                }
-                combined.entries.extend(arch_session.entries);
-                if !arch_session.gc_roots.is_empty() {
-                    combined
-                        .gc_roots
-                        .entry(arch_session.system)
-                        .or_default()
-                        .extend(arch_session.gc_roots);
-                }
-                combined.completed_jobs.extend(arch_session.completed_jobs);
-            }
-        }
-
-        if found_any {
-            Ok(Some((combined, first_digest)))
-        } else {
-            Ok(None)
-        }
+        let blob_bytes = self.get_blob(&layer.digest).await?;
+        let delta: DeltaPatchData = IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+        Ok(Some((delta, manifest_digest)))
     }
 
-    pub async fn get_cache_index(
+    /// 构造并推送 Delta Patch 的 Image Manifest
+    pub async fn push_delta_patch_manifest(
         &self,
         tag: &str,
-    ) -> Result<Option<(CacheIndexData, String)>, OciError> {
-        let mut combined = CacheIndexData {
-            version: CACHE_INDEX_VERSION,
-            repo: self.repo.clone(),
-            registry: self.registry.clone(),
-            image: format!("{}/{}/nix-cache", self.registry, self.repo),
-            generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            ..Default::default()
-        };
+        delta: &DeltaPatchData,
+        previous_digest: Option<&str>,
+    ) -> Result<String, OciError> {
+        let (delta_blob_digest, delta_blob_size, _) = self.push_delta_patch(delta).await?;
+        let manifest = build_delta_patch_manifest(
+            &delta_blob_digest,
+            delta_blob_size,
+            EMPTY_CONFIG_DIGEST,
+            EMPTY_CONFIG_SIZE,
+            delta.run_id,
+            &delta.job_id,
+            &delta.system,
+        );
 
-        if let Ok(Some(artifact)) = self.fetch_artifact(tag).await {
-            match artifact.manifest {
-                OciArtifactManifest::Index(ref index) => {
-                    for desc in &index.manifests {
-                        if let Ok(Some((sub_json, _))) =
-                            self.get_manifest_with_digest(&desc.digest).await
-                            && let Ok(sub_manifest) =
-                                serde_json::from_str::<OciImageManifest>(&sub_json)
-                            && let Some(layer) = sub_manifest.layers.first()
-                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                            && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
-                                &blob_bytes,
-                                &layer.media_type,
-                            )
-                        {
-                            if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
-                                combined.public_key = arch_data.public_key;
-                            }
-                            if combined.last_promoted_run.is_none()
-                                && arch_data.last_promoted_run.is_some()
-                            {
-                                combined.last_promoted_run = arch_data.last_promoted_run;
-                            }
-                            combined.entries.extend(arch_data.entries);
-                            if !arch_data.gc_roots.is_empty() {
-                                combined
-                                    .gc_roots
-                                    .entry(arch_data.system)
-                                    .or_default()
-                                    .extend(arch_data.gc_roots);
-                            }
-                        }
-                    }
-                    if !combined.entries.is_empty() || !combined.gc_roots.is_empty() {
-                        return Ok(Some((combined, artifact.digest)));
-                    }
-                }
-                OciArtifactManifest::Manifest(ref sub_manifest) => {
-                    if let Some(layer) = sub_manifest.layers.first()
-                        && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                        && let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
-                            &blob_bytes,
-                            &layer.media_type,
-                        )
-                    {
-                        if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
-                            combined.public_key = arch_data.public_key;
-                        }
-                        if combined.last_promoted_run.is_none()
-                            && arch_data.last_promoted_run.is_some()
-                        {
-                            combined.last_promoted_run = arch_data.last_promoted_run;
-                        }
-                        combined.entries.extend(arch_data.entries);
-                        if !arch_data.gc_roots.is_empty() {
-                            combined
-                                .gc_roots
-                                .entry(arch_data.system)
-                                .or_default()
-                                .extend(arch_data.gc_roots);
-                        }
-                        return Ok(Some((combined, artifact.digest)));
-                    }
-                }
-            }
-        }
-
-        let mut found_any = false;
-        let mut first_digest = String::new();
-
-        for sys in SystemArch::all() {
-            if let Ok(Some((arch_data, digest))) = self.get_arch_cache_index(tag, &sys).await {
-                found_any = true;
-                if first_digest.is_empty() {
-                    first_digest = digest;
-                }
-                if combined.public_key.is_empty() && !arch_data.public_key.is_empty() {
-                    combined.public_key = arch_data.public_key;
-                }
-                if combined.last_promoted_run.is_none() && arch_data.last_promoted_run.is_some() {
-                    combined.last_promoted_run = arch_data.last_promoted_run;
-                }
-                combined.entries.extend(arch_data.entries);
-                if !arch_data.gc_roots.is_empty() {
-                    combined
-                        .gc_roots
-                        .entry(arch_data.system)
-                        .or_default()
-                        .extend(arch_data.gc_roots);
-                }
-            }
-        }
-
-        if found_any {
-            Ok(Some((combined, first_digest)))
-        } else {
-            Ok(None)
-        }
+        let manifest_str = manifest.to_json_string()?;
+        self.put_manifest_conditional(tag, &manifest_str, previous_digest)
+            .await?;
+        let manifest_digest = compute_sha256_digest(manifest_str.as_bytes());
+        Ok(manifest_digest)
     }
 
     pub async fn put_manifest_conditional(
@@ -1473,52 +1342,93 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 单架构无锁 CAS 更新会话 (无跨架构竞争)
-    pub async fn update_arch_session_with_cas(
+    /// 单架构分片索引根目录 CAS 更新状态机
+    pub async fn update_sharded_arch_index_cas<F>(
         &self,
-        request: SessionMutationRequest,
-    ) -> Result<(), OciError> {
-        let arch_tag = format!("run-{}-{}", request.run_id, request.system.as_str());
+        tag: &str,
+        system: &SystemArch,
+        max_retries: usize,
+        mut mutator: F,
+    ) -> Result<String, OciError>
+    where
+        F: FnMut(
+            Option<ShardedArchCacheIndexData>,
+        ) -> Result<(ShardedArchCacheIndexData, String, u64), OciError>,
+    {
         let mut attempt = 0;
-
-        let config_digest = EMPTY_CONFIG_DIGEST;
-        let config_size = EMPTY_CONFIG_SIZE;
+        let arch_tag = if tag.ends_with(system.as_str()) {
+            tag.to_string()
+        } else {
+            format!("{}-{}", tag, system.as_str())
+        };
 
         loop {
             attempt += 1;
-            let (mut arch_session, previous_digest) = match self
-                .get_arch_session_manifest(&arch_tag, &request.system)
-                .await?
-            {
-                Some((data, digest)) => (data, Some(digest)),
-                None => (
-                    ArchRunSessionManifest::new(request.run_id, request.system),
-                    None,
-                ),
-            };
+            let (existing_root, prev_digest) =
+                match self.get_sharded_root_index(&arch_tag, system).await? {
+                    Some((data, digest)) => (Some(data), Some(digest)),
+                    None => (None, None),
+                };
 
-            request.apply_to_arch(&mut arch_session);
-
-            let (session_blob_digest, compressed_size, uncompressed_size) =
-                self.push_zstd_blob(&arch_session).await?;
-            let manifest = build_arch_session_manifest(
-                &session_blob_digest,
-                compressed_size,
-                uncompressed_size,
-                config_digest,
-                config_size,
-                request.run_id,
-                &request.system,
-            );
-            let manifest_str = manifest.to_json_string()?;
+            let (updated_root, bloom_digest, bloom_size) = mutator(existing_root)?;
 
             match self
-                .put_manifest_conditional(&arch_tag, &manifest_str, previous_digest.as_deref())
+                .push_sharded_root_index(
+                    &arch_tag,
+                    &updated_root,
+                    &bloom_digest,
+                    bloom_size,
+                    prev_digest.as_deref(),
+                )
+                .await
+            {
+                Ok(digest) => return Ok(digest),
+                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
+                    let pid = get_process_id();
+                    let backoff_ms =
+                        (100 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 100);
+                    warn!(
+                        "CAS conflict on sharded root index tag {}, retrying in {}ms (attempt {}/{})",
+                        arch_tag, backoff_ms, attempt, max_retries
+                    );
+                    self.transport
+                        .sleep(Duration::from_millis(backoff_ms))
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 单架构无锁 CAS 追加会话 Delta Patch (构建期极速提交，零全量开销)
+    pub async fn update_run_session_with_cas(
+        &self,
+        request: SessionMutationRequest,
+    ) -> Result<(), OciError> {
+        let delta = request.to_delta_patch();
+        let arch_tag = format!("run-{}-{}", request.run_id, request.system.as_str());
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (mut current_delta, previous_digest) =
+                match self.get_delta_patch_manifest(&arch_tag).await? {
+                    Some((d, digest)) => (d, Some(digest)),
+                    None => (
+                        DeltaPatchData::new(request.run_id, &request.job_id, request.system),
+                        None,
+                    ),
+                };
+
+            request.apply_to_delta(&mut current_delta);
+
+            match self
+                .push_delta_patch_manifest(&arch_tag, &current_delta, previous_digest.as_deref())
                 .await
             {
                 Ok(_) => {
                     info!(
-                        "Successfully updated arch-session tag {} on attempt {}",
+                        "Successfully updated run session delta tag {} on attempt {}",
                         arch_tag, attempt
                     );
                     return Ok(());
@@ -1528,7 +1438,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     let backoff_ms =
                         (50 * (1 << attempt.min(4))) + ((pid * 37 + attempt as u64 * 53) % 50);
                     warn!(
-                        "CAS conflict on arch tag {}, retrying in {}ms (attempt {}/{})",
+                        "CAS conflict on session delta tag {}, retrying in {}ms (attempt {}/{})",
                         arch_tag, backoff_ms, attempt, request.max_retries
                     );
                     self.transport
@@ -1537,7 +1447,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 }
                 Err(e) => {
                     error!(
-                        "Failed to update arch-session tag {} after {} attempts: {}",
+                        "Failed to update session delta tag {} after {} attempts: {}",
                         arch_tag, attempt, e
                     );
                     let fallback_tag = format!(
@@ -1547,18 +1457,19 @@ impl<T: OciTransport + Clone> OciClient<T> {
                         request.job_id.replace(['/', ':', ' '], "-")
                     );
                     warn!("Falling back to job-specific chunk tag: {}", fallback_tag);
-                    self.push_manifest(&fallback_tag, &manifest_str).await?;
+                    self.push_delta_patch_manifest(&fallback_tag, &delta, None)
+                        .await?;
                     return Ok(());
                 }
             }
         }
     }
 
-    pub async fn update_run_session_with_cas(
+    pub async fn update_arch_session_with_cas(
         &self,
         request: SessionMutationRequest,
     ) -> Result<(), OciError> {
-        self.update_arch_session_with_cas(request).await
+        self.update_run_session_with_cas(request).await
     }
 
     pub async fn get_blob(&self, digest: &str) -> Result<Bytes, OciError> {

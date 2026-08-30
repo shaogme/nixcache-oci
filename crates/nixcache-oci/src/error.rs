@@ -101,7 +101,9 @@ pub enum OciError {
     #[error("Digest mismatch after stream upload: expected {expected}, computed {computed}")]
     StreamDigestMismatch { expected: String, computed: String },
 
-    #[error("Unsupported or legacy layer media type: '{0}' (only v3+zstd is supported)")]
+    #[error(
+        "Unsupported or legacy layer media type: '{0}' (only Schema v5 media types are supported)"
+    )]
     UnsupportedMediaType(String),
 
     #[error("Zstd compression/decompression error: {0}")]

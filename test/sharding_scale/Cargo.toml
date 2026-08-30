@@ -1,0 +1,18 @@
+[package]
+name = "sharding-scale-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nixcache-core = { path = "../../crates/nixcache-core" }
+nixcache-oci = { path = "../../crates/nixcache-oci" }
+nixcache-utils = { path = "../../crates/nixcache-utils" }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+scc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

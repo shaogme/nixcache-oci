@@ -6,9 +6,9 @@ use crate::{
     summary::write_worker_step_summary,
 };
 use chrono::Utc;
-use nixcache_core::{BuildReceipt, BuildStats, CacheIndexData, IndexEntry, StoreHash, SystemArch};
-use nixcache_oci::OciClient;
-use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
+use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
+use nixcache_oci::{OciClient, OciTransport};
+use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -118,18 +118,43 @@ pub async fn setup_self_substituter(
     Ok(ProxyGuard { child: proxy_child })
 }
 
-pub async fn fetch_remote_cache_index(
-    oci: &OciClient<ReqwestTransport>,
-) -> (CacheIndexData, HashSet<StoreHash>) {
-    let mut remote_index = CacheIndexData::default();
+pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
+    oci: &OciClient<T>,
+    system: &SystemArch,
+) -> HashSet<StoreHash> {
     let mut own_hashes = HashSet::new();
 
-    if let Ok(Some((data, _))) = oci.get_cache_index("cache-index").await {
-        own_hashes = data.entries.keys().cloned().collect();
-        remote_index = data;
+    if let Ok(Some((root_data, _))) = oci.get_sharded_root_index("cache-index", system).await {
+        let non_empty_shards: Vec<_> = root_data
+            .shards
+            .iter()
+            .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
+            .map(|s| s.blob_digest.clone())
+            .collect();
+
+        let futures = non_empty_shards.into_iter().map(|digest| {
+            let oci = oci.clone();
+            async move { oci.get_shard_data(&digest).await.ok() }
+        });
+        let payloads = futures_util::future::join_all(futures).await;
+        for payload in payloads.into_iter().flatten() {
+            own_hashes.extend(payload.entries.into_keys());
+        }
     }
 
-    (remote_index, own_hashes)
+    own_hashes
+}
+
+#[allow(dead_code)]
+pub async fn fetch_remote_cache_hashes<T: OciTransport + Clone>(
+    oci: &OciClient<T>,
+) -> HashSet<StoreHash> {
+    let mut own_hashes = HashSet::new();
+    for sys in SystemArch::all() {
+        let hashes = fetch_remote_arch_hashes(oci, &sys).await;
+        own_hashes.extend(hashes);
+    }
+    own_hashes
 }
 
 #[derive(Debug, Clone)]
@@ -179,10 +204,11 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
 
     // 5. 获取已有远端 hashes
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
-    let (_remote_index, own_hashes) = fetch_remote_cache_index(&oci).await;
+    let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
     info!(
-        "GHCR index contains {} previously-cached entries",
-        own_hashes.len()
+        "Remote index contains {} previously-cached entries for {}",
+        own_hashes.len(),
+        system
     );
 
     let own_hashes_vec: Vec<String> = own_hashes.into_iter().map(|h| h.into_inner()).collect();
@@ -296,4 +322,67 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixcache_core::{
+        FastBlockedBloomFilter, IndexEntry, ShardDataPayload, ShardedArchCacheIndexData, StoreHash,
+        SystemArch,
+    };
+    use nixcache_oci::MockRouterTransport;
+
+    #[tokio::test]
+    async fn test_fetch_remote_arch_hashes_empty() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", false, transport);
+        let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
+        assert!(hashes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_remote_arch_hashes_populated() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let mut payload = ShardDataPayload::new(h1.shard_id());
+        payload.entries.insert(h1.clone(), IndexEntry::default());
+
+        let (shard_digest, comp_size, uncomp_size) =
+            client.push_shard_data(&payload).await.unwrap();
+
+        let mut root_data =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
+        let sid = h1.shard_id() as usize;
+        root_data.shards[sid].blob_digest = shard_digest;
+        root_data.shards[sid].compressed_size = comp_size;
+        root_data.shards[sid].uncompressed_size = uncomp_size;
+        root_data.shards[sid].entry_count = 1;
+        root_data.shards[sid].merkle_hash = payload.compute_merkle_hash();
+        root_data.recalculate_merkle_root();
+
+        let bloom = FastBlockedBloomFilter::new_with_defaults(10);
+        let bf_manifest = client.push_bloom_filter(&bloom).await.unwrap();
+
+        client
+            .push_sharded_root_index(
+                "cache-index-x86_64-linux",
+                &root_data,
+                &bf_manifest.blob_digest,
+                bf_manifest.compressed_size,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&h1));
+
+        let all_hashes = fetch_remote_cache_hashes(&client).await;
+        assert_eq!(all_hashes.len(), 1);
+        assert!(all_hashes.contains(&h1));
+    }
 }

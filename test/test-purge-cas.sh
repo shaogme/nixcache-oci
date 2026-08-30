@@ -79,14 +79,19 @@ export GITHUB_TOKEN="dummy-token"
 # 3. Promote a dummy receipt to establish initial baseline cache-index
 RECEIPT_DIR="/tmp/mock-oci-registry-purge/receipts"
 mkdir -p "$RECEIPT_DIR"
+# Create dummy blobs in mock registry
+mkdir -p /tmp/mock-oci-registry-purge/blobs
+touch /tmp/mock-oci-registry-purge/blobs/sha256_0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
+touch /tmp/mock-oci-registry-purge/blobs/sha256_1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
+touch /tmp/mock-oci-registry-purge/blobs/sha256_2d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
 
 cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
 {
-  "version": 4,
+  "version": 5,
   "system": "x86_64-linux",
   "repo": "testorg/testrepo",
-  "generated": "2026-08-29T10:00:00Z",
-  "entries": {
+  "timestamp": "2026-08-29T10:00:00Z",
+  "new_entries": {
     "0000000000000000000000000000app1": {
       "name": "my-app-1.0",
       "system": "x86_64-linux",
@@ -95,7 +100,8 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
         "nar_basename": "app1.nar.xz",
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 500,
-        "references": ["0000000000000000000000000000lib1-my-lib-1.0"]
+        "references": ["0000000000000000000000000000lib1-my-lib-1.0"],
+        "signatures": []
       },
       "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 500,
@@ -110,22 +116,24 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
         "nar_basename": "lib1.nar.xz",
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 300,
-        "references": ["0000000000000000000000000000cor1-glibc-2.38"]
+        "references": ["0000000000000000000000000000car1-glibc-2.38"],
+        "signatures": []
       },
       "nar_digest": "sha256:1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 300,
       "added": "2026-08-29T10:00:00Z",
       "origin_job": "run:100:job:x86"
     },
-    "0000000000000000000000000000cor1": {
+    "0000000000000000000000000000car1": {
       "name": "glibc-2.38",
       "system": "x86_64-linux",
       "narinfo_meta": {
-        "store_path": "/nix/store/0000000000000000000000000000cor1-glibc-2.38",
-        "nar_basename": "cor1.nar.xz",
+        "store_path": "/nix/store/0000000000000000000000000000car1-glibc-2.38",
+        "nar_basename": "car1.nar.xz",
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 200,
-        "references": []
+        "references": [],
+        "signatures": []
       },
       "nar_digest": "sha256:2d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 200,
@@ -133,7 +141,7 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
       "origin_job": "run:100:job:x86"
     }
   },
-  "roots": [
+  "active_gc_roots": [
     "0000000000000000000000000000app1"
   ],
   "stats": {

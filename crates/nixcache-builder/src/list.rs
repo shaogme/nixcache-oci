@@ -1,13 +1,19 @@
 use crate::{
     error::BuilderError, nix::resolve_flake_output_hashes, summary::write_list_step_summary,
 };
+use futures_util::future::join_all;
 use nixcache_cli::{ListArgs, OutputFormat};
 use nixcache_core::{
-    CacheIndexData, CacheQueryResult, CascadeMode, SortBy, SortOrder, evaluate_cache_query,
+    CacheQueryResult, CascadeMode, IndexEntry, SortBy, SortOrder, StoreHash, SystemArch,
+    evaluate_cache_query,
 };
+use nixcache_oci::OciArtifactManifest;
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+};
 use tokio::fs;
 use tracing::{info, warn};
 
@@ -266,21 +272,82 @@ pub async fn run_list(
 
     let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
 
-    let maybe_index = oci.get_cache_index(&target_tag).await?;
-    let index_data = match maybe_index {
-        Some((data, _)) => data,
-        None => {
-            warn!(
-                "No cache index found for target tag '{}' in {}/{}",
-                target_tag, registry, repo
-            );
-            CacheIndexData {
-                repo: repo.to_string(),
-                registry: registry.to_string(),
-                ..Default::default()
+    // 1. 探查多架构并获取所有架构的 ShardedArchCacheIndexData
+    let mut target_systems: HashSet<SystemArch> = HashSet::new();
+    if let Ok(Some(artifact)) = oci.fetch_artifact(&target_tag).await {
+        match artifact.manifest {
+            OciArtifactManifest::Index(index) => {
+                for desc in index.manifests {
+                    if let Some(ref plat) = desc.platform {
+                        let sys = SystemArch::from_oci(
+                            &plat.os,
+                            &plat.architecture,
+                            plat.variant.as_deref(),
+                        );
+                        if sys.is_known() {
+                            target_systems.insert(sys);
+                        }
+                    }
+                }
+            }
+            OciArtifactManifest::Manifest(_) => {
+                let detected = SystemArch::detect_current();
+                if detected.is_known() {
+                    target_systems.insert(detected);
+                }
             }
         }
-    };
+    }
+
+    if target_systems.is_empty() {
+        for sys in SystemArch::all() {
+            target_systems.insert(sys);
+        }
+    }
+
+    let mut all_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
+    let mut all_gc_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
+
+    let root_futures = target_systems.into_iter().map(|sys| {
+        let oci = oci.clone();
+        let tag = target_tag.clone();
+        async move {
+            if let Ok(Some((root_data, _))) = oci.get_sharded_root_index(&tag, &sys).await {
+                let non_empty_shards: Vec<_> = root_data
+                    .shards
+                    .iter()
+                    .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
+                    .map(|s| s.blob_digest.clone())
+                    .collect();
+
+                let shard_futures = non_empty_shards.into_iter().map(|digest| {
+                    let oci = oci.clone();
+                    async move { oci.get_shard_data(&digest).await.ok() }
+                });
+                let payloads = join_all(shard_futures).await;
+                let mut entries = HashMap::new();
+                for p in payloads.into_iter().flatten() {
+                    entries.extend(p.entries);
+                }
+                Some((sys, root_data.gc_roots, entries))
+            } else {
+                None
+            }
+        }
+    });
+
+    let results = join_all(root_futures).await;
+    for (sys, roots, entries) in results.into_iter().flatten() {
+        all_gc_roots.insert(sys, roots);
+        all_entries.extend(entries);
+    }
+
+    if all_entries.is_empty() {
+        warn!(
+            "No cache index found for target tag '{}' in {}/{}",
+            target_tag, registry, repo
+        );
+    }
 
     // 动态解析 Flake 输出 StoreHash (若有指定)
     let mut extra_hashes = Vec::new();
@@ -296,16 +363,16 @@ pub async fn run_list(
     }
 
     let selector = args.selector.to_selector(&extra_hashes, CascadeMode::Exact);
-    let query_res: CacheQueryResult = evaluate_cache_query(&index_data, &selector);
+    let query_res: CacheQueryResult = evaluate_cache_query(&all_entries, &all_gc_roots, &selector);
 
-    let total_entries = index_data.entries.len();
-    let total_bytes: u64 = index_data.entries.values().map(|e| e.nar_size).sum();
+    let total_entries = all_entries.len();
+    let total_bytes: u64 = all_entries.values().map(|e| e.nar_size).sum();
     let matched_entries = query_res.matched_entries.len();
     let matched_bytes = query_res.matched_bytes;
 
     // 统计架构分布
     let mut arch_breakdown: HashMap<String, ArchStat> = HashMap::new();
-    for entry in index_data.entries.values() {
+    for entry in all_entries.values() {
         let sys_name = entry
             .system
             .map(|s| s.to_string())
@@ -318,7 +385,7 @@ pub async fn run_list(
         stat.count += 1;
         stat.bytes += entry.nar_size;
     }
-    for (sys, roots) in &index_data.gc_roots {
+    for (sys, roots) in &all_gc_roots {
         let sys_name = sys.to_string();
         let stat = arch_breakdown.entry(sys_name).or_insert(ArchStat {
             count: 0,

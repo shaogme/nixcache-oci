@@ -24,9 +24,9 @@ pub async fn run_gc(
 #[cfg(test)]
 mod tests {
     use nixcache_core::{
-        CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
-        evaluate_multi_arch_gc,
+        IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch, evaluate_multi_arch_gc,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn test_gc_multi_arch_aggregation() {
@@ -35,13 +35,9 @@ mod tests {
         let hash_dead_old = StoreHash::parse("00000000000000000000000000000003").unwrap();
         let hash_dead_recent = StoreHash::parse("00000000000000000000000000000004").unwrap();
 
-        let mut index = CacheIndexData::default();
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![hash_x86_live.clone()]);
-        index
-            .gc_roots
-            .insert(SystemArch::Aarch64Linux, vec![hash_arm_live.clone()]);
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![hash_x86_live.clone()]);
+        gc_roots.insert(SystemArch::Aarch64Linux, vec![hash_arm_live.clone()]);
 
         let now = chrono::Utc::now();
         let sixty_days_ago = (now - chrono::Duration::days(60)).to_rfc3339();
@@ -120,15 +116,14 @@ mod tests {
             origin_job: None,
         };
 
-        index.entries.insert(hash_x86_live.clone(), entry_x86_live);
-        index.entries.insert(hash_arm_live.clone(), entry_arm_live);
-        index.entries.insert(hash_dead_old.clone(), entry_dead_old);
-        index
-            .entries
-            .insert(hash_dead_recent.clone(), entry_dead_recent);
+        let mut entries = HashMap::new();
+        entries.insert(hash_x86_live.clone(), entry_x86_live);
+        entries.insert(hash_arm_live.clone(), entry_arm_live);
+        entries.insert(hash_dead_old.clone(), entry_dead_old);
+        entries.insert(hash_dead_recent.clone(), entry_dead_recent);
 
         let cutoff = now - chrono::Duration::days(30);
-        let result = evaluate_multi_arch_gc(&index, &cutoff);
+        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff);
 
         assert_eq!(result.deleted_hashes, vec![hash_dead_old]);
         assert_eq!(result.kept_entries.len(), 3);
@@ -146,18 +141,16 @@ mod tests {
         let hash_orphan_ancient = StoreHash::parse("00000000000000000000000000000014").unwrap();
         let hash_orphan_recent = StoreHash::parse("00000000000000000000000000000015").unwrap();
 
-        let mut index = CacheIndexData::default();
-        index.gc_roots.insert(
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(
             SystemArch::X86_64Linux,
             vec![hash_shared_libc.clone(), hash_x86_server.clone()],
         );
-        index.gc_roots.insert(
+        gc_roots.insert(
             SystemArch::Aarch64Linux,
             vec![hash_shared_libc.clone(), hash_arm_server.clone()],
         );
-        index
-            .gc_roots
-            .insert(SystemArch::Aarch64Darwin, vec![hash_darwin_client.clone()]);
+        gc_roots.insert(SystemArch::Aarch64Darwin, vec![hash_darwin_client.clone()]);
 
         let now = chrono::Utc::now();
         let ninety_days_ago = (now - chrono::Duration::days(90)).to_rfc3339();
@@ -188,8 +181,9 @@ mod tests {
             (hash_orphan_recent.clone(), "ci-temp", one_hour_ago),
         ];
 
+        let mut entries = HashMap::new();
         for (h, name, added) in entries_def {
-            index.entries.insert(
+            entries.insert(
                 h.clone(),
                 IndexEntry {
                     name: name.to_string(),
@@ -209,7 +203,7 @@ mod tests {
         }
 
         let cutoff = now - chrono::Duration::days(30);
-        let result = evaluate_multi_arch_gc(&index, &cutoff);
+        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff);
 
         assert_eq!(result.deleted_hashes, vec![hash_orphan_ancient]);
         assert_eq!(result.kept_entries.len(), 5);

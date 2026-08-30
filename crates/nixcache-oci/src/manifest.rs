@@ -13,22 +13,42 @@ pub const EMPTY_CONFIG_DIGEST: &str =
 /// OCI 空配置 Blob 大小 (2 字节)
 pub const EMPTY_CONFIG_SIZE: u64 = 2;
 
-/// 强类型 OCI NixCache Layer 媒体类型
+/// Schema v5 媒体类型静态常量
+pub struct CacheLayerMediaTypeV5;
+
+impl CacheLayerMediaTypeV5 {
+    /// 单架构分片索引根目录元数据清单
+    pub const ROOT_INDEX_V5_ZSTD: &'static str = "application/vnd.nix.cache.root.v5+zstd";
+    /// 全局布隆过滤器数据层
+    pub const BLOOM_FILTER_V5_ZSTD: &'static str = "application/vnd.nix.cache.bloom.v5+zstd";
+    /// 单个分片数据内容层
+    pub const SHARD_DATA_V5_ZSTD: &'static str = "application/vnd.nix.cache.shard.v5+zstd";
+    /// 增量 Delta Patch 补丁层
+    pub const DELTA_PATCH_V5_ZSTD: &'static str = "application/vnd.nix.cache.delta.v5+zstd";
+}
+
+/// 强类型 OCI NixCache Layer 媒体类型 (Schema v5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheLayerMediaType {
-    IndexV3Zstd,
-    SessionV3Zstd,
+    RootIndexV5Zstd,
+    BloomFilterV5Zstd,
+    ShardDataV5Zstd,
+    DeltaPatchV5Zstd,
 }
 
 impl CacheLayerMediaType {
-    pub const INDEX_V3_ZSTD: &'static str = "application/vnd.nix.cache.index.v3+zstd";
-    pub const SESSION_V3_ZSTD: &'static str = "application/vnd.nix.cache.session.v3+zstd";
+    pub const ROOT_INDEX_V5_ZSTD: &'static str = CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD;
+    pub const BLOOM_FILTER_V5_ZSTD: &'static str = CacheLayerMediaTypeV5::BLOOM_FILTER_V5_ZSTD;
+    pub const SHARD_DATA_V5_ZSTD: &'static str = CacheLayerMediaTypeV5::SHARD_DATA_V5_ZSTD;
+    pub const DELTA_PATCH_V5_ZSTD: &'static str = CacheLayerMediaTypeV5::DELTA_PATCH_V5_ZSTD;
 
     /// 从媒体类型字符串严格解析
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            Self::INDEX_V3_ZSTD => Some(Self::IndexV3Zstd),
-            Self::SESSION_V3_ZSTD => Some(Self::SessionV3Zstd),
+            Self::ROOT_INDEX_V5_ZSTD => Some(Self::RootIndexV5Zstd),
+            Self::BLOOM_FILTER_V5_ZSTD => Some(Self::BloomFilterV5Zstd),
+            Self::SHARD_DATA_V5_ZSTD => Some(Self::ShardDataV5Zstd),
+            Self::DELTA_PATCH_V5_ZSTD => Some(Self::DeltaPatchV5Zstd),
             _ => None,
         }
     }
@@ -36,19 +56,31 @@ impl CacheLayerMediaType {
     /// 转换为静态媒体类型字符串
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::IndexV3Zstd => Self::INDEX_V3_ZSTD,
-            Self::SessionV3Zstd => Self::SESSION_V3_ZSTD,
+            Self::RootIndexV5Zstd => Self::ROOT_INDEX_V5_ZSTD,
+            Self::BloomFilterV5Zstd => Self::BLOOM_FILTER_V5_ZSTD,
+            Self::ShardDataV5Zstd => Self::SHARD_DATA_V5_ZSTD,
+            Self::DeltaPatchV5Zstd => Self::DELTA_PATCH_V5_ZSTD,
         }
     }
 
-    /// 是否为索引类型
-    pub const fn is_index(&self) -> bool {
-        matches!(self, Self::IndexV3Zstd)
+    /// 是否为分片根目录索引类型
+    pub const fn is_root_index(&self) -> bool {
+        matches!(self, Self::RootIndexV5Zstd)
     }
 
-    /// 是否为会话类型
-    pub const fn is_session(&self) -> bool {
-        matches!(self, Self::SessionV3Zstd)
+    /// 是否为布隆过滤器类型
+    pub const fn is_bloom_filter(&self) -> bool {
+        matches!(self, Self::BloomFilterV5Zstd)
+    }
+
+    /// 是否为分片数据类型
+    pub const fn is_shard_data(&self) -> bool {
+        matches!(self, Self::ShardDataV5Zstd)
+    }
+
+    /// 是否为增量补丁类型
+    pub const fn is_delta_patch(&self) -> bool {
+        matches!(self, Self::DeltaPatchV5Zstd)
     }
 }
 
@@ -235,28 +267,32 @@ impl OciArtifactManifest {
     }
 }
 
-/// 构造强类型的单架构 Session Image Manifest
-pub fn build_arch_session_manifest(
-    session_blob_digest: &str,
-    session_blob_size: u64,
-    uncompressed_size: u64,
+/// 构造强类型的单架构 Schema v5 Baseline Root Index Image Manifest (Root Directory + Bloom Filter)
+#[allow(clippy::too_many_arguments)]
+pub fn build_sharded_arch_index_manifest(
+    root_blob_digest: &str,
+    root_blob_size: u64,
+    bloom_blob_digest: &str,
+    bloom_blob_size: u64,
     config_digest: &str,
     config_size: u64,
-    run_id: u64,
     system: &SystemArch,
+    merkle_root: &str,
 ) -> OciImageManifest {
-    let mut layer_annotations = HashMap::new();
-    layer_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
-    layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
-    layer_annotations.insert(
-        "org.nixos.nixcache.uncompressed_size".to_string(),
-        uncompressed_size.to_string(),
+    let mut root_layer_annotations = HashMap::new();
+    root_layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    root_layer_annotations.insert(
+        "org.nixos.nixcache.merkle_root".to_string(),
+        merkle_root.to_string(),
     );
-    layer_annotations.insert(
-        "org.nixos.nixcache.compression".to_string(),
-        "zstd".to_string(),
+    root_layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
+
+    let mut bloom_layer_annotations = HashMap::new();
+    bloom_layer_annotations.insert(
+        "org.nixos.nixcache.type".to_string(),
+        "bloom_filter".to_string(),
     );
-    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
+    bloom_layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert(
@@ -265,12 +301,31 @@ pub fn build_arch_session_manifest(
     );
     manifest_annotations.insert(
         "org.opencontainers.image.description".to_string(),
-        format!(
-            "NixCache Workflow Run Session Sub-Manifest ({})",
-            system.as_str()
-        ),
+        format!("NixCache Sharded Merkle Baseline ({})", system.as_str()),
     );
     manifest_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    manifest_annotations.insert(
+        "org.nixos.nixcache.merkle_root".to_string(),
+        merkle_root.to_string(),
+    );
+    manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
+
+    let layers = vec![
+        OciDescriptor {
+            media_type: CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD.to_string(),
+            digest: root_blob_digest.to_string(),
+            size: root_blob_size,
+            platform: Some(OciPlatform::from_system(system)),
+            annotations: Some(root_layer_annotations),
+        },
+        OciDescriptor {
+            media_type: CacheLayerMediaTypeV5::BLOOM_FILTER_V5_ZSTD.to_string(),
+            digest: bloom_blob_digest.to_string(),
+            size: bloom_blob_size,
+            platform: Some(OciPlatform::from_system(system)),
+            annotations: Some(bloom_layer_annotations),
+        },
+    ];
 
     OciImageManifest {
         schema_version: 2,
@@ -282,36 +337,25 @@ pub fn build_arch_session_manifest(
             platform: None,
             annotations: None,
         },
-        layers: vec![OciDescriptor {
-            media_type: CacheLayerMediaType::SESSION_V3_ZSTD.to_string(),
-            digest: session_blob_digest.to_string(),
-            size: session_blob_size,
-            platform: Some(OciPlatform::from_system(system)),
-            annotations: Some(layer_annotations),
-        }],
+        layers,
         annotations: Some(manifest_annotations),
     }
 }
 
-/// 构造强类型的单架构 Baseline Index Image Manifest (强制 V3+Zstd)
-pub fn build_arch_index_manifest(
-    index_blob_digest: &str,
-    index_blob_size: u64,
-    uncompressed_size: u64,
+/// 构造强类型的单架构 Delta Patch Image Manifest
+pub fn build_delta_patch_manifest(
+    delta_blob_digest: &str,
+    delta_blob_size: u64,
     config_digest: &str,
     config_size: u64,
+    run_id: u64,
+    job_id: &str,
     system: &SystemArch,
 ) -> OciImageManifest {
     let mut layer_annotations = HashMap::new();
+    layer_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
+    layer_annotations.insert("org.nixos.nixcache.job_id".to_string(), job_id.to_string());
     layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
-    layer_annotations.insert(
-        "org.nixos.nixcache.uncompressed_size".to_string(),
-        uncompressed_size.to_string(),
-    );
-    layer_annotations.insert(
-        "org.nixos.nixcache.compression".to_string(),
-        "zstd".to_string(),
-    );
     layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
     let mut manifest_annotations = HashMap::new();
@@ -321,12 +365,11 @@ pub fn build_arch_index_manifest(
     );
     manifest_annotations.insert(
         "org.opencontainers.image.description".to_string(),
-        format!(
-            "NixCache Production Baseline Sub-Manifest ({})",
-            system.as_str()
-        ),
+        format!("NixCache Delta Patch ({})", system.as_str()),
     );
     manifest_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    manifest_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
+    manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
     OciImageManifest {
         schema_version: 2,
@@ -339,9 +382,9 @@ pub fn build_arch_index_manifest(
             annotations: None,
         },
         layers: vec![OciDescriptor {
-            media_type: CacheLayerMediaType::INDEX_V3_ZSTD.to_string(),
-            digest: index_blob_digest.to_string(),
-            size: index_blob_size,
+            media_type: CacheLayerMediaTypeV5::DELTA_PATCH_V5_ZSTD.to_string(),
+            digest: delta_blob_digest.to_string(),
+            size: delta_blob_size,
             platform: Some(OciPlatform::from_system(system)),
             annotations: Some(layer_annotations),
         }],

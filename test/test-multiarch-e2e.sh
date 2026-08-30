@@ -188,13 +188,13 @@ echo ">>> [Phase 2] Running Promote Coordinator..."
     --repo "$NIXCACHE_REPO" \
     --registry "$NIXCACHE_REGISTRY"
 
-echo ">>> Fetching published cache-index from local registry to verify Schema v4..."
+echo ">>> Fetching published cache-index from local registry to verify Schema v5..."
 INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
 
 echo ">>> Published Cache Index Manifest:"
 echo "$INDEX_MANIFEST" | python3 -m json.tool
 
-# Verify Schema v4 and multi-arch entries
+# Verify Schema v5 and multi-arch entries
 python3 -c "
 import json, subprocess, sys
 
@@ -222,18 +222,26 @@ for m in manifests:
     
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 4, f'Expected version 4, got {arch_data[\"version\"]}'
+    assert arch_data['version'] == 5, f'Expected version 5, got {arch_data[\"version\"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']
-    for k, v in arch_data['entries'].items():
-        all_entries[k] = v
+    for shard in arch_data['shards']:
+        if shard['entry_count'] > 0 and shard['blob_digest']:
+            s_bytes = subprocess.check_output([
+                'curl', '-fsSL',
+                f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{shard[\"blob_digest\"]}'
+            ])
+            s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
+            s_data = json.loads(s_decomp)
+            for k, v in s_data['entries'].items():
+                all_entries[k] = v
 
 print(f'>>> Aggregated {len(all_entries)} entries across {len(gc_roots)} architectures.')
 assert len(all_entries) >= 2, f'Expected at least 2 entries, got {len(all_entries)}'
 assert 'x86_64-linux' in gc_roots, f'Missing x86_64-linux in gc_roots: {gc_roots}'
 assert 'aarch64-linux' in gc_roots, f'Missing aarch64-linux in gc_roots: {gc_roots}'
-print('>>> Schema v4 and Multi-Arch verification SUCCESS!')
+print('>>> Schema v5 and Multi-Arch verification SUCCESS!')
 "
 
 # =========================================================================
@@ -293,8 +301,16 @@ for m in manifests:
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
     if arch_data['system'] == 'x86_64-linux':
-        for h in arch_data['entries'].keys():
-            print(h)
+        for shard in arch_data['shards']:
+            if shard['entry_count'] > 0 and shard['blob_digest']:
+                s_bytes = subprocess.check_output([
+                    'curl', '-fsSL',
+                    f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{shard[\"blob_digest\"]}'
+                ])
+                s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
+                s_data = json.loads(s_decomp)
+                for h in s_data['entries'].keys():
+                    print(h)
 ")
 
 for HASH in $X86_HASHES; do
@@ -339,8 +355,16 @@ for m in manifests:
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
     if arch_data['system'] == 'aarch64-linux':
-        for h in arch_data['entries'].keys():
-            print(h)
+        for shard in arch_data['shards']:
+            if shard['entry_count'] > 0 and shard['blob_digest']:
+                s_bytes = subprocess.check_output([
+                    'curl', '-fsSL',
+                    f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{shard[\"blob_digest\"]}'
+                ])
+                s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
+                s_data = json.loads(s_decomp)
+                for h in s_data['entries'].keys():
+                    print(h)
 ")
 
 for HASH in $ARM_HASHES; do
@@ -377,9 +401,17 @@ for m in manifests:
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
     if arch_data['system'] == 'x86_64-linux':
-        for entry in arch_data['entries'].values():
-            print(entry['narinfo_meta']['store_path'])
-            sys.exit(0)
+        for shard in arch_data['shards']:
+            if shard['entry_count'] > 0 and shard['blob_digest']:
+                s_bytes = subprocess.check_output([
+                    'curl', '-fsSL',
+                    f'http://$NIXCACHE_REGISTRY/v2/$NIXCACHE_REPO/nix-cache/blobs/{shard[\"blob_digest\"]}'
+                ])
+                s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
+                s_data = json.loads(s_decomp)
+                for entry in s_data['entries'].values():
+                    print(entry['narinfo_meta']['store_path'])
+                    sys.exit(0)
 ")
 
 echo ">>> Testing substitution for: $SAMPLE_STORE_PATH"

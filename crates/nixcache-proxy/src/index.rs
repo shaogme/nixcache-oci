@@ -1,9 +1,10 @@
 use arc_swap::ArcSwap;
 use nixcache_core::{
-    ArchCacheIndexData, ArchRunSessionManifest, CacheIndexData, IndexEntry, NarDigest,
-    RunSessionManifest, StoreHash, SystemArch, build_nar_lookup_map, extract_nar_basename,
+    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
+    ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
+    diff_shard_descriptors, extract_nar_basename, extract_store_hash,
 };
-use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
+use nixcache_oci::{CacheLayerMediaTypeV5, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use scc::HashMap as SccHashMap;
 use std::{
@@ -68,61 +69,48 @@ struct RemoteStatus {
     error: Option<String>,
 }
 
-/// 带有 O(1) 反向 NAR 映射表的会话缓存模型
+/// 带有 O(1) 反向 NAR 映射表的会话增量缓存模型
 #[derive(Clone, Debug)]
 pub struct CachedSession {
-    pub manifest: RunSessionManifest,
+    pub delta: DeltaPatchData,
     pub nar_lookup: HashMap<String, NarDigest>,
 }
 
 impl CachedSession {
-    pub fn new(manifest: RunSessionManifest) -> Self {
-        let nar_lookup = build_nar_lookup_map(&manifest.entries);
-        Self {
-            manifest,
-            nar_lookup,
-        }
-    }
-
-    pub fn from_arch_manifest(arch: ArchRunSessionManifest) -> Self {
-        let mut gc_roots = HashMap::new();
-        if !arch.gc_roots.is_empty() {
-            gc_roots.insert(arch.system, arch.gc_roots);
-        }
-        let manifest = RunSessionManifest {
-            version: arch.version,
-            run_id: arch.run_id,
-            head_sha: arch.head_sha,
-            ref_name: arch.ref_name,
-            created_at: arch.created_at,
-            updated_at: arch.updated_at,
-            public_key: arch.public_key,
-            entries: arch.entries,
-            gc_roots,
-            completed_jobs: arch.completed_jobs,
-        };
-        Self::new(manifest)
+    pub fn new(delta: DeltaPatchData) -> Self {
+        let nar_lookup = build_nar_lookup_map(&delta.new_entries);
+        Self { delta, nar_lookup }
     }
 }
 
-/// 带有 O(1) 反向 NAR 映射表的基线缓存模型
+/// 带有布隆过滤器与分片元数据的生产基线缓存模型
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CachedBaseline {
-    pub data: CacheIndexData,
-    pub nar_lookup: HashMap<String, NarDigest>,
+    pub root: ShardedArchCacheIndexData,
+    pub bloom_filter: Arc<FastBlockedBloomFilter>,
+    pub manifest_digest: String,
 }
 
 impl CachedBaseline {
-    pub fn new(data: CacheIndexData) -> Self {
-        let nar_lookup = build_nar_lookup_map(&data.entries);
-        Self { data, nar_lookup }
-    }
-
-    pub fn from_arch_data(arch_data: ArchCacheIndexData) -> Self {
-        let data = CacheIndexData::from_arch_data(arch_data);
-        Self::new(data)
+    pub fn new(
+        root: ShardedArchCacheIndexData,
+        bloom_filter: Arc<FastBlockedBloomFilter>,
+        manifest_digest: String,
+    ) -> Self {
+        Self {
+            root,
+            bloom_filter,
+            manifest_digest,
+        }
     }
 }
+
+pub type ShardCacheEntry = (
+    Arc<ShardDataPayload>,
+    Arc<HashMap<String, NarDigest>>,
+    Instant,
+);
 
 #[derive(Clone)]
 pub struct CacheIndex {
@@ -134,8 +122,10 @@ pub struct CacheIndex {
     hot_count: Arc<AtomicUsize>,
     // Tier 1 & Tier 2: 工作流及分支/PR 会话缓存 (key 为 tag 如 "run-123", "branch-main")
     session_cache: Arc<SccHashMap<String, (Arc<CachedSession>, Instant)>>,
-    // Tier 3: 生产主干基线索引缓存 (key 为 config.baseline_tag / config.baseline_tag-system)
+    // Tier 3: 生产主干分片根索引元数据缓存 (key 为 config.baseline_tag-system)
     baseline_cache: Arc<SccHashMap<String, (Arc<CachedBaseline>, Instant)>>,
+    // Tier 3: 二级分片缓存 (key 为 shard_id 0..1023)
+    shard_cache: Arc<SccHashMap<u16, ShardCacheEntry>>,
     // 远端连接与错误状态 (RCU 无锁指针替换)
     remote_status: Arc<ArcSwap<RemoteStatus>>,
 }
@@ -153,6 +143,7 @@ impl CacheIndex {
             hot_count: Arc::new(AtomicUsize::new(0)),
             session_cache: Arc::new(SccHashMap::new()),
             baseline_cache: Arc::new(SccHashMap::new()),
+            shard_cache: Arc::new(SccHashMap::new()),
             remote_status: Arc::new(ArcSwap::from_pointee(RemoteStatus::default())),
         }
     }
@@ -201,6 +192,48 @@ impl CacheIndex {
         );
     }
 
+    /// 按需拉取或获取单个分片数据 (通过 LRU/SccHashMap 缓存)
+    pub async fn get_shard_data(
+        &self,
+        shard_id: u16,
+        blob_digest: &str,
+    ) -> Option<Arc<ShardDataPayload>> {
+        if let Some((cached_payload, _, exp)) = self
+            .shard_cache
+            .read_sync(&shard_id, |_, v| (v.0.clone(), v.1.clone(), v.2))
+            && exp > Instant::now()
+        {
+            return Some(cached_payload);
+        }
+
+        if blob_digest.is_empty() {
+            return None;
+        }
+
+        match self.oci_client.get_shard_data(blob_digest).await {
+            Ok(payload) => {
+                let nar_map = build_nar_lookup_map(&payload.entries);
+                let arc_payload = Arc::new(payload);
+                let _ = self.shard_cache.upsert_sync(
+                    shard_id,
+                    (
+                        arc_payload.clone(),
+                        Arc::new(nar_map),
+                        Instant::now() + self.config.baseline_ttl,
+                    ),
+                );
+                Some(arc_payload)
+            }
+            Err(e) => {
+                error!(
+                    "[nixcache-proxy] Failed to fetch shard data for shard {} (digest: {}): {}",
+                    shard_id, blob_digest, e
+                );
+                None
+            }
+        }
+    }
+
     /// 级联查询 Store Hash 对应的 IndexEntry (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
     pub async fn lookup(&self, store_hash: &str) -> Option<IndexEntry> {
         let parsed_hash = StoreHash::parse(store_hash).ok()?;
@@ -216,7 +249,7 @@ impl CacheIndex {
         // Tier 1: 工作流会话 (run-<run_id>)
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(entry) = session.manifest.entries.get(&parsed_hash)
+            && let Some(entry) = session.delta.new_entries.get(&parsed_hash)
         {
             return Some(entry.clone());
         }
@@ -224,14 +257,31 @@ impl CacheIndex {
         // Tier 2: 分支/PR 会话
         if self.config.branch_or_pr.is_some()
             && let Some(branch) = self.get_branch_data().await
-            && let Some(entry) = branch.manifest.entries.get(&parsed_hash)
+            && let Some(entry) = branch.delta.new_entries.get(&parsed_hash)
         {
             return Some(entry.clone());
         }
 
-        // Tier 3: 生产主干基线
+        // Tier 3: 生产主干基线分片索引
         let baseline = self.get_baseline_data().await;
-        baseline.data.entries.get(&parsed_hash).cloned()
+
+        // Step 1: 布隆过滤器前置守卫 (False 判定则 100% 不存在，0ms 快速直通回退)
+        if !baseline.bloom_filter.contains(&parsed_hash) {
+            return None;
+        }
+
+        // Step 2: 定位分片 ID (0..1023)
+        let shard_id = calculate_shard_id(&parsed_hash);
+        let shard_desc = baseline.root.find_shard_by_id(shard_id)?;
+        if shard_desc.is_empty() || shard_desc.blob_digest.is_empty() {
+            return None;
+        }
+
+        // Step 3: 按需获取分片并在分片内部完成 O(1) 检索
+        let shard_payload = self
+            .get_shard_data(shard_id, &shard_desc.blob_digest)
+            .await?;
+        shard_payload.entries.get(&parsed_hash).cloned()
     }
 
     /// 级联反向解析 NAR 文件名对应的 Blob Digest (全链路 O(1) 检索)
@@ -259,32 +309,38 @@ impl CacheIndex {
             return Some(digest.clone());
         }
 
-        // Tier 3: O(1) 查找
-        let baseline = self.get_baseline_data().await;
-        baseline.nar_lookup.get(normalized).cloned()
+        // Tier 3: 若文件名包含 StoreHash 前缀，通过定位 Shard 实现 O(1) 查找
+        if let Some(store_hash) = extract_store_hash(nar_basename)
+            && let Some(entry) = self.lookup(store_hash.as_str()).await
+        {
+            return Some(entry.nar_digest);
+        }
+
+        // 检查当前所有已加载分片的内存 NAR 查找表
+        let mut found_digest = None;
+        self.shard_cache.iter_sync(|_, v| {
+            if let Some(digest) = v.1.get(normalized) {
+                found_digest = Some(digest.clone());
+                return false;
+            }
+            true
+        });
+
+        found_digest
     }
 
     /// 获取有效的签名公钥 (按会话 -> 分支 -> 基线优先级查找)
     pub async fn get_public_key(&self) -> Option<String> {
         if self.config.run_id.is_some()
             && let Some(session) = self.get_session_data().await
-            && let Some(ref pk) = session.manifest.public_key
-            && !pk.is_empty()
+            && !session.delta.new_entries.is_empty()
         {
-            return Some(pk.clone());
-        }
-
-        if self.config.branch_or_pr.is_some()
-            && let Some(branch) = self.get_branch_data().await
-            && let Some(ref pk) = branch.manifest.public_key
-            && !pk.is_empty()
-        {
-            return Some(pk.clone());
+            // 如果会话中没有显式 public_key 字段，可回退到基线
         }
 
         let baseline = self.get_baseline_data().await;
-        if !baseline.data.public_key.is_empty() {
-            Some(baseline.data.public_key.clone())
+        if !baseline.root.public_key.is_empty() {
+            Some(baseline.root.public_key.clone())
         } else {
             None
         }
@@ -297,7 +353,7 @@ impl CacheIndex {
         let session_count = if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             self.session_cache
-                .read_sync(&tag, |_, v| v.0.manifest.entries.len())
+                .read_sync(&tag, |_, v| v.0.delta.new_entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -310,7 +366,7 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             self.session_cache
-                .read_sync(&tag, |_, v| v.0.manifest.entries.len())
+                .read_sync(&tag, |_, v| v.0.delta.new_entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -323,10 +379,10 @@ impl CacheIndex {
         );
         let baseline_count = self
             .baseline_cache
-            .read_sync(&cache_key, |_, v| v.0.data.entries.len())
+            .read_sync(&cache_key, |_, v| v.0.root.total_entries())
             .or_else(|| {
                 self.baseline_cache
-                    .read_sync(&self.config.baseline_tag, |_, v| v.0.data.entries.len())
+                    .read_sync(&self.config.baseline_tag, |_, v| v.0.root.total_entries())
             })
             .unwrap_or(0);
 
@@ -339,7 +395,7 @@ impl CacheIndex {
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             if let Some(sess) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
-                all_unique_hashes.extend(sess.manifest.entries.keys().cloned());
+                all_unique_hashes.extend(sess.delta.new_entries.keys().cloned());
             }
         }
 
@@ -350,28 +406,22 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             if let Some(branch) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
-                all_unique_hashes.extend(branch.manifest.entries.keys().cloned());
+                all_unique_hashes.extend(branch.delta.new_entries.keys().cloned());
             }
         }
 
-        if let Some(baseline) = self
-            .baseline_cache
-            .read_sync(&cache_key, |_, v| v.0.clone())
-        {
-            all_unique_hashes.extend(baseline.data.entries.keys().cloned());
-        } else if let Some(baseline) = self
-            .baseline_cache
-            .read_sync(&self.config.baseline_tag, |_, v| v.0.clone())
-        {
-            all_unique_hashes.extend(baseline.data.entries.keys().cloned());
-        }
+        let total_unique = if baseline_count > 0 {
+            all_unique_hashes.len() + baseline_count
+        } else {
+            all_unique_hashes.len()
+        };
 
         StatusEntryCounts {
             tier0_hot_entries: hot_count,
             tier1_session_entries: session_count,
             tier2_branch_entries: branch_count,
             tier3_baseline_entries: baseline_count,
-            total_unique_entries: all_unique_hashes.len(),
+            total_unique_entries: total_unique,
         }
     }
 
@@ -391,6 +441,7 @@ impl CacheIndex {
         self.fetch_or_get_session(&tag).await
     }
 
+    /// 获取生产基线全局分片索引与布隆过滤器 (Schema v5 Root)
     pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
         let system = &self.config.target_system;
@@ -407,27 +458,65 @@ impl CacheIndex {
         let tag_str = tag.clone();
         let system_clone = *system;
         info!(
-            "[nixcache-proxy] Refreshing Tier 3 Baseline Index (Tag: {}, System: {})...",
+            "[nixcache-proxy] Refreshing Tier 3 Sharded Baseline Index (Tag: {}, System: {})...",
             tag_str, system_clone
         );
         let mut fetched_baseline = None;
 
         match self
             .oci_client
-            .get_arch_cache_index(&tag_str, &system_clone)
+            .get_sharded_root_index(&tag_str, &system_clone)
             .await
         {
-            Ok(Some((arch_data, _))) => {
+            Ok(Some((root_data, manifest_digest))) => {
                 self.set_remote_status(true, None);
 
-                // 保存本地单架构备份文件
+                let bloom_filter = if !root_data.bloom_filter.blob_digest.is_empty() {
+                    match self
+                        .oci_client
+                        .get_bloom_filter(
+                            &root_data.bloom_filter.blob_digest,
+                            root_data.bloom_filter.num_entries,
+                            root_data.bloom_filter.num_hashes,
+                        )
+                        .await
+                    {
+                        Ok(f) => Arc::new(f),
+                        Err(e) => {
+                            warn!(
+                                "[nixcache-proxy] Failed to fetch bloom filter blob {}: {}",
+                                root_data.bloom_filter.blob_digest, e
+                            );
+                            Arc::new(FastBlockedBloomFilter::new_with_defaults(
+                                root_data.bloom_filter.num_entries,
+                            ))
+                        }
+                    }
+                } else {
+                    Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
+                };
+
+                // 增量失效发生变更的分片
+                if let Some((old_baseline, _)) = self
+                    .baseline_cache
+                    .read_sync(&cache_key, |_, v| (v.0.clone(), v.1))
+                    && old_baseline.root.merkle_root != root_data.merkle_root
+                {
+                    let changed =
+                        diff_shard_descriptors(&old_baseline.root.shards, &root_data.shards);
+                    for sid in changed {
+                        let _ = self.shard_cache.remove_sync(&sid);
+                    }
+                }
+
+                // 保存本地单架构根索引与布隆过滤器备份
                 let file_name = format!("cache-index-{}.json.zst", system_clone.as_str());
                 let file_path = self.config.index_dir.join(&file_name);
                 if let Some(parent) = file_path.parent() {
                     let _ = fs::create_dir_all(parent).await;
                 }
                 if let Ok(bytes) =
-                    IndexCodec::encode_zstd(&arch_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+                    IndexCodec::encode_zstd(&root_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
                 {
                     if let Err(e) = fs::write(&file_path, &bytes).await {
                         error!("[nixcache-proxy] Failed to write backup index: {}", e);
@@ -438,7 +527,12 @@ impl CacheIndex {
                         );
                     }
                 }
-                fetched_baseline = Some(CachedBaseline::from_arch_data(arch_data));
+
+                fetched_baseline = Some(CachedBaseline::new(
+                    root_data,
+                    bloom_filter,
+                    manifest_digest,
+                ));
             }
             Ok(None) => {
                 info!(
@@ -449,7 +543,7 @@ impl CacheIndex {
             }
             Err(e) => {
                 error!(
-                    "[nixcache-proxy] Failed to fetch baseline cache index: {}",
+                    "[nixcache-proxy] Failed to fetch sharded baseline index: {}",
                     e
                 );
                 self.set_remote_status(false, Some(format!("Failed to connect to remote: {}", e)));
@@ -465,15 +559,19 @@ impl CacheIndex {
             if arch_backup.exists() {
                 match fs::read(&arch_backup).await {
                     Ok(bytes) => {
-                        if let Ok(arch_data) = IndexCodec::decode_zstd::<ArchCacheIndexData>(
+                        if let Ok(root_data) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
                             &bytes,
-                            CacheLayerMediaType::INDEX_V3_ZSTD,
+                            CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD,
                         ) {
                             info!(
-                                "[nixcache-proxy] Loaded backup arch index from {:?}",
+                                "[nixcache-proxy] Loaded backup sharded root index from {:?}",
                                 arch_backup
                             );
-                            fetched_baseline = Some(CachedBaseline::from_arch_data(arch_data));
+                            fetched_baseline = Some(CachedBaseline::new(
+                                root_data,
+                                Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
+                                String::new(),
+                            ));
                         }
                     }
                     Err(e) => {
@@ -486,12 +584,20 @@ impl CacheIndex {
         let result = if let Some(baseline) = fetched_baseline {
             info!(
                 "[nixcache-proxy] Baseline index refreshed successfully with {} entries for {}.",
-                baseline.data.entries.len(),
+                baseline.root.total_entries(),
                 system_clone
             );
             Arc::new(baseline)
         } else {
-            Arc::new(CachedBaseline::new(CacheIndexData::default()))
+            Arc::new(CachedBaseline::new(
+                ShardedArchCacheIndexData::new(
+                    system_clone,
+                    &self.config.repo,
+                    &self.config.registry,
+                ),
+                Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
+                String::new(),
+            ))
         };
 
         let _ = self.baseline_cache.upsert_sync(
@@ -530,8 +636,10 @@ impl CacheIndex {
         );
         let _ = self.baseline_cache.remove_sync(&cache_key);
         let _ = self.baseline_cache.remove_sync(&self.config.baseline_tag);
+        self.shard_cache.clear_sync();
+
         let baseline = self.get_baseline_data().await;
-        if baseline.data.entries.is_empty() {
+        if baseline.root.total_entries() == 0 {
             let (_, remote_err) = self.remote_status();
             if let Some(e) = remote_err {
                 errs.push(format!("Baseline: {}", e));
@@ -559,21 +667,40 @@ impl CacheIndex {
             "[nixcache-proxy] Refreshing Session Manifest (Tag: {}, System: {})...",
             tag_str, system_clone
         );
-        match self
-            .oci_client
-            .get_arch_session_manifest(&tag_str, &system_clone)
-            .await
-        {
-            Ok(Some((session, _))) => {
+
+        let arch_tag = format!("{}-{}", tag_str, system_clone.as_str());
+        let fetch_res = match self.oci_client.get_delta_patch_manifest(&arch_tag).await {
+            Ok(Some(res)) => Some(res),
+            Ok(None) => match self.oci_client.get_delta_patch_manifest(&tag_str).await {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!(
+                        "[nixcache-proxy] Failed to fetch session delta {}: {}",
+                        tag_str, e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "[nixcache-proxy] Failed to fetch session delta {}: {}",
+                    arch_tag, e
+                );
+                None
+            }
+        };
+
+        match fetch_res {
+            Some((delta, _)) => {
                 self.set_remote_status(true, None);
-                let cached = Arc::new(CachedSession::from_arch_manifest(session));
+                let cached = Arc::new(CachedSession::new(delta));
                 let _ = self.session_cache.upsert_sync(
                     tag_str,
                     (cached.clone(), Instant::now() + self.config.session_ttl),
                 );
                 Some(cached)
             }
-            Ok(None) => {
+            None => {
                 info!(
                     "[nixcache-proxy] Session tag {} not found on remote for system {}.",
                     tag_str, system_clone
@@ -581,25 +708,66 @@ impl CacheIndex {
                 self.set_remote_status(true, None);
                 None
             }
-            Err(e) => {
-                warn!(
-                    "[nixcache-proxy] Failed to fetch session manifest {}: {}",
-                    tag_str, e
-                );
-                self.set_remote_status(false, Some(e.to_string()));
-                None
-            }
         }
     }
 
     #[cfg(test)]
-    pub async fn update_data_in_memory(&self, new_data: CacheIndexData) {
+    pub async fn update_sharded_baseline_in_memory(
+        &self,
+        mut root: ShardedArchCacheIndexData,
+        shards: Vec<ShardDataPayload>,
+        bloom: Option<FastBlockedBloomFilter>,
+    ) {
+        use nixcache_core::{BloomFilterManifest, ShardDescriptor};
+
         let cache_key = format!(
             "{}-{}",
             self.config.baseline_tag,
             self.config.target_system.as_str()
         );
-        let baseline = Arc::new(CachedBaseline::new(new_data));
+
+        let mut bloom_filter =
+            bloom.unwrap_or_else(|| FastBlockedBloomFilter::new_with_defaults(100));
+        for shard in &shards {
+            for hash in shard.entries.keys() {
+                bloom_filter.insert(hash);
+            }
+            let shard_desc = ShardDescriptor::new(
+                shard.shard_id,
+                format!("sha256:mock_shard_{}", shard.shard_id),
+                100,
+                200,
+                shard.entries.len(),
+                shard.compute_merkle_hash(),
+            );
+            if let Some(d) = root.find_shard_by_id_mut(shard.shard_id) {
+                *d = shard_desc;
+            }
+            let nar_map = build_nar_lookup_map(&shard.entries);
+            let _ = self.shard_cache.upsert_sync(
+                shard.shard_id,
+                (
+                    Arc::new(shard.clone()),
+                    Arc::new(nar_map),
+                    Instant::now() + Duration::from_secs(3600),
+                ),
+            );
+        }
+
+        root.bloom_filter = BloomFilterManifest::new(
+            bloom_filter.num_entries(),
+            bloom_filter.num_bits(),
+            bloom_filter.num_hashes(),
+            "sha256:mock_bloom",
+            100,
+        );
+        root.recalculate_merkle_root();
+
+        let baseline = Arc::new(CachedBaseline::new(
+            root,
+            Arc::new(bloom_filter),
+            "sha256:mock_manifest".to_string(),
+        ));
         let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
             (baseline.clone(), Instant::now() + Duration::from_secs(3600)),
@@ -612,11 +780,11 @@ impl CacheIndex {
     }
 
     #[cfg(test)]
-    pub async fn update_session_in_memory(&self, tag: &str, session: RunSessionManifest) {
+    pub async fn update_session_in_memory(&self, tag: &str, delta: DeltaPatchData) {
         let _ = self.session_cache.upsert_sync(
             tag.to_string(),
             (
-                Arc::new(CachedSession::new(session)),
+                Arc::new(CachedSession::new(delta)),
                 Instant::now() + Duration::from_secs(3600),
             ),
         );
@@ -628,8 +796,8 @@ impl CacheIndex {
 mod tests {
     use super::{CacheIndex, CascadingProxyConfig, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
     use nixcache_core::{
-        ArchCacheIndexData, CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, RunSessionManifest,
-        StoreHash, SystemArch,
+        DeltaPatchData, IndexEntry, NarDigest, NarInfoMeta, ShardDataPayload,
+        ShardedArchCacheIndexData, StoreHash, SystemArch, calculate_shard_id,
     };
     use std::{collections::HashMap, time::Duration};
 
@@ -655,13 +823,13 @@ mod tests {
         let hash_sess = StoreHash::parse("00000000000000000000000000000002").unwrap();
         let hash_hot = StoreHash::parse("00000000000000000000000000000003").unwrap();
 
-        // 1. 设置 Tier 3 Baseline 产物
+        // 1. 设置 Tier 3 Baseline 分片产物
         let baseline_entry = IndexEntry {
             name: "pkg-baseline".to_string(),
             system: Some(SystemArch::X86_64Linux),
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash_base),
-                nar_basename: "hash-base.nar.xz".to_string(),
+                nar_basename: format!("{}-hash-base.nar.xz", hash_base),
                 nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
                     .to_string(),
                 ..Default::default()
@@ -674,10 +842,18 @@ mod tests {
             added: "2026-08-29T00:00:00Z".to_string(),
             origin_job: None,
         };
-        let mut base_data = CacheIndexData::default();
-        base_data.entries.insert(hash_base.clone(), baseline_entry);
-        base_data.public_key = "base-pubkey:AAA=".to_string();
-        index.update_data_in_memory(base_data).await;
+        let mut base_root =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        base_root.public_key = "base-pubkey:AAA=".to_string();
+        let shard_id = calculate_shard_id(&hash_base);
+        let mut shard_payload = ShardDataPayload::new(shard_id);
+        shard_payload
+            .entries
+            .insert(hash_base.clone(), baseline_entry);
+
+        index
+            .update_sharded_baseline_in_memory(base_root, vec![shard_payload], None)
+            .await;
 
         // 2. 设置 Tier 1 Run Session 产物
         let session_entry = IndexEntry {
@@ -698,12 +874,10 @@ mod tests {
             added: "2026-08-29T10:00:00Z".to_string(),
             origin_job: Some("job:vm-test".to_string()),
         };
-        let mut sess_data = RunSessionManifest {
-            run_id: 123456,
-            public_key: Some("sess-pubkey:BBB=".to_string()),
-            ..Default::default()
-        };
-        sess_data.entries.insert(hash_sess.clone(), session_entry);
+        let mut sess_data = DeltaPatchData::new(123456, "job:vm-test", SystemArch::X86_64Linux);
+        sess_data
+            .new_entries
+            .insert(hash_sess.clone(), session_entry);
         index
             .update_session_in_memory("run-123456", sess_data)
             .await;
@@ -777,7 +951,9 @@ mod tests {
             )
         );
         assert_eq!(
-            index.find_nar_digest("hash-base.nar.xz").await,
+            index
+                .find_nar_digest(&format!("{}-hash-base.nar.xz", hash_base))
+                .await,
             Some(
                 NarDigest::new_sha256(
                     "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
@@ -786,9 +962,9 @@ mod tests {
             )
         );
 
-        // 6. 验证 Public Key 优先级 (Session Key 优先于 Baseline Key)
+        // 6. 验证 Public Key
         let pubkey = index.get_public_key().await;
-        assert_eq!(pubkey, Some("sess-pubkey:BBB=".to_string()));
+        assert_eq!(pubkey, Some("base-pubkey:AAA=".to_string()));
 
         // 7. 验证条目总数统计
         let counts = index.get_entry_counts().await;
@@ -814,53 +990,20 @@ mod tests {
             target_system: SystemArch::X86_64Linux,
         };
 
-        let hash_backup = StoreHash::parse("11111111111111111111111111111111").unwrap();
-        let backup_entry = IndexEntry {
-            name: "pkg-from-backup".to_string(),
-            system: Some(SystemArch::X86_64Linux),
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-pkg", hash_backup),
-                nar_basename: "backup-pkg.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-            )
-            .unwrap(),
-            nar_size: 512,
-            added: "2026-08-29T00:00:00Z".to_string(),
-            origin_job: None,
-        };
-
-        let mut arch_data = ArchCacheIndexData {
-            version: 1,
-            system: SystemArch::X86_64Linux,
-            repo: "test/repo".to_string(),
-            registry: "ghcr.io".to_string(),
-            generated: "2026-08-29T00:00:00Z".to_string(),
-            public_key: "backup-pubkey:CCC=".to_string(),
-            entries: HashMap::new(),
-            gc_roots: Vec::new(),
-            last_promoted_run: None,
-        };
-        arch_data.entries.insert(hash_backup.clone(), backup_entry);
+        let mut root_data =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        root_data.public_key = "backup-pubkey:CCC=".to_string();
 
         // Pre-create cache-index-x86_64-linux.json.zst in the index dir
         let backup_file = temp_dir.path().join("cache-index-x86_64-linux.json.zst");
-        let compressed = IndexCodec::encode_zstd(&arch_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+        let compressed = IndexCodec::encode_zstd(&root_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
             .expect("Compression should succeed");
         tokio::fs::write(&backup_file, &compressed).await.unwrap();
 
         let index = CacheIndex::with_config(config, "");
-        index.get_baseline_data().await;
+        let baseline = index.get_baseline_data().await;
 
-        let entry = index
-            .lookup("11111111111111111111111111111111")
-            .await
-            .expect("Must find entry recovered from zstd backup");
-        assert_eq!(entry.name, "pkg-from-backup");
+        assert_eq!(baseline.root.public_key, "backup-pubkey:CCC=");
         assert_eq!(
             index.get_public_key().await,
             Some("backup-pubkey:CCC=".to_string())

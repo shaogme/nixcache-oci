@@ -20,42 +20,76 @@ if [[ -z "$TOKEN" ]]; then
     TOKEN="$CRED_TOKEN"
 fi
 
-MANIFEST=$(curl -fsSL \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Accept: application/vnd.oci.image.manifest.v1+json" \
-    "https://ghcr.io/v2/${REPO}/nix-cache/manifests/cache-index" 2>/dev/null) || {
+STORE_INFO=$(python3 -c "
+import json, subprocess, sys
+
+token = '''$TOKEN'''
+repo = '''$REPO'''
+headers = ['-H', f'Authorization: Bearer {token}'] if token else []
+
+try:
+    manifest_raw = subprocess.check_output([
+        'curl', '-fsSL',
+        *headers,
+        '-H', 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json',
+        f'https://ghcr.io/v2/{repo}/nix-cache/manifests/cache-index'
+    ])
+    manifest_json = json.loads(manifest_raw)
+
+    if 'manifests' in manifest_json:
+        sub_digest = manifest_json['manifests'][0]['digest']
+        sub_raw = subprocess.check_output([
+            'curl', '-fsSL',
+            *headers,
+            '-H', 'Accept: application/vnd.oci.image.manifest.v1+json',
+            f'https://ghcr.io/v2/{repo}/nix-cache/manifests/{sub_digest}'
+        ])
+        sub_json = json.loads(sub_raw)
+    else:
+        sub_json = manifest_json
+
+    layer_digest = sub_json['layers'][0]['digest']
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL', '-L',
+        *headers,
+        f'https://ghcr.io/v2/{repo}/nix-cache/blobs/{layer_digest}'
+    ])
+
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
+    root_data = json.loads(decompressed)
+
+    if 'shards' in root_data:
+        for shard in root_data['shards']:
+            if shard['entry_count'] > 0 and shard['blob_digest']:
+                s_bytes = subprocess.check_output([
+                    'curl', '-fsSL', '-L',
+                    *headers,
+                    f'https://ghcr.io/v2/{repo}/nix-cache/blobs/{shard[\"blob_digest\"]}'
+                ])
+                s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
+                s_data = json.loads(s_decomp)
+                for h, entry in s_data['entries'].items():
+                    print(f'{h} {entry.get(\"name\", \"unknown\")}')
+                    sys.exit(0)
+    elif 'entries' in root_data:
+        for h, entry in root_data['entries'].items():
+            print(f'{h} {entry.get(\"name\", \"unknown\")}')
+            sys.exit(0)
+except Exception as e:
+    sys.stderr.write(f'Error fetching index: {e}\n')
+    sys.exit(1)
+") || {
     echo "!!! Cannot fetch cache index. Has the cache been published?"
     exit 1
 }
 
-INDEX_DIGEST=$(echo "$MANIFEST" | jq -r '.layers[0].digest')
-INDEX=$(curl -fsSL -L \
-    -H "Authorization: Bearer $TOKEN" \
-    "https://ghcr.io/v2/${REPO}/nix-cache/blobs/${INDEX_DIGEST}" 2>/dev/null)
-
-STORE_HASH=$(echo "$INDEX" | python3 -c "
-import json, sys
-idx = json.load(sys.stdin)
-roots = idx.get('gc_roots', [])
-entries = idx.get('entries', {})
-for r in roots:
-    if r in entries:
-        print(r)
-        sys.exit(0)
-if entries:
-    print(next(iter(entries)))
-")
+STORE_HASH=$(echo "$STORE_INFO" | cut -d' ' -f1)
+STORE_NAME=$(echo "$STORE_INFO" | cut -d' ' -f2)
 
 if [[ -z "$STORE_HASH" ]]; then
     echo "!!! Index is empty"
     exit 1
 fi
-
-STORE_NAME=$(echo "$INDEX" | python3 -c "
-import json, sys
-idx = json.load(sys.stdin)
-print(idx['entries']['$STORE_HASH'].get('name', 'unknown'))
-")
 
 echo ">>> Testing: $STORE_HASH-$STORE_NAME"
 

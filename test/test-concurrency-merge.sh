@@ -136,7 +136,7 @@ active_roots = [
 ]
 
 receipt = {
-    'version': 4,
+    'version': 5,
     'system': sys_name,
     'repo': 'concurrency-test/cache',
     'timestamp': '2026-08-28T00:00:00Z',
@@ -193,15 +193,20 @@ for m in manifests:
     layer_safe = layer_digest.replace(':', '_')
     blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
     
-    # Decompress zstd blob
+    # Decompress zstd blob (ShardedArchCacheIndexData)
     decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 4, f'Expected version 4, got {arch_data[\"version\"]}'
+    assert arch_data['version'] == 5, f'Expected version 5, got {arch_data[\"version\"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']
-    for k, v in arch_data['entries'].items():
-        all_entries[k] = v
+    for shard in arch_data['shards']:
+        if shard['entry_count'] > 0 and shard['blob_digest']:
+            s_blob_path = f'/tmp/mock-oci-registry/blobs/{shard[\"blob_digest\"].replace(\":\", \"_\")}'
+            s_decomp = subprocess.check_output(['zstd', '-dc', s_blob_path])
+            s_data = json.loads(s_decomp)
+            for k, v in s_data['entries'].items():
+                all_entries[k] = v
 
 print(f'>>> Merged cache index contains {len(all_entries)} unique entries across all architectures.')
 assert len(all_entries) == 16, f'Expected 16 entries, got {len(all_entries)}'
@@ -240,8 +245,13 @@ for m in manifests:
     
     decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
     arch_data = json.loads(decompressed)
-    for k, v in arch_data['entries'].items():
-        all_entries[k] = v
+    for shard in arch_data['shards']:
+        if shard['entry_count'] > 0 and shard['blob_digest']:
+            s_blob_path = f'/tmp/mock-oci-registry/blobs/{shard[\"blob_digest\"].replace(\":\", \"_\")}'
+            s_decomp = subprocess.check_output(['zstd', '-dc', s_blob_path])
+            s_data = json.loads(s_decomp)
+            for k, v in s_data['entries'].items():
+                all_entries[k] = v
 
 assert len(all_entries) == 16, f'Expected 16 entries on idempotency check, got {len(all_entries)}'
 "

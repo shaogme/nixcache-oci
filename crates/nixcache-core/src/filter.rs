@@ -1,4 +1,4 @@
-use crate::types::{CacheIndexData, IndexEntry, StoreHash, SystemArch};
+use crate::types::{IndexEntry, StoreHash, SystemArch};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -132,13 +132,31 @@ pub fn matches_pattern(pattern: &str, text: &str) -> bool {
     }
 }
 
+/// 单架构缓存选择与依赖图闭包展开评估
+pub fn evaluate_arch_cache_query(
+    entries: &HashMap<StoreHash, IndexEntry>,
+    gc_roots: &[StoreHash],
+    system: SystemArch,
+    selector: &CacheSelector,
+) -> CacheQueryResult {
+    let mut roots_map = HashMap::new();
+    if !gc_roots.is_empty() {
+        roots_map.insert(system, gc_roots.to_vec());
+    }
+    evaluate_cache_query(entries, &roots_map, selector)
+}
+
 /// 纯函数：多维构建缓存选择与依赖图闭包展开引擎
-pub fn evaluate_cache_query(index: &CacheIndexData, selector: &CacheSelector) -> CacheQueryResult {
+pub fn evaluate_cache_query(
+    entries: &HashMap<StoreHash, IndexEntry>,
+    gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
+    selector: &CacheSelector,
+) -> CacheQueryResult {
     // 1. 构建正向依赖图 (A -> References) 与 反向依赖图 (B -> Dependents of B)
     let mut forward_graph: HashMap<StoreHash, Vec<StoreHash>> = HashMap::new();
     let mut reverse_graph: HashMap<StoreHash, Vec<StoreHash>> = HashMap::new();
 
-    for (hash, entry) in &index.entries {
+    for (hash, entry) in entries {
         let deps: Vec<StoreHash> = entry.narinfo_meta.reference_hashes().collect();
         for dep in &deps {
             reverse_graph
@@ -153,7 +171,7 @@ pub fn evaluate_cache_query(index: &CacheIndexData, selector: &CacheSelector) ->
     let mut active_gc_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
     let mut protected_reachable: HashSet<StoreHash> = HashSet::new();
 
-    for (sys, roots) in &index.gc_roots {
+    for (sys, roots) in gc_roots {
         if selector.systems.is_empty() || selector.systems.contains(sys) {
             active_gc_roots.insert(*sys, roots.clone());
         }
@@ -193,7 +211,7 @@ pub fn evaluate_cache_query(index: &CacheIndexData, selector: &CacheSelector) ->
         && selector.origin_jobs.is_empty()
         && selector.origin_runs.is_empty();
 
-    for (hash, entry) in &index.entries {
+    for (hash, entry) in entries {
         // 3.0 若受 GC Roots 保护且处于可达闭包中，绝对不作为初始命中目标
         if selector.protect_gc_roots && protected_reachable.contains(hash) {
             continue;
@@ -393,7 +411,7 @@ pub fn evaluate_cache_query(index: &CacheIndexData, selector: &CacheSelector) ->
     let mut matched_bytes = 0u64;
     let mut unmatched_bytes = 0u64;
 
-    for (hash, entry) in &index.entries {
+    for (hash, entry) in entries {
         if total_matched.contains(hash) {
             matched_entries.insert(hash.clone(), entry.clone());
             final_matched_hashes.push(hash.clone());

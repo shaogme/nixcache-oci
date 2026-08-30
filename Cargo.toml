@@ -9,6 +9,7 @@ members = [
     "crates/nixcache-builder",
     "crates/nixcache-worker",
     "crates/nixcache-oci-backend",
+    "test/sharding_scale",
 ]
 
 [workspace.dependencies]

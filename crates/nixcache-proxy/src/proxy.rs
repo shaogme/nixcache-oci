@@ -267,7 +267,8 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use nixcache_core::{
-        CacheIndexData, IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch,
+        IndexEntry, NarDigest, NarInfoMeta, ShardDataPayload, ShardedArchCacheIndexData, StoreHash,
+        SystemArch, calculate_shard_id,
     };
     use nixcache_oci_backend::create_tokio_reqwest_client;
     use std::{collections::HashMap, time::Duration};
@@ -287,12 +288,12 @@ mod tests {
             },
             "",
         );
-        let index_data = CacheIndexData {
-            generated: "2026-08-28T00:00:00Z".to_string(),
-            public_key: "test-key-1:abcd".to_string(),
-            ..Default::default()
-        };
-        index.update_data_in_memory(index_data).await;
+        let mut root =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        root.public_key = "test-key-1:abcd".to_string();
+        index
+            .update_sharded_baseline_in_memory(root, vec![], None)
+            .await;
 
         let state = AppState {
             repo: "test/repo".to_string(),
@@ -335,11 +336,12 @@ mod tests {
             },
             "",
         );
-        let index_data = CacheIndexData {
-            public_key: "test-key-1:abcd".to_string(),
-            ..Default::default()
-        };
-        index.update_data_in_memory(index_data).await;
+        let mut root =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        root.public_key = "test-key-1:abcd".to_string();
+        index
+            .update_sharded_baseline_in_memory(root, vec![], None)
+            .await;
 
         let state = AppState {
             repo: "test/repo".to_string(),
@@ -367,7 +369,13 @@ mod tests {
         assert_eq!(body_str.trim(), "test-key-1:abcd");
 
         // Missing key returns 404
-        index.update_data_in_memory(CacheIndexData::default()).await;
+        index
+            .update_sharded_baseline_in_memory(
+                ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io"),
+                vec![],
+                None,
+            )
+            .await;
         let empty_state = AppState {
             repo: "test/repo".to_string(),
             index,
@@ -400,9 +408,10 @@ mod tests {
             },
             "",
         );
-        let mut entries = HashMap::new();
         let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        entries.insert(
+        let shard_id = calculate_shard_id(&hash1);
+        let mut shard = ShardDataPayload::new(shard_id);
+        shard.entries.insert(
             hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
@@ -425,12 +434,10 @@ mod tests {
             },
         );
 
-        let index_data = CacheIndexData {
-            generated: "2026-08-28T00:00:00Z".to_string(),
-            entries,
-            ..Default::default()
-        };
-        index.update_data_in_memory(index_data).await;
+        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        index
+            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .await;
 
         let state = AppState {
             repo: "test/repo".to_string(),
@@ -477,7 +484,6 @@ mod tests {
         );
 
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let mut entries = HashMap::new();
         let entry = IndexEntry {
             name: "local-pkg".to_string(),
             system: Some(SystemArch::X86_64Linux),
@@ -497,13 +503,14 @@ mod tests {
             origin_job: None,
         };
         let local_rendered = entry.to_narinfo_string();
-        entries.insert(local_hash.clone(), entry);
+        let shard_id = calculate_shard_id(&local_hash);
+        let mut shard = ShardDataPayload::new(shard_id);
+        shard.entries.insert(local_hash.clone(), entry);
 
-        let index_data = CacheIndexData {
-            entries,
-            ..Default::default()
-        };
-        index.update_data_in_memory(index_data).await;
+        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        index
+            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .await;
 
         let upstream_narinfo = "StorePath: /nix/store/11111111111111111111111111111111-pkg\nURL: nar/upstream.nar.xz\nNarHash: sha256:000\nNarSize: 10\n";
         Mock::given(method("GET"))
@@ -612,15 +619,16 @@ mod tests {
 
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let digest_str = "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0";
-        let mut entries = HashMap::new();
-        entries.insert(
+        let shard_id = calculate_shard_id(&local_hash);
+        let mut shard = ShardDataPayload::new(shard_id);
+        shard.entries.insert(
             local_hash.clone(),
             IndexEntry {
                 name: "local-pkg".to_string(),
                 system: Some(SystemArch::X86_64Linux),
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg", local_hash),
-                    nar_basename: "local.nar.xz".to_string(),
+                    nar_basename: format!("{}-local.nar.xz", local_hash),
                     nar_hash: format!("sha256:{}", digest_str),
                     ..Default::default()
                 },
@@ -631,11 +639,10 @@ mod tests {
             },
         );
 
-        let index_data = CacheIndexData {
-            entries,
-            ..Default::default()
-        };
-        index.update_data_in_memory(index_data).await;
+        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        index
+            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .await;
 
         // Mock OCI Blob streaming
         Mock::given(method("GET"))
@@ -676,7 +683,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/nar/local.nar.xz")
+                    .uri(format!("/nar/{}-local.nar.xz", local_hash))
                     .body(Body::empty())
                     .unwrap(),
             )

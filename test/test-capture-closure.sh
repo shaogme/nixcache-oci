@@ -7,7 +7,7 @@
 #   4. Target expression & Flake resolution without out-link
 #   5. Strict closure validation (rejection of missing target outputs)
 #   6. Permissive fallback mode (--no-strict-closure / diff-all)
-#   7. Remote OCI session manifest Schema v4 CAS merge & GC root purification
+#   7. Remote OCI session manifest Schema v5 CAS merge & GC root purification
 #   8. Multi-architecture promote & ephemeral session tag cleanup
 #   9. Proxy binary substitution & executable roundtrip validation
 
@@ -307,7 +307,7 @@ fi
 grep -q "No valid target outputs or result symlinks found" "$TMP_DIR/strict_error.log"
 echo ">>> [PASS] 严格模式在目标缺失时按预期拦截并给出友好错误提示！"
 
-# 8. 验证远程 OCI 会话清单 (Schema v4 CAS 合并与 GC 根纯净度)
+# 8. 验证远程 OCI 会话清单 (Schema v5 Delta Patch CAS 追加与 GC 根纯净度)
 echo ">>> [7/9] 验证远程 OCI 镜像仓库会话清单 (run-${RUN_ID}-x86_64-linux)..."
 SESSION_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
 
@@ -325,17 +325,17 @@ lib1_h = '$RUNTIME_LIB_PATH_1'.split('/')[-1][:32]
 rust_h = '$RUST_APP_PATH'.split('/')[-1][:32]
 exp_h = '$EXPLICIT_STORE_PATH'.split('/')[-1][:32]
 
-entries = session_data['entries']
-gc_roots = session_data['gc_roots']
+entries = session_data['new_entries']
+gc_roots = session_data['active_gc_roots']
 
-assert session_data['version'] == 4, 'Schema version must be 4'
+assert session_data['version'] == 5, f'Schema version must be 5, got {session_data.get(\"version\")}'
 assert session_data['run_id'] == $RUN_ID, 'run_id mismatch'
 assert len(entries) == 4, f'Expected 4 entries merged via CAS, got {len(entries)}'
 assert app1_h in entries and lib1_h in entries and rust_h in entries and exp_h in entries
 
 # 关键断言：gc_roots 严格仅包含 3 个顶层目标根 (app1, rust, exp)，绝不含 lib1 或 compiler tool
 assert set(gc_roots) == {app1_h, rust_h, exp_h}, f'GC Roots mismatch: {gc_roots}'
-print('>>> [PASS] 远程 OCI 会话清单 Schema v4 CAS 合并与 GC Roots 纯净度检验完全通过！')
+print('>>> [PASS] 远程 OCI 会话清单 Schema v5 Delta Patch CAS 追加与 GC Roots 纯净度检验完全通过！')
 "
 
 # 9. 会话提升 (Promote) 与临时 Session Tag 清理
@@ -361,10 +361,11 @@ blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
 
 decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
 idx = json.loads(decompressed)
-assert idx['version'] == 4
+assert idx['version'] == 5, f'Expected version 5, got {idx.get(\"version\")}'
 assert idx['last_promoted_run'] == $RUN_ID
-assert len(idx['entries']) == 4
-print('>>> [PASS] 基线全局索引 cache-index 验证通过 (4 个条目，last_promoted_run 记录正确)！')
+total_entries = sum(s['entry_count'] for s in idx['shards'])
+assert total_entries == 4, f'Expected 4 entries across shards, got {total_entries}'
+print('>>> [PASS] 基线全局分片索引 cache-index 验证通过 (4 个条目，last_promoted_run 记录正确)！')
 "
 
 # 验证临时会话 tag 已被安全清理

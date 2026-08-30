@@ -1,7 +1,7 @@
 use crate::{
     filter::{CacheSelector, CascadeMode, TimeFilter},
     purge::evaluate_cache_purge,
-    types::{CacheIndexData, IndexEntry, StoreHash},
+    types::{IndexEntry, StoreHash, SystemArch},
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,9 +15,23 @@ pub struct GcEvaluationResult {
     pub cutoff_utc: String,
 }
 
+/// 单架构可达性依赖图与保留期垃圾回收计算
+pub fn evaluate_gc(
+    entries: &HashMap<StoreHash, IndexEntry>,
+    gc_roots: &[StoreHash],
+    cutoff: &DateTime<Utc>,
+) -> GcEvaluationResult {
+    let mut roots_map = HashMap::new();
+    if !gc_roots.is_empty() {
+        roots_map.insert(SystemArch::Unknown, gc_roots.to_vec());
+    }
+    evaluate_multi_arch_gc(entries, &roots_map, cutoff)
+}
+
 /// 纯函数：多架构可达性依赖图与保留期垃圾回收计算 (直接复用统一的 selector/purge 评估引擎)
 pub fn evaluate_multi_arch_gc(
-    index: &CacheIndexData,
+    entries: &HashMap<StoreHash, IndexEntry>,
+    gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     cutoff: &DateTime<Utc>,
 ) -> GcEvaluationResult {
     let selector = CacheSelector {
@@ -27,11 +41,11 @@ pub fn evaluate_multi_arch_gc(
         ..Default::default()
     };
 
-    let purge_res = evaluate_cache_purge(index, &selector);
+    let purge_res = evaluate_cache_purge(entries, gc_roots, &selector);
 
     // 计算跨所有架构系统收集的顶层活跃根及传递可达集合
     let mut initial_roots = HashSet::new();
-    for roots in index.gc_roots.values() {
+    for roots in gc_roots.values() {
         initial_roots.extend(roots.iter().cloned());
     }
 
@@ -40,7 +54,7 @@ pub fn evaluate_multi_arch_gc(
 
     while let Some(current_hash) = queue.pop_front() {
         if reachable.insert(current_hash.clone())
-            && let Some(entry) = index.entries.get(&current_hash)
+            && let Some(entry) = entries.get(&current_hash)
         {
             for dep_hash in entry.narinfo_meta.reference_hashes() {
                 if !reachable.contains(&dep_hash) {

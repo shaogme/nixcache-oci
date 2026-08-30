@@ -1,8 +1,5 @@
 use chrono::Utc;
-use nixcache_core::{
-    ArchRunSessionManifest, IndexEntry, JobSummaryMetadata, RunSessionManifest, StoreHash,
-    SystemArch,
-};
+use nixcache_core::{DeltaPatchData, IndexEntry, JobSummaryMetadata, StoreHash, SystemArch};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -69,105 +66,68 @@ impl SessionMutationRequest {
         self
     }
 
-    pub fn apply_to(&self, session: &mut RunSessionManifest) {
-        if session.head_sha.is_empty()
-            && let Some(ref sha) = self.head_sha
-        {
-            session.head_sha = sha.clone();
-        }
-        if session.ref_name.is_empty()
-            && let Some(ref rn) = self.ref_name
-        {
-            session.ref_name = rn.clone();
-        }
-        if session.public_key.is_none()
-            && let Some(ref pk) = self.public_key
-            && !pk.is_empty()
-        {
-            session.public_key = Some(pk.clone());
-        }
-
-        session.entries.extend(self.new_entries.clone());
-        let roots_entry = session.gc_roots.entry(self.system).or_default();
-        roots_entry.extend_from_slice(&self.new_roots);
-        roots_entry.sort_unstable();
-        roots_entry.dedup();
-        session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        session.completed_jobs.push(JobSummaryMetadata {
-            job_id: self.job_id.clone(),
-            system: self.system,
-            uploaded_blobs: self.uploaded_blobs,
-            uploaded_bytes: self.uploaded_bytes,
-            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        });
+    /// 转换为可独立持久化的 DeltaPatchData
+    pub fn to_delta_patch(&self) -> DeltaPatchData {
+        let mut delta = DeltaPatchData::new(self.run_id, &self.job_id, self.system);
+        delta.new_entries = self.new_entries.clone();
+        delta.active_gc_roots = self.new_roots.clone();
+        delta.active_gc_roots.sort_unstable();
+        delta.active_gc_roots.dedup();
+        delta
     }
 
-    pub fn apply_to_arch(&self, session: &mut ArchRunSessionManifest) {
-        if session.head_sha.is_empty()
-            && let Some(ref sha) = self.head_sha
-        {
-            session.head_sha = sha.clone();
-        }
-        if session.ref_name.is_empty()
-            && let Some(ref rn) = self.ref_name
-        {
-            session.ref_name = rn.clone();
-        }
-        if session.public_key.is_none()
-            && let Some(ref pk) = self.public_key
-            && !pk.is_empty()
-        {
-            session.public_key = Some(pk.clone());
-        }
+    /// 合并变更至已有的 DeltaPatchData
+    pub fn apply_to_delta(&self, delta: &mut DeltaPatchData) {
+        delta.new_entries.extend(self.new_entries.clone());
+        delta.active_gc_roots.extend_from_slice(&self.new_roots);
+        delta.active_gc_roots.sort_unstable();
+        delta.active_gc_roots.dedup();
+        delta.timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    }
 
-        session.entries.extend(self.new_entries.clone());
-        session.gc_roots.extend_from_slice(&self.new_roots);
-        session.gc_roots.sort_unstable();
-        session.gc_roots.dedup();
-        session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        session.completed_jobs.push(JobSummaryMetadata {
+    /// 提取当前请求的 JobSummaryMetadata
+    pub fn to_job_summary(&self) -> JobSummaryMetadata {
+        JobSummaryMetadata {
             job_id: self.job_id.clone(),
             system: self.system,
             uploaded_blobs: self.uploaded_blobs,
             uploaded_bytes: self.uploaded_bytes,
             timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::SessionMutationRequest;
-    use nixcache_core::{ArchRunSessionManifest, RunSessionManifest, StoreHash, SystemArch};
+    use nixcache_core::{DeltaPatchData, IndexEntry, StoreHash, SystemArch};
+    use std::collections::HashMap;
 
     fn h(id: u8) -> StoreHash {
         format!("{:032x}", id).parse().unwrap()
     }
 
     #[test]
-    fn test_gc_roots_merge_and_dedup() {
-        let mut manifest = RunSessionManifest::default();
-        manifest
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![h(2), h(1)]);
+    fn test_delta_patch_generation_and_merge() {
+        let mut entries = HashMap::new();
+        entries.insert(h(1), IndexEntry::default());
 
-        let req = SessionMutationRequest::new(1, "job1", SystemArch::X86_64Linux)
+        let req = SessionMutationRequest::new(100, "job-vm", SystemArch::X86_64Linux)
+            .with_entries(entries)
             .with_roots(vec![h(3), h(2)]);
 
-        req.apply_to(&mut manifest);
+        let delta = req.to_delta_patch();
+        assert_eq!(delta.run_id, 100);
+        assert_eq!(delta.job_id, "job-vm");
+        assert_eq!(delta.system, SystemArch::X86_64Linux);
+        assert_eq!(delta.new_entries.len(), 1);
+        assert_eq!(delta.active_gc_roots, vec![h(2), h(3)]);
 
-        let roots = manifest.gc_roots.get(&SystemArch::X86_64Linux).unwrap();
-        assert_eq!(roots, &vec![h(1), h(2), h(3)]);
+        let mut existing_delta = DeltaPatchData::new(100, "job-prev", SystemArch::X86_64Linux);
+        existing_delta.active_gc_roots = vec![h(1), h(3)];
 
-        let mut arch_manifest = ArchRunSessionManifest::new(1, SystemArch::X86_64Linux);
-        arch_manifest.gc_roots = vec![h(3), h(1)];
-
-        let req_arch = SessionMutationRequest::new(1, "job1", SystemArch::X86_64Linux)
-            .with_roots(vec![h(2), h(1)]);
-
-        req_arch.apply_to_arch(&mut arch_manifest);
-        assert_eq!(arch_manifest.gc_roots, vec![h(1), h(2), h(3)]);
+        req.apply_to_delta(&mut existing_delta);
+        assert_eq!(existing_delta.new_entries.len(), 1);
+        assert_eq!(existing_delta.active_gc_roots, vec![h(1), h(2), h(3)]);
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-pipeline-session-cas.sh — End-to-end integration test for Schema v4 Session CAS & Cascading Proxy
+# test-pipeline-session-cas.sh — End-to-end integration test for Schema v5 Session CAS & Cascading Proxy
 
 set -euo pipefail
 
@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-echo "=== Starting NixCache Schema v4 Pipeline Session CAS & Cascading Test ==="
+echo "=== Starting NixCache Schema v5 Pipeline Session CAS & Cascading Test ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-pipeline-test-XXXXXX)
 export GITHUB_ENV="$TMP_DIR/github_env"
@@ -145,10 +145,10 @@ layer_safe = layer_digest.replace(':', '_')
 blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
 decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
 session_data = json.loads(decompressed)
-assert session_data['version'] == 4, f'Expected version 4, got {session_data[\"version\"]}'
+assert session_data['version'] == 5, f'Expected version 5, got {session_data[\"version\"]}'
 assert session_data['run_id'] == $RUN_ID, f'Expected run_id $RUN_ID, got {session_data[\"run_id\"]}'
-assert len(session_data['entries']) == 4, f'Expected 4 entries from 4 workers, got {len(session_data[\"entries\"])}'
-print('>>> Session manifest verified: Schema v4, 4 entries merged via CAS.')
+assert len(session_data['new_entries']) == 4, f'Expected 4 entries from 4 workers, got {len(session_data[\"new_entries\"])}'
+print('>>> Session manifest verified: Schema v5, 4 entries merged via CAS.')
 "
 
 # 6. Test Cascading Proxy Tier 0 (Hot Registry) & Tier 1 (run-<run_id>)
@@ -183,10 +183,11 @@ blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
 
 decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
 idx = json.loads(decompressed)
-assert idx['version'] == 4, f'Expected version 4, got {idx[\"version\"]}'
+assert idx['version'] == 5, f'Expected version 5, got {idx[\"version\"]}'
 assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx[\"last_promoted_run\"]}'
-assert len(idx['entries']) == 4, f'Expected 4 promoted entries, got {len(idx[\"entries\"])}'
-print('>>> Promoted cache-index verified (Schema v4, last_promoted_run & 4 entries).')
+total_entries = sum(s['entry_count'] for s in idx['shards'])
+assert total_entries == 4, f'Expected 4 promoted entries across shards, got {total_entries}'
+print('>>> Promoted cache-index verified (Schema v5, last_promoted_run & 4 entries).')
 "
 
 # 9. Verify ephemeral session tag cleanup
@@ -207,4 +208,4 @@ if [[ -f "$SNAPSHOT_FILE" ]]; then
 fi
 echo ">>> Session clean verified."
 
-echo "=== ALL SCHEMA V4 PIPELINE CAS & CASCADING TESTS PASSED ==="
+echo "=== ALL SCHEMA V5 PIPELINE CAS & CASCADING TESTS PASSED ==="

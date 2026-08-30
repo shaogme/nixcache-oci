@@ -1,20 +1,23 @@
-use crate::error::TypeError;
+use crate::{
+    error::TypeError,
+    sharding::{
+        EMPTY_SHARD_MERKLE_HASH, calculate_shard_id, compute_merkle_root,
+        compute_shard_merkle_hash, partition_entries_by_shard, shard_id_to_prefix,
+    },
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    borrow::Borrow,
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    env, fmt,
-    ops::Deref,
-    path::Path,
+    borrow::Borrow, collections::HashMap, convert::Infallible, env, fmt, ops::Deref, path::Path,
     str::FromStr,
 };
 use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
-pub const SCHEMA_VERSION: u32 = 4;
-pub const CACHE_INDEX_VERSION: u32 = 4;
-pub const RUN_SESSION_VERSION: u32 = 4;
-pub const RECEIPT_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION_V5: u32 = 5;
+pub const CACHE_INDEX_VERSION: u32 = 5;
+pub const RUN_SESSION_VERSION: u32 = 5;
+pub const RECEIPT_VERSION: u32 = 5;
+pub const NUM_SHARDS: usize = 1024;
 
 /// Nix 32 字符 Base32 散列值 (例如: `s66mzxpvicwk07gjbjfw9izjfa797vsw`)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,6 +48,10 @@ impl StoreHash {
 
     pub fn into_inner(self) -> String {
         self.0
+    }
+
+    pub fn shard_id(&self) -> u16 {
+        calculate_shard_id(self)
     }
 }
 
@@ -561,210 +568,273 @@ pub struct JobSummaryMetadata {
     pub timestamp: String,
 }
 
-/// 生产基线全局索引数据 (Tier 3)
+/// 单个分片描述符 (Merkle Tree 叶子节点)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct CacheIndexData {
-    pub version: u32,
-    pub repo: String,
-    pub registry: String,
-    pub image: String,
-    pub generated: String,
-    pub public_key: String,
-    pub entries: HashMap<StoreHash, IndexEntry>,
-    pub gc_roots: HashMap<SystemArch, Vec<StoreHash>>,
-    pub last_promoted_run: Option<u64>,
+pub struct ShardDescriptor {
+    /// 分片前缀编号 (0..1023)
+    pub shard_id: u16,
+    /// 对应的 2 字符 Nix Base32 前缀 (如 "0a", "s6")
+    pub prefix: String,
+    /// 该分片的数据 Blob OCI 内容寻址散列
+    pub blob_digest: String,
+    /// 压缩后大小 (Bytes)
+    pub compressed_size: u64,
+    /// 解压后大小 (Bytes)
+    pub uncompressed_size: u64,
+    /// 该分片包含的条目总数
+    pub entry_count: usize,
+    /// 该分片条目的 Merkle 散列校验值
+    pub merkle_hash: String,
 }
 
-impl Default for CacheIndexData {
-    fn default() -> Self {
+impl ShardDescriptor {
+    /// 创建一个空的初始分片描述符
+    pub fn empty(shard_id: u16) -> Self {
         Self {
-            version: CACHE_INDEX_VERSION,
-            repo: String::new(),
-            registry: String::new(),
-            image: String::new(),
-            generated: String::new(),
-            public_key: String::new(),
-            entries: HashMap::new(),
-            gc_roots: HashMap::new(),
-            last_promoted_run: None,
-        }
-    }
-}
-
-impl CacheIndexData {
-    /// 针对特定系统架构过滤出单架构视图
-    pub fn filter_for_system(&self, system: &SystemArch) -> ArchCacheIndexData {
-        let mut arch_entries = HashMap::new();
-        for (hash, entry) in &self.entries {
-            if entry.system.as_ref() == Some(system) || entry.system.is_none() {
-                arch_entries.insert(hash.clone(), entry.clone());
-            }
-        }
-        let roots = self.gc_roots.get(system).cloned().unwrap_or_default();
-        ArchCacheIndexData {
-            version: self.version,
-            system: *system,
-            repo: self.repo.clone(),
-            registry: self.registry.clone(),
-            generated: self.generated.clone(),
-            public_key: self.public_key.clone(),
-            entries: arch_entries,
-            gc_roots: roots,
-            last_promoted_run: self.last_promoted_run,
+            shard_id,
+            prefix: shard_id_to_prefix(shard_id),
+            blob_digest: String::new(),
+            compressed_size: 0,
+            uncompressed_size: 0,
+            entry_count: 0,
+            merkle_hash: EMPTY_SHARD_MERKLE_HASH.to_string(),
         }
     }
 
-    /// 将多架构数据按系统架构拆分为各自独立的单架构数据集
-    pub fn into_arch_partitioned(self) -> HashMap<SystemArch, ArchCacheIndexData> {
-        let mut partitioned_entries: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
-            HashMap::new();
-        for (hash, entry) in self.entries {
-            let sys = entry.system.unwrap_or_default();
-            partitioned_entries
-                .entry(sys)
-                .or_default()
-                .insert(hash, entry);
-        }
-
-        let mut result = HashMap::new();
-        let mut all_systems: HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
-        all_systems.extend(self.gc_roots.keys().cloned());
-
-        for sys in all_systems {
-            let entries = partitioned_entries.remove(&sys).unwrap_or_default();
-            let roots = self.gc_roots.get(&sys).cloned().unwrap_or_default();
-            result.insert(
-                sys,
-                ArchCacheIndexData {
-                    version: self.version,
-                    system: sys,
-                    repo: self.repo.clone(),
-                    registry: self.registry.clone(),
-                    generated: self.generated.clone(),
-                    public_key: self.public_key.clone(),
-                    entries,
-                    gc_roots: roots,
-                    last_promoted_run: self.last_promoted_run,
-                },
-            );
-        }
-        result
-    }
-
-    /// 从单架构索引数据构造全局多架构容器对象
-    pub fn from_arch_data(arch_data: ArchCacheIndexData) -> Self {
-        let mut gc_roots = HashMap::new();
-        if !arch_data.gc_roots.is_empty() {
-            gc_roots.insert(arch_data.system, arch_data.gc_roots);
-        }
+    pub fn new(
+        shard_id: u16,
+        blob_digest: impl Into<String>,
+        compressed_size: u64,
+        uncompressed_size: u64,
+        entry_count: usize,
+        merkle_hash: impl Into<String>,
+    ) -> Self {
         Self {
-            version: arch_data.version,
-            repo: arch_data.repo,
-            registry: arch_data.registry,
-            image: String::new(),
-            generated: arch_data.generated,
-            public_key: arch_data.public_key,
-            entries: arch_data.entries,
-            gc_roots,
-            last_promoted_run: arch_data.last_promoted_run,
+            shard_id,
+            prefix: shard_id_to_prefix(shard_id),
+            blob_digest: blob_digest.into(),
+            compressed_size,
+            uncompressed_size,
+            entry_count,
+            merkle_hash: merkle_hash.into(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entry_count == 0
     }
 }
 
-/// 单架构生产基线索引数据
+/// 全局紧凑布隆过滤器元数据容器
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ArchCacheIndexData {
+pub struct BloomFilterManifest {
+    pub num_entries: usize,
+    pub num_bits: u64,
+    pub num_hashes: u8,
+    pub blob_digest: String,
+    pub compressed_size: u64,
+}
+
+impl BloomFilterManifest {
+    pub fn empty() -> Self {
+        Self {
+            num_entries: 0,
+            num_bits: 512,
+            num_hashes: 7,
+            blob_digest: String::new(),
+            compressed_size: 0,
+        }
+    }
+
+    pub fn new(
+        num_entries: usize,
+        num_bits: u64,
+        num_hashes: u8,
+        blob_digest: impl Into<String>,
+        compressed_size: u64,
+    ) -> Self {
+        Self {
+            num_entries,
+            num_bits,
+            num_hashes,
+            blob_digest: blob_digest.into(),
+            compressed_size,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num_entries == 0
+    }
+}
+
+/// 单架构全局分片索引根目录 (Schema v5 Root)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ShardedArchCacheIndexData {
     pub version: u32,
     pub system: SystemArch,
     pub repo: String,
     pub registry: String,
     pub generated: String,
     pub public_key: String,
-    pub entries: HashMap<StoreHash, IndexEntry>,
+    /// 1024 个分片描述符列表
+    pub shards: Vec<ShardDescriptor>,
+    /// 全局 Merkle Root 签名
+    pub merkle_root: String,
+    /// 布隆过滤器描述符
+    pub bloom_filter: BloomFilterManifest,
+    /// 跨分片聚合的活跃 GC Roots 列表
     pub gc_roots: Vec<StoreHash>,
     pub last_promoted_run: Option<u64>,
 }
 
-impl ArchCacheIndexData {
+impl ShardedArchCacheIndexData {
+    /// 创建一个全新的 Schema v5 单架构分片索引根目录 (包含 1024 个空分片描述符)
     pub fn new(system: SystemArch, repo: impl Into<String>, registry: impl Into<String>) -> Self {
+        let mut shards = Vec::with_capacity(NUM_SHARDS);
+        for id in 0..NUM_SHARDS {
+            shards.push(ShardDescriptor::empty(id as u16));
+        }
+        let merkle_root = compute_merkle_root(&shards);
+
         Self {
-            version: CACHE_INDEX_VERSION,
+            version: SCHEMA_VERSION_V5,
             system,
             repo: repo.into(),
             registry: registry.into(),
             generated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             public_key: String::new(),
-            entries: HashMap::new(),
+            shards,
+            merkle_root,
+            bloom_filter: BloomFilterManifest::empty(),
             gc_roots: Vec::new(),
             last_promoted_run: None,
         }
     }
-}
 
-/// 单架构工作流会话清单
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ArchRunSessionManifest {
-    pub version: u32,
-    pub run_id: u64,
-    pub system: SystemArch,
-    pub head_sha: String,
-    pub ref_name: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub public_key: Option<String>,
-    pub entries: HashMap<StoreHash, IndexEntry>,
-    pub gc_roots: Vec<StoreHash>,
-    pub completed_jobs: Vec<JobSummaryMetadata>,
-}
+    /// 根据 StoreHash 快速定位其所属分片的描述符
+    pub fn find_shard(&self, hash: &StoreHash) -> Option<&ShardDescriptor> {
+        let shard_id = calculate_shard_id(hash);
+        self.shards.get(shard_id as usize)
+    }
 
-impl ArchRunSessionManifest {
-    pub fn new(run_id: u64, system: SystemArch) -> Self {
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        Self {
-            version: RUN_SESSION_VERSION,
-            run_id,
-            system,
-            head_sha: String::new(),
-            ref_name: String::new(),
-            created_at: now.clone(),
-            updated_at: now,
-            public_key: None,
-            entries: HashMap::new(),
-            gc_roots: Vec::new(),
-            completed_jobs: Vec::new(),
-        }
+    /// 根据分片 ID (0..1023) 获取描述符
+    pub fn find_shard_by_id(&self, shard_id: u16) -> Option<&ShardDescriptor> {
+        self.shards.get(shard_id as usize)
+    }
+
+    /// 根据 StoreHash 快速定位其所属分片的可变描述符
+    pub fn find_shard_mut(&mut self, hash: &StoreHash) -> Option<&mut ShardDescriptor> {
+        let shard_id = calculate_shard_id(hash);
+        self.shards.get_mut(shard_id as usize)
+    }
+
+    /// 根据分片 ID (0..1023) 获取可变描述符
+    pub fn find_shard_by_id_mut(&mut self, shard_id: u16) -> Option<&mut ShardDescriptor> {
+        self.shards.get_mut(shard_id as usize)
+    }
+
+    /// 获取所有分片的条目总数
+    pub fn total_entries(&self) -> usize {
+        self.shards.iter().map(|s| s.entry_count).sum()
+    }
+
+    /// 重新计算并更新全局 Merkle Root Hash
+    pub fn recalculate_merkle_root(&mut self) {
+        self.merkle_root = compute_merkle_root(&self.shards);
     }
 }
 
-/// 工作流会话清单 (Tier 1 / Tier 2)
+/// 单个分片内部的实际数据 Payload (独立 Zstd 压缩存储)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RunSessionManifest {
+pub struct ShardDataPayload {
     pub version: u32,
-    pub run_id: u64,
-    pub head_sha: String,
-    pub ref_name: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub public_key: Option<String>,
+    pub shard_id: u16,
+    pub prefix: String,
     pub entries: HashMap<StoreHash, IndexEntry>,
-    pub gc_roots: HashMap<SystemArch, Vec<StoreHash>>,
-    pub completed_jobs: Vec<JobSummaryMetadata>,
 }
 
-impl Default for RunSessionManifest {
-    fn default() -> Self {
+impl ShardDataPayload {
+    pub fn new(shard_id: u16) -> Self {
         Self {
-            version: RUN_SESSION_VERSION,
-            run_id: 0,
-            head_sha: String::new(),
-            ref_name: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            public_key: None,
+            version: SCHEMA_VERSION_V5,
+            shard_id,
+            prefix: shard_id_to_prefix(shard_id),
             entries: HashMap::new(),
-            gc_roots: HashMap::new(),
-            completed_jobs: Vec::new(),
         }
+    }
+
+    pub fn with_entries(shard_id: u16, entries: HashMap<StoreHash, IndexEntry>) -> Self {
+        Self {
+            version: SCHEMA_VERSION_V5,
+            shard_id,
+            prefix: shard_id_to_prefix(shard_id),
+            entries,
+        }
+    }
+
+    pub fn compute_merkle_hash(&self) -> String {
+        compute_shard_merkle_hash(&self.entries)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// 增量 Patch 数据结构 (CI 构建节点产物，零写放大)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeltaPatchData {
+    pub version: u32,
+    pub run_id: u64,
+    pub job_id: String,
+    pub system: SystemArch,
+    pub timestamp: String,
+    pub new_entries: HashMap<StoreHash, IndexEntry>,
+    pub active_gc_roots: Vec<StoreHash>,
+}
+
+impl DeltaPatchData {
+    pub fn new(run_id: u64, job_id: impl Into<String>, system: SystemArch) -> Self {
+        Self {
+            version: SCHEMA_VERSION_V5,
+            run_id,
+            job_id: job_id.into(),
+            system,
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            new_entries: HashMap::new(),
+            active_gc_roots: Vec::new(),
+        }
+    }
+
+    pub fn with_entries_and_roots(
+        run_id: u64,
+        job_id: impl Into<String>,
+        system: SystemArch,
+        new_entries: HashMap<StoreHash, IndexEntry>,
+        active_gc_roots: Vec<StoreHash>,
+    ) -> Self {
+        Self {
+            version: SCHEMA_VERSION_V5,
+            run_id,
+            job_id: job_id.into(),
+            system,
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            new_entries,
+            active_gc_roots,
+        }
+    }
+
+    /// 将新增条目按 1024 个分片进行分组分桶
+    pub fn partition_by_shard(&self) -> HashMap<u16, HashMap<StoreHash, IndexEntry>> {
+        partition_entries_by_shard(self.new_entries.clone())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.new_entries.is_empty() && self.active_gc_roots.is_empty()
     }
 }
 

@@ -2,7 +2,7 @@
 
 将任何 GitHub 仓库或企业私有 OCI 镜像仓库转变为高性能 Nix 二进制缓存（Binary Cache）。推送你的 Flake，即可自动获得专属的二进制缓存。对公开仓库完全免费。
 
-本项目以 OCI 镜像分发协议为基础 —— NAR 包将作为 OCI blob 存储，并结合单文件压缩索引清单（Index Manifest）实现极速的路径查找。无需维护专用的外部二进制缓存服务、CDN 或复杂数据库。
+本项目以 OCI 镜像分发协议为基础 —— NAR 包将作为 OCI blob 存储，并结合分片梅克尔基数索引清单（Sharded Merkle-Radix Index Manifest）与全局布隆过滤器（Bloom Filter）实现极速的路径查找。无需维护专用的外部二进制缓存服务、CDN 或复杂数据库。
 
 ## 工作原理与核心架构
 
@@ -23,7 +23,7 @@
 4. **直通式流传输与零常驻开销**：从 OCI Registry 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
 
 5. **解耦的 8-Crate 架构体系**：
-   - `nixcache-core`：纯核心数据模型、Schema v4 规范、NarInfo 解析器、统一的依赖图闭包分析与 Purge/GC 核心算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
+   - `nixcache-core`：纯核心数据模型、Schema v5 分片梅克尔与布隆索引规范、NarInfo 解析器、统一的依赖图闭包分析与 Purge/GC 核心算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
    - `nixcache-utils`：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口，零 tokio/clap 依赖）。
    - `nixcache-cli`：共享 CLI 参数组件（`PurgeFilterArgs`、`OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs` 等）与声明式强类型领域配置转换体系。
    - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`BlobUploadStrategy`、CAS 并发安全更新器、批量物理删除与并发防击穿 Token 管理器。
@@ -757,7 +757,14 @@ nixcache-builder list \
 
 ### 代理如何工作
 
-代理服务只缓存一样东西：**索引（Index）**（包含所有的 `.narinfo` 数据）。索引会被加载到内存中，并根据 `NIXCACHE_INDEX_TTL`（默认 5 分钟）定期从 GHCR 刷新。这意味着 `.narinfo` 的查找是即时的 —— 不需要进行任何网络往返。在你的 Actions 成功发布新构建后，客户端最晚会在该时间窗口内看到新包。
+代理服务基于 **Schema v5 分片梅克尔基数索引（SMRI）与全局布隆过滤器** 进行元数据管理与极速解析：
+
+1. **轻量冷启动**：代理冷启动时仅拉取单架构**分片根目录元数据清单（Root Directory，~15 KB）**与**全局紧凑布隆过滤器（Bloom Filter，~120 KB）**，总传输量 $< 150\text{ KB}$，瞬时完成初始化就绪。
+2. **两级极速查询与分片按需加载 (`GET /{store_hash}.narinfo`)**：
+   - **布隆过滤器前置守卫**：查询请求到达时，首先通过内存布隆过滤器快速探测。若判定不存在，则 **$0\text{ ms}$ 零网络开销直接穿透回退至上游公共缓存**，彻底消除未命中包的检索延迟；
+   - **均匀前缀基数定位与二级分片缓存**：若布隆过滤器判定可能存在，根据 Nix Base32 哈希前缀直接定位分片 ID（$0\sim 1023$），优先从本地内存二级分片缓存（`scc::HashMap`）中检索；
+   - **按需惰性拉取单个分片**：若分片未在本地缓存，仅按需向 OCI Registry 请求该特定分片 Blob（单分片仅 ~2 KB，传输 $< 15\text{ ms}$），解压后写入本地内存并在分片内部完成 $O(1)$ 查找返回 `.narinfo`。
+3. **梅克尔树状态校验与增量刷新**：代理根据 `NIXCACHE_INDEX_TTL`（默认 5 分钟）定期检查远端根清单的 `merkle_root`。若发生变动，仅下载 Root Directory 比对各分片的 `merkle_hash`，精准逐出变动的分片，其余未变动分片继续安全复用。
 
 **NAR blob 采用直通式流传输**：从 GHCR（或上游缓存）获取的数据会直接以 64 KB 的块流式传输给 Nix 客户端。代理服务不会在内存中缓冲整个包，也不会将其写入代理主机的磁盘。同时，服务内置 `mimalloc` 全局内存分配器，消除 musl/Linux 默认分配器在高并发下的锁争用问题。Nix 客户端收到数据后，会像往常一样直接将其解压存入本地的 `/nix/store/`。这保证了本地代理服务几乎不占用磁盘空间，并且内存消耗极低。
 
@@ -886,7 +893,7 @@ curl -X POST http://localhost:37515/_refresh
 
 ```mermaid
 flowchart TD
-    Core["crates/nixcache-core<br>(纯核心模型 / Schema v4 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
+    Core["crates/nixcache-core<br>(纯核心模型 / Schema v5 分片与布隆索引 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
     Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 纯标准库 Env 工具)"]
     CLI["crates/nixcache-cli<br>(共享 CLI 参数组件 / 认证探测 / 强类型配置转换)"]
     OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
@@ -916,7 +923,7 @@ flowchart TD
     Utils --> Worker
 ```
 
-- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`ArchCacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
+- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `ShardedArchCacheIndexData`、`ShardDescriptor`、`FastBlockedBloomFilter`、`ShardDataPayload`、`DeltaPatchData`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
 - **`crates/nixcache-utils`**：跨平台底层系统调用、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
 - **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`（包含 `--registry-kind` 强类型后端种类与自动探测）、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
 - **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
@@ -949,7 +956,7 @@ flowchart TD
 
     subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
         Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
-        MergedIndex["全局 Cache Index v4<br>(合并 entries + 跨平台 gc_roots)"]
+        MergedIndex["全局分片根索引 (Schema v5 Root)<br>(1024 分片 Merkle 局部压实 + Bloom Filter + 跨平台 gc_roots)"]
         TagPush["更新 GHCR tag: cache-index"]
     end
 
@@ -969,9 +976,9 @@ flowchart TD
     MergedIndex --> TagPush
 ```
 
-- **多架构分片索引（Arch-scoped Index / Session）**：在并行 Matrix 阶段，各 Runner 独立构建目标平台产物（如 `x86_64-linux`、`aarch64-linux`），并将架构专有索引保存为特定 Tag（如 `session-<run_id>-<system>`），避免多架构节点在构建期相互干扰。
+- **构建期轻量 Delta Patch (WAL 机制)**：在并行 Matrix 阶段，各 Runner 独立构建目标平台产物，仅产出当前 Job 新增条目的轻量增量补丁（`DeltaPatchData`，体积 ~3 KB），通过 CAS 机制将增量描述符追加至会话清单（`run-<run_id>-<system>`），避免了全量覆写与并发争用。
 - **CAS（Compare-And-Swap）原子更新与指数退避**：所有 OCI 清单的更新均通过 CAS 条件写入机制进行，在并发竞争时采用抖动指数退避自动重试，确保多节点无锁并发提交时绝对不会发生数据覆盖或丢失。
-- **Coordinator 汇聚与 GC 活性根聚合**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session 分片，合并为全局统一的 `cache-index`（Schema v4），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
+- **Coordinator 汇聚与分片局部压实（Partial Compaction）**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session Delta Patches，基于 1024 分片梅克尔差集精准计算受影响的分片（未变动分片 0 传输 0 上传，直接复用原 digest 与 merkle_hash），局部压实并上传变动分片，生成新 Merkle Root 与全局布隆过滤器，原子发布全局分片根索引 `cache-index`（Schema v5），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
 
 
 ### 输出自动发现机制
@@ -990,7 +997,7 @@ GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的�
 - **天然的内容寻址**：NAR 包的 sha256 哈希值可以直接映射为 OCI blob 的哈希，天然实现去重。
 - **广泛的生态兼容性**：不仅支持 GitHub 官方托管的 GHCR（公开仓库完全免费且无容量限制），还可无缝迁移至 Docker Hub、AWS ECR、Google Cloud Artifact Registry、Azure ACR 或企业内网自建 Harbor/Zot。
 - **无文件数限制**：OCI 仓库允许存储任意数量的 blob，无需担心传统存储服务的分区限制。
-- **单一压缩索引清单**：所有的 `.narinfo` 元数据全部合并存在一个单独的 blob 索引中，本地代理在初始化或刷新时一次性拉取，后续查询全部在本地内存中完成，消除了逐个网络请求的开销。
+- **分片梅克尔基数索引与布隆过滤器 (SMRI)**：元数据按 Nix Base32 前缀均匀划分为 1,024 个轻量级分片（单分片仅 ~2 KB），并配备全局紧凑布隆过滤器（Bloom Filter）与 Merkle Tree 状态校验。冷启动仅需拉取 ~135 KB 根元数据，未命中包 0ms 旁路直通上游，命中包按需加载分片并缓存，彻底消除超大规模仓库下的单文件读写放大与内存瓶颈。
 - **超大文件支持**：单个 blob 支持最大约 10 GiB，能够轻松应对超大型软件包。
 
 ### 垃圾回收与主动清理（GC vs. Purge 统一架构）
@@ -1096,6 +1103,10 @@ nix-build default.nix -A tests.vmtest --no-out-link
 
 # 6. 验证基于图论的运行时闭包精准捕获、编译期依赖剥离 (Rust 软件包零中间产物泄漏) 与替代执行
 ./test/test-capture-closure.sh
+
+# 7. 验证 10 万 ~ 100 万条目下 Schema v5 分片离散均匀度、Merkle Tree 状态检验与高并发压测仿真
+./test/test-sharding-scale-simulation.sh
+# 或执行 100 万条目极限压测: ./test/test-sharding-scale-simulation.sh --million
 ```
 
 #### 端到端（E2E）与替换器测试

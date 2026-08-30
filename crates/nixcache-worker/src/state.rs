@@ -1,6 +1,7 @@
 use arc_swap::ArcSwapOption;
 use nixcache_core::{
-    CacheIndexData, IndexEntry, NarDigest, RunSessionManifest, StoreHash, build_nar_lookup_map,
+    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
+    ShardedArchCacheIndexData, StoreHash, build_nar_lookup_map,
 };
 use scc::HashMap as SccHashMap;
 use std::{
@@ -13,15 +14,18 @@ use std::{
 
 pub const L1_MEM_TTL_MS: f64 = 10_000.0;
 pub const DEBOUNCE_THRESHOLD_MS: f64 = 500.0;
-pub type CachedSessionEntry = (RunSessionManifest, HashMap<String, NarDigest>, f64);
-pub type CachedBaselineEntry = (CacheIndexData, HashMap<String, NarDigest>, f64);
 
-/// 收敛的 Worker 全局内存状态
+pub type CachedSessionEntry = (DeltaPatchData, HashMap<String, NarDigest>, f64);
+pub type CachedBaselineEntry = (ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>, f64);
+pub type CachedShardEntry = (ShardDataPayload, HashMap<String, NarDigest>, f64);
+
+/// 收敛的 Worker 全局内存状态 (Schema v5 SMRI with Bloom Filter)
 pub struct WorkerState {
     pub hot_entries: SccHashMap<StoreHash, Arc<IndexEntry>>,
     pub hot_nar_lookup: SccHashMap<String, NarDigest>,
     pub mem_session_cache: SccHashMap<String, Arc<CachedSessionEntry>>,
     pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
+    pub mem_shard_cache: SccHashMap<u16, Arc<CachedShardEntry>>,
     pub last_ghcr_check_ms: AtomicU64,
 }
 
@@ -30,6 +34,7 @@ static GLOBAL_STATE: LazyLock<WorkerState> = LazyLock::new(|| WorkerState {
     hot_nar_lookup: SccHashMap::new(),
     mem_session_cache: SccHashMap::new(),
     mem_baseline_cache: ArcSwapOption::from(None),
+    mem_shard_cache: SccHashMap::new(),
     last_ghcr_check_ms: AtomicU64::new(0),
 });
 
@@ -56,6 +61,7 @@ impl WorkerState {
     pub fn clear_l1_caches(&self) {
         self.mem_session_cache.clear_sync();
         self.mem_baseline_cache.store(None);
+        self.mem_shard_cache.clear_sync();
     }
 
     /// 原子抢占 GHCR 刷新权限

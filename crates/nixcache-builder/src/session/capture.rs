@@ -103,13 +103,13 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
 
     // 4. 并行获取远端已缓存 StoreHash 集合 (cache-index + 当前 run-id session)
-    let (_remote_index, own_cached_hashes) = worker::fetch_remote_cache_index(&oci).await;
+    let own_cached_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;
     let mut all_known_hashes = own_cached_hashes;
-    if let Ok(Some((session_manifest, _))) = oci
-        .get_arch_session_manifest(&format!("run-{}", opts.run_id), &system)
+    if let Ok(Some((delta_data, _))) = oci
+        .get_delta_patch_manifest(&format!("run-{}-{}", opts.run_id, system.as_str()))
         .await
     {
-        all_known_hashes.extend(session_manifest.entries.into_keys());
+        all_known_hashes.extend(delta_data.new_entries.into_keys());
     }
 
     // 5. 先验过滤分类 (直接消费 closure_res.items，零二次 path-info 查询)

@@ -1,5 +1,3 @@
-#![cfg(target_arch = "wasm32")]
-
 mod state;
 mod store;
 mod transport;
@@ -8,7 +6,7 @@ use crate::{
     store::{CacheStore, WorkerOciClient, WorkerProxyConfig},
     transport::WorkerFetchTransport,
 };
-use nixcache_core::{IndexEntry, StoreHash};
+use nixcache_core::{IndexEntry, StoreHash, SystemArch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
@@ -80,6 +78,11 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         .map(|v| v.to_string().parse::<u64>().unwrap_or(10))
         .unwrap_or(10);
 
+    let target_system = env
+        .var("NIXCACHE_SYSTEM")
+        .map(|v| SystemArch::from(v.to_string().as_str()))
+        .unwrap_or(SystemArch::X86_64Linux);
+
     Ok(WorkerProxyConfig {
         registry,
         repo,
@@ -89,6 +92,7 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         upstream_caches,
         session_ttl_secs,
         baseline_ttl_secs,
+        target_system,
     })
 }
 

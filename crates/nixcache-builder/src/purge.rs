@@ -2,30 +2,22 @@ use crate::{
     error::BuilderError, nix::resolve_flake_output_hashes, summary::write_purge_step_summary,
 };
 use chrono::Utc;
+use futures_util::future::{join_all, try_join_all};
 use nixcache_cli::PurgeArgs;
-use nixcache_core::{CACHE_INDEX_VERSION, CacheIndexData, evaluate_cache_purge};
+use nixcache_core::{
+    FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V5, ShardDataPayload,
+    ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
+    partition_entries_by_shard,
+};
 use nixcache_oci::{
-    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor,
-    OciPlatform, build_arch_index_manifest, build_image_index,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciPlatform,
+    build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-fn compute_sha256_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let hash = hasher.finalize();
-    format!(
-        "sha256:{}",
-        hash.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    )
-}
-
-/// 执行缓存主动清理与失效工作流
+/// 执行缓存主动清理与失效工作流 (Schema v5 分片梅克尔基数索引)
 pub async fn run_purge(
     args: &PurgeArgs,
     repo: &str,
@@ -72,17 +64,82 @@ pub async fn run_purge(
         return Ok(());
     }
 
-    // 2. 拉取现存 cache-index
-    let index_data_opt = oci.get_cache_index("cache-index").await?;
-    let (index_data, _) = match index_data_opt {
-        Some(pair) => pair,
-        None => {
-            info!("No cache index found, nothing to purge.");
-            return Ok(());
+    // 2. 探查多架构并加载现存基线索引数据
+    let mut target_systems: HashSet<SystemArch> = HashSet::new();
+    if let Ok(Some(artifact)) = oci.fetch_artifact("cache-index").await {
+        match artifact.manifest {
+            OciArtifactManifest::Index(index) => {
+                for desc in index.manifests {
+                    if let Some(ref plat) = desc.platform {
+                        let sys = SystemArch::from_oci(
+                            &plat.os,
+                            &plat.architecture,
+                            plat.variant.as_deref(),
+                        );
+                        if sys.is_known() {
+                            target_systems.insert(sys);
+                        }
+                    }
+                }
+            }
+            OciArtifactManifest::Manifest(_) => {
+                let detected = SystemArch::detect_current();
+                if detected.is_known() {
+                    target_systems.insert(detected);
+                }
+            }
         }
-    };
+    }
 
-    if index_data.entries.is_empty() {
+    if target_systems.is_empty() {
+        for sys in SystemArch::all() {
+            target_systems.insert(sys);
+        }
+    }
+
+    let mut arch_roots_data: HashMap<
+        SystemArch,
+        (ShardedArchCacheIndexData, HashMap<StoreHash, IndexEntry>),
+    > = HashMap::new();
+    let mut all_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
+    let mut all_gc_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
+
+    let root_futures = target_systems.into_iter().map(|sys| {
+        let oci = oci.clone();
+        async move {
+            if let Ok(Some((root_data, _))) = oci.get_sharded_root_index("cache-index", &sys).await
+            {
+                let non_empty_shards: Vec<_> = root_data
+                    .shards
+                    .iter()
+                    .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
+                    .map(|s| s.blob_digest.clone())
+                    .collect();
+
+                let shard_futures = non_empty_shards.into_iter().map(|digest| {
+                    let oci = oci.clone();
+                    async move { oci.get_shard_data(&digest).await.ok() }
+                });
+                let payloads = join_all(shard_futures).await;
+                let mut entries = HashMap::new();
+                for p in payloads.into_iter().flatten() {
+                    entries.extend(p.entries);
+                }
+                Some((sys, root_data, entries))
+            } else {
+                None
+            }
+        }
+    });
+
+    let loaded_archs = join_all(root_futures).await;
+    for (sys, root_data, entries) in loaded_archs.into_iter().flatten() {
+        all_gc_roots.insert(sys, root_data.gc_roots.clone());
+        all_entries.extend(entries.clone());
+        arch_roots_data.insert(sys, (root_data, entries));
+    }
+
+    if all_entries.is_empty() {
         info!("Cache index is empty, nothing to purge.");
         return Ok(());
     }
@@ -101,11 +158,11 @@ pub async fn run_purge(
     }
 
     let selector = args.to_purge_filter(&extra_hashes);
-    let purge_result = evaluate_cache_purge(&index_data, &selector);
+    let purge_result = evaluate_cache_purge(&all_entries, &all_gc_roots, &selector);
 
     info!(
         "Purge Evaluation: Total Before: {}, Purged: {}, Kept: {}, Estimated Space Freed: {} bytes",
-        index_data.entries.len(),
+        all_entries.len(),
         purge_result.purged_entries.len(),
         purge_result.kept_entries.len(),
         purge_result.estimated_freed_bytes
@@ -113,7 +170,7 @@ pub async fn run_purge(
 
     if purge_result.purged_entries.is_empty() {
         info!("No entries matched purge filter. Cache index remains untouched.");
-        write_purge_step_summary(dry_run, 0, index_data.entries.len(), 0, 0).await;
+        write_purge_step_summary(dry_run, 0, all_entries.len(), 0, 0).await;
         return Ok(());
     }
 
@@ -135,53 +192,103 @@ pub async fn run_purge(
         return Ok(());
     }
 
-    // 3. 将保留的 entries 和 roots 按架构拆分写回
-    let kept_data = CacheIndexData {
-        version: CACHE_INDEX_VERSION,
-        repo: repo.to_string(),
-        registry: registry.to_string(),
-        image: format!("{}/{}/nix-cache", registry, repo),
-        generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        public_key: index_data.public_key.clone(),
-        entries: purge_result.kept_entries.clone(),
-        gc_roots: purge_result.updated_gc_roots,
-        last_promoted_run: index_data.last_promoted_run,
-    };
+    // 3. 按架构对发生变化的分片执行局部压实与推送
+    let purged_hashes_set: HashSet<StoreHash> =
+        purge_result.purged_hashes.iter().cloned().collect();
+    let push_futures = arch_roots_data.into_iter().map(
+        |(sys, (mut root_index, original_entries))| {
+            let oci = oci.clone();
+            let purged_hashes_set = purged_hashes_set.clone();
+            let updated_roots = purge_result
+                .updated_gc_roots
+                .get(&sys)
+                .cloned()
+                .unwrap_or_default();
 
-    let partitioned = kept_data.into_arch_partitioned();
-    let config_digest = EMPTY_CONFIG_DIGEST;
-    let config_size = EMPTY_CONFIG_SIZE;
+            async move {
+                let kept_entries_for_sys: HashMap<StoreHash, IndexEntry> = original_entries
+                    .into_iter()
+                    .filter(|(h, _)| !purged_hashes_set.contains(h))
+                    .collect();
 
-    let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
+                let mut partitioned_kept = partition_entries_by_shard(kept_entries_for_sys.clone());
 
-    for (sys, arch_data) in partitioned {
-        let (blob_digest, compressed_size, uncompressed_size) =
-            oci.push_zstd_blob(&arch_data).await?;
-        let sub_manifest = build_arch_index_manifest(
-            &blob_digest,
-            compressed_size,
-            uncompressed_size,
-            config_digest,
-            config_size,
-            &sys,
-        );
-        let sub_manifest_json = sub_manifest.to_json_string()?;
-        let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
+                for shard_id in 0..NUM_SHARDS as u16 {
+                    let kept_for_shard = partitioned_kept.remove(&shard_id).unwrap_or_default();
+                    let desc = &mut root_index.shards[shard_id as usize];
 
-        let arch_tag = format!("cache-index-{}", sys.as_str());
-        oci.push_manifest(&arch_tag, &sub_manifest_json).await?;
+                    if kept_for_shard.is_empty() {
+                        *desc = ShardDescriptor::empty(shard_id);
+                    } else if desc.entry_count != kept_for_shard.len() {
+                        // 该分片有部分条目被清除，重新序列化并推送
+                        let mut payload = ShardDataPayload::new(shard_id);
+                        payload.entries = kept_for_shard;
+                        let (blob_digest, comp_size, uncomp_size) =
+                            oci.push_shard_data(&payload).await?;
 
-        let mut desc_annotations = HashMap::new();
-        desc_annotations.insert("org.nixos.nixcache.system".to_string(), sys.to_string());
+                        desc.blob_digest = blob_digest;
+                        desc.compressed_size = comp_size;
+                        desc.uncompressed_size = uncomp_size;
+                        desc.entry_count = payload.len();
+                        desc.merkle_hash = payload.compute_merkle_hash();
+                    }
+                    // 未发生变更的分片：完全复用原描述符
+                }
 
-        manifest_descriptors.push(OciDescriptor {
-            media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-            digest: sub_manifest_digest,
-            size: sub_manifest_json.len() as u64,
-            platform: Some(OciPlatform::from_system(&sys)),
-            annotations: Some(desc_annotations),
-        });
-    }
+                root_index.gc_roots = updated_roots;
+                root_index.recalculate_merkle_root();
+
+                // 重建 Bloom Filter
+                let total_entries = root_index.total_entries();
+                let mut bloom_filter =
+                    FastBlockedBloomFilter::new_with_defaults(total_entries.max(100));
+                for hash in kept_entries_for_sys.keys() {
+                    bloom_filter.insert(hash);
+                }
+
+                let bf_manifest = oci.push_bloom_filter(&bloom_filter).await?;
+                root_index.bloom_filter = bf_manifest.clone();
+                root_index.version = SCHEMA_VERSION_V5;
+                root_index.generated =
+                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+                let arch_tag = format!("cache-index-{}", sys.as_str());
+                let sub_manifest_digest = oci
+                    .push_sharded_root_index(
+                        &arch_tag,
+                        &root_index,
+                        &bf_manifest.blob_digest,
+                        bf_manifest.compressed_size,
+                        None,
+                    )
+                    .await?;
+
+                info!(
+                    "Pushed updated Sharded Sub-Manifest for {} after purge: digest {} (tag: {})",
+                    sys, sub_manifest_digest, arch_tag
+                );
+
+                let mut desc_annotations = HashMap::new();
+                desc_annotations.insert("org.nixos.nixcache.system".to_string(), sys.to_string());
+                desc_annotations.insert(
+                    "org.nixos.nixcache.merkle_root".to_string(),
+                    root_index.merkle_root.clone(),
+                );
+
+                let descriptor = OciDescriptor {
+                    media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+                    digest: sub_manifest_digest,
+                    size: 0,
+                    platform: Some(OciPlatform::from_system(&sys)),
+                    annotations: Some(desc_annotations),
+                };
+
+                Ok::<OciDescriptor, BuilderError>(descriptor)
+            }
+        },
+    );
+
+    let manifest_descriptors: Vec<OciDescriptor> = try_join_all(push_futures).await?;
 
     let final_descriptors = manifest_descriptors;
     oci.update_image_index_cas("cache-index", 5, |_existing| {
@@ -252,21 +359,12 @@ mod tests {
     use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
 
     #[test]
-    fn test_purge_sha256_digest() {
-        let digest = compute_sha256_digest(b"hello world");
-        assert_eq!(
-            digest,
-            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-
-    #[test]
     fn test_purge_filter_integration_with_builder() {
         let hash1 = StoreHash::new_unchecked("0000000000000000000000000000pkg1");
         let hash2 = StoreHash::new_unchecked("0000000000000000000000000000pkg2");
 
-        let mut index = CacheIndexData::default();
-        index.entries.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             hash1.clone(),
             IndexEntry {
                 name: "pkg-x86".to_string(),
@@ -282,7 +380,7 @@ mod tests {
                 origin_job: None,
             },
         );
-        index.entries.insert(
+        entries.insert(
             hash2.clone(),
             IndexEntry {
                 name: "pkg-arm".to_string(),
@@ -299,6 +397,10 @@ mod tests {
             },
         );
 
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
+        gc_roots.insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
+
         let args = PurgeArgs {
             selector: CacheSelectorArgs {
                 system: vec!["x86_64-linux".to_string()],
@@ -308,7 +410,7 @@ mod tests {
         };
 
         let selector = args.to_purge_filter(&[]);
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_hashes, vec![hash1]);
         assert_eq!(result.kept_entries.len(), 1);
         assert!(result.kept_entries.contains_key(&hash2));

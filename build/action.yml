@@ -105,7 +105,7 @@ runs:
         nixcache-builder build
 
     - name: Upload Build Receipt Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@main
       with:
         name: ${{ inputs.receipt-name != '' && inputs.receipt-name || (inputs.system != '' && format('nixcache-receipt-{0}', inputs.system) || format('nixcache-receipt-{0}', runner.os)) }}
         path: ${{ runner.temp }}/receipt-${{ inputs.system != '' && inputs.system || runner.os }}.json

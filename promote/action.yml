@@ -45,7 +45,7 @@ runs:
         fi
 
     - name: Download Build Receipt Artifacts (optional)
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@main
       continue-on-error: true
       with:
         path: ${{ inputs.receipts-dir != '' && inputs.receipts-dir || format('{0}/receipts', runner.temp) }}

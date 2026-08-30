@@ -1,37 +1,54 @@
+pub mod bloom;
 pub mod error;
 pub mod filter;
 pub mod gc;
 pub mod lookup;
 pub mod narinfo;
 pub mod purge;
+pub mod sharding;
 pub mod types;
 
-pub use error::{CoreError, GcError, NarInfoParseError, TypeError};
+pub use bloom::{BloomFilter, FastBlockedBloomFilter, murmur3_x64_128};
+pub use error::{BloomError, CoreError, GcError, NarInfoParseError, ShardingError, TypeError};
 pub use filter::{
     CacheQueryResult, CacheSelector, CascadeMode, SizeFilter, SortBy, SortOrder, TimeFilter,
-    evaluate_cache_query, matches_pattern,
+    evaluate_arch_cache_query, evaluate_cache_query, matches_pattern,
 };
-pub use gc::{GcEvaluationResult, evaluate_multi_arch_gc};
+pub use gc::{GcEvaluationResult, evaluate_gc, evaluate_multi_arch_gc};
 pub use lookup::{
     build_nar_lookup_map, extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use narinfo::NarInfo;
-pub use purge::{PurgeEvaluationResult, evaluate_cache_purge, prune_broken_gc_roots};
+pub use purge::{
+    PurgeEvaluationResult, evaluate_arch_cache_purge, evaluate_cache_purge, prune_broken_gc_roots,
+};
+pub use sharding::{
+    EMPTY_SHARD_MERKLE_HASH, NIX_BASE32_ALPHABET, calculate_shard_id, calculate_shard_id_from_str,
+    compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors, nix_base32_char,
+    nix_base32_val, partition_entries_by_shard, partition_hashes_by_shard, shard_id_to_prefix,
+    shard_id_to_prefix_bytes,
+};
 pub use types::{
-    ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-    CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfoMeta, RECEIPT_VERSION,
-    RUN_SESSION_VERSION, RunSessionManifest, SCHEMA_VERSION, StoreHash, SystemArch,
+    BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry,
+    JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
+    SCHEMA_VERSION, SCHEMA_VERSION_V5, ShardDataPayload, ShardDescriptor,
+    ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-        CacheIndexData, CacheQueryResult, CacheSelector, CascadeMode, IndexEntry,
-        JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
-        RunSessionManifest, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
-        build_nar_lookup_map, evaluate_cache_purge, evaluate_cache_query, evaluate_multi_arch_gc,
-        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
+        BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
+        CacheQueryResult, CacheSelector, CascadeMode, DeltaPatchData, EMPTY_SHARD_MERKLE_HASH,
+        FastBlockedBloomFilter, IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS,
+        NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, SCHEMA_VERSION_V5, ShardDataPayload,
+        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
+        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
+        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
+        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
+        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
+        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
+        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -243,25 +260,295 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
-    fn test_multi_arch_gc_evaluation() {
+    fn test_sharding_and_prefix_mapping() {
+        assert_eq!(NIX_BASE32_ALPHABET.len(), 32);
+
+        // Test all 32 alphabet characters mapping
+        for (i, &byte) in NIX_BASE32_ALPHABET.iter().enumerate() {
+            let val = nix_base32_val(byte).expect("Valid base32 char");
+            assert_eq!(val as usize, i);
+            let converted_byte = nix_base32_char(val).expect("Valid base32 val");
+            assert_eq!(converted_byte, byte);
+        }
+
+        // Test invalid base32 characters: 'e', 'o', 't', 'u'
+        assert!(nix_base32_val(b'e').is_err());
+        assert!(nix_base32_val(b'o').is_err());
+        assert!(nix_base32_val(b't').is_err());
+        assert!(nix_base32_val(b'u').is_err());
+
+        // Test all 1024 shards round-trip
+        for shard_id in 0..1024u16 {
+            let prefix = shard_id_to_prefix(shard_id);
+            assert_eq!(prefix.len(), 2);
+            let parsed_shard_id =
+                calculate_shard_id_from_str(&prefix).expect("Valid prefix to shard_id");
+            assert_eq!(parsed_shard_id, shard_id);
+        }
+
+        // Boundary cases
+        assert_eq!(shard_id_to_prefix(0), "00");
+        assert_eq!(shard_id_to_prefix(1), "01");
+        assert_eq!(shard_id_to_prefix(1023), "zz");
+
+        // Specific hash test: "s66mzxpvicwk07gjbjfw9izjfa797vsw"
+        let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let sid = calculate_shard_id(&hash);
+        assert_eq!(sid, hash.shard_id());
+        assert_eq!(shard_id_to_prefix(sid), "s6");
+
+        // Partition test
+        let mut entries = HashMap::new();
+        let h1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let h2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
+        let h3 = StoreHash::parse("s6000000000000000000000000000000").unwrap();
+
+        entries.insert(h1.clone(), IndexEntry::default());
+        entries.insert(h2.clone(), IndexEntry::default());
+        entries.insert(h3.clone(), IndexEntry::default());
+
+        let partitioned = partition_entries_by_shard(entries);
+        assert_eq!(partitioned.get(&0).unwrap().len(), 2);
+        assert_eq!(partitioned.get(&sid).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_fast_blocked_bloom_filter() {
+        let mut filter = FastBlockedBloomFilter::new_with_defaults(100);
+        assert!(filter.is_empty());
+        assert_eq!(filter.num_entries(), 0);
+
+        let h1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let h2 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let h3 = StoreHash::parse("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
+        let non_existent = StoreHash::parse("ffffffffffffffffffffffffffffffff").unwrap();
+
+        filter.insert(&h1);
+        filter.insert(&h2);
+        filter.insert(&h3);
+
+        assert_eq!(filter.num_entries(), 3);
+        assert!(!filter.is_empty());
+
+        // Zero false negatives
+        assert!(filter.contains(&h1));
+        assert!(filter.contains(&h2));
+        assert!(filter.contains(&h3));
+        assert!(!filter.contains(&non_existent));
+
+        // Binary serialization & deserialization roundtrip
+        let bytes = filter.to_bytes();
+        assert_eq!(bytes.len() % 64, 0);
+
+        let restored =
+            FastBlockedBloomFilter::from_bytes(&bytes, filter.num_entries(), filter.num_hashes())
+                .expect("Valid bloom bytes restore");
+
+        assert_eq!(filter, restored);
+        assert!(restored.contains(&h1));
+        assert!(restored.contains(&h2));
+        assert!(restored.contains(&h3));
+        assert!(!restored.contains(&non_existent));
+
+        // Large scale false positive rate test
+        let mut large_filter = FastBlockedBloomFilter::new_with_defaults(2000);
+        let mut inserted_set = HashSet::new();
+
+        for i in 0..2000 {
+            let hash = StoreHash::new_unchecked(format!("a{:031}", i));
+            large_filter.insert(&hash);
+            inserted_set.insert(hash);
+        }
+
+        // Verify zero false negatives
+        for hash in &inserted_set {
+            assert!(large_filter.contains(hash));
+        }
+
+        // BloomFilter type alias test
+        let mut alias_filter: BloomFilter = BloomFilter::new_with_defaults(10);
+        alias_filter.insert(&h1);
+        assert!(alias_filter.contains(&h1));
+
+        // Test false positive rate on 5000 distinct items
+        let mut false_positives = 0;
+        let test_count = 5000;
+        for i in 0..test_count {
+            let probe_hash = StoreHash::new_unchecked(format!("z{:031}", i));
+            if !inserted_set.contains(&probe_hash) && large_filter.contains(&probe_hash) {
+                false_positives += 1;
+            }
+        }
+
+        let fpr = (false_positives as f64) / (test_count as f64);
+        // Design specifies ~1% false positive rate (allow tolerance up to 2.5% in probabilistic sample)
+        assert!(
+            fpr < 0.025,
+            "False positive rate too high: {} (fp: {})",
+            fpr,
+            false_positives
+        );
+    }
+
+    #[test]
+    fn test_merkle_tree_and_diffing() {
+        let mut entries1 = HashMap::new();
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        entries1.insert(
+            h1.clone(),
+            IndexEntry {
+                name: "pkg1".to_string(),
+                nar_size: 500,
+                nar_digest: NarDigest::new_unchecked("sha256:digest1"),
+                ..Default::default()
+            },
+        );
+
+        let hash_a = compute_shard_merkle_hash(&entries1);
+        let hash_b = compute_shard_merkle_hash(&entries1);
+        assert_eq!(hash_a, hash_b, "Merkle hash must be deterministic");
+
+        let empty_entries = HashMap::new();
+        assert_eq!(
+            compute_shard_merkle_hash(&empty_entries),
+            EMPTY_SHARD_MERKLE_HASH
+        );
+
+        let mut shards1 = Vec::with_capacity(NUM_SHARDS);
+        let mut shards2 = Vec::with_capacity(NUM_SHARDS);
+        for id in 0..NUM_SHARDS {
+            shards1.push(ShardDescriptor::empty(id as u16));
+            shards2.push(ShardDescriptor::empty(id as u16));
+        }
+
+        let root1 = compute_merkle_root(&shards1);
+        let root2 = compute_merkle_root(&shards2);
+        assert_eq!(root1, root2);
+        assert!(diff_shard_descriptors(&shards1, &shards2).is_empty());
+
+        // Modify shard 42 in shards2
+        shards2[42].merkle_hash = "sha256:changed42".to_string();
+        shards2[42].entry_count = 1;
+
+        let root2_changed = compute_merkle_root(&shards2);
+        assert_ne!(root1, root2_changed);
+
+        let diff = diff_shard_descriptors(&shards1, &shards2);
+        assert_eq!(diff, vec![42]);
+    }
+
+    #[test]
+    fn test_schema_v5_structures_and_serialization() {
+        let mut root_index =
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "owner/repo", "ghcr.io");
+        assert_eq!(root_index.version, SCHEMA_VERSION_V5);
+        assert_eq!(root_index.shards.len(), NUM_SHARDS);
+        assert_eq!(root_index.total_entries(), 0);
+
+        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        root_index.gc_roots.push(h1.clone());
+
+        let target_shard = root_index.find_shard_mut(&h1).expect("Shard exists");
+        target_shard.entry_count = 1;
+        target_shard.blob_digest = "sha256:shard_blob_digest".to_string();
+        target_shard.compressed_size = 1024;
+        target_shard.uncompressed_size = 4096;
+        target_shard.merkle_hash = "sha256:new_merkle".to_string();
+        root_index.recalculate_merkle_root();
+
+        let json = serde_json::to_string(&root_index).expect("Serialize root index");
+        let deserialized: ShardedArchCacheIndexData =
+            serde_json::from_str(&json).expect("Deserialize root index");
+
+        assert_eq!(deserialized.version, SCHEMA_VERSION_V5);
+        assert_eq!(deserialized.system, SystemArch::X86_64Linux);
+        assert_eq!(deserialized.total_entries(), 1);
+        assert_eq!(deserialized.shards.len(), NUM_SHARDS);
+        assert_eq!(deserialized.gc_roots, vec![h1.clone()]);
+        assert_eq!(deserialized.merkle_root, root_index.merkle_root);
+
+        // ShardDataPayload
+        let mut payload = ShardDataPayload::new(838);
+        payload.entries.insert(
+            h1.clone(),
+            IndexEntry {
+                name: "pkg1".to_string(),
+                nar_size: 100,
+                ..Default::default()
+            },
+        );
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let loaded_payload: ShardDataPayload = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V5);
+        assert_eq!(loaded_payload.shard_id, 838);
+        assert_eq!(loaded_payload.len(), 1);
+
+        // DeltaPatchData
+        let mut delta = DeltaPatchData::new(12345, "job-build", SystemArch::X86_64Linux);
+        delta.new_entries.insert(h1.clone(), IndexEntry::default());
+        delta.active_gc_roots.push(h1.clone());
+
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        let loaded_delta: DeltaPatchData = serde_json::from_str(&delta_json).unwrap();
+        assert_eq!(loaded_delta.run_id, 12345);
+        assert_eq!(loaded_delta.new_entries.len(), 1);
+        let partitioned = loaded_delta.partition_by_shard();
+        assert_eq!(partitioned.get(&838).unwrap().len(), 1);
+
+        // BloomFilterManifest
+        let bf_manifest = BloomFilterManifest::new(100, 1024, 7, "sha256:bloom_blob", 120);
+        let bf_json = serde_json::to_string(&bf_manifest).unwrap();
+        let loaded_bf: BloomFilterManifest = serde_json::from_str(&bf_json).unwrap();
+        assert_eq!(loaded_bf.num_entries, 100);
+        assert!(!loaded_bf.is_empty());
+
+        // JobSummaryMetadata
+        let job_summary = JobSummaryMetadata {
+            job_id: "build-1".to_string(),
+            system: SystemArch::X86_64Linux,
+            uploaded_blobs: 2,
+            uploaded_bytes: 2048,
+            timestamp: "2026-08-30T10:00:00Z".to_string(),
+        };
+        let js_json = serde_json::to_string(&job_summary).unwrap();
+        let loaded_js: JobSummaryMetadata = serde_json::from_str(&js_json).unwrap();
+        assert_eq!(loaded_js.job_id, "build-1");
+
+        // BuildReceipt
+        let receipt = BuildReceipt::new(
+            SystemArch::X86_64Linux,
+            "owner/repo".to_string(),
+            "2026-08-29T10:00:00Z".to_string(),
+            Some("pubkey".to_string()),
+            HashMap::new(),
+            vec![h1],
+            BuildStats {
+                discovered_outputs: 1,
+                built_paths: 1,
+                substituted_paths: 0,
+                uploaded_blobs: 1,
+                total_bytes_uploaded: 500,
+            },
+        )
+        .with_run_info(Some(12345), Some("job1".to_string()));
+        assert_eq!(receipt.version, RECEIPT_VERSION);
+        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V5);
+    }
+
+    #[test]
+    fn test_gc_evaluation() {
         let root_app = StoreHash::new_unchecked("hash0000000000000000000000000app");
         let shared_dep = StoreHash::new_unchecked("hash0000000000000000000000000dep");
         let sub_dep = StoreHash::new_unchecked("hash0000000000000000000000000sub");
         let orphan_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
         let orphan_new = StoreHash::new_unchecked("hash0000000000000000000000000new");
 
-        let mut index = CacheIndexData::default();
-        // 只有 root_app 被列为 gc_root，shared_dep 与 sub_dep 是其传递依赖
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
-
+        let mut entries = HashMap::new();
         let now = Utc::now();
         let sixty_days_ago = (now - Duration::days(60)).to_rfc3339();
         let five_days_ago = (now - Duration::days(5)).to_rfc3339();
 
-        // 1. Root app 引用 shared_dep
-        index.entries.insert(
+        entries.insert(
             root_app.clone(),
             IndexEntry {
                 name: "root-app".to_string(),
@@ -279,8 +566,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        // 2. Shared dep 引用 sub_dep (深层传递依赖，虽然生成于60天前且未在root中列出，但闭包可达必须保留)
-        index.entries.insert(
+        entries.insert(
             shared_dep.clone(),
             IndexEntry {
                 name: "shared-dep".to_string(),
@@ -298,8 +584,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        // 3. Sub dep (叶子依赖，60天前生成，闭包可达必须保留)
-        index.entries.insert(
+        entries.insert(
             sub_dep.clone(),
             IndexEntry {
                 name: "sub-dep".to_string(),
@@ -317,8 +602,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        // 4. 孤立过期条目 (不可达且过期，应该被删除)
-        index.entries.insert(
+        entries.insert(
             orphan_old.clone(),
             IndexEntry {
                 name: "orphan-old".to_string(),
@@ -336,8 +620,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        // 5. 孤立新条目 (不可达但未过期，在宽限期内保留)
-        index.entries.insert(
+        entries.insert(
             orphan_new.clone(),
             IndexEntry {
                 name: "orphan-new".to_string(),
@@ -355,135 +638,22 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
+        let gc_roots = vec![root_app.clone()];
         let cutoff = now - Duration::days(30);
-        let result = evaluate_multi_arch_gc(&index, &cutoff);
 
+        let result = evaluate_gc(&entries, &gc_roots, &cutoff);
         assert_eq!(result.deleted_hashes, vec![orphan_old]);
         assert_eq!(result.kept_entries.len(), 4);
         assert!(result.kept_entries.contains_key(&root_app));
-        assert!(
-            result.kept_entries.contains_key(&shared_dep),
-            "Closure reachable shared_dep must be kept!"
-        );
-        assert!(
-            result.kept_entries.contains_key(&sub_dep),
-            "Closure reachable sub_dep must be kept!"
-        );
+        assert!(result.kept_entries.contains_key(&shared_dep));
+        assert!(result.kept_entries.contains_key(&sub_dep));
         assert!(result.kept_entries.contains_key(&orphan_new));
         assert_eq!(result.reachable_roots.len(), 3);
-    }
 
-    #[test]
-    fn test_types_serialization() {
-        let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let mut index = CacheIndexData {
-            repo: "owner/repo".to_string(),
-            ..Default::default()
-        };
-        index.entries.insert(
-            hash1.clone(),
-            IndexEntry {
-                name: "pkg1".to_string(),
-                system: Some(SystemArch::X86_64Linux),
-                narinfo_meta: NarInfoMeta {
-                    store_path: format!("/nix/store/{}-pkg1", hash1),
-                    nar_basename: "pkg1.nar.xz".to_string(),
-                    nar_hash:
-                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                            .to_string(),
-                    ..Default::default()
-                },
-                nar_digest: NarDigest::new_sha256(
-                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                )
-                .unwrap(),
-                nar_size: 1024,
-                added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: Some("job:ci".to_string()),
-            },
-        );
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
-
-        let json_str = serde_json::to_string(&index).expect("Failed to serialize index");
-        let deserialized: CacheIndexData =
-            serde_json::from_str(&json_str).expect("Failed to deserialize index");
-
-        assert_eq!(deserialized.version, CACHE_INDEX_VERSION);
-        assert_eq!(deserialized.repo, "owner/repo");
-        assert_eq!(deserialized.entries.len(), 1);
-        assert_eq!(
-            deserialized.gc_roots.get(&SystemArch::X86_64Linux).unwrap(),
-            &vec![hash1]
-        );
-    }
-
-    #[test]
-    fn test_session_and_receipt_structures() {
-        let mut session = RunSessionManifest {
-            run_id: 12345,
-            head_sha: "abcdef".to_string(),
-            ref_name: "refs/heads/main".to_string(),
-            ..Default::default()
-        };
-        session.completed_jobs.push(JobSummaryMetadata {
-            job_id: "build-x86".to_string(),
-            system: SystemArch::X86_64Linux,
-            uploaded_blobs: 5,
-            uploaded_bytes: 10240,
-            timestamp: "2026-08-29T10:00:00Z".to_string(),
-        });
-        let session_json = serde_json::to_string(&session).unwrap();
-        let loaded_session: RunSessionManifest = serde_json::from_str(&session_json).unwrap();
-        assert_eq!(loaded_session.version, RUN_SESSION_VERSION);
-        assert_eq!(loaded_session.run_id, 12345);
-        assert_eq!(loaded_session.completed_jobs.len(), 1);
-
-        // Arch-scoped session
-        let mut arch_session = ArchRunSessionManifest::new(12345, SystemArch::X86_64Linux);
-        arch_session.completed_jobs.push(JobSummaryMetadata {
-            job_id: "build-x86".to_string(),
-            system: SystemArch::X86_64Linux,
-            uploaded_blobs: 5,
-            uploaded_bytes: 10240,
-            timestamp: "2026-08-29T10:00:00Z".to_string(),
-        });
-        let arch_session_json = serde_json::to_string(&arch_session).unwrap();
-        let loaded_arch_session: ArchRunSessionManifest =
-            serde_json::from_str(&arch_session_json).unwrap();
-        assert_eq!(loaded_arch_session.version, RUN_SESSION_VERSION);
-        assert_eq!(loaded_arch_session.system, SystemArch::X86_64Linux);
-
-        // Arch-scoped cache index
-        let arch_index = ArchCacheIndexData::new(SystemArch::Aarch64Linux, "owner/repo", "ghcr.io");
-        let arch_index_json = serde_json::to_string(&arch_index).unwrap();
-        let loaded_arch_index: ArchCacheIndexData = serde_json::from_str(&arch_index_json).unwrap();
-        assert_eq!(loaded_arch_index.version, CACHE_INDEX_VERSION);
-        assert_eq!(loaded_arch_index.system, SystemArch::Aarch64Linux);
-
-        let root1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let receipt = BuildReceipt::new(
-            SystemArch::X86_64Linux,
-            "owner/repo".to_string(),
-            "2026-08-29T10:00:00Z".to_string(),
-            Some("key:pub".to_string()),
-            HashMap::new(),
-            vec![root1],
-            BuildStats {
-                discovered_outputs: 2,
-                built_paths: 2,
-                substituted_paths: 0,
-                uploaded_blobs: 2,
-                total_bytes_uploaded: 5000,
-            },
-        )
-        .with_run_info(Some(12345), Some("job1".to_string()));
-        assert_eq!(receipt.version, RECEIPT_VERSION);
-        let receipt_json = serde_json::to_string(&receipt).unwrap();
-        let loaded_receipt: BuildReceipt = serde_json::from_str(&receipt_json).unwrap();
-        assert_eq!(loaded_receipt.job_id, Some("job1".to_string()));
-        assert_eq!(loaded_receipt.stats.uploaded_blobs, 2);
+        let mut multi_roots = HashMap::new();
+        multi_roots.insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
+        let multi_result = evaluate_multi_arch_gc(&entries, &multi_roots, &cutoff);
+        assert_eq!(multi_result.deleted_hashes, result.deleted_hashes);
     }
 
     #[test]
@@ -506,8 +676,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
         let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
 
-        let mut index = CacheIndexData::default();
-        index.entries.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             hash1.clone(),
             IndexEntry {
                 name: "rust-1.80".to_string(),
@@ -523,7 +693,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 origin_job: None,
             },
         );
-        index.entries.insert(
+        entries.insert(
             hash2.clone(),
             IndexEntry {
                 name: "llvm-18".to_string(),
@@ -544,12 +714,17 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             patterns: vec!["*rust*".to_string()],
             ..Default::default()
         };
-        let query_res: CacheQueryResult = evaluate_cache_query(&index, &selector);
+        let query_res: CacheQueryResult =
+            evaluate_cache_query(&entries, &HashMap::new(), &selector);
         assert_eq!(query_res.matched_entries.len(), 1);
         assert_eq!(query_res.unmatched_entries.len(), 1);
         assert_eq!(query_res.matched_bytes, 1000);
         assert_eq!(query_res.unmatched_bytes, 2000);
         assert_eq!(query_res.final_matched_hashes, vec![hash1.clone()]);
+
+        let arch_query_res =
+            evaluate_arch_cache_query(&entries, &[], SystemArch::X86_64Linux, &selector);
+        assert_eq!(arch_query_res.matched_entries.len(), 1);
     }
 
     #[test]
@@ -557,8 +732,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
         let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
 
-        let mut index = CacheIndexData::default();
-        index.entries.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
@@ -574,7 +749,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 origin_job: None,
             },
         );
-        index.entries.insert(
+        entries.insert(
             hash2.clone(),
             IndexEntry {
                 name: "pkg2".to_string(),
@@ -590,25 +765,27 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 origin_job: None,
             },
         );
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
-        index
-            .gc_roots
-            .insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
+
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
+        gc_roots.insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
 
         let selector = CacheSelector {
             select_all: true,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert!(result.kept_entries.is_empty());
         assert_eq!(result.purged_entries.len(), 2);
         assert_eq!(result.purged_hashes.len(), 2);
         assert_eq!(result.purged_nar_digests.len(), 2);
         assert_eq!(result.estimated_freed_bytes, 3000);
         assert!(result.updated_gc_roots.is_empty());
+
+        let arch_result =
+            evaluate_arch_cache_purge(&entries, &[hash1], SystemArch::X86_64Linux, &selector);
+        assert_eq!(arch_result.purged_entries.len(), 2);
     }
 
     #[test]
@@ -617,12 +794,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
         let core = StoreHash::new_unchecked("hash000000000000000000000000core");
 
-        let mut index = CacheIndexData::default();
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![app.clone()]);
+        let mut entries = HashMap::new();
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![app.clone()]);
 
-        index.entries.insert(
+        entries.insert(
             app.clone(),
             IndexEntry {
                 name: "app".to_string(),
@@ -640,7 +816,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             lib_a.clone(),
             IndexEntry {
                 name: "liba".to_string(),
@@ -658,7 +834,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             core.clone(),
             IndexEntry {
                 name: "core".to_string(),
@@ -685,7 +861,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_hashes, vec![lib_a.clone()]);
         assert_eq!(result.estimated_freed_bytes, 300);
         assert!(result.kept_entries.contains_key(&app));
@@ -701,12 +877,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
         let core = StoreHash::new_unchecked("hash000000000000000000000000core");
 
-        let mut index = CacheIndexData::default();
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![app.clone()]);
+        let mut entries = HashMap::new();
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![app.clone()]);
 
-        index.entries.insert(
+        entries.insert(
             app.clone(),
             IndexEntry {
                 name: "app".to_string(),
@@ -724,7 +899,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             lib_a.clone(),
             IndexEntry {
                 name: "liba".to_string(),
@@ -742,7 +917,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             core.clone(),
             IndexEntry {
                 name: "core".to_string(),
@@ -769,7 +944,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_entries.len(), 2);
         assert!(result.purged_entries.contains_key(&lib_a));
         assert!(result.purged_entries.contains_key(&app));
@@ -784,8 +959,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
         let core = StoreHash::new_unchecked("hash000000000000000000000000core");
 
-        let mut index = CacheIndexData::default();
-        index.entries.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             app.clone(),
             IndexEntry {
                 name: "app".to_string(),
@@ -802,7 +977,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 origin_job: None,
             },
         );
-        index.entries.insert(
+        entries.insert(
             lib_a.clone(),
             IndexEntry {
                 name: "liba".to_string(),
@@ -819,7 +994,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 origin_job: None,
             },
         );
-        index.entries.insert(
+        entries.insert(
             core.clone(),
             IndexEntry {
                 name: "core".to_string(),
@@ -846,7 +1021,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Transitive,
             ..Default::default()
         };
-        let res_transitive = evaluate_cache_purge(&index, &selector_transitive);
+        let res_transitive = evaluate_cache_purge(&entries, &HashMap::new(), &selector_transitive);
         assert_eq!(res_transitive.purged_entries.len(), 2);
         assert!(res_transitive.purged_entries.contains_key(&lib_a));
         assert!(res_transitive.purged_entries.contains_key(&core));
@@ -858,7 +1033,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::FullTree,
             ..Default::default()
         };
-        let res_full = evaluate_cache_purge(&index, &selector_full);
+        let res_full = evaluate_cache_purge(&entries, &HashMap::new(), &selector_full);
         assert_eq!(res_full.purged_entries.len(), 3);
         assert!(res_full.purged_entries.contains_key(&app));
         assert!(res_full.purged_entries.contains_key(&lib_a));
@@ -872,8 +1047,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let hash_small = StoreHash::new_unchecked("hash00000000000000000000000small");
         let hash_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
 
-        let mut index = CacheIndexData::default();
-        index.entries.insert(
+        let mut entries = HashMap::new();
+        entries.insert(
             hash_chromium.clone(),
             IndexEntry {
                 name: "chromium-120.0".to_string(),
@@ -890,7 +1065,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             hash_small.clone(),
             IndexEntry {
                 name: "small-lib".to_string(),
@@ -907,7 +1082,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             hash_old.clone(),
             IndexEntry {
                 name: "old-lib".to_string(),
@@ -930,7 +1105,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_pat = evaluate_cache_purge(&index, &selector_pat);
+        let res_pat = evaluate_cache_purge(&entries, &HashMap::new(), &selector_pat);
         assert_eq!(res_pat.purged_hashes, vec![hash_chromium.clone()]);
 
         // Size filter: MinBytes(100MB)
@@ -939,7 +1114,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_size = evaluate_cache_purge(&index, &selector_size);
+        let res_size = evaluate_cache_purge(&entries, &HashMap::new(), &selector_size);
         assert_eq!(res_size.purged_hashes, vec![hash_chromium.clone()]);
 
         // Time filter: Before 2026-08-01
@@ -952,7 +1127,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_time = evaluate_cache_purge(&index, &selector_time);
+        let res_time = evaluate_cache_purge(&entries, &HashMap::new(), &selector_time);
         assert_eq!(res_time.purged_hashes, vec![hash_old.clone()]);
 
         // System filter
@@ -964,7 +1139,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_sys = evaluate_cache_purge(&index, &selector_sys);
+        let res_sys = evaluate_cache_purge(&entries, &HashMap::new(), &selector_sys);
         assert_eq!(res_sys.purged_hashes, vec![hash_old.clone()]);
     }
 
@@ -974,15 +1149,12 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let root_arm = StoreHash::new_unchecked("000000000000000000000000000root2");
         let dep_x86 = StoreHash::new_unchecked("0000000000000000000000000000dep1");
 
-        let mut index = CacheIndexData::default();
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![root_x86.clone()]);
-        index
-            .gc_roots
-            .insert(SystemArch::Aarch64Linux, vec![root_arm.clone()]);
+        let mut entries = HashMap::new();
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![root_x86.clone()]);
+        gc_roots.insert(SystemArch::Aarch64Linux, vec![root_arm.clone()]);
 
-        index.entries.insert(
+        entries.insert(
             root_x86.clone(),
             IndexEntry {
                 name: "root-x86".to_string(),
@@ -1000,7 +1172,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             dep_x86.clone(),
             IndexEntry {
                 name: "dep-x86".to_string(),
@@ -1018,7 +1190,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             root_arm.clone(),
             IndexEntry {
                 name: "root-arm".to_string(),
@@ -1045,7 +1217,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         // root_x86 should be pruned because its dependency dep_x86 was purged!
         // root_arm should remain untouched!
         assert_eq!(
@@ -1061,14 +1233,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let shared_dep = StoreHash::new_unchecked("hash0000000000000000000000000dep");
         let orphan_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
 
-        let mut index = CacheIndexData::default();
-        index
-            .gc_roots
-            .insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
+        let mut entries = HashMap::new();
+        let mut gc_roots = HashMap::new();
+        gc_roots.insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
 
         let sixty_days_ago = (Utc::now() - Duration::days(60)).to_rfc3339();
 
-        index.entries.insert(
+        entries.insert(
             root_app.clone(),
             IndexEntry {
                 name: "root-app".to_string(),
@@ -1086,7 +1257,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             shared_dep.clone(),
             IndexEntry {
                 name: "shared-dep".to_string(),
@@ -1104,7 +1275,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        index.entries.insert(
+        entries.insert(
             orphan_old.clone(),
             IndexEntry {
                 name: "orphan-old".to_string(),
@@ -1117,7 +1288,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 },
                 nar_digest: NarDigest::new_unchecked("sha256:old-blob"),
                 nar_size: 100,
-                added: sixty_days_ago.clone(),
+                added: sixty_days_ago,
                 origin_job: None,
             },
         );
@@ -1131,7 +1302,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_hashes, vec![orphan_old]);
         assert_eq!(result.kept_entries.len(), 2);
         assert!(result.kept_entries.contains_key(&root_app));
