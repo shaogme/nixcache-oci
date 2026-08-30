@@ -30,6 +30,40 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
+async fn collect_receipt_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs_to_visit = Vec::new();
+
+    for p in paths {
+        if p.is_dir() {
+            dirs_to_visit.push(p.clone());
+        } else if p.is_file() && p.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            files.push(p.clone());
+        }
+    }
+
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        if let Ok(mut dir_entries) = fs::read_dir(&current_dir).await {
+            while let Ok(Some(entry)) = dir_entries.next_entry().await {
+                let file_path = entry.path();
+                if let Ok(file_type) = entry.file_type().await {
+                    if file_type.is_dir() {
+                        dirs_to_visit.push(file_path);
+                    } else if file_type.is_file()
+                        && file_path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    {
+                        files.push(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Promote: 汇聚多架构会话清单与 Receipts，分架构生成 Sub-Manifest，并原子发布顶层 OCI Image Index
 pub async fn run_promote(
     run_id: Option<u64>,
@@ -78,74 +112,35 @@ pub async fn run_promote(
     let mut receipt_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
     let mut receipt_pub_key: Option<String> = None;
 
-    // 2. 从本地 Receipt 文件/目录加载
-    for p in receipt_paths {
-        if p.is_dir() {
-            if let Ok(mut dir_entries) = fs::read_dir(p).await {
-                while let Ok(Some(entry)) = dir_entries.next_entry().await {
-                    let file_path = entry.path();
-                    if file_path.is_file()
-                        && file_path.extension().and_then(|ext| ext.to_str()) == Some("json")
+    // 2. 从本地 Receipt 文件/目录加载（支持单文件、目录及多级子目录递归扫描）
+    let receipt_files = collect_receipt_files(receipt_paths).await;
+    for file_path in receipt_files {
+        match fs::read_to_string(&file_path).await {
+            Ok(content) => match serde_json::from_str::<BuildReceipt>(&content) {
+                Ok(receipt) => {
+                    info!(
+                        "Loaded receipt from {:?} (system: {}, entries: {})",
+                        file_path,
+                        receipt.system,
+                        receipt.new_entries.len()
+                    );
+                    if let Some(ref pk) = receipt.public_key
+                        && !pk.is_empty()
                     {
-                        match fs::read_to_string(&file_path).await {
-                            Ok(content) => match serde_json::from_str::<BuildReceipt>(&content) {
-                                Ok(receipt) => {
-                                    info!(
-                                        "Loaded receipt from {:?} (system: {}, entries: {})",
-                                        file_path,
-                                        receipt.system,
-                                        receipt.new_entries.len()
-                                    );
-                                    if let Some(ref pk) = receipt.public_key
-                                        && !pk.is_empty()
-                                    {
-                                        receipt_pub_key = Some(pk.clone());
-                                    }
-                                    receipt_entries.extend(receipt.new_entries);
-                                    receipt_roots
-                                        .entry(receipt.system)
-                                        .or_default()
-                                        .extend(receipt.active_gc_roots);
-                                }
-                                Err(e) => {
-                                    warn!("Could not parse receipt JSON at {:?}: {}", file_path, e);
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Could not read file {:?}: {}", file_path, e);
-                            }
-                        }
+                        receipt_pub_key = Some(pk.clone());
                     }
+                    receipt_entries.extend(receipt.new_entries);
+                    receipt_roots
+                        .entry(receipt.system)
+                        .or_default()
+                        .extend(receipt.active_gc_roots);
                 }
-            }
-        } else if p.is_file() {
-            match fs::read_to_string(p).await {
-                Ok(content) => match serde_json::from_str::<BuildReceipt>(&content) {
-                    Ok(receipt) => {
-                        info!(
-                            "Loaded receipt from {:?} (system: {}, entries: {})",
-                            p,
-                            receipt.system,
-                            receipt.new_entries.len()
-                        );
-                        if let Some(ref pk) = receipt.public_key
-                            && !pk.is_empty()
-                        {
-                            receipt_pub_key = Some(pk.clone());
-                        }
-                        receipt_entries.extend(receipt.new_entries);
-                        receipt_roots
-                            .entry(receipt.system)
-                            .or_default()
-                            .extend(receipt.active_gc_roots);
-                    }
-                    Err(e) => {
-                        warn!("Could not parse receipt JSON at {:?}: {}", p, e);
-                    }
-                },
                 Err(e) => {
-                    warn!("Could not read file {:?}: {}", p, e);
+                    warn!("Could not parse receipt JSON at {:?}: {}", file_path, e);
                 }
+            },
+            Err(e) => {
+                warn!("Could not read file {:?}: {}", file_path, e);
             }
         }
     }
@@ -476,5 +471,28 @@ mod tests {
         let systems: HashSet<SystemArch> = loaded.into_iter().map(|r| r.system).collect();
         assert!(systems.contains(&SystemArch::X86_64Linux));
         assert!(systems.contains(&SystemArch::Aarch64Linux));
+    }
+
+    #[tokio::test]
+    async fn test_collect_receipt_files_recursive() {
+        let temp_dir = tempdir().unwrap();
+        let base_dir = temp_dir.path().join("downloaded-receipts");
+        let sub_dir1 = base_dir.join("nixcache-receipt-x86_64-linux");
+        let sub_dir2 = base_dir.join("nixcache-receipt-aarch64-linux");
+        fs::create_dir_all(&sub_dir1).await.unwrap();
+        fs::create_dir_all(&sub_dir2).await.unwrap();
+
+        let file1 = sub_dir1.join("receipt.json");
+        let file2 = sub_dir2.join("receipt.json");
+        let non_json = sub_dir1.join("log.txt");
+
+        fs::write(&file1, "{}").await.unwrap();
+        fs::write(&file2, "{}").await.unwrap();
+        fs::write(&non_json, "log").await.unwrap();
+
+        let files = collect_receipt_files(&[base_dir]).await;
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&file1));
+        assert!(files.contains(&file2));
     }
 }

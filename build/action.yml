@@ -99,7 +99,7 @@ runs:
         NIXCACHE_STRICT: ${{ inputs.strict }}
         NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         NIXCACHE_RUN_ID: ${{ inputs.run-id }}
-        NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt.json
+        NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt-${{ inputs.system != '' && inputs.system || runner.os }}.json
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         nixcache-builder build
@@ -108,6 +108,6 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.receipt-name != '' && inputs.receipt-name || (inputs.system != '' && format('nixcache-receipt-{0}', inputs.system) || format('nixcache-receipt-{0}', runner.os)) }}
-        path: ${{ runner.temp }}/receipt.json
+        path: ${{ runner.temp }}/receipt-${{ inputs.system != '' && inputs.system || runner.os }}.json
         retention-days: 1
         overwrite: true
