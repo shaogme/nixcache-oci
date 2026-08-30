@@ -9,6 +9,7 @@ nixcache-oci = { workspace = true }
 nixcache-utils = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }

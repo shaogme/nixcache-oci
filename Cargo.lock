@@ -1184,6 +1184,7 @@ dependencies = [
  "nixcache-core",
  "nixcache-oci",
  "nixcache-utils",
+ "serde",
  "tempfile",
  "thiserror",
  "tokio",

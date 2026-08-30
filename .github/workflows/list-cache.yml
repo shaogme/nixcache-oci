@@ -1,0 +1,123 @@
+name: List & Inspect Build Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      view_mode:
+        description: 'Query View Preset'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'all'          # 全量概览与架构分布
+          - 'filter'       # 按名称/路径/模式自定义筛选
+          - 'top_size'     # 体积最大产物排行 (Top Heavy Packages)
+          - 'recent'       # 最近 24 小时新构建产物
+          - 'outputs'      # 当前 Flake 输出闭包匹配
+      patterns:
+        description: 'Pattern match (e.g. *linux*, *chromium*, gcc*)'
+        required: false
+        default: ''
+        type: string
+      system:
+        description: 'Target Architecture (leave blank for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - 'x86_64-linux'
+          - 'aarch64-linux'
+          - 'aarch64-darwin'
+          - 'x86_64-darwin'
+      target_tag:
+        description: 'Target OCI Tag (e.g., cache-index, run-123456)'
+        required: false
+        default: 'cache-index'
+        type: string
+      limit:
+        description: 'Display Item Limit'
+        required: false
+        default: '50'
+        type: string
+      format:
+        description: 'Console Output Format'
+        required: true
+        default: 'table'
+        type: choice
+        options:
+          - 'table'
+          - 'summary'
+          - 'json'
+          - 'paths'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  list-cache:
+    name: Inspect Cache (${{ github.event.inputs.view_mode }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build NixCache Builder
+        run: |
+          nix build .#cache-builder
+          echo "${{ github.workspace }}/result/bin" >> "$GITHUB_PATH"
+
+      - name: Load Environment Variables
+        run: |
+          chmod +x scripts/load-env.sh
+          ./scripts/load-env.sh flake
+          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
+            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
+          fi
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Execute Query
+        run: |
+          MODE="${{ github.event.inputs.view_mode }}"
+          PATTERNS="${{ github.event.inputs.patterns }}"
+          SYSTEM="${{ github.event.inputs.system }}"
+          TAG="${{ github.event.inputs.target_tag || 'cache-index' }}"
+          LIMIT="${{ github.event.inputs.limit || '50' }}"
+          FORMAT="${{ github.event.inputs.format || 'table' }}"
+
+          ARGS=(--target-tag "$TAG" --limit "$LIMIT" --format "$FORMAT")
+          if [[ -n "$SYSTEM" ]]; then
+            ARGS+=(--system "$SYSTEM")
+          fi
+
+          if [[ "$MODE" == "top_size" ]]; then
+            echo ">>> Inspecting Top Heavy Cache Entries"
+            nixcache-builder list --all --sort-by size --sort-order desc "${ARGS[@]}"
+          elif [[ "$MODE" == "recent" ]]; then
+            echo ">>> Inspecting Recent 24h Cache Entries"
+            nixcache-builder list --newer-than 24h --sort-by date --sort-order desc "${ARGS[@]}"
+          elif [[ "$MODE" == "outputs" ]]; then
+            echo ">>> Inspecting Current Flake Outputs Closure"
+            nixcache-builder list --flake-path . "${ARGS[@]}"
+          elif [[ "$MODE" == "filter" ]]; then
+            echo ">>> Inspecting Filtered Entries with Patterns: $PATTERNS"
+            if [[ -n "$PATTERNS" ]]; then
+              ARGS+=(--patterns "$PATTERNS")
+            fi
+            nixcache-builder list "${ARGS[@]}"
+          else
+            echo ">>> Inspecting All Baseline Cache Entries"
+            nixcache-builder list --all "${ARGS[@]}"
+          fi

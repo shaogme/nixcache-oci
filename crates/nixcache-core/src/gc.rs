@@ -1,5 +1,6 @@
 use crate::{
-    purge::{CachePurgeFilter, CascadeMode, TimeFilter, evaluate_cache_purge},
+    filter::{CacheSelector, CascadeMode, TimeFilter},
+    purge::evaluate_cache_purge,
     types::{CacheIndexData, IndexEntry, StoreHash},
 };
 use chrono::{DateTime, Utc};
@@ -14,19 +15,19 @@ pub struct GcEvaluationResult {
     pub cutoff_utc: String,
 }
 
-/// 纯函数：多架构可达性依赖图与保留期垃圾回收计算 (直接复用统一的 purge 评估引擎)
+/// 纯函数：多架构可达性依赖图与保留期垃圾回收计算 (直接复用统一的 selector/purge 评估引擎)
 pub fn evaluate_multi_arch_gc(
     index: &CacheIndexData,
     cutoff: &DateTime<Utc>,
 ) -> GcEvaluationResult {
-    let filter = CachePurgeFilter {
+    let selector = CacheSelector {
         time_filter: Some(TimeFilter::Before(*cutoff)),
         protect_gc_roots: true,
         cascade_mode: CascadeMode::Exact,
         ..Default::default()
     };
 
-    let purge_res = evaluate_cache_purge(index, &filter);
+    let purge_res = evaluate_cache_purge(index, &selector);
 
     // 计算跨所有架构系统收集的顶层活跃根及传递可达集合
     let mut initial_roots = HashSet::new();

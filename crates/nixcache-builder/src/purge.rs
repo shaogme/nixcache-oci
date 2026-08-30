@@ -1,13 +1,9 @@
 use crate::{
-    error::BuilderError,
-    nix::{BuildConfig, BuildMode, BuildTarget, discovery::discover_outputs},
-    summary::write_purge_step_summary,
+    error::BuilderError, nix::resolve_flake_output_hashes, summary::write_purge_step_summary,
 };
 use chrono::Utc;
-use nixcache_cli::PurgeFilterArgs;
-use nixcache_core::{
-    CACHE_INDEX_VERSION, CacheIndexData, StoreHash, evaluate_cache_purge, extract_store_hash,
-};
+use nixcache_cli::PurgeArgs;
+use nixcache_core::{CACHE_INDEX_VERSION, CacheIndexData, evaluate_cache_purge};
 use nixcache_oci::{
     EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor,
     OciPlatform, build_arch_index_manifest, build_image_index,
@@ -15,8 +11,7 @@ use nixcache_oci::{
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -30,116 +25,9 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
-async fn resolve_flake_output_hashes(
-    flake_path: &str,
-    attributes: &[String],
-) -> Result<Vec<StoreHash>, BuilderError> {
-    let mut hashes = Vec::new();
-    let abs_flake_path = match tokio::fs::canonicalize(flake_path).await {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(e) => {
-            warn!("Failed to canonicalize flake path {}: {}", flake_path, e);
-            flake_path.to_string()
-        }
-    };
-
-    if !attributes.is_empty() {
-        for attr in attributes {
-            let target = format!("path:{}#{}", abs_flake_path, attr);
-            let output = Command::new("nix")
-                .args(["path-info", "--accept-flake-config", "--json", &target])
-                .output()
-                .await;
-
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let stdout_str = String::from_utf8_lossy(&out.stdout);
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
-                    if let Some(obj) = val.as_object() {
-                        for k in obj.keys() {
-                            if let Some(h) = extract_store_hash(k) {
-                                hashes.push(h);
-                            }
-                        }
-                    } else if let Some(arr) = val.as_array() {
-                        for item in arr {
-                            if let Some(path_str) = item.get("path").and_then(|p| p.as_str())
-                                && let Some(h) = extract_store_hash(path_str)
-                            {
-                                hashes.push(h);
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Fallback: try nix eval --raw <target>.outPath
-                let eval_out = Command::new("nix")
-                    .args([
-                        "eval",
-                        "--accept-flake-config",
-                        "--raw",
-                        &format!("{}.outPath", target),
-                    ])
-                    .output()
-                    .await;
-
-                if let Ok(e_out) = eval_out
-                    && e_out.status.success()
-                {
-                    let p = String::from_utf8_lossy(&e_out.stdout).trim().to_string();
-                    if let Some(h) = extract_store_hash(&p) {
-                        hashes.push(h);
-                    }
-                }
-            }
-        }
-    } else {
-        // 发现当前 Flake 的所有输出
-        let build_config = BuildConfig {
-            system: None,
-            mode: BuildMode::Flake,
-            flake_path: abs_flake_path.clone(),
-            file: "default.nix".to_string(),
-            attributes: Vec::new(),
-        };
-        if let Ok(targets) = discover_outputs(&build_config).await {
-            for target in targets {
-                if let BuildTarget::Flake {
-                    flake_ref,
-                    attribute,
-                } = target
-                {
-                    let full_target = format!("{}#{}", flake_ref, attribute);
-                    let eval_out = Command::new("nix")
-                        .args([
-                            "eval",
-                            "--accept-flake-config",
-                            "--raw",
-                            &format!("{}.outPath", full_target),
-                        ])
-                        .output()
-                        .await;
-
-                    if let Ok(e_out) = eval_out
-                        && e_out.status.success()
-                    {
-                        let p = String::from_utf8_lossy(&e_out.stdout).trim().to_string();
-                        if let Some(h) = extract_store_hash(&p) {
-                            hashes.push(h);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(hashes)
-}
-
 /// 执行缓存主动清理与失效工作流
 pub async fn run_purge(
-    args: &PurgeFilterArgs,
+    args: &PurgeArgs,
     repo: &str,
     registry: &str,
     github_token: &str,
@@ -169,8 +57,8 @@ pub async fn run_purge(
 
     // 若指定了 flake-path 或 attributes，解析 Flake 输出闭包对应的 StoreHash
     let mut extra_hashes = Vec::new();
-    if let Some(ref flake_path) = args.resolve_flake_path() {
-        let attrs = args.resolve_attributes();
+    if let Some(ref flake_path) = args.selector.resolve_flake_path() {
+        let attrs = args.selector.resolve_attributes();
         info!("Evaluating flake outputs for purging from: {}", flake_path);
         let flake_hashes = resolve_flake_output_hashes(flake_path, &attrs).await?;
         info!(
@@ -180,8 +68,8 @@ pub async fn run_purge(
         extra_hashes.extend(flake_hashes);
     }
 
-    let filter = args.to_purge_filter(&extra_hashes);
-    let purge_result = evaluate_cache_purge(&index_data, &filter);
+    let selector = args.to_purge_filter(&extra_hashes);
+    let purge_result = evaluate_cache_purge(&index_data, &selector);
 
     info!(
         "Purge Evaluation: Total Before: {}, Purged: {}, Kept: {}, Estimated Space Freed: {} bytes",
@@ -308,7 +196,8 @@ pub async fn run_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, SystemArch};
+    use nixcache_cli::CacheSelectorArgs;
+    use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
 
     #[test]
     fn test_purge_sha256_digest() {
@@ -358,13 +247,16 @@ mod tests {
             },
         );
 
-        let args = PurgeFilterArgs {
-            system: vec!["x86_64-linux".to_string()],
+        let args = PurgeArgs {
+            selector: CacheSelectorArgs {
+                system: vec!["x86_64-linux".to_string()],
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let filter = args.to_purge_filter(&[]);
-        let result = evaluate_cache_purge(&index, &filter);
+        let selector = args.to_purge_filter(&[]);
+        let result = evaluate_cache_purge(&index, &selector);
         assert_eq!(result.purged_hashes, vec![hash1]);
         assert_eq!(result.kept_entries.len(), 1);
         assert!(result.kept_entries.contains_key(&hash2));

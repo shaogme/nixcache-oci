@@ -8,17 +8,17 @@ pub async fn run_gc(
     registry: &str,
     github_token: &str,
 ) -> Result<(), BuilderError> {
-    let filter_args = args.to_purge_filter_args();
+    let purge_args = args.to_purge_args();
     info!(
         "Running multi-arch garbage collection via purge engine for {}/{} (retention: {} days, dry_run: {}, delete_blobs: {})",
         registry,
         repo,
         args.resolve_retention_days(),
-        filter_args.dry_run,
-        filter_args.delete_blobs
+        purge_args.dry_run,
+        purge_args.delete_blobs
     );
 
-    run_purge(&filter_args, repo, registry, github_token).await
+    run_purge(&purge_args, repo, registry, github_token).await
 }
 
 #[cfg(test)]

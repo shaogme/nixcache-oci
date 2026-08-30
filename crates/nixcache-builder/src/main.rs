@@ -10,6 +10,7 @@ mod cli;
 mod env_injector;
 mod error;
 mod gc;
+mod list;
 mod nix;
 mod promote;
 mod purge;
@@ -19,6 +20,7 @@ mod worker;
 
 use cli::{Cli, Commands, SessionCommands};
 use gc::run_gc;
+use list::run_list;
 use nix::BuildConfig;
 use promote::run_promote;
 use purge::run_purge;
@@ -175,6 +177,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        Commands::List(args) => {
+            let active_token = args.auth.resolve_token().await;
+            let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
+
+            if let Err(e) = run_list(&args, &repo, &registry, &active_token).await {
+                eprintln!("Cache list failed: {}", e);
+                process::exit(1);
+            }
+        }
+
         Commands::Gc(args) => {
             let active_token = args.auth.resolve_token().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
@@ -189,7 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let active_token = args.auth.resolve_token().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
 
-            if let Err(e) = run_purge(&args.filter, &repo, &registry, &active_token).await {
+            if let Err(e) = run_purge(&args, &repo, &registry, &active_token).await {
                 eprintln!("Purge failed: {}", e);
                 process::exit(1);
             }

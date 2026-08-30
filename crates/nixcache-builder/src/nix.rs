@@ -5,7 +5,7 @@ pub mod driver;
 pub mod exporter;
 pub mod filter;
 
-pub use discovery::discover_outputs;
+pub use discovery::{discover_outputs, resolve_flake_output_hashes};
 pub use driver::{BuildConfig, BuildMode, BuildTarget, NixCli};
 pub use exporter::{ParallelExportConfig, ParallelExporter};
 

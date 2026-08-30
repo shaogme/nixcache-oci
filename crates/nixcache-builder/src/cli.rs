@@ -1,8 +1,8 @@
 use crate::nix::BuildMode;
 use clap::{Parser, Subcommand};
 use nixcache_cli::{
-    AuthTokenArgs, CachePolicyArgs, OciTargetArgs, PurgeFilterArgs, ServerBindArgs,
-    SessionContextArgs, SigningKeyArgs,
+    AuthTokenArgs, CachePolicyArgs, CacheSelectorArgs, ListArgs, OciTargetArgs, PurgeArgs,
+    ServerBindArgs, SessionContextArgs, SigningKeyArgs,
 };
 use nixcache_utils::Env;
 use std::path::PathBuf;
@@ -28,6 +28,9 @@ pub enum Commands {
 
     /// Promote workflow run session into the baseline production cache-index
     Promote(PromoteArgs),
+
+    /// List, query, filter, and inspect Nix build cache entries in OCI Registry
+    List(ListArgs),
 
     /// Perform cross-architecture garbage collection on cache-index
     Gc(GcArgs),
@@ -439,28 +442,20 @@ impl GcArgs {
         Env::get_bool("NIXCACHE_DELETE_BLOBS").unwrap_or(false)
     }
 
-    pub fn to_purge_filter_args(&self) -> PurgeFilterArgs {
-        PurgeFilterArgs {
-            older_than: Some(format!("{}d", self.resolve_retention_days())),
-            protect_gc_roots: true,
-            cascade: Some("exact".to_string()),
+    pub fn to_purge_args(&self) -> PurgeArgs {
+        PurgeArgs {
+            oci: self.oci.clone(),
+            auth: self.auth.clone(),
+            selector: CacheSelectorArgs {
+                older_than: Some(format!("{}d", self.resolve_retention_days())),
+                protect_gc_roots: true,
+                cascade: Some("exact".to_string()),
+                ..Default::default()
+            },
             delete_blobs: self.resolve_delete_blobs(),
             dry_run: self.dry_run,
-            ..Default::default()
         }
     }
-}
-
-#[derive(Parser, Debug, Clone, Default)]
-pub struct PurgeArgs {
-    #[command(flatten)]
-    pub oci: OciTargetArgs,
-
-    #[command(flatten)]
-    pub auth: AuthTokenArgs,
-
-    #[command(flatten)]
-    pub filter: PurgeFilterArgs,
 }
 
 #[cfg(test)]

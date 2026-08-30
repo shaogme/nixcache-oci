@@ -1,0 +1,163 @@
+name: 'NixCache OCI Cache Lister & Inspector'
+description: 'List, query, filter, and inspect Nix build cache entries in OCI Registry'
+inputs:
+  all:
+    description: 'List all cache entries without filtering'
+    required: false
+    default: 'false'
+  hashes:
+    description: 'Specific store hashes to filter (comma/space separated)'
+    required: false
+    default: ''
+  patterns:
+    description: 'Name or store path patterns to match (e.g. *linux-kernel*, gcc*)'
+    required: false
+    default: ''
+  system:
+    description: 'Target system architecture (e.g., x86_64-linux, aarch64-linux)'
+    required: false
+    default: ''
+  flake-path:
+    description: 'Path to flake to evaluate outputs for listing'
+    required: false
+    default: ''
+  attributes:
+    description: 'Flake attributes to evaluate and match'
+    required: false
+    default: ''
+  older-than:
+    description: 'Filter entries older than duration/date (e.g. 30d, 7d)'
+    required: false
+    default: ''
+  newer-than:
+    description: 'Filter entries newer than duration/date (e.g. 24h, 3d)'
+    required: false
+    default: ''
+  min-size:
+    description: 'Minimum NAR size threshold (e.g., 100M, 1G)'
+    required: false
+    default: ''
+  max-size:
+    description: 'Maximum NAR size threshold (e.g., 50M, 500M)'
+    required: false
+    default: ''
+  cascade:
+    description: 'Cascade mode: exact, dependents, transitive, full'
+    required: false
+    default: 'exact'
+  target-tag:
+    description: 'Target OCI tag to inspect (e.g., cache-index, run-12345)'
+    required: false
+    default: 'cache-index'
+  format:
+    description: 'Output format (table, json, ndjson, paths, summary)'
+    required: false
+    default: 'table'
+  limit:
+    description: 'Maximum number of items to display'
+    required: false
+    default: '100'
+  sort-by:
+    description: 'Sort by field (date, size, name, hash)'
+    required: false
+    default: 'date'
+  sort-order:
+    description: 'Sort order (desc, asc)'
+    required: false
+    default: 'desc'
+  details:
+    description: 'Include detailed NarInfo metadata in output'
+    required: false
+    default: 'false'
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  registry:
+    description: 'OCI Registry'
+    required: false
+    default: 'ghcr.io'
+  registry-kind:
+    description: 'OCI Registry backend kind'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token with package read permissions'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  total-count:
+    description: 'Total number of cache entries in target index'
+    value: ${{ steps.exec-list.outputs.total_count }}
+  total-size-bytes:
+    description: 'Total size in bytes of all cache entries'
+    value: ${{ steps.exec-list.outputs.total_size_bytes }}
+  matched-count:
+    description: 'Number of matched cache entries'
+    value: ${{ steps.exec-list.outputs.matched_count }}
+  matched-size-bytes:
+    description: 'Total size in bytes of matched cache entries'
+    value: ${{ steps.exec-list.outputs.matched_size_bytes }}
+  entries-json:
+    description: 'JSON array of matched cache entries'
+    value: ${{ steps.exec-list.outputs.entries_json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Execute Cache List
+      id: exec-list
+      shell: bash
+      env:
+        NIXCACHE_FILTER_ALL: ${{ inputs.all }}
+        NIXCACHE_FILTER_HASHES: ${{ inputs.hashes }}
+        NIXCACHE_FILTER_PATTERNS: ${{ inputs.patterns }}
+        NIXCACHE_SYSTEM: ${{ inputs.system }}
+        NIXCACHE_FLAKE_PATH: ${{ inputs.flake-path }}
+        NIXCACHE_ATTRIBUTES: ${{ inputs.attributes }}
+        NIXCACHE_OLDER_THAN: ${{ inputs.older-than }}
+        NIXCACHE_NEWER_THAN: ${{ inputs.newer-than }}
+        NIXCACHE_MIN_SIZE: ${{ inputs.min-size }}
+        NIXCACHE_MAX_SIZE: ${{ inputs.max-size }}
+        NIXCACHE_CASCADE: ${{ inputs.cascade }}
+        NIXCACHE_TARGET_TAG: ${{ inputs.target-tag }}
+        NIXCACHE_OUTPUT_FORMAT: ${{ inputs.format }}
+        NIXCACHE_LIMIT: ${{ inputs.limit }}
+        NIXCACHE_SORT_BY: ${{ inputs.sort-by }}
+        NIXCACHE_SORT_ORDER: ${{ inputs.sort-order }}
+        NIXCACHE_DETAILS: ${{ inputs.details }}
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+          if [[ -n "$REF" ]]; then
+            echo ">>> Found .nixcache-version file, using version: $REF"
+          fi
+        fi
+        if [[ -z "$REF" ]]; then
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+          echo ">>> Using fallback version: $REF"
+        fi
+
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- list

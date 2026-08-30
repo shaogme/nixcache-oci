@@ -1,4 +1,5 @@
 pub mod error;
+pub mod filter;
 pub mod gc;
 pub mod lookup;
 pub mod narinfo;
@@ -6,15 +7,16 @@ pub mod purge;
 pub mod types;
 
 pub use error::{CoreError, GcError, NarInfoParseError, TypeError};
+pub use filter::{
+    CacheQueryResult, CacheSelector, CascadeMode, SizeFilter, SortBy, SortOrder, TimeFilter,
+    evaluate_cache_query, matches_pattern,
+};
 pub use gc::{GcEvaluationResult, evaluate_multi_arch_gc};
 pub use lookup::{
     build_nar_lookup_map, extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use narinfo::NarInfo;
-pub use purge::{
-    CachePurgeFilter, CascadeMode, PurgeEvaluationResult, SizeFilter, TimeFilter,
-    evaluate_cache_purge, matches_pattern,
-};
+pub use purge::{PurgeEvaluationResult, evaluate_cache_purge, prune_broken_gc_roots};
 pub use types::{
     ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
     CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfoMeta, RECEIPT_VERSION,
@@ -25,11 +27,11 @@ pub use types::{
 mod tests {
     use super::{
         ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-        CacheIndexData, CachePurgeFilter, CascadeMode, IndexEntry, JobSummaryMetadata, NarDigest,
-        NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, SizeFilter,
-        StoreHash, SystemArch, TimeFilter, TypeError, build_nar_lookup_map, evaluate_cache_purge,
-        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
-        matches_pattern,
+        CacheIndexData, CacheQueryResult, CacheSelector, CascadeMode, IndexEntry,
+        JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
+        RunSessionManifest, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
+        build_nar_lookup_map, evaluate_cache_purge, evaluate_cache_query, evaluate_multi_arch_gc,
+        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -122,7 +124,6 @@ mod tests {
         let content = r#"StorePath: /nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1
 URL: nar/14j8s5vg8w80z5k86k6r00000000000000000000000.nar.xz
 Compression: xz
-FileHash: sha256:14j8s5vg8w80z5k86k6r5h3w08g214v0z6v26767v8v3wz7y30x9
 FileSize: 51200
 NarHash: sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
 NarSize: 204800
@@ -501,6 +502,57 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
+    fn test_evaluate_cache_query_and_selector() {
+        let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
+        let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
+
+        let mut index = CacheIndexData::default();
+        index.entries.insert(
+            hash1.clone(),
+            IndexEntry {
+                name: "rust-1.80".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-rust-1.80", hash1),
+                    nar_basename: "rust-1.80.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-rust"),
+                nar_size: 1000,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+        index.entries.insert(
+            hash2.clone(),
+            IndexEntry {
+                name: "llvm-18".to_string(),
+                system: Some(SystemArch::Aarch64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-llvm-18", hash2),
+                    nar_basename: "llvm-18.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-llvm"),
+                nar_size: 2000,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        let selector = CacheSelector {
+            patterns: vec!["*rust*".to_string()],
+            ..Default::default()
+        };
+        let query_res: CacheQueryResult = evaluate_cache_query(&index, &selector);
+        assert_eq!(query_res.matched_entries.len(), 1);
+        assert_eq!(query_res.unmatched_entries.len(), 1);
+        assert_eq!(query_res.matched_bytes, 1000);
+        assert_eq!(query_res.unmatched_bytes, 2000);
+        assert_eq!(query_res.final_matched_hashes, vec![hash1.clone()]);
+    }
+
+    #[test]
     fn test_purge_all_clears_everything() {
         let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
         let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
@@ -545,12 +597,12 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             .gc_roots
             .insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
 
-        let filter = CachePurgeFilter {
-            purge_all: true,
+        let selector = CacheSelector {
+            select_all: true,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &filter);
+        let result = evaluate_cache_purge(&index, &selector);
         assert!(result.kept_entries.is_empty());
         assert_eq!(result.purged_entries.len(), 2);
         assert_eq!(result.purged_hashes.len(), 2);
@@ -627,13 +679,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut hashes = HashSet::new();
         hashes.insert(lib_a.clone());
 
-        let filter = CachePurgeFilter {
+        let selector = CacheSelector {
             store_hashes: hashes,
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &filter);
+        let result = evaluate_cache_purge(&index, &selector);
         assert_eq!(result.purged_hashes, vec![lib_a.clone()]);
         assert_eq!(result.estimated_freed_bytes, 300);
         assert!(result.kept_entries.contains_key(&app));
@@ -711,13 +763,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut hashes = HashSet::new();
         hashes.insert(lib_a.clone());
 
-        let filter = CachePurgeFilter {
+        let selector = CacheSelector {
             store_hashes: hashes,
             cascade_mode: CascadeMode::Dependents,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &filter);
+        let result = evaluate_cache_purge(&index, &selector);
         assert_eq!(result.purged_entries.len(), 2);
         assert!(result.purged_entries.contains_key(&lib_a));
         assert!(result.purged_entries.contains_key(&app));
@@ -789,24 +841,24 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         hashes.insert(lib_a.clone());
 
         // Transitive: lib_a + core
-        let filter_transitive = CachePurgeFilter {
+        let selector_transitive = CacheSelector {
             store_hashes: hashes.clone(),
             cascade_mode: CascadeMode::Transitive,
             ..Default::default()
         };
-        let res_transitive = evaluate_cache_purge(&index, &filter_transitive);
+        let res_transitive = evaluate_cache_purge(&index, &selector_transitive);
         assert_eq!(res_transitive.purged_entries.len(), 2);
         assert!(res_transitive.purged_entries.contains_key(&lib_a));
         assert!(res_transitive.purged_entries.contains_key(&core));
         assert!(res_transitive.kept_entries.contains_key(&app));
 
         // FullTree: app + lib_a + core
-        let filter_full = CachePurgeFilter {
+        let selector_full = CacheSelector {
             store_hashes: hashes,
             cascade_mode: CascadeMode::FullTree,
             ..Default::default()
         };
-        let res_full = evaluate_cache_purge(&index, &filter_full);
+        let res_full = evaluate_cache_purge(&index, &selector_full);
         assert_eq!(res_full.purged_entries.len(), 3);
         assert!(res_full.purged_entries.contains_key(&app));
         assert!(res_full.purged_entries.contains_key(&lib_a));
@@ -873,25 +925,25 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
 
         // Pattern filter
-        let filter_pat = CachePurgeFilter {
+        let selector_pat = CacheSelector {
             patterns: vec!["*chromium*".to_string()],
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_pat = evaluate_cache_purge(&index, &filter_pat);
+        let res_pat = evaluate_cache_purge(&index, &selector_pat);
         assert_eq!(res_pat.purged_hashes, vec![hash_chromium.clone()]);
 
         // Size filter: MinBytes(100MB)
-        let filter_size = CachePurgeFilter {
+        let selector_size = CacheSelector {
             size_filter: Some(SizeFilter::MinBytes(100_000_000)),
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_size = evaluate_cache_purge(&index, &filter_size);
+        let res_size = evaluate_cache_purge(&index, &selector_size);
         assert_eq!(res_size.purged_hashes, vec![hash_chromium.clone()]);
 
         // Time filter: Before 2026-08-01
-        let filter_time = CachePurgeFilter {
+        let selector_time = CacheSelector {
             time_filter: Some(TimeFilter::Before(
                 DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
                     .unwrap()
@@ -900,19 +952,19 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_time = evaluate_cache_purge(&index, &filter_time);
+        let res_time = evaluate_cache_purge(&index, &selector_time);
         assert_eq!(res_time.purged_hashes, vec![hash_old.clone()]);
 
         // System filter
         let mut sys_filter = HashSet::new();
         sys_filter.insert(SystemArch::Aarch64Linux);
-        let filter_sys = CachePurgeFilter {
+        let selector_sys = CacheSelector {
             systems: sys_filter,
             patterns: vec!["*lib*".to_string()],
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
-        let res_sys = evaluate_cache_purge(&index, &filter_sys);
+        let res_sys = evaluate_cache_purge(&index, &selector_sys);
         assert_eq!(res_sys.purged_hashes, vec![hash_old.clone()]);
     }
 
@@ -987,13 +1039,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         // Purge dep_x86 with Exact mode
         let mut hashes = HashSet::new();
         hashes.insert(dep_x86.clone());
-        let filter = CachePurgeFilter {
+        let selector = CacheSelector {
             store_hashes: hashes,
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &filter);
+        let result = evaluate_cache_purge(&index, &selector);
         // root_x86 should be pruned because its dependency dep_x86 was purged!
         // root_arm should remain untouched!
         assert_eq!(
@@ -1072,14 +1124,14 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
         // When protect_gc_roots is true, root_app and shared_dep must be protected even if older_than / patterns match
         let cutoff = Utc::now() - Duration::days(30);
-        let filter = CachePurgeFilter {
+        let selector = CacheSelector {
             time_filter: Some(TimeFilter::Before(cutoff)),
             protect_gc_roots: true,
             cascade_mode: CascadeMode::Exact,
             ..Default::default()
         };
 
-        let result = evaluate_cache_purge(&index, &filter);
+        let result = evaluate_cache_purge(&index, &selector);
         assert_eq!(result.purged_hashes, vec![orphan_old]);
         assert_eq!(result.kept_entries.len(), 2);
         assert!(result.kept_entries.contains_key(&root_app));

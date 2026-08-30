@@ -151,6 +151,115 @@ in {{ inherit pkgs devShells nixos; }}"#,
     }
 }
 
+/// 解析 Flake 及其属性对应的输出 StoreHash 列表
+pub async fn resolve_flake_output_hashes(
+    flake_path: &str,
+    attributes: &[String],
+) -> Result<Vec<nixcache_core::StoreHash>, BuilderError> {
+    use nixcache_core::extract_store_hash;
+    use tracing::warn;
+
+    let mut hashes = Vec::new();
+    let abs_flake_path = match fs::canonicalize(flake_path).await {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(e) => {
+            warn!("Failed to canonicalize flake path {}: {}", flake_path, e);
+            flake_path.to_string()
+        }
+    };
+
+    if !attributes.is_empty() {
+        for attr in attributes {
+            let target = format!("path:{}#{}", abs_flake_path, attr);
+            let output = Command::new("nix")
+                .args(["path-info", "--accept-flake-config", "--json", &target])
+                .output()
+                .await;
+
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let stdout_str = String::from_utf8_lossy(&out.stdout);
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
+                    if let Some(obj) = val.as_object() {
+                        for k in obj.keys() {
+                            if let Some(h) = extract_store_hash(k) {
+                                hashes.push(h);
+                            }
+                        }
+                    } else if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(path_str) = item.get("path").and_then(|p| p.as_str())
+                                && let Some(h) = extract_store_hash(path_str)
+                            {
+                                hashes.push(h);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let eval_out = Command::new("nix")
+                    .args([
+                        "eval",
+                        "--accept-flake-config",
+                        "--raw",
+                        &format!("{}.outPath", target),
+                    ])
+                    .output()
+                    .await;
+
+                if let Ok(e_out) = eval_out
+                    && e_out.status.success()
+                {
+                    let p = String::from_utf8_lossy(&e_out.stdout).trim().to_string();
+                    if let Some(h) = extract_store_hash(&p) {
+                        hashes.push(h);
+                    }
+                }
+            }
+        }
+    } else {
+        let build_config = BuildConfig {
+            system: None,
+            mode: BuildMode::Flake,
+            flake_path: abs_flake_path.clone(),
+            file: "default.nix".to_string(),
+            attributes: Vec::new(),
+        };
+        if let Ok(targets) = discover_outputs(&build_config).await {
+            for target in targets {
+                if let BuildTarget::Flake {
+                    flake_ref,
+                    attribute,
+                } = target
+                {
+                    let full_target = format!("{}#{}", flake_ref, attribute);
+                    let eval_out = Command::new("nix")
+                        .args([
+                            "eval",
+                            "--accept-flake-config",
+                            "--raw",
+                            &format!("{}.outPath", full_target),
+                        ])
+                        .output()
+                        .await;
+
+                    if let Ok(e_out) = eval_out
+                        && e_out.status.success()
+                    {
+                        let p = String::from_utf8_lossy(&e_out.stdout).trim().to_string();
+                        if let Some(h) = extract_store_hash(&p) {
+                            hashes.push(h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(hashes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DiscoveredFlakeOutputs, discover_outputs};

@@ -261,7 +261,23 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-##### 6. 版本控制与配置
+##### 6. 构建缓存查询与洞察（List / Inspect Cache）
+
+你可以通过官方 `list` Action 或直接触发 `List & Inspect Build Cache` 交互式工作流，实时查询、过滤并审查远程 OCI 镜像仓库中的构建缓存状态：
+
+```yaml
+      # 查询当前缓存中体积大于 500M 的 Linux 产物并输出 Markdown 统计摘要
+      - name: Inspect Large Cache Entries
+        uses: shaogme/nixcache-oci/list@main
+        with:
+          system: 'x86_64-linux'
+          min-size: '500M'
+          sort-by: 'size'
+          limit: '20'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+##### 7. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
@@ -665,6 +681,52 @@ nixcache-builder purge \
 | `--origin-run <RUN_ID>` | `NIXCACHE_ORIGIN_RUN` | （无） | 按 CI Run ID 过滤 |
 | `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 尽力而为（Best-effort）尝试物理删除 OCI Blobs |
 | `--dry-run` | `NIXCACHE_DRY_RUN` | `false` | 试运行模式（仅输出审查报告，不修改远端） |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+#### 6. `list` (构建缓存多维查询、列表与统计)
+多维查询、过滤并分析远程 OCI 镜像仓库中的构建缓存，支持终端 ASCII 表格、JSON、NDJSON、纯路径输出与 GitHub Step Summary 报表渲染：
+```bash
+# 列出生产基线全部缓存并打印终端美化表格
+nixcache-builder list --all
+
+# 按模式筛选并按体积倒序查看前 10 大软件包
+nixcache-builder list \
+  --patterns "*rust*" "*llvm*" \
+  --sort-by size \
+  --sort-order desc \
+  --limit 10
+
+# 导出符合条件的纯 store paths 供管道处理
+nixcache-builder list \
+  --older-than 30d \
+  --format paths > old-paths.txt
+```
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--all` | `NIXCACHE_FILTER_ALL` | `false` | 全量匹配所有缓存条目 |
+| `--hashes <HASHES>` | `NIXCACHE_FILTER_HASHES` | （无） | 指定要查询的 Store Hash（逗号或空格分隔） |
+| `--patterns <PATTERN...>` | `NIXCACHE_FILTER_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
+| `--system <SYSTEM...>` | `NIXCACHE_SYSTEM` | （全部） | 限制目标架构（如 `x86_64-linux`, `aarch64-linux`） |
+| `--flake-path <PATH>` | `NIXCACHE_FLAKE_PATH` | （无） | 指向 Flake 目录，自动评估其输出作为查询目标 |
+| `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 指定要查询的 Flake 属性（逗号或空格分隔） |
+| `--older-than <TIME>` | `NIXCACHE_OLDER_THAN` | （无） | 筛选早于指定时间/时长的条目（如 `30d`, `12h`, ISO8601） |
+| `--newer-than <TIME>` | `NIXCACHE_NEWER_THAN` | （无） | 筛选晚于指定时间/时长的条目（如 `24h`, `7d`） |
+| `--min-size <BYTES>` | `NIXCACHE_MIN_SIZE` | （无） | 仅显示大于等于指定大小（支持 `500M`, `1G`）的条目 |
+| `--max-size <BYTES>` | `NIXCACHE_MAX_SIZE` | （无） | 仅显示小于等于指定大小（支持 `100M`, `2G`）的条目 |
+| `--origin-job <JOB>` | `NIXCACHE_ORIGIN_JOB` | （无） | 按 CI Job ID 过滤 |
+| `--origin-run <RUN_ID>` | `NIXCACHE_ORIGIN_RUN` | （无） | 按 CI Run ID 过滤 |
+| `--cascade <MODE>` | `NIXCACHE_CASCADE` | `exact` | 级联展开模式：`exact`、`dependents`、`transitive`、`full` |
+| `--protect-gc-roots` | `NIXCACHE_PROTECT_GC_ROOTS` | `false` | 保护活跃 GC Roots 及其正向传递可达闭包不被匹配 |
+| `--target-tag <TAG>` | `NIXCACHE_TARGET_TAG` | `cache-index` | 要审查的目标 OCI Tag（如 `cache-index`, `run-12345`） |
+| `--format <FORMAT>` | `NIXCACHE_OUTPUT_FORMAT` | `table` | 输出格式：`table`、`json`、`ndjson`、`paths`、`summary` |
+| `--sort-by <FIELD>` | `NIXCACHE_SORT_BY` | `date` | 排序字段：`date`、`size`、`name`、`hash` |
+| `--sort-order <ORDER>` | `NIXCACHE_SORT_ORDER` | `desc` | 排序方向：`desc`、`asc` |
+| `--limit <NUM>` | `NIXCACHE_LIMIT` | `100` | 最多显示/输出的条目数量上限 |
+| `--details` | `NIXCACHE_DETAILS` | `false` | 展开显示详细 NarInfo 元数据（References、Digest 等） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |

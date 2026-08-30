@@ -161,12 +161,113 @@ pub async fn write_purge_step_summary_to(
     append_summary(content, file_opt).await;
 }
 
+/// 为 List 步骤生成并写入 GitHub Actions Step Summary
+pub async fn write_list_step_summary(
+    report: &crate::list::CacheListSummaryReport,
+    selector_desc: &str,
+    displayed_items: &[crate::list::ListItemDto],
+) {
+    write_list_step_summary_to(report, selector_desc, displayed_items, None).await;
+}
+
+pub async fn write_list_step_summary_to(
+    report: &crate::list::CacheListSummaryReport,
+    selector_desc: &str,
+    displayed_items: &[crate::list::ListItemDto],
+    file_opt: Option<&str>,
+) {
+    use crate::list::format_bytes;
+
+    let mut md = String::new();
+    md.push_str("### 📋 NixCache Build Cache Inspection Report\n\n");
+    md.push_str(&format!(
+        "- **Target Repository:** `{}/{}`\n- **Target Tag:** `{}`\n- **Selector Scope:** `{}`\n\n",
+        report.registry, report.repo, report.target_tag, selector_desc
+    ));
+
+    md.push_str("#### 📊 Cache Overview & Statistics\n\n");
+    md.push_str("| Metric | Value |\n");
+    md.push_str("| :--- | :--- |\n");
+    md.push_str(&format!(
+        "| Total Index Entries | `{}` |\n",
+        report.total_entries
+    ));
+    md.push_str(&format!(
+        "| Total Cache Volume | `{}` ({} bytes) |\n",
+        format_bytes(report.total_bytes),
+        report.total_bytes
+    ));
+    md.push_str(&format!(
+        "| Matched Query Entries | `{}` |\n",
+        report.matched_entries
+    ));
+    md.push_str(&format!(
+        "| Matched Query Volume | `{}` ({} bytes) |\n",
+        format_bytes(report.matched_bytes),
+        report.matched_bytes
+    ));
+    let total_roots: usize = report.arch_breakdown.values().map(|a| a.roots_count).sum();
+    md.push_str(&format!(
+        "| Total Active GC Roots | `{}` |\n\n",
+        total_roots
+    ));
+
+    if !report.arch_breakdown.is_empty() {
+        md.push_str("#### 🖥️ System Architecture Breakdown\n\n");
+        md.push_str("| Architecture | Total Entries | Total Size | GC Roots |\n");
+        md.push_str("| :--- | :--- | :--- | :--- |\n");
+        let mut sorted_arch: Vec<_> = report.arch_breakdown.iter().collect();
+        sorted_arch.sort_by_key(|(k, _)| (*k).clone());
+        for (arch, stat) in sorted_arch {
+            md.push_str(&format!(
+                "| `{}` | `{}` | `{}` | `{}` |\n",
+                arch,
+                stat.count,
+                format_bytes(stat.bytes),
+                stat.roots_count
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !displayed_items.is_empty() {
+        md.push_str(&format!(
+            "#### 🔍 Matched Entries Preview (Top {})\n\n",
+            displayed_items.len()
+        ));
+        md.push_str("| # | Package / Store Path | Arch | NAR Size | Added At | Match Reason |\n");
+        md.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+        for (i, item) in displayed_items.iter().enumerate() {
+            let pkg_display = if item.name.is_empty() {
+                format!("`{}`", item.hash)
+            } else {
+                format!("**{}**<br>`{}`", item.name, item.store_path)
+            };
+            md.push_str(&format!(
+                "| {} | {} | `{}` | `{}` | `{}` | {} |\n",
+                i + 1,
+                pkg_display,
+                item.system,
+                item.nar_size_human,
+                item.added,
+                item.reason
+            ));
+        }
+        md.push('\n');
+    }
+
+    append_summary(md, file_opt).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        write_promote_step_summary_to, write_session_capture_summary_to,
-        write_session_init_summary_to, write_worker_step_summary_to,
+        write_list_step_summary_to, write_promote_step_summary_to, write_purge_step_summary_to,
+        write_session_capture_summary_to, write_session_init_summary_to,
+        write_worker_step_summary_to,
     };
+    use crate::list::{ArchStat, CacheListSummaryReport, ListItemDto};
+    use std::collections::HashMap;
     use tempfile::NamedTempFile;
     use tokio::fs;
 
@@ -200,5 +301,52 @@ mod tests {
         write_promote_step_summary_to(Some(12345), "cache-index", 100, 10, Some(&path_str)).await;
         let content4 = fs::read_to_string(&path_str).await.unwrap();
         assert!(content4.contains("NixCache Promotion Complete"));
+
+        write_purge_step_summary_to(false, 10, 90, 50000, 5, Some(&path_str)).await;
+        let content5 = fs::read_to_string(&path_str).await.unwrap();
+        assert!(content5.contains("NixCache Cache Purge Report"));
+
+        let mut arch_breakdown = HashMap::new();
+        arch_breakdown.insert(
+            "x86_64-linux".to_string(),
+            ArchStat {
+                count: 1,
+                bytes: 1024,
+                roots_count: 1,
+            },
+        );
+        let list_report = CacheListSummaryReport {
+            target_tag: "cache-index".to_string(),
+            registry: "ghcr.io".to_string(),
+            repo: "owner/repo".to_string(),
+            total_entries: 1,
+            total_bytes: 1024,
+            matched_entries: 1,
+            matched_bytes: 1024,
+            arch_breakdown,
+            items: vec![ListItemDto {
+                hash: "0000000000000000000000000000pkg1".to_string(),
+                name: "pkg1".to_string(),
+                system: "x86_64-linux".to_string(),
+                store_path: "/nix/store/0000000000000000000000000000pkg1-pkg1".to_string(),
+                nar_basename: "pkg1.nar.xz".to_string(),
+                nar_size: 1024,
+                nar_size_human: "1.00 KiB".to_string(),
+                added: "2026-08-30T10:00:00Z".to_string(),
+                reason: "Match".to_string(),
+                references: vec![],
+                nar_digest: "sha256:blob1".to_string(),
+            }],
+        };
+        write_list_step_summary_to(
+            &list_report,
+            "all=true",
+            &list_report.items,
+            Some(&path_str),
+        )
+        .await;
+        let content6 = fs::read_to_string(&path_str).await.unwrap();
+        assert!(content6.contains("NixCache Build Cache Inspection Report"));
+        assert!(content6.contains("pkg1"));
     }
 }
