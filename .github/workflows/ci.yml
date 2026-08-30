@@ -326,6 +326,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-ci-binaries]
     if: github.repository == 'shaogme/nixcache-oci'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@main
 
@@ -335,10 +338,59 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
 
+      - name: Download Pre-compiled Binaries
+        uses: actions/download-artifact@main
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+
+      - name: Setup Binaries
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          cp "${{ runner.temp }}/bin/nixcache-builder-x86_64-linux" "${{ runner.temp }}/bin/nixcache-builder"
+          cp "${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux" "${{ runner.temp }}/bin/nixcache-proxy"
+          echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
+
       - name: Run Worker E2E Test
         env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
           TEST_WORKER_URL: ${{ secrets.TEST_WORKER_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x test/test-worker.sh
           ./test/test-worker.sh
+
+  # =========================================================================
+  # 阶段 3: 最终门禁 (Final CI Success Gate)
+  # =========================================================================
+  ci-success:
+    name: 3. CI Success Gate
+    runs-on: ubuntu-latest
+    needs:
+      - static-and-lint
+      - cargo-unit-tests
+      - loom-concurrency
+      - build-ci-binaries
+      - nix-static-checks
+      - nixos-vm-tests
+      - single-runner-e2e
+      - multiarch-e2e
+      - resilience-e2e
+      - test-worker
+    if: always()
+    steps:
+      - name: Verify All Preceding CI Jobs Succeeded
+        env:
+          NEEDS_CONTEXT: ${{ toJson(needs) }}
+        run: |
+          echo "Checking status of all pipeline jobs..."
+          echo "$NEEDS_CONTEXT" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+
+          failed_jobs=$(echo "$NEEDS_CONTEXT" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+
+          if [ -n "$failed_jobs" ]; then
+            echo "::error::The following required jobs did not succeed: $failed_jobs"
+            exit 1
+          fi
+
+          echo "All required CI jobs succeeded or were legitimately skipped."
