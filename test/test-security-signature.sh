@@ -9,6 +9,13 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting Nix OCI Cache Security & Signature Verification Test ==="
 
+TMP_DIR=$(mktemp -d /tmp/nixcache-security-test-XXXXXX)
+export GITHUB_ENV="$TMP_DIR/github_env"
+export GITHUB_OUTPUT="$TMP_DIR/github_output"
+export GITHUB_PATH="$TMP_DIR/github_path"
+touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
+unset NIX_CONFIG || true
+
 REGISTRY_PORT=5001
 PROXY_PORT=37515
 REGISTRY_PID=""
@@ -24,7 +31,7 @@ cleanup() {
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
     pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry
+    rm -rf /tmp/mock-oci-registry "$TMP_DIR"
     rm -f valid-secret.key valid-public.key rogue-secret.key rogue-public.key
     echo ">>> Cleanup complete."
 }

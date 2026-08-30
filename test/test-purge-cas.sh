@@ -9,6 +9,13 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting NixCache Purge & Invalidation CAS Integration Test ==="
 
+TMP_DIR=$(mktemp -d /tmp/nixcache-purge-test-XXXXXX)
+export GITHUB_ENV="$TMP_DIR/github_env"
+export GITHUB_OUTPUT="$TMP_DIR/github_output"
+export GITHUB_PATH="$TMP_DIR/github_path"
+touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
+unset NIX_CONFIG || true
+
 REGISTRY_PORT=5015
 REGISTRY_PID=""
 
@@ -18,7 +25,7 @@ cleanup() {
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
     pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry-purge
+    rm -rf /tmp/mock-oci-registry-purge "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT

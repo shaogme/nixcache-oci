@@ -9,6 +9,12 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting NixCache Schema v4 Pipeline Session CAS & Cascading Test ==="
 
+TMP_DIR=$(mktemp -d /tmp/nixcache-pipeline-test-XXXXXX)
+export GITHUB_ENV="$TMP_DIR/github_env"
+export GITHUB_OUTPUT="$TMP_DIR/github_output"
+export GITHUB_PATH="$TMP_DIR/github_path"
+touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
+
 REGISTRY_PORT=5003
 PROXY_PORT=37515
 REGISTRY_PID=""
@@ -21,7 +27,7 @@ cleanup() {
     fi
     pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
     pkill -9 -f "nixcache-proxy" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry /tmp/nixcache-test-*
+    rm -rf /tmp/mock-oci-registry /tmp/nixcache-test-* "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT

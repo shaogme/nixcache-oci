@@ -18,11 +18,13 @@ rm -rf /homeless-shelter 2>/dev/null || true
 
 # 1. 测试默认安装 (binary)
 echo ">>> Test 1: Default Binary Installation..."
+unset NIX_CONFIG || true
 export GITHUB_WORKSPACE="$PROJECT_DIR"
 export RUNNER_TEMP="$TMP_DIR/run1"
+export GITHUB_ENV="$TMP_DIR/github_env"
 export GITHUB_PATH="$TMP_DIR/github_path"
 export GITHUB_OUTPUT="$TMP_DIR/github_output"
-touch "$GITHUB_PATH" "$GITHUB_OUTPUT"
+touch "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT"
 
 # 彻底清理 PATH 中包含 nixcache 工具的目录以模拟全新环境
 CLEAN_PATH=""

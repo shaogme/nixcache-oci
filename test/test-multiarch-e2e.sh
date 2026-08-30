@@ -9,6 +9,13 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting Nix Multi-Arch Scatter-Gather E2E Integration Test ==="
 
+TMP_DIR=$(mktemp -d /tmp/nixcache-multiarch-test-XXXXXX)
+export GITHUB_ENV="$TMP_DIR/github_env"
+export GITHUB_OUTPUT="$TMP_DIR/github_output"
+export GITHUB_PATH="$TMP_DIR/github_path"
+touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
+unset NIX_CONFIG || true
+
 # 1. Start a local OCI registry container or mock registry
 REGISTRY_CONTAINER="nixcache-multiarch-registry"
 REGISTRY_PORT=5002
@@ -55,7 +62,7 @@ cleanup() {
     if command -v docker &>/dev/null && docker ps &>/dev/null; then
         docker rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
     fi
-    rm -rf "$RECEIPTS_DIR" /tmp/mock-oci-registry
+    rm -rf "$RECEIPTS_DIR" /tmp/mock-oci-registry "$TMP_DIR"
     rm -f test-multi-secret.key test-multi-public.key
     echo ">>> Cleanup complete."
 }

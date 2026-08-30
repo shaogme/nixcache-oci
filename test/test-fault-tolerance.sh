@@ -9,6 +9,13 @@ cd "$PROJECT_DIR"
 
 echo "=== Starting Nix OCI Cache Fault Tolerance & Upstream Fallback Test ==="
 
+TMP_DIR=$(mktemp -d /tmp/nixcache-fault-test-XXXXXX)
+export GITHUB_ENV="$TMP_DIR/github_env"
+export GITHUB_OUTPUT="$TMP_DIR/github_output"
+export GITHUB_PATH="$TMP_DIR/github_path"
+touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
+unset NIX_CONFIG || true
+
 REGISTRY_PORT=5001
 UPSTREAM_PORT=5003
 PROXY_PORT=37516
@@ -29,7 +36,7 @@ cleanup() {
         kill -9 "$UPSTREAM_PID" 2>/dev/null || true
     fi
     pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-upstream-cache /tmp/mock-oci-registry
+    rm -rf /tmp/mock-upstream-cache /tmp/mock-oci-registry "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
