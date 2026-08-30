@@ -53,7 +53,7 @@ jobs:
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@master
         with:
-          scandir: "./scripts ./test ./install"
+          scandir: "./test ./install"
 
       - name: Run ActionLint
         uses: raven-actions/actionlint@v2

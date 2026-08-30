@@ -119,18 +119,21 @@ export NIXCACHE_REPO="test/cache"
 export NIXCACHE_SIGNING_KEY_FILE="test-secret.key"
 export GITHUB_TOKEN="dummy-token"
 
-# 加载环境变量
-# shellcheck disable=SC1091
-source "$(dirname "$0")/../scripts/load-env.sh" "$TEST_MODE"
-
-if [[ "${NIXCACHE_MODE:-flake}" == "flake" ]]; then
-    sed -i "s/Built at: .*/Built at: $(date +%s%N)\"/" examples/flake/flake.nix
-    TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
-elif [[ "${NIXCACHE_MODE:-}" == "non-flake" ]]; then
+if [[ "$TEST_MODE" == "legacy" || "$TEST_MODE" == "non-flake" || "${NIXCACHE_MODE:-}" == "non-flake" || "${NIXCACHE_MODE:-}" == "legacy" ]]; then
+    export NIXCACHE_MODE="non-flake"
+    export NIXCACHE_CONFIG_DIR="${NIXCACHE_CONFIG_DIR:-examples/legacy}"
+    export NIXCACHE_FILE="${NIXCACHE_FILE:-examples/legacy/default.nix}"
+    export NIXCACHE_ATTRIBUTES="${NIXCACHE_ATTRIBUTES:-nixcache-test}"
     sed -i "s/Built at: .*/Built at: $(date +%s%N)\"/" examples/legacy/default.nix
     TEST_STORE_PATH=$(nix build --file "${NIXCACHE_FILE}" "${NIXCACHE_ATTRIBUTES}" --no-link --print-out-paths)
+elif [[ "$TEST_MODE" == "flake" || "${NIXCACHE_MODE:-flake}" == "flake" ]]; then
+    export NIXCACHE_MODE="flake"
+    export NIXCACHE_CONFIG_DIR="${NIXCACHE_CONFIG_DIR:-examples/flake}"
+    export NIXCACHE_FLAKE_PATH="${NIXCACHE_FLAKE_PATH:-examples/flake}"
+    sed -i "s/Built at: .*/Built at: $(date +%s%N)\"/" examples/flake/flake.nix
+    TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
 else
-    echo "!!! Unknown NIXCACHE_MODE: $NIXCACHE_MODE"
+    echo "!!! Unknown TEST_MODE: $TEST_MODE (NIXCACHE_MODE: ${NIXCACHE_MODE:-})"
     exit 1
 fi
 

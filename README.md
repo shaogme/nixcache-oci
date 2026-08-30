@@ -1111,7 +1111,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 
 #### 工作流与 Shell 脚本检查
 ```bash
-nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh scripts/*.sh && actionlint"
+nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh install/*.sh && actionlint"
 ```
 
 
