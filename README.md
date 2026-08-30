@@ -277,7 +277,28 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-##### 7. 版本控制与配置
+##### 7. 统一工具安装与独立环境准备（install Action）
+
+如果您需要在工作流中直接使用 `nixcache-builder` 或 `nixcache-proxy` 命令行工具，可使用官方统一的 `install` Action。默认通过预编译二进制（免编译）极速安装并加入 PATH，同时支持从 Rust 源码编译安装。若环境中已存在工具则自动跳过，支持配置强制覆盖：
+
+```yaml
+      # 统一安装 nixcache 工具链（默认 binary 预编译包）
+      - name: Install NixCache Tools
+        uses: shaogme/nixcache-oci/install@main
+        with:
+          source: 'binary' # 可选，'binary' (默认) 或 'source' (从源码编译)
+          force: 'false'   # 可选，若为 'true' 则强制重新安装覆盖现有工具
+          version: ''      # 可选，显式指定版本/commit/tag（留空则自动读取 .nixcache-version 或回退 action 版本）
+```
+
+###### `install` Action 参数说明：
+| 参数名 | 类型 | 默认值 | 描述 |
+|---|---|---|---|
+| `source` | string | `binary` | 安装方式：`binary`（推荐，免编译预编译包）或 `source`（从源码编译） |
+| `force` | string / boolean | `false` | 若为 `true`，即使环境中已存在 `nixcache-builder` 和 `nixcache-proxy` 也强制重新安装并覆盖 |
+| `version` | string | （自动探测） | 指定要安装的版本/Git Commit SHA/Tag（默认读取 `.nixcache-version` 或回退 Action 自身版本） |
+
+##### 8. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。

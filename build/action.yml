@@ -84,6 +84,12 @@ runs:
       run: |
         echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
 
+    - name: Install NixCache Tools
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/../install/install.sh"
+        "${{ github.action_path }}/../install/install.sh"
+
     - name: Build outputs and push NAR blobs
       shell: bash
       env:
@@ -101,21 +107,7 @@ runs:
         NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt.json
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        REF=""
-        if [[ -f .nixcache-version ]]; then
-          REF=$(cat .nixcache-version | tr -d '[:space:]')
-          if [[ -n "$REF" ]]; then
-            echo ">>> Found .nixcache-version file, using version: $REF"
-          fi
-        fi
-        if [[ -z "$REF" ]]; then
-          REF="${{ github.action_ref }}"
-          if [[ -z "$REF" ]]; then
-            REF="main"
-          fi
-          echo ">>> Using fallback version: $REF"
-        fi
-        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- build
+        nixcache-builder build
 
     - name: Upload Build Receipt Artifact
       uses: actions/upload-artifact@v4

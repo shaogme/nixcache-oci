@@ -57,6 +57,12 @@ runs:
         pattern: 'nixcache-receipt-*'
         merge-multiple: true
 
+    - name: Install NixCache Tools
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/../install/install.sh"
+        "${{ github.action_path }}/../install/install.sh"
+
     - name: Promote Session & Receipts to Baseline
       shell: bash
       env:
@@ -68,14 +74,4 @@ runs:
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        REF=""
-        if [[ -f .nixcache-version ]]; then
-          REF=$(cat .nixcache-version | tr -d '[:space:]')
-        fi
-        if [[ -z "$REF" ]]; then
-          REF="${{ github.action_ref }}"
-          if [[ -z "$REF" ]]; then
-            REF="main"
-          fi
-        fi
-        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- promote
+        nixcache-builder promote

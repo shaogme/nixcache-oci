@@ -1,0 +1,36 @@
+name: 'NixCache OCI Tools Installer'
+description: 'Install nixcache-builder and nixcache-proxy tools via pre-compiled binary or source compilation'
+inputs:
+  source:
+    description: 'Installation source/mode: "binary" (default, fast pre-compiled binary) or "source" (compile from Rust source)'
+    required: false
+    default: 'binary'
+  force:
+    description: 'Force re-installation even if nixcache-builder and nixcache-proxy already exist in PATH'
+    required: false
+    default: 'false'
+  version:
+    description: 'Git commit/tag or Flake reference version override (defaults to .nixcache-version file, action ref, or main)'
+    required: false
+    default: ''
+outputs:
+  installed:
+    description: 'Whether installation was performed (true) or skipped because tools already existed (false)'
+    value: ${{ steps.install-tools.outputs.installed }}
+  bin-path:
+    description: 'Directory path where nixcache tools are installed'
+    value: ${{ steps.install-tools.outputs.bin-path }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Install NixCache Tools
+      id: install-tools
+      shell: bash
+      env:
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_ACTION_REF: ${{ github.action_ref }}
+      run: |
+        chmod +x "${{ github.action_path }}/install.sh"
+        "${{ github.action_path }}/install.sh"

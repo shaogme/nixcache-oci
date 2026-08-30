@@ -75,11 +75,8 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build NixCache Builder
-        run: |
-          nix build .#cache-builder .#cache-proxy
-          echo "${{ github.workspace }}/result/bin" >> "$GITHUB_PATH"
-          echo "${{ github.workspace }}/result-1/bin" >> "$GITHUB_PATH"
+      - name: Install NixCache Tools
+        uses: ./install
 
       - name: Load Environment Variables
         run: |

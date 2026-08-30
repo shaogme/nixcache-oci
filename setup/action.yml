@@ -70,6 +70,12 @@ runs:
       run: |
         echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
 
+    - name: Install NixCache Tools
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/../install/install.sh"
+        "${{ github.action_path }}/../install/install.sh"
+
     - name: Initialize NixCache Session & Proxy
       shell: bash
       env:
@@ -84,15 +90,4 @@ runs:
         NIXCACHE_UPSTREAM: ${{ inputs.upstream }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        REF=""
-        if [[ -f .nixcache-version ]]; then
-          REF=$(cat .nixcache-version | tr -d '[:space:]')
-        fi
-        if [[ -z "$REF" ]]; then
-          REF="${{ github.action_ref }}"
-          if [[ -z "$REF" ]]; then
-            REF="main"
-          fi
-        fi
-
-        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session init
+        nixcache-builder session init
