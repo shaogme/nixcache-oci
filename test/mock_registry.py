@@ -266,6 +266,47 @@ class MockRegistryHandler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
 
+            # Validate referenced blobs exist in storage (compliance with OCI Distribution Spec)
+            try:
+                manifest_json = json.loads(body.decode("utf-8"))
+                if isinstance(manifest_json, dict):
+                    if "config" in manifest_json and isinstance(manifest_json["config"], dict):
+                        cfg_digest = manifest_json["config"].get("digest")
+                        if cfg_digest:
+                            cfg_file = os.path.join(STORAGE_DIR, "blobs", cfg_digest.replace(":", "_"))
+                            if not os.path.exists(cfg_file):
+                                self.send_response(400)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    "errors": [{
+                                        "code": "BLOB_UNKNOWN",
+                                        "message": f"blob unknown to registry: {cfg_digest}",
+                                        "detail": cfg_digest
+                                    }]
+                                }).encode())
+                                return
+                    if "layers" in manifest_json and isinstance(manifest_json["layers"], list):
+                        for layer in manifest_json["layers"]:
+                            if isinstance(layer, dict):
+                                l_digest = layer.get("digest")
+                                if l_digest:
+                                    l_file = os.path.join(STORAGE_DIR, "blobs", l_digest.replace(":", "_"))
+                                    if not os.path.exists(l_file):
+                                        self.send_response(400)
+                                        self.send_header("Content-Type", "application/json")
+                                        self.end_headers()
+                                        self.wfile.write(json.dumps({
+                                            "errors": [{
+                                                "code": "BLOB_UNKNOWN",
+                                                "message": f"blob unknown to registry: {l_digest}",
+                                                "detail": l_digest
+                                            }]
+                                        }).encode())
+                                        return
+            except Exception:
+                pass
+
             manifest_file = os.path.join(STORAGE_DIR, "manifests", tag)
 
             # CAS optimistic concurrency check via If-Match header

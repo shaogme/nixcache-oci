@@ -319,6 +319,15 @@ impl<T: OciTransport> OciClient<T> {
         self.push_blob_bytes_with_digest(&digest, bytes).await
     }
 
+    /// 确保 OCI 规范所需的空配置 Blob (b"{}") 已存在于目标 Registry 中
+    pub async fn ensure_empty_config_blob(&self) -> Result<(), OciError> {
+        if !self.head_blob(EMPTY_CONFIG_DIGEST).await? {
+            self.push_blob_bytes_with_digest(EMPTY_CONFIG_DIGEST, Bytes::from_static(b"{}"))
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn push_blob_stream(
         &self,
         digest: &str,
@@ -1018,6 +1027,10 @@ impl<T: OciTransport> OciClient<T> {
         manifest: &str,
         previous_digest: Option<&str>,
     ) -> Result<(), OciError> {
+        if manifest.contains(EMPTY_CONFIG_DIGEST) {
+            self.ensure_empty_config_blob().await?;
+        }
+
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),

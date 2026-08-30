@@ -42,9 +42,9 @@ pub use upload::{BlobPayload, UploadConfig};
 #[cfg(test)]
 mod tests {
     use super::{
-        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, GenericOciDriver, GhcrDriver,
-        HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest, NarInfoMeta,
-        OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryKind,
+        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
+        GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
+        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryKind,
         SessionMutationRequest, StoreHash, StreamHashState, SystemArch, TransportError,
         UploadConfig, build_image_index, parse_range_header,
     };
@@ -210,6 +210,52 @@ mod tests {
             fail_res,
             Err(OciError::ManifestPushFailed(StatusCode::FORBIDDEN))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_push_manifest_ensures_empty_config_blob_mock() {
+        let manifest_content = format!(
+            r#"{{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {{"digest": "{}"}}}}"#,
+            EMPTY_CONFIG_DIGEST
+        );
+
+        let transport = MockRouterTransport::default();
+        // 初始状态下 HEAD empty config blob 返回 404
+        transport.add_route(
+            "HEAD",
+            &format!("/blobs/{}", EMPTY_CONFIG_DIGEST),
+            MockResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        // 上传 empty config blob 的 1-RTT monolithic post
+        transport.add_route(
+            "POST",
+            &format!("/blobs/uploads/?digest={}", EMPTY_CONFIG_DIGEST),
+            MockResponse {
+                status: StatusCode::CREATED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        // 上传 manifest
+        transport.add_route(
+            "PUT",
+            "/manifests/cache-index-x86",
+            MockResponse {
+                status: StatusCode::CREATED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        let push_res = client
+            .push_manifest("cache-index-x86", &manifest_content)
+            .await;
+        assert!(push_res.is_ok());
     }
 
     #[test]
