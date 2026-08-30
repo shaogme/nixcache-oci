@@ -7,6 +7,12 @@ pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manif
 pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 
+/// OCI 空配置 Blob Sha256 散列常量 ("{}" 的 sha256 结果)
+pub const EMPTY_CONFIG_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+/// OCI 空配置 Blob 大小 (2 字节)
+pub const EMPTY_CONFIG_SIZE: u64 = 2;
+
 /// 强类型 OCI NixCache Layer 媒体类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheLayerMediaType {

@@ -69,11 +69,6 @@ runs:
           echo ">>> Nix signing key configured"
         fi
 
-    - name: Log in to OCI Registry
-      shell: bash
-      run: |
-        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
-
     - name: Capture newly built paths and upload session cache
       shell: bash
       env:
@@ -89,19 +84,24 @@ runs:
         NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        REF=""
-        if [[ -f .nixcache-version ]]; then
-          REF=$(cat .nixcache-version | tr -d '[:space:]')
-          if [[ -n "$REF" ]]; then
-            echo ">>> Found .nixcache-version file, using version: $REF"
+        # 优先使用本地已存在的二进制，降级使用 nix run
+        if command -v nixcache-builder &> /dev/null; then
+          nixcache-builder session capture
+        else
+          REF=""
+          if [[ -f .nixcache-version ]]; then
+            REF=$(cat .nixcache-version | tr -d '[:space:]')
+            if [[ -n "$REF" ]]; then
+              echo ">>> Found .nixcache-version file, using version: $REF"
+            fi
           fi
-        fi
-        if [[ -z "$REF" ]]; then
-          REF="${{ github.action_ref }}"
           if [[ -z "$REF" ]]; then
-            REF="main"
+            REF="${{ github.action_ref }}"
+            if [[ -z "$REF" ]]; then
+              REF="main"
+            fi
+            echo ">>> Using fallback version: $REF"
           fi
-          echo ">>> Using fallback version: $REF"
-        fi
 
-        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session capture
+          nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- session capture
+        fi

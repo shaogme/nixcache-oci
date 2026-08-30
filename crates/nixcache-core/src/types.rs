@@ -4,7 +4,7 @@ use std::{
     borrow::Borrow,
     collections::{HashMap, HashSet},
     convert::Infallible,
-    fmt,
+    env, fmt,
     ops::Deref,
     path::Path,
     str::FromStr,
@@ -358,6 +358,18 @@ impl SystemArch {
             ("linux", "s390x", _) => Self::S390xLinux,
             ("wasi" | "wasip1", "wasm" | "wasm32", _) => Self::Wasm32Wasi,
             _ => Self::Unknown,
+        }
+    }
+
+    /// 探测当前运行环境的系统架构 (基于运行时 OS/ARCH，零子进程开销)
+    pub fn detect_current() -> Self {
+        let os = env::consts::OS;
+        let arch = env::consts::ARCH;
+        let detected = Self::from_oci(os, arch, None);
+        if detected.is_known() {
+            detected
+        } else {
+            Self::Unknown
         }
     }
 }

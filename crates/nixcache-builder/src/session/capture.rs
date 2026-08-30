@@ -1,17 +1,20 @@
 use crate::{
     error::BuilderError,
-    nix::{self, driver::get_own_public_key},
+    nix::{
+        self,
+        driver::get_own_public_key,
+        exporter::{ParallelExportConfig, ParallelExporter},
+        filter::{NixArtifactFilter, NixArtifactFilterContext},
+    },
+    session::init::FastStoreScanner,
     summary::write_session_capture_summary,
+    worker,
 };
 use chrono::Utc;
 use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
-use nixcache_oci::SessionMutationRequest;
+use nixcache_oci::{SessionMutationRequest, UploadConfig};
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    path::Path,
-};
+use std::{collections::HashMap, env, path::Path, time::Duration};
 use tokio::fs;
 use tracing::{error, info};
 
@@ -31,11 +34,18 @@ pub struct SessionCaptureOptions<'a> {
     pub explicit_paths: &'a [String],
 }
 
-/// Session Capture: 捕获本 Job 新构建产物，并行无盘流式导出并上传 NAR Blobs，CAS 更新 run-<run_id>，热注册到 Proxy
+/// Session Capture: 阶段 1 先验过滤 -> 阶段 2 精准签名与无盘流式上传 -> 阶段 3 清单瘦身与原子 CAS 提交
 pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(), BuilderError> {
     let system = match opts.system_opt {
         Some(s) if !s.trim().is_empty() => SystemArch::from(s.trim()),
-        _ => SystemArch::from(nix::get_system().await?.as_str()),
+        _ => {
+            let detected = SystemArch::detect_current();
+            if detected.is_known() {
+                detected
+            } else {
+                SystemArch::from(nix::get_system().await?.as_str())
+            }
+        }
     };
 
     info!(
@@ -43,65 +53,94 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         opts.job_id, opts.run_id, system, opts.registry, opts.repo
     );
 
-    let candidate_paths: Vec<String> = if !opts.explicit_paths.is_empty() {
+    // 1. 同步 Inode 扫描获取差集候选路径
+    let raw_diff_paths: Vec<String> = if !opts.explicit_paths.is_empty() {
         opts.explicit_paths.to_vec()
-    } else if let Some(snap_file) = opts.snapshot_before
-        && snap_file.exists()
-    {
-        let before_content = fs::read_to_string(snap_file).await.unwrap_or_default();
-        let before_set: HashSet<&str> = before_content
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect();
-
-        let mut diff_paths = Vec::new();
-        if let Ok(mut entries) = fs::read_dir("/nix/store").await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str()
-                    && !before_set.contains(name)
-                    && !name.ends_with(".lock")
-                    && !name.ends_with(".drv")
-                {
-                    diff_paths.push(format!("/nix/store/{}", name));
-                }
-            }
-        }
-        diff_paths
+    } else if let Some(snap_file) = opts.snapshot_before {
+        FastStoreScanner::compute_diff_paths(Path::new("/nix/store"), snap_file).await?
     } else {
         Vec::new()
     };
 
     info!(
-        "Found {} candidate path(s) to capture",
-        candidate_paths.len()
+        "Found {} raw candidate path(s) to evaluate for capture",
+        raw_diff_paths.len()
     );
 
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
 
+    // 2. 并行获取远端已缓存的 StoreHash 集合 (cache-index + 当前 run-id session)
+    let (_remote_index, own_cached_hashes) = worker::fetch_remote_cache_index(&oci).await;
+    let mut all_known_hashes = own_cached_hashes;
+    if let Ok(Some((session_manifest, _))) = oci
+        .get_arch_session_manifest(&format!("run-{}", opts.run_id), &system)
+        .await
+    {
+        all_known_hashes.extend(session_manifest.entries.into_keys());
+    }
+
+    // 3. 批量强类型查询 path-info 并执行信任链判定与先验过滤
+    let path_infos = if !raw_diff_paths.is_empty() {
+        ParallelExporter::batch_fetch_path_infos_typed(&raw_diff_paths, 256).await?
+    } else {
+        Vec::new()
+    };
+
+    let own_pub_key = get_own_public_key(opts.signing_key_file).await;
+    let filter_ctx = NixArtifactFilterContext {
+        own_public_key: own_pub_key.as_deref(),
+        remote_cached_hashes: &all_known_hashes,
+        trusted_upstream_prefixes: &["cache.nixos.org-1".to_string()],
+    };
+
+    let decision_report = NixArtifactFilter::classify_and_filter(path_infos, &filter_ctx);
+
+    info!(
+        "Pre-filtering result: {} locally-built, {} substituted (upstream), {} already-cached, {} ignored",
+        decision_report.to_export.len(),
+        decision_report.substituted_count,
+        decision_report.already_cached_count,
+        decision_report.ignored_count
+    );
+
+    // 4. 阶段 2: 目标精准签名与流式上传 (仅处理真正本地新编译产物)
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
 
-    if !candidate_paths.is_empty() {
+    if !decision_report.to_export.is_empty() {
         info!(
-            "Capturing {} paths via ParallelExporter (Diskless, concurrency: {})",
-            candidate_paths.len(),
+            "Capturing {} locally-built path(s) via ParallelExporter (Diskless, concurrency: {})",
+            decision_report.to_export.len(),
             opts.export_concurrency
         );
 
-        let export_config = nix::ParallelExportConfig {
+        let target_paths: Vec<String> = decision_report
+            .to_export
+            .iter()
+            .map(|i| i.path.clone())
+            .collect();
+
+        // 仅对精准产物执行单批次极速签名
+        if let Some(key_file) = opts.signing_key_file {
+            ParallelExporter::batch_sign_paths(&target_paths, key_file).await?;
+        }
+
+        let export_config = ParallelExportConfig {
             concurrency: opts.export_concurrency,
-            signing_key_file: opts.signing_key_file.map(|s| s.to_string()),
+            signing_key_file: None, // 前序已完成精准签名
             fail_fast: false,
-            upload_config: nixcache_oci::UploadConfig::default(),
+            upload_config: UploadConfig::default(),
             system,
             origin_job: Some(format!("job:{}", opts.job_id)),
         };
 
-        let report =
-            nix::ParallelExporter::export_and_upload_paths(&candidate_paths, &oci, &export_config)
-                .await?;
+        let report = ParallelExporter::export_and_upload_paths_with_preinfo(
+            &decision_report.to_export,
+            &oci,
+            &export_config,
+        )
+        .await?;
 
         for exported in report.successful {
             new_entries.insert(exported.store_hash, exported.index_entry);
@@ -116,19 +155,15 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         }
     }
 
-    let mut active_gc_roots: Vec<StoreHash> = Vec::new();
-    for p in &candidate_paths {
-        if let Some(file_name) = Path::new(p).file_name().and_then(|n| n.to_str())
-            && file_name.len() >= 32
-            && let Ok(sh) = StoreHash::parse(&file_name[..32])
-        {
-            active_gc_roots.push(sh);
-        }
-    }
+    // 5. 阶段 3: 仅收录真正的本地新构建产物作为 active_gc_roots
+    let mut active_gc_roots: Vec<StoreHash> = decision_report
+        .to_export
+        .iter()
+        .filter_map(|i| i.store_hash())
+        .collect();
     active_gc_roots.sort();
     active_gc_roots.dedup();
 
-    let pub_key = get_own_public_key(opts.signing_key_file).await;
     let head_sha = env::var("GITHUB_SHA").ok();
     let ref_name = env::var("GITHUB_REF_NAME").ok();
 
@@ -138,46 +173,51 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
             .with_entries(new_entries.clone())
             .with_roots(active_gc_roots.clone())
             .with_git_info(head_sha, ref_name)
-            .with_public_key(pub_key.clone())
+            .with_public_key(own_pub_key.clone())
             .with_upload_stats(uploaded_count, total_bytes_uploaded)
             .with_max_retries(5);
 
         oci.update_arch_session_with_cas(request).await?;
     }
 
-    // 热注册到本机 Proxy
+    // 热注册到本机 Proxy (配置短超时，避免阻塞 Runner 退出)
     if let Some(purl) = opts.proxy_url
         && !new_entries.is_empty()
     {
         let register_endpoint = format!("{}/_session/register", purl.trim_end_matches('/'));
-        let client = reqwest::Client::new();
-        let _ = client
-            .post(&register_endpoint)
-            .json(&new_entries)
-            .send()
-            .await;
-        info!(
-            "Hot-registered {} entries to proxy at {}",
-            new_entries.len(),
-            register_endpoint
-        );
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+        {
+            let _ = client
+                .post(&register_endpoint)
+                .json(&new_entries)
+                .send()
+                .await;
+            info!(
+                "Hot-registered {} entries to proxy at {}",
+                new_entries.len(),
+                register_endpoint
+            );
+        }
     }
 
-    // 写入 Schema v4 的 BuildReceipt
+    // 写入精简准确的 BuildReceipt
     if let Some(receipt_path) = opts.output_receipt_path {
         let stats = BuildStats {
-            discovered_outputs: candidate_paths.len(),
-            built_paths: candidate_paths.len(),
+            discovered_outputs: raw_diff_paths.len(),
+            built_paths: decision_report.to_export.len(),
             uploaded_blobs: uploaded_count,
             total_bytes_uploaded,
-            substituted_paths: 0,
+            substituted_paths: decision_report.substituted_count,
         };
 
         let receipt = BuildReceipt::new(
             system,
             opts.repo.to_string(),
             Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            pub_key,
+            own_pub_key,
             new_entries,
             active_gc_roots,
             stats,
@@ -190,7 +230,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
             let _ = fs::create_dir_all(parent).await;
         }
 
-        let receipt_json = serde_json::to_string_pretty(&receipt)?;
+        let receipt_json = serde_json::to_string(&receipt)?;
         fs::write(receipt_path, receipt_json).await?;
         info!("Build receipt written to {:?}", receipt_path);
     }
@@ -198,7 +238,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
     write_session_capture_summary(
         opts.job_id,
         system.as_str(),
-        candidate_paths.len(),
+        raw_diff_paths.len(),
         uploaded_count,
         total_bytes_uploaded,
     )

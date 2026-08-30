@@ -6,8 +6,9 @@ use crate::{
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
-        OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
-        OciImageIndex, OciImageManifest, build_arch_session_manifest,
+        EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciImageIndex, OciImageManifest,
+        build_arch_session_manifest,
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
@@ -1182,9 +1183,8 @@ impl<T: OciTransport> OciClient<T> {
         let arch_tag = format!("run-{}-{}", request.run_id, request.system.as_str());
         let mut attempt = 0;
 
-        let empty_config = Bytes::from_static(b"{}");
-        let config_digest = self.push_blob_bytes(empty_config).await?;
-        let config_size = 2u64;
+        let config_digest = EMPTY_CONFIG_DIGEST;
+        let config_size = EMPTY_CONFIG_SIZE;
 
         loop {
             attempt += 1;
@@ -1207,7 +1207,7 @@ impl<T: OciTransport> OciClient<T> {
                 &session_blob_digest,
                 compressed_size,
                 uncompressed_size,
-                &config_digest,
+                config_digest,
                 config_size,
                 request.run_id,
                 &request.system,
@@ -1228,7 +1228,7 @@ impl<T: OciTransport> OciClient<T> {
                 Err(OciError::CasConflict(_)) if attempt <= request.max_retries => {
                     let pid = get_process_id();
                     let backoff_ms =
-                        (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
+                        (50 * (1 << attempt.min(4))) + ((pid * 37 + attempt as u64 * 53) % 50);
                     warn!(
                         "CAS conflict on arch tag {}, retrying in {}ms (attempt {}/{})",
                         arch_tag, backoff_ms, attempt, request.max_retries

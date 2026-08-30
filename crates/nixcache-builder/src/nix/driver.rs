@@ -1,5 +1,10 @@
-use crate::{env_injector::NixEnvInjector, error::BuilderError};
+use crate::{
+    env_injector::NixEnvInjector,
+    error::BuilderError,
+    nix::filter::{NixArtifactFilter, NixArtifactFilterContext, NixPathInfoItem},
+};
 use clap::ValueEnum;
+use nixcache_core::StoreHash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -261,6 +266,10 @@ impl NixCli {
         paths: &[String],
         own_hashes: &[String],
     ) -> Result<Vec<String>, BuilderError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut cmd = Command::new("nix");
         cmd.args(["path-info", "--json", "--recursive"]);
         for p in paths {
@@ -276,10 +285,24 @@ impl NixCli {
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
-        let parsed = serde_json::from_str::<Value>(&json_str)?;
+        let items = parse_path_info_items_typed(&json_str)?;
 
-        let items = parse_path_info_items(&parsed)?;
-        Ok(filter_locally_built_paths(&items, own_hashes))
+        let own_hashes_set: HashSet<StoreHash> = own_hashes
+            .iter()
+            .map(|s| StoreHash::parse(s).unwrap_or_else(|_| StoreHash::new_unchecked(s)))
+            .collect();
+
+        let filter_ctx = NixArtifactFilterContext {
+            own_public_key: None,
+            remote_cached_hashes: &own_hashes_set,
+            trusted_upstream_prefixes: &[],
+        };
+
+        let report = NixArtifactFilter::classify_and_filter(items, &filter_ctx);
+        let mut result: Vec<String> = report.to_export.into_iter().map(|i| i.path).collect();
+        result.sort();
+        result.dedup();
+        Ok(result)
     }
 
     pub async fn get_own_public_key(&self, signing_key_file: Option<&str>) -> Option<String> {
@@ -314,15 +337,25 @@ impl NixCli {
     }
 }
 
-pub fn parse_path_info_items(parsed: &Value) -> Result<Vec<Value>, BuilderError> {
+pub fn parse_path_info_items_typed(json_str: &str) -> Result<Vec<NixPathInfoItem>, BuilderError> {
+    let parsed: Value = serde_json::from_str(json_str)?;
+    parse_path_info_value_typed(&parsed)
+}
+
+pub fn parse_path_info_value_typed(parsed: &Value) -> Result<Vec<NixPathInfoItem>, BuilderError> {
     if let Some(arr) = parsed.as_array() {
-        Ok(arr.clone())
+        let mut list = Vec::with_capacity(arr.len());
+        for v in arr {
+            let item: NixPathInfoItem = serde_json::from_value(v.clone())?;
+            list.push(item);
+        }
+        Ok(list)
     } else if let Some(obj) = parsed.as_object() {
-        let mut list = Vec::new();
-        for (path, val) in obj {
-            let mut item = val.clone();
-            if let Some(item_obj) = item.as_object_mut() {
-                item_obj.insert("path".to_string(), Value::String(path.clone()));
+        let mut list = Vec::with_capacity(obj.len());
+        for (path, v) in obj {
+            let mut item: NixPathInfoItem = serde_json::from_value(v.clone())?;
+            if item.path.is_empty() {
+                item.path = path.clone();
             }
             list.push(item);
         }
@@ -334,48 +367,13 @@ pub fn parse_path_info_items(parsed: &Value) -> Result<Vec<Value>, BuilderError>
     }
 }
 
-pub fn filter_locally_built_paths(items: &[Value], own_hashes: &[String]) -> Vec<String> {
-    let own_hashes_set: HashSet<&str> = own_hashes.iter().map(|s| s.as_str()).collect();
-    let mut locally_built = Vec::new();
-    for item in items {
-        if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
-            let sigs = item
-                .get("signatures")
-                .or_else(|| item.get("sigs"))
-                .and_then(|s| s.as_array());
-
-            let has_sig = match sigs {
-                None => false,
-                Some(arr) => !arr.is_empty(),
-            };
-
-            if !has_sig
-                && let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str())
-                && name.len() >= 32
-            {
-                let hash = &name[..32];
-                if !own_hashes_set.contains(hash) {
-                    locally_built.push(path.to_string());
-                }
-            }
-        }
-    }
-
-    locally_built.sort();
-    locally_built.dedup();
-    locally_built
-}
-
 pub async fn get_own_public_key(signing_key_file: Option<&str>) -> Option<String> {
     NixCli.get_own_public_key(signing_key_file).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BuildMode, BuildTarget, NixCli, filter_locally_built_paths, parse_path_info_items,
-    };
-    use serde_json::json;
+    use super::{BuildMode, BuildTarget, NixCli, parse_path_info_items_typed};
     use std::str::FromStr;
 
     #[test]
@@ -427,37 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_locally_built_paths_edge_cases() {
-        let json_data = json!([
-            {
-                "path": "/nix/store/short",
-                "signatures": []
-            },
-            {
-                "path": "/nix/store/44444444444444444444444444444444-no-sigs-field"
-            },
-            {
-                "path": "/nix/store/55555555555555555555555555555555-sigs-null",
-                "signatures": null
-            },
-            {
-                "path": "/nix/store/66666666666666666666666666666666-sigs-alias",
-                "sigs": ["key1:sig"]
-            }
-        ]);
-
-        let items = parse_path_info_items(&json_data).unwrap();
-        let filtered = filter_locally_built_paths(&items, &[]);
-        assert_eq!(
-            filtered,
-            vec![
-                "/nix/store/44444444444444444444444444444444-no-sigs-field".to_string(),
-                "/nix/store/55555555555555555555555555555555-sigs-null".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn test_build_target_display() {
         let flake_target = BuildTarget::Flake {
             flake_ref: "path:/root/workspace".to_string(),
@@ -485,62 +452,50 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_info_array_format() {
-        let json_data = json!([
-            {
-                "path": "/nix/store/00000000000000000000000000000001-local-unsigned",
-                "signatures": [],
-                "narHash": "sha256:abcd",
-                "narSize": 1000
-            },
-            {
-                "path": "/nix/store/00000000000000000000000000000002-upstream-signed",
-                "signatures": ["cache.nixos.org-1:sig123"],
-                "narHash": "sha256:efgh",
-                "narSize": 2000
-            },
-            {
-                "path": "/nix/store/00000000000000000000000000000003-already-in-cache",
-                "signatures": [],
-                "narHash": "sha256:ijkl",
-                "narSize": 3000
-            }
-        ]);
-
-        let items = parse_path_info_items(&json_data).unwrap();
-        assert_eq!(items.len(), 3);
-
-        let own_hashes = vec!["00000000000000000000000000000003".to_string()];
-        let filtered = filter_locally_built_paths(&items, &own_hashes);
-
-        assert_eq!(
-            filtered,
-            vec!["/nix/store/00000000000000000000000000000001-local-unsigned".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_parse_path_info_object_format() {
-        let json_data = json!({
-            "/nix/store/11111111111111111111111111111111-map-pkg": {
-                "narHash": "sha256:xxxx",
-                "narSize": 500
-            }
-        });
-
-        let items = parse_path_info_items(&json_data).unwrap();
-        assert_eq!(items.len(), 1);
-
-        let filtered = filter_locally_built_paths(&items, &[]);
-        assert_eq!(
-            filtered,
-            vec!["/nix/store/11111111111111111111111111111111-map-pkg".to_string()]
-        );
-    }
-
-    #[test]
     fn test_parse_path_info_invalid_format() {
-        let json_data = json!("invalid string");
-        assert!(parse_path_info_items(&json_data).is_err());
+        let json_data = "invalid string";
+        assert!(parse_path_info_items_typed(json_data).is_err());
+    }
+
+    #[test]
+    fn test_parse_path_info_typed_formats() {
+        let json_arr = r#"[
+            {
+                "path": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-typed-1",
+                "narHash": "sha256:1111",
+                "narSize": 100,
+                "references": ["/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep"],
+                "signatures": ["sig1"]
+            }
+        ]"#;
+
+        let items = parse_path_info_items_typed(json_arr).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].path,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-typed-1"
+        );
+        assert_eq!(items[0].nar_hash, "sha256:1111");
+        assert_eq!(items[0].nar_size, 100);
+        assert_eq!(
+            items[0].normalized_references(),
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep"]
+        );
+
+        let json_map = r#"{
+            "/nix/store/cccccccccccccccccccccccccccccccc-typed-map": {
+                "narHash": "sha256:2222",
+                "narSize": 200,
+                "references": []
+            }
+        }"#;
+
+        let map_items = parse_path_info_items_typed(json_map).unwrap();
+        assert_eq!(map_items.len(), 1);
+        assert_eq!(
+            map_items[0].path,
+            "/nix/store/cccccccccccccccccccccccccccccccc-typed-map"
+        );
+        assert_eq!(map_items[0].nar_size, 200);
     }
 }

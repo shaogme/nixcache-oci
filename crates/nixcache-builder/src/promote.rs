@@ -1,13 +1,13 @@
 use crate::{error::BuilderError, summary::write_promote_step_summary};
-use bytes::Bytes;
 use chrono::Utc;
 use futures_util::future::{join_all, try_join_all};
 use nixcache_core::{
     ArchCacheIndexData, BuildReceipt, CACHE_INDEX_VERSION, IndexEntry, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor,
-    OciImageManifest, OciPlatform, build_arch_index_manifest, build_image_index,
+    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OciArtifactManifest, OciDescriptor, OciImageManifest, OciPlatform, build_arch_index_manifest,
+    build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
@@ -255,9 +255,8 @@ pub async fn run_promote(
     }
 
     // 4. 为每个系统架构并发构建并推送 Sub-Manifest 与 Index Blob
-    let empty_config = Bytes::from_static(b"{}");
-    let config_digest = oci.push_blob_bytes(empty_config).await?;
-    let config_size = 2u64;
+    let config_digest = EMPTY_CONFIG_DIGEST.to_string();
+    let config_size = EMPTY_CONFIG_SIZE;
 
     let mut all_systems: HashSet<SystemArch> = partitioned_entries.keys().cloned().collect();
     all_systems.extend(partitioned_roots.keys().cloned());

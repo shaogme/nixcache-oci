@@ -279,7 +279,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         fs::create_dir_all(parent).await?;
     }
 
-    let receipt_json = serde_json::to_string_pretty(&receipt)?;
+    let receipt_json = serde_json::to_string(&receipt)?;
     fs::write(opts.output_receipt_path, receipt_json).await?;
 
     info!(

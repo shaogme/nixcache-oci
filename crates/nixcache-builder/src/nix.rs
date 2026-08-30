@@ -3,6 +3,7 @@ use crate::error::BuilderError;
 pub mod discovery;
 pub mod driver;
 pub mod exporter;
+pub mod filter;
 
 pub use discovery::discover_outputs;
 pub use driver::{BuildConfig, BuildMode, BuildTarget, NixCli};

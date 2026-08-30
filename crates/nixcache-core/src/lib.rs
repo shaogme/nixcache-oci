@@ -105,6 +105,10 @@ mod tests {
             SystemArch::from_oci("linux", "invalid_arch", None),
             SystemArch::Unknown
         );
+
+        // SystemArch detect_current returns a known arch on supported platforms
+        let detected = SystemArch::detect_current();
+        assert!(detected.is_known());
     }
 
     #[test]

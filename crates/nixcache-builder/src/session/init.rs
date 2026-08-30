@@ -3,7 +3,8 @@ use crate::{
     summary::write_session_init_summary,
 };
 use std::{
-    env,
+    collections::HashSet,
+    env, fs as std_fs,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -12,9 +13,62 @@ use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
     process::Command,
+    task,
     time::{Instant, sleep},
 };
 use tracing::info;
+
+/// 快速本地 Nix Store Inode 扫描器与差集比对引擎
+pub struct FastStoreScanner;
+
+impl FastStoreScanner {
+    /// 在阻塞线程池中以原生同步 I/O 极速扫描 `/nix/store` 目录全量 Inode
+    pub async fn scan_store_names(store_path: &Path) -> Result<HashSet<String>, BuilderError> {
+        let p = store_path.to_path_buf();
+        task::spawn_blocking(move || {
+            let mut set = HashSet::with_capacity(32768);
+            let entries = std_fs::read_dir(&p)?;
+            for entry in entries.flatten() {
+                if let Ok(file_name) = entry.file_name().into_string()
+                    && !file_name.ends_with(".drv")
+                    && !file_name.ends_with(".lock")
+                {
+                    set.insert(file_name);
+                }
+            }
+            Ok(set)
+        })
+        .await
+        .map_err(|e| BuilderError::Other(format!("Store scan thread joined error: {}", e)))?
+    }
+
+    /// 计算差集候选路径全量列表
+    pub async fn compute_diff_paths(
+        store_path: &Path,
+        snapshot_file: &Path,
+    ) -> Result<Vec<String>, BuilderError> {
+        if !snapshot_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let snap_content = fs::read_to_string(snapshot_file).await.unwrap_or_default();
+        let before_set: HashSet<String> = snap_content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        let current_set = Self::scan_store_names(store_path).await?;
+
+        let mut diff_paths = Vec::new();
+        for name in current_set.difference(&before_set) {
+            diff_paths.push(format!("{}/{}", store_path.display(), name));
+        }
+
+        diff_paths.sort();
+        Ok(diff_paths)
+    }
+}
 
 pub fn find_proxy_binary() -> PathBuf {
     if let Ok(current_exe) = env::current_exe()
@@ -40,14 +94,8 @@ pub async fn record_store_snapshot_from_dir(
     store_dir: &Path,
     snap_path: &Path,
 ) -> Result<(), BuilderError> {
-    let mut paths = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(store_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str() {
-                paths.push(name.to_string());
-            }
-        }
-    }
+    let names = FastStoreScanner::scan_store_names(store_dir).await?;
+    let mut paths: Vec<String> = names.into_iter().collect();
     paths.sort();
     if let Some(parent) = snap_path.parent() {
         let _ = fs::create_dir_all(parent).await;
@@ -195,5 +243,34 @@ mod tests {
     async fn test_find_proxy_binary_fallback() {
         let bin = find_proxy_binary();
         assert!(!bin.as_os_str().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fast_store_scanner_compute_diff_paths() {
+        let temp = tempdir().unwrap();
+        let fake_store = temp.path().join("store");
+        fs::create_dir_all(&fake_store).await.unwrap();
+
+        fs::write(fake_store.join("1111-old-pkg"), b"")
+            .await
+            .unwrap();
+        fs::write(fake_store.join("2222-new-pkg"), b"")
+            .await
+            .unwrap();
+        fs::write(fake_store.join("3333-drv.drv"), b"")
+            .await
+            .unwrap();
+        fs::write(fake_store.join("4444-lock.lock"), b"")
+            .await
+            .unwrap();
+
+        let snap_file = temp.path().join("snap.txt");
+        fs::write(&snap_file, "1111-old-pkg\n").await.unwrap();
+
+        let diff = FastStoreScanner::compute_diff_paths(&fake_store, &snap_file)
+            .await
+            .unwrap();
+
+        assert_eq!(diff, vec![format!("{}/2222-new-pkg", fake_store.display())]);
     }
 }

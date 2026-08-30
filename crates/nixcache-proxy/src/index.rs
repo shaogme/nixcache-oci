@@ -8,7 +8,6 @@ use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use scc::HashMap as SccHashMap;
 use std::{
     collections::{HashMap, HashSet},
-    env,
     path::PathBuf,
     sync::{
         Arc,
@@ -20,9 +19,7 @@ use tokio::fs;
 use tracing::{error, info, warn};
 
 pub fn detect_current_system() -> SystemArch {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
-    SystemArch::from_oci(os, arch, None)
+    SystemArch::detect_current()
 }
 
 #[derive(Clone, Debug)]

@@ -1,10 +1,9 @@
 use crate::error::BuilderError;
-use bytes::Bytes;
 use chrono::Utc;
 use nixcache_core::{CACHE_INDEX_VERSION, CacheIndexData, evaluate_multi_arch_gc};
 use nixcache_oci::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciPlatform, build_arch_index_manifest,
-    build_image_index,
+    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor,
+    OciPlatform, build_arch_index_manifest, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
@@ -80,9 +79,8 @@ pub async fn run_gc(
     };
 
     let partitioned = kept_data.into_arch_partitioned();
-    let empty_config = Bytes::from_static(b"{}");
-    let config_digest = oci.push_blob_bytes(empty_config).await?;
-    let config_size = 2u64;
+    let config_digest = EMPTY_CONFIG_DIGEST;
+    let config_size = EMPTY_CONFIG_SIZE;
 
     let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
 
@@ -93,7 +91,7 @@ pub async fn run_gc(
             &blob_digest,
             compressed_size,
             uncompressed_size,
-            &config_digest,
+            config_digest,
             config_size,
             &sys,
         );

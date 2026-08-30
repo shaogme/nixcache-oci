@@ -1,17 +1,17 @@
-use crate::error::BuilderError;
+use crate::{
+    error::BuilderError,
+    nix::{driver::parse_path_info_items_typed, filter::NixPathInfoItem},
+};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::Utc;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
 use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use nixcache_oci_backend::ReqwestTransport;
-use serde_json::Value;
 use std::{
-    collections::HashMap,
     io,
     path::Path,
     process::Stdio,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -93,17 +93,6 @@ pub struct ParallelExportReport {
     pub elapsed: Duration,
 }
 
-/// 预查的单路径原始元数据结构
-#[derive(Clone, Debug, Default)]
-pub struct RawPathInfo {
-    pub nar_hash: String,
-    pub nar_size: u64,
-    pub references: Vec<String>,
-    pub deriver: Option<String>,
-    pub signatures: Vec<String>,
-    pub ca: Option<String>,
-}
-
 /// 高性能无盘流式并行 Export 协调器
 pub struct ParallelExporter;
 
@@ -118,27 +107,87 @@ impl ParallelExporter {
             return Ok(ParallelExportReport::default());
         }
 
-        let start_time = Instant::now();
-        info!(
-            "Starting parallel export for {} paths (concurrency: {}, fail_fast: {})",
-            paths.len(),
-            config.concurrency,
-            config.fail_fast
-        );
-
         // 1. 批量签名 (按批次调用，防止超出命令行长度限制)
         if let Some(ref key) = config.signing_key_file {
             Self::batch_sign_paths(paths, key).await?;
         }
 
-        // 2. 批量预查元数据并构建内存字典
-        let info_map = Arc::new(Self::batch_fetch_path_infos(paths).await?);
+        // 2. 批量预查强类型元数据
+        let items = Self::batch_fetch_path_infos_typed(paths, 128).await?;
 
         // 3. 执行流式无盘并发池
-        let report =
-            Self::execute_parallel_pipeline(paths, oci_client, config, info_map, start_time)
-                .await?;
+        let mut modified_config = config.clone();
+        modified_config.signing_key_file = None;
+        Self::export_and_upload_paths_with_preinfo(&items, oci_client, &modified_config).await
+    }
 
+    /// 消费过滤后的强类型 NixPathInfoItem，端到端无盘流式并行导出并上传
+    pub async fn export_and_upload_paths_with_preinfo(
+        items: &[NixPathInfoItem],
+        oci_client: &OciClient<ReqwestTransport>,
+        config: &ParallelExportConfig,
+    ) -> Result<ParallelExportReport, BuilderError> {
+        if items.is_empty() {
+            return Ok(ParallelExportReport::default());
+        }
+
+        let start_time = Instant::now();
+        info!(
+            "Starting parallel export with pre-info for {} items (concurrency: {}, fail_fast: {})",
+            items.len(),
+            config.concurrency,
+            config.fail_fast
+        );
+
+        if let Some(ref key) = config.signing_key_file {
+            let paths: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+            Self::batch_sign_paths(&paths, key).await?;
+        }
+
+        let concurrency = config.concurrency.max(1);
+        let items_stream = stream::iter(items.iter().cloned().map(|item| {
+            let oci_client = oci_client.clone();
+            let upload_config = config.upload_config.clone();
+            let system = config.system;
+            let origin_job = config.origin_job.clone();
+
+            async move {
+                let res = Self::export_single_item_stream(
+                    &item,
+                    &oci_client,
+                    &upload_config,
+                    system,
+                    origin_job.as_deref(),
+                )
+                .await;
+                (item.path.clone(), res)
+            }
+        }));
+
+        let mut buffered = items_stream.buffer_unordered(concurrency);
+        let mut report = ParallelExportReport::default();
+
+        while let Some((path, result)) = buffered.next().await {
+            match result {
+                Ok(exported) => {
+                    info!(
+                        "  [OK] Exported & uploaded {} ({} bytes)",
+                        exported.index_entry.name, exported.file_size
+                    );
+                    report.total_bytes_uploaded += exported.file_size;
+                    report.successful.push(exported);
+                }
+                Err(e) => {
+                    error!("  [FAIL] Failed to export {}: {}", path, e);
+                    if config.fail_fast {
+                        return Err(e);
+                    }
+                    report.failed.push((path, e.to_string()));
+                }
+            }
+        }
+
+        report.elapsed = start_time.elapsed();
         info!(
             "Parallel export finished in {:.2?}: {} succeeded, {} failed, {} bytes uploaded",
             report.elapsed,
@@ -146,38 +195,26 @@ impl ParallelExporter {
             report.failed.len(),
             report.total_bytes_uploaded
         );
-
         Ok(report)
     }
 
-    /// 分批执行 `nix store sign` 签名
-    pub async fn batch_sign_paths(paths: &[String], key_file: &str) -> Result<(), BuilderError> {
-        info!("Batch signing {} store paths", paths.len());
-        const BATCH_SIZE: usize = 128;
-
-        for chunk in paths.chunks(BATCH_SIZE) {
-            let mut cmd = Command::new("nix");
-            cmd.args(["store", "sign", "--key-file", key_file]);
-            for p in chunk {
-                cmd.arg(p);
-            }
-            let status = cmd.status().await?;
-            if !status.success() {
-                warn!("Signing command returned non-zero status, continuing...");
-            }
-        }
-        Ok(())
-    }
-
-    /// 分批批量查询 `nix path-info --json` 元数据
-    pub async fn batch_fetch_path_infos(
+    /// 批量查询强类型 NixPathInfoItem 元数据
+    pub async fn batch_fetch_path_infos_typed(
         paths: &[String],
-    ) -> Result<HashMap<String, RawPathInfo>, BuilderError> {
-        info!("Batch querying path-info for {} paths", paths.len());
-        let mut map = HashMap::new();
-        const BATCH_SIZE: usize = 128;
+        batch_size: usize,
+    ) -> Result<Vec<NixPathInfoItem>, BuilderError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bsize = if batch_size == 0 { 128 } else { batch_size };
+        info!(
+            "Batch querying typed path-info for {} paths (batch size: {})",
+            paths.len(),
+            bsize
+        );
+        let mut all_items = Vec::with_capacity(paths.len());
 
-        for chunk in paths.chunks(BATCH_SIZE) {
+        for chunk in paths.chunks(bsize) {
             let mut cmd = Command::new("nix");
             cmd.args(["path-info", "--json"]);
             for p in chunk {
@@ -194,101 +231,22 @@ impl ParallelExporter {
             }
 
             let json_str = String::from_utf8_lossy(&output.stdout);
-            let parsed: Value = serde_json::from_str(&json_str)?;
-            let chunk_map = Self::parse_path_info_json(&parsed)?;
-            map.extend(chunk_map);
+            let items = parse_path_info_items_typed(&json_str)?;
+            all_items.extend(items);
         }
 
-        Ok(map)
+        Ok(all_items)
     }
 
-    /// 解析 `nix path-info --json` 输出（支持 Array 格式与 Map 格式）
-    pub fn parse_path_info_json(
-        parsed: &Value,
-    ) -> Result<HashMap<String, RawPathInfo>, BuilderError> {
-        let mut result = HashMap::new();
-
-        if let Some(arr) = parsed.as_array() {
-            for item in arr {
-                if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
-                    let info = Self::extract_single_raw_path_info(item);
-                    result.insert(path.to_string(), info);
-                }
-            }
-        } else if let Some(obj) = parsed.as_object() {
-            for (path, item) in obj {
-                let info = Self::extract_single_raw_path_info(item);
-                result.insert(path.clone(), info);
-            }
-        } else {
-            return Err(BuilderError::NixCli(
-                "Unexpected path-info JSON format".to_string(),
-            ));
-        }
-
-        Ok(result)
-    }
-
-    fn extract_single_raw_path_info(item: &Value) -> RawPathInfo {
-        let nar_hash = item
-            .get("narHash")
-            .and_then(|h| h.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let nar_size = item.get("narSize").and_then(|s| s.as_u64()).unwrap_or(0);
-        let deriver = item
-            .get("deriver")
-            .and_then(|d| d.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        let ca = item
-            .get("ca")
-            .and_then(|c| c.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        let mut references = Vec::new();
-        if let Some(refs_arr) = item.get("references").and_then(|r| r.as_array()) {
-            for r_val in refs_arr {
-                if let Some(r_str) = r_val.as_str() {
-                    let bname = Path::new(r_str)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(r_str);
-                    references.push(bname.to_string());
-                }
-            }
-        }
-
-        let mut signatures = Vec::new();
-        let sigs_val = item.get("signatures").or_else(|| item.get("sigs"));
-        if let Some(sigs_arr) = sigs_val.and_then(|s| s.as_array()) {
-            for sig_val in sigs_arr {
-                if let Some(sig_str) = sig_val.as_str() {
-                    signatures.push(sig_str.to_string());
-                }
-            }
-        }
-
-        RawPathInfo {
-            nar_hash,
-            nar_size,
-            references,
-            deriver,
-            signatures,
-            ca,
-        }
-    }
-
-    /// 执行单路径端到端无盘流式导出并推送到 OCI Registry
-    pub async fn export_single_path_stream(
-        store_path: &str,
+    /// 执行强类型单个产物端到端无盘流式导出并推送到 OCI Registry
+    pub async fn export_single_item_stream(
+        item: &NixPathInfoItem,
         oci_client: &OciClient<ReqwestTransport>,
         upload_config: &UploadConfig,
-        path_info: &RawPathInfo,
         system: SystemArch,
         origin_job: Option<&str>,
     ) -> Result<ExportedStorePath, BuilderError> {
+        let store_path = &item.path;
         let file_name = Path::new(store_path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -363,7 +321,7 @@ impl ParallelExporter {
 
         // 构造 NarInfo 与 IndexEntry
         let raw_hash = nar_digest.strip_prefix("sha256:").unwrap_or(&nar_digest);
-        let deriver_bname = path_info.deriver.as_deref().and_then(|d| {
+        let deriver_bname = item.deriver.as_deref().and_then(|d| {
             Path::new(d)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -376,11 +334,11 @@ impl ParallelExporter {
             compression: Some("zstd".to_string()),
             file_hash: Some(format!("sha256:{}", raw_hash)),
             file_size: Some(nar_size),
-            nar_hash: path_info.nar_hash.clone(),
-            references: path_info.references.clone(),
+            nar_hash: item.nar_hash.clone(),
+            references: item.normalized_references(),
             deriver: deriver_bname,
-            signatures: path_info.signatures.clone(),
-            ca: path_info.ca.clone(),
+            signatures: item.signatures.clone(),
+            ca: item.ca.clone(),
         };
 
         let store_hash = StoreHash::parse(hash).unwrap_or_else(|_| StoreHash::new_unchecked(hash));
@@ -399,7 +357,7 @@ impl ParallelExporter {
             system: Some(system),
             narinfo_meta,
             nar_digest: nar_digest_obj,
-            nar_size: nar_size.max(path_info.nar_size),
+            nar_size: nar_size.max(item.nar_size),
             added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             origin_job: origin_job.map(|s| s.to_string()),
         };
@@ -411,70 +369,33 @@ impl ParallelExporter {
         })
     }
 
-    /// 执行并发流式管道调度
-    async fn execute_parallel_pipeline(
-        paths: &[String],
-        oci_client: &OciClient<ReqwestTransport>,
-        config: &ParallelExportConfig,
-        info_map: Arc<HashMap<String, RawPathInfo>>,
-        start_time: Instant,
-    ) -> Result<ParallelExportReport, BuilderError> {
-        let concurrency = config.concurrency.max(1);
-        let paths_stream = stream::iter(paths.iter().cloned().map(|path| {
-            let oci_client = oci_client.clone();
-            let upload_config = config.upload_config.clone();
-            let path_info = info_map.get(&path).cloned().unwrap_or_default();
-            let system = config.system;
-            let origin_job = config.origin_job.clone();
+    /// 分批执行 `nix store sign` 签名
+    pub async fn batch_sign_paths(paths: &[String], key_file: &str) -> Result<(), BuilderError> {
+        info!("Batch signing {} store paths", paths.len());
+        const BATCH_SIZE: usize = 128;
 
-            async move {
-                let res = Self::export_single_path_stream(
-                    &path,
-                    &oci_client,
-                    &upload_config,
-                    &path_info,
-                    system,
-                    origin_job.as_deref(),
-                )
-                .await;
-                (path, res)
+        for chunk in paths.chunks(BATCH_SIZE) {
+            let mut cmd = Command::new("nix");
+            cmd.args(["store", "sign", "--key-file", key_file]);
+            for p in chunk {
+                cmd.arg(p);
             }
-        }));
-
-        let mut buffered = paths_stream.buffer_unordered(concurrency);
-        let mut report = ParallelExportReport::default();
-
-        while let Some((path, result)) = buffered.next().await {
-            match result {
-                Ok(exported) => {
-                    info!(
-                        "  [OK] Exported & uploaded {} ({} bytes)",
-                        exported.index_entry.name, exported.file_size
-                    );
-                    report.total_bytes_uploaded += exported.file_size;
-                    report.successful.push(exported);
-                }
-                Err(e) => {
-                    error!("  [FAIL] Failed to export {}: {}", path, e);
-                    if config.fail_fast {
-                        return Err(e);
-                    }
-                    report.failed.push((path, e.to_string()));
-                }
+            let status = cmd.status().await?;
+            if !status.success() {
+                warn!("Signing command returned non-zero status, continuing...");
             }
         }
-
-        report.elapsed = start_time.elapsed();
-        Ok(report)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExportedStorePath, ParallelExporter, copy_nar_stream};
+    use super::{
+        ExportedStorePath, ParallelExporter, copy_nar_stream, parse_path_info_items_typed,
+    };
     use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
     use nixcache_core::{IndexEntry, NarDigest, StoreHash, SystemArch};
-    use serde_json::json;
     use std::{
         io::{self},
         pin::Pin,
@@ -484,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_info_json_array_and_object() {
-        let array_json = json!([
+        let array_json = r#"[
             {
                 "path": "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg",
                 "narHash": "sha256:1111",
@@ -493,17 +414,19 @@ mod tests {
                 "deriver": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test.drv",
                 "signatures": ["sig1", "sig2"]
             }
-        ]);
+        ]"#;
 
-        let map = ParallelExporter::parse_path_info_json(&array_json).unwrap();
-        assert_eq!(map.len(), 1);
-        let item = map
-            .get("/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg")
-            .unwrap();
+        let items = parse_path_info_items_typed(array_json).unwrap();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(
+            item.path,
+            "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg"
+        );
         assert_eq!(item.nar_hash, "sha256:1111");
         assert_eq!(item.nar_size, 1024);
         assert_eq!(
-            item.references,
+            item.normalized_references(),
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"]
         );
         assert_eq!(
@@ -512,19 +435,21 @@ mod tests {
         );
         assert_eq!(item.signatures, vec!["sig1", "sig2"]);
 
-        let object_json = json!({
+        let object_json = r#"{
             "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg": {
                 "narHash": "sha256:2222",
                 "narSize": 2048,
                 "references": []
             }
-        });
+        }"#;
 
-        let map2 = ParallelExporter::parse_path_info_json(&object_json).unwrap();
-        assert_eq!(map2.len(), 1);
-        let item2 = map2
-            .get("/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg")
-            .unwrap();
+        let items2 = parse_path_info_items_typed(object_json).unwrap();
+        assert_eq!(items2.len(), 1);
+        let item2 = &items2[0];
+        assert_eq!(
+            item2.path,
+            "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test-pkg"
+        );
         assert_eq!(item2.nar_hash, "sha256:2222");
         assert_eq!(item2.nar_size, 2048);
     }
