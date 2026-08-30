@@ -79,11 +79,6 @@ runs:
           echo ">>> No signing key configured — cache will be unsigned"
         fi
 
-    - name: Log in to OCI Registry
-      shell: bash
-      run: |
-        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
-
     - name: Install NixCache Tools
       shell: bash
       run: |

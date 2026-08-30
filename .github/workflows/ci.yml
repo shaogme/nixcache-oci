@@ -201,7 +201,7 @@ jobs:
   publish-cache-matrix:
     name: 2. Scatter Build Multi-Arch Cache (${{ matrix.system }})
     runs-on: ${{ matrix.os }}
-    needs: [build-linux-binaries]
+    needs: [build-linux-binaries, build-darwin-binaries]
     strategy:
       fail-fast: false
       matrix:
@@ -212,6 +212,12 @@ jobs:
           - os: ubuntu-24.04-arm
             system: aarch64-linux
             binary_target: aarch64-unknown-linux-musl
+          - os: macos-26-intel
+            system: x86_64-darwin
+            binary_target: x86_64-apple-darwin
+          - os: macos-latest
+            system: aarch64-darwin
+            binary_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@main
 
@@ -240,9 +246,6 @@ jobs:
             echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
             echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
           fi
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build Outputs and Push NAR Blobs
         env:
@@ -298,9 +301,6 @@ jobs:
           pattern: 'nixcache-receipt-*'
           path: ${{ runner.temp }}/receipts
           merge-multiple: true
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Promote Receipts & Publish Multi-Arch Index
         env:

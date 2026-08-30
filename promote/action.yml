@@ -44,11 +44,6 @@ runs:
           exit 1
         fi
 
-    - name: Log in to OCI Registry
-      shell: bash
-      run: |
-        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
-
     - name: Download Build Receipt Artifacts (optional)
       uses: actions/download-artifact@v4
       continue-on-error: true
