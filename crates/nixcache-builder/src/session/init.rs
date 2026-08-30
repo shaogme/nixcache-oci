@@ -2,6 +2,7 @@ use crate::{
     env_injector::NixEnvInjector, error::BuilderError, nix::driver::get_own_public_key,
     summary::write_session_init_summary,
 };
+use nixcache_utils::env::Env;
 use std::{
     collections::HashSet,
     env, fs as std_fs,
@@ -71,9 +72,26 @@ impl FastStoreScanner {
 }
 
 pub fn find_proxy_binary() -> PathBuf {
+    if let Some(explicit) = Env::get_first(&["NIXCACHE_PROXY_BIN", "PROXY_BIN"]) {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return path;
+        }
+    }
+
     if let Ok(current_exe) = env::current_exe()
         && let Some(parent) = current_exe.parent()
     {
+        if let Some(file_name) = current_exe.file_name().and_then(|f| f.to_str())
+            && file_name.starts_with("nixcache-builder")
+        {
+            let proxy_name = file_name.replacen("nixcache-builder", "nixcache-proxy", 1);
+            let sibling_proxy = parent.join(proxy_name);
+            if sibling_proxy.exists() {
+                return sibling_proxy;
+            }
+        }
+
         let local_proxy = parent.join("nixcache-proxy");
         if local_proxy.exists() {
             return local_proxy;
@@ -243,6 +261,22 @@ mod tests {
     async fn test_find_proxy_binary_fallback() {
         let bin = find_proxy_binary();
         assert!(!bin.as_os_str().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_proxy_binary_with_env() {
+        let temp = tempdir().unwrap();
+        let custom_proxy = temp.path().join("nixcache-proxy-custom");
+        fs::write(&custom_proxy, b"").await.unwrap();
+
+        unsafe {
+            env::set_var("NIXCACHE_PROXY_BIN", &custom_proxy);
+        }
+        let bin = find_proxy_binary();
+        assert_eq!(bin, custom_proxy);
+        unsafe {
+            env::remove_var("NIXCACHE_PROXY_BIN");
+        }
     }
 
     #[tokio::test]

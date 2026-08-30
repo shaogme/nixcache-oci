@@ -99,8 +99,16 @@ export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export NIXCACHE_REPO="test/multiarch"
 export NIXCACHE_SIGNING_KEY_FILE="test-multi-secret.key"
 export GITHUB_TOKEN="dummy-token"
+export NIXCACHE_PROXY_BIN="$PROXY_BIN"
+export PROXY_BIN="$PROXY_BIN"
 PROXY_DIR="$(cd "$(dirname "$PROXY_BIN")" && pwd)"
 export PATH="$PROXY_DIR:$PATH"
+if [[ ! -e "$PROXY_DIR/nixcache-proxy" && -x "$PROXY_BIN" ]]; then
+    ln -sf "$PROXY_BIN" "$PROXY_DIR/nixcache-proxy" 2>/dev/null || true
+fi
+if [[ ! -e "$PROXY_DIR/nixcache-builder" && -x "$BUILDER_BIN" ]]; then
+    ln -sf "$BUILDER_BIN" "$PROXY_DIR/nixcache-builder" 2>/dev/null || true
+fi
 
 
 # =========================================================================

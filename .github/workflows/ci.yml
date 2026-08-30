@@ -534,13 +534,19 @@ jobs:
           name: binary-x86_64-unknown-linux-musl
           path: ${{ runner.temp }}/bin
 
+      - name: Setup Binaries
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          cp "${{ runner.temp }}/bin/nixcache-builder-x86_64-linux" "${{ runner.temp }}/bin/nixcache-builder"
+          cp "${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux" "${{ runner.temp }}/bin/nixcache-proxy"
+          echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
+
       - name: Run Multi-Arch E2E Test
         env:
           PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
           BUILDER_BIN: ${{ runner.temp }}/bin/nixcache-builder-x86_64-linux
           PROXY_BIN: ${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux
         run: |
-          chmod +x ${{ runner.temp }}/bin/*
           chmod +x test/test-multiarch-e2e.sh
           ./test/test-multiarch-e2e.sh
 
