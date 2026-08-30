@@ -35,10 +35,10 @@ jobs:
           npins update
           
           if git diff --quiet npins/sources.json; then
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             echo ">>> npins dependencies are already up-to-date."
           else
-            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "updated=true" >> "$GITHUB_OUTPUT"
             echo ">>> npins dependencies have been updated."
           fi
 
