@@ -1,38 +1,38 @@
 {
-  "version": "ab673e90d9eabbb30515e89d4f570430eb4c8f3a",
+  "version": "82cb30fed21e3cf90e547096d3e53794e698ef7f",
   "nixcache-proxy": {
     "x86_64-linux": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-proxy-x86_64-linux",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-proxy-x86_64-linux",
       "hash": "sha256-2ruAe75Pei4Rx/+DVJbCXH7EwZF+HKPk5AKZ/xYDxpA="
     },
     "aarch64-linux": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-proxy-aarch64-linux",
-      "hash": "sha256-wmhlPKzsZ17WStRXxwSK82Ef1NEbtuEfx5GmIFHVgfM="
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-proxy-aarch64-linux",
+      "hash": "sha256-6TOvfbbUzcbxdApgvxCq92ttKRyg/SbAahMOaC3tOjM="
     },
     "x86_64-darwin": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-proxy-x86_64-darwin",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-proxy-x86_64-darwin",
       "hash": "sha256-qNZDxPHNbzvDnWA9GsBijjjwiSjdfKig52Llc6f/8pc="
     },
     "aarch64-darwin": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-proxy-aarch64-darwin",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-proxy-aarch64-darwin",
       "hash": "sha256-clIrhHOVu0mXddAYxQHi8V7tuXjl6BLxT3D60AEr+kQ="
     }
   },
   "nixcache-builder": {
     "x86_64-linux": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-builder-x86_64-linux",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-builder-x86_64-linux",
       "hash": "sha256-ty5XUrE9m3niRsVtIu7nMI22fHFVofye7FpWfv0Rrgw="
     },
     "aarch64-linux": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-builder-aarch64-linux",
-      "hash": "sha256-6UdhpGSuu/iVxxGdTd2N95NqxPbeEF24ppnj9iF4pZg="
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-builder-aarch64-linux",
+      "hash": "sha256-8btUJyY0Z/qE2TaaPUgYCCJJFNBLR3ztMmC/NFnkeII="
     },
     "x86_64-darwin": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-builder-x86_64-darwin",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-builder-x86_64-darwin",
       "hash": "sha256-/xvNcuwcGwg1YlmSKx1qVisDbZd+LYbMmfEL0VnrtgQ="
     },
     "aarch64-darwin": {
-      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-ab673e90d9eabbb30515e89d4f570430eb4c8f3a/nixcache-builder-aarch64-darwin",
+      "url": "https://github.com/shaogme/nixcache-oci/releases/download/bin-82cb30fed21e3cf90e547096d3e53794e698ef7f/nixcache-builder-aarch64-darwin",
       "hash": "sha256-TxCIv8dbg7S/ku0f8XX72Wj9USZna502/OPy5Kgb6uA="
     }
   }
