@@ -10,6 +10,9 @@ let
         lockFile = ./Cargo.lock;
       };
       buildAndTestSubdir = "crates/nixcache-proxy";
+      preBuild = ''
+        export HOME=$(mktemp -d)
+      '';
       nativeCheckInputs = [ pkgs.cacert ];
       SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     };
@@ -22,6 +25,9 @@ let
         lockFile = ./Cargo.lock;
       };
       buildAndTestSubdir = "crates/nixcache-builder";
+      preBuild = ''
+        export HOME=$(mktemp -d)
+      '';
       nativeCheckInputs = [ pkgs.cacert ];
       SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       postInstall = ''
