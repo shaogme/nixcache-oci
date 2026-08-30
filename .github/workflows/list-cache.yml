@@ -20,12 +20,12 @@ on:
         default: ''
         type: string
       system:
-        description: 'Target Architecture (leave blank for all)'
+        description: 'Target Architecture (choose all for all)'
         required: false
-        default: ''
+        default: 'all'
         type: choice
         options:
-          - ''
+          - 'all'
           - 'x86_64-linux'
           - 'aarch64-linux'
           - 'aarch64-darwin'
@@ -98,7 +98,7 @@ jobs:
           FORMAT="${{ github.event.inputs.format || 'table' }}"
 
           ARGS=(--target-tag "$TAG" --limit "$LIMIT" --format "$FORMAT")
-          if [[ -n "$SYSTEM" ]]; then
+          if [[ -n "$SYSTEM" && "$SYSTEM" != "all" ]]; then
             ARGS+=(--system "$SYSTEM")
           fi
 

@@ -18,12 +18,12 @@ on:
         default: ''
         type: string
       system:
-        description: 'Target System Architecture (leave blank for all)'
+        description: 'Target System Architecture (choose all for all)'
         required: false
-        default: ''
+        default: 'all'
         type: choice
         options:
-          - ''
+          - 'all'
           - 'x86_64-linux'
           - 'aarch64-linux'
           - 'aarch64-darwin'
@@ -113,7 +113,7 @@ jobs:
           if [[ -n "$CASCADE" ]]; then
             ARGS+=(--cascade "$CASCADE")
           fi
-          if [[ -n "$SYSTEM" ]]; then
+          if [[ -n "$SYSTEM" && "$SYSTEM" != "all" ]]; then
             ARGS+=(--system "$SYSTEM")
           fi
           if [[ -n "$OLDER_THAN" ]]; then
