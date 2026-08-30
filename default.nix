@@ -71,9 +71,4 @@ in
 
   tests = import ./nix/tests { inherit pkgs; };
   checks = import ./nix/tests { inherit pkgs; };
-
-  nixConfig = {
-    extra-substituters = [ "http://localhost:37515" ];
-    extra-trusted-public-keys = [ ];
-  };
 }

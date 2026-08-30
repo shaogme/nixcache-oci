@@ -1,11 +1,6 @@
 {
   description = "nixcache-oci: Self-hosted Nix binary cache via GHCR (OCI registry)";
 
-  nixConfig = {
-    extra-substituters = [ "http://localhost:37515" ];
-    extra-trusted-public-keys = [ ];
-  };
-
   outputs = { self }:
     let
       sources = import ./npins;
