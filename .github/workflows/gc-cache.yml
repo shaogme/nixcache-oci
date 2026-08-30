@@ -6,23 +6,28 @@ on:
   workflow_dispatch:
     inputs:
       retention_days:
-        description: 'Delete entries older than N days not in current closure'
+        description: 'Delete entries older than N days not in active closure'
+        required: false
         default: '30'
         type: string
       dry_run:
-        description: 'Show what would be deleted without deleting'
+        description: 'Show what would be deleted without applying changes'
+        required: false
         default: true
         type: boolean
       delete_blobs:
         description: 'Attempt physical OCI blob deletion'
+        required: false
         default: false
         type: boolean
       allow_unsupported_blob_deletion:
         description: 'Allow skipping blob deletion if registry does not support it (e.g. GHCR)'
+        required: false
         default: false
         type: boolean
       strict:
-        description: 'Strict error handling mode (default true)'
+        description: 'Strict error handling mode (fail on missing references)'
+        required: false
         default: true
         type: boolean
 
@@ -32,12 +37,17 @@ permissions:
 
 jobs:
   gc:
+    name: Run Garbage Collection
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@main
+      - name: Checkout Code
+        uses: actions/checkout@main
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -45,40 +55,31 @@ jobs:
       - name: Install NixCache Tools
         uses: ./install
 
-      - name: Load Environment Variables
-        run: |
-          chmod +x scripts/load-env.sh
-          ./scripts/load-env.sh flake
-          
-          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
-            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
-          fi
-          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
-          fi
-
-      - name: Run garbage collection
+      - name: Execute Garbage Collection
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_REGISTRY: 'ghcr.io'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           DELETE_BLOBS="${{ github.event.inputs.delete_blobs || 'false' }}"
           ALLOW_UNSUPPORTED="${{ github.event.inputs.allow_unsupported_blob_deletion || 'false' }}"
           STRICT="${{ github.event.inputs.strict || 'true' }}"
-          
-          EXTRA_ARGS=()
+
+          ARGS=(--retention-days "$RETENTION_DAYS")
           if [[ "$DRY_RUN" == "true" ]]; then
-            EXTRA_ARGS+=(--dry-run)
+            ARGS+=(--dry-run)
           fi
           if [[ "$DELETE_BLOBS" == "true" ]]; then
-            EXTRA_ARGS+=(--delete-blobs)
+            ARGS+=(--delete-blobs)
           fi
           if [[ "$ALLOW_UNSUPPORTED" == "true" ]]; then
-            EXTRA_ARGS+=(--allow-unsupported-blob-deletion)
+            ARGS+=(--allow-unsupported-blob-deletion)
           fi
           if [[ "$STRICT" == "false" ]]; then
-            EXTRA_ARGS+=(--no-strict)
+            ARGS+=(--no-strict)
           fi
-          
-          nixcache-builder gc --retention-days "$RETENTION_DAYS" "${EXTRA_ARGS[@]}"
 
-
+          echo ">>> Executing nixcache-builder gc with retention: ${RETENTION_DAYS}d, dry_run: ${DRY_RUN}"
+          nixcache-builder gc "${ARGS[@]}"

@@ -140,7 +140,7 @@ jobs:
           fi
 
       - name: Upload Linux Binary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: binary-${{ matrix.target }}
           path: dist/*
@@ -188,7 +188,7 @@ jobs:
           fi
 
       - name: Upload Darwin Binary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: binary-${{ matrix.target }}
           path: dist/*
@@ -222,7 +222,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Download Target Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           name: binary-${{ matrix.binary_target }}
           path: ${{ runner.temp }}/bin
@@ -248,7 +248,7 @@ jobs:
         env:
           NIXCACHE_SYSTEM: ${{ matrix.system }}
           NIXCACHE_MODE: 'flake'
-          NIXCACHE_FLAKE_PATH: 'examples/flake'
+          NIXCACHE_FLAKE_PATH: '.'
           NIXCACHE_REPO: ${{ github.repository }}
           NIXCACHE_REGISTRY: 'ghcr.io'
           NIXCACHE_STRICT: 'true'
@@ -259,7 +259,7 @@ jobs:
           nixcache-builder build
 
       - name: Upload Receipt Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: nixcache-receipt-${{ matrix.system }}
           path: ${{ runner.temp }}/receipt-${{ matrix.system }}.json
@@ -280,7 +280,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Download Linux x86_64 Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           name: binary-x86_64-unknown-linux-musl
           path: ${{ runner.temp }}/bin
@@ -293,7 +293,7 @@ jobs:
           echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
 
       - name: Download All Receipts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           pattern: 'nixcache-receipt-*'
           path: ${{ runner.temp }}/receipts
@@ -327,7 +327,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download All Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           pattern: 'binary-*'
           path: all-binaries
@@ -497,7 +497,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Download Pre-compiled Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           name: binary-x86_64-unknown-linux-musl
           path: ${{ runner.temp }}/bin
@@ -529,7 +529,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Download Pre-compiled Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           name: binary-x86_64-unknown-linux-musl
           path: ${{ runner.temp }}/bin
@@ -564,7 +564,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Download Pre-compiled Binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           name: binary-x86_64-unknown-linux-musl
           path: ${{ runner.temp }}/bin

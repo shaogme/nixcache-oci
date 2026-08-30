@@ -10,10 +10,10 @@ on:
         type: choice
         options:
           - 'filter'      # 按条件/模式/时间筛选清理
-          - 'outputs'     # 清理当前 Flake 指定输出的闭包
+          - 'outputs'     # 清理当前 nixcache-oci Flake 输出闭包
           - 'all'         # 彻底清空重置所有基线缓存
       patterns:
-        description: 'Patterns to match (e.g. *debug*, linux-kernel*, my-pkg)'
+        description: 'Patterns to match (e.g. *proxy*, *builder*, *test*)'
         required: false
         default: ''
         type: string
@@ -88,19 +88,11 @@ jobs:
       - name: Install NixCache Tools
         uses: ./install
 
-      - name: Load Environment Variables
-        run: |
-          chmod +x scripts/load-env.sh
-          ./scripts/load-env.sh flake
-          
-          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
-            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
-          fi
-          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
-          fi
-
       - name: Execute Purge
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_REGISTRY: 'ghcr.io'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           MODE="${{ github.event.inputs.purge_mode }}"
           DRY_RUN="${{ github.event.inputs.dry_run }}"
@@ -139,7 +131,7 @@ jobs:
             echo ">>> Running in PURGE ALL mode"
             nixcache-builder purge --all "${ARGS[@]}"
           elif [[ "$MODE" == "outputs" ]]; then
-            echo ">>> Running in FLAKE OUTPUTS mode"
+            echo ">>> Running in FLAKE OUTPUTS mode (target: .)"
             nixcache-builder purge --flake-path . "${ARGS[@]}"
           else
             echo ">>> Running in FILTER mode"
