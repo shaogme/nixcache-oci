@@ -26,7 +26,8 @@ touch "$GITHUB_PATH" "$GITHUB_OUTPUT"
 CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v 'nixcache' | tr '\n' ':' | sed 's/:$//')
 PATH="$CLEAN_PATH"
 
-./install/install.sh
+chmod +x "$PROJECT_DIR/install/install.sh"
+"$PROJECT_DIR/install/install.sh"
 
 if ! grep -q "installed=true" "$GITHUB_OUTPUT"; then
     echo "!!! Test 1 Failed: Expected installed=true in GITHUB_OUTPUT"

@@ -29,6 +29,8 @@ pub struct PurgeArgs {
 
     #[arg(
         long,
+        default_missing_value = "true",
+        num_args = 0..=1,
         help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
     )]
     pub strict: Option<bool>,
@@ -142,5 +144,25 @@ mod tests {
             selector.size_filter,
             Some(SizeFilter::MinBytes(500 * 1024 * 1024))
         );
+    }
+
+    #[test]
+    fn test_purge_args_clap_parse_strict_flag() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestPurgeCli {
+            #[command(flatten)]
+            purge: PurgeArgs,
+        }
+
+        let parsed = TestPurgeCli::try_parse_from(["test-purge", "--strict"]).unwrap();
+        assert_eq!(parsed.purge.strict, Some(true));
+        assert!(parsed.purge.resolve_strict());
+
+        let parsed_no_strict = TestPurgeCli::try_parse_from(["test-purge", "--no-strict"]).unwrap();
+        assert_eq!(parsed_no_strict.purge.strict, None);
+        assert!(parsed_no_strict.purge.no_strict);
+        assert!(!parsed_no_strict.purge.resolve_strict());
     }
 }

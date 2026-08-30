@@ -220,6 +220,8 @@ pub struct BuildArgs {
 
     #[arg(
         long,
+        default_missing_value = "true",
+        num_args = 0..=1,
         help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
     )]
     pub strict: Option<bool>,
@@ -427,6 +429,8 @@ pub struct GcArgs {
 
     #[arg(
         long,
+        default_missing_value = "true",
+        num_args = 0..=1,
         help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
     )]
     pub strict: Option<bool>,
@@ -520,5 +524,28 @@ mod tests {
             ..Default::default()
         };
         assert!(strict_explicit_true.resolve_strict());
+    }
+
+    #[test]
+    fn test_build_args_clap_parse_strict_flag() {
+        let parsed = Cli::try_parse_from(["nixcache-builder", "build", "--strict"]).unwrap();
+        match parsed.command {
+            Commands::Build(args) => {
+                assert_eq!(args.strict, Some(true));
+                assert!(args.resolve_strict());
+            }
+            _ => panic!("Expected build command"),
+        }
+
+        let parsed_no_strict =
+            Cli::try_parse_from(["nixcache-builder", "build", "--no-strict"]).unwrap();
+        match parsed_no_strict.command {
+            Commands::Build(args) => {
+                assert_eq!(args.strict, None);
+                assert!(args.no_strict);
+                assert!(!args.resolve_strict());
+            }
+            _ => panic!("Expected build command"),
+        }
     }
 }
