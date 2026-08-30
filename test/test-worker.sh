@@ -33,10 +33,33 @@ rm -f test-worker-secret.key test-worker-public.key
 nix-store --generate-binary-cache-key test-worker-key-1 test-worker-secret.key test-worker-public.key
 
 # 2. Build builder and proxy binaries
-echo ">>> Building nixcache-builder and nixcache-proxy..."
-cargo build -p nixcache-builder -p nixcache-proxy
-BUILDER_BIN="./target/debug/nixcache-builder"
-PROXY_BIN="./target/debug/nixcache-proxy"
+find_binaries() {
+    if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" && -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
+        echo ">>> Using binaries from environment variables: BUILDER_BIN=$BUILDER_BIN, PROXY_BIN=$PROXY_BIN"
+        return 0
+    fi
+
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-builder" && -x "$PRECOMPILED_BIN_DIR/nixcache-proxy" ]]; then
+        BUILDER_BIN="$PRECOMPILED_BIN_DIR/nixcache-builder"
+        PROXY_BIN="$PRECOMPILED_BIN_DIR/nixcache-proxy"
+        echo ">>> Using precompiled binaries from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-builder &>/dev/null && command -v nixcache-proxy &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        BUILDER_BIN="$(command -v nixcache-builder)"
+        PROXY_BIN="$(command -v nixcache-proxy)"
+        echo ">>> Using binaries found in PATH: $BUILDER_BIN, $PROXY_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building nixcache-builder and nixcache-proxy..."
+    cargo build -p nixcache-builder -p nixcache-proxy
+    BUILDER_BIN="./target/debug/nixcache-builder"
+    PROXY_BIN="./target/debug/nixcache-proxy"
+}
+
+find_binaries
 
 # 3. Retrieve target registry and repo from Worker status
 echo ">>> Fetching Worker status to identify target repo..."

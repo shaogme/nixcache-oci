@@ -68,10 +68,30 @@ for _ in {1..20}; do
 done
 
 # 3. Build & Launch nixcache-proxy
-echo ">>> Building cargo workspace..."
-cargo build --bin nixcache-proxy
+find_binaries() {
+    if [[ -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
+        echo ">>> Using proxy binary from environment variable: PROXY_BIN=$PROXY_BIN"
+        return 0
+    fi
 
-PROXY_BIN="./target/debug/nixcache-proxy"
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-proxy" ]]; then
+        PROXY_BIN="$PRECOMPILED_BIN_DIR/nixcache-proxy"
+        echo ">>> Using precompiled proxy binary from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-proxy &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        PROXY_BIN="$(command -v nixcache-proxy)"
+        echo ">>> Using proxy binary found in PATH: $PROXY_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building nixcache-proxy..."
+    cargo build --bin nixcache-proxy
+    PROXY_BIN="./target/debug/nixcache-proxy"
+}
+
+find_binaries
 
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export NIXCACHE_REPO="fault-test/cache"

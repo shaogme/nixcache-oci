@@ -67,10 +67,33 @@ rm -f test-multi-secret.key test-multi-public.key
 nix-store --generate-binary-cache-key test-multi-key-1 test-multi-secret.key test-multi-public.key
 
 # 3. Build builder and proxy binaries
-echo ">>> Building cargo workspace..."
-cargo build --workspace
-BUILDER_BIN="./target/debug/nixcache-builder"
-PROXY_BIN="./target/debug/nixcache-proxy"
+find_binaries() {
+    if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" && -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
+        echo ">>> Using binaries from environment variables: BUILDER_BIN=$BUILDER_BIN, PROXY_BIN=$PROXY_BIN"
+        return 0
+    fi
+
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-builder" && -x "$PRECOMPILED_BIN_DIR/nixcache-proxy" ]]; then
+        BUILDER_BIN="$PRECOMPILED_BIN_DIR/nixcache-builder"
+        PROXY_BIN="$PRECOMPILED_BIN_DIR/nixcache-proxy"
+        echo ">>> Using precompiled binaries from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-builder &>/dev/null && command -v nixcache-proxy &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        BUILDER_BIN="$(command -v nixcache-builder)"
+        PROXY_BIN="$(command -v nixcache-proxy)"
+        echo ">>> Using binaries found in PATH: $BUILDER_BIN, $PROXY_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building cargo workspace..."
+    cargo build --workspace
+    BUILDER_BIN="./target/debug/nixcache-builder"
+    PROXY_BIN="./target/debug/nixcache-proxy"
+}
+
+find_binaries
 
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export NIXCACHE_REPO="test/multiarch"

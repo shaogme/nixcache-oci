@@ -24,9 +24,30 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. Build binaries
-echo ">>> Building cargo workspace..."
-cargo build --bin nixcache-builder
-BUILDER_BIN="./target/debug/nixcache-builder"
+find_binaries() {
+    if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" ]]; then
+        echo ">>> Using builder binary from environment variable: BUILDER_BIN=$BUILDER_BIN"
+        return 0
+    fi
+
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-builder" ]]; then
+        BUILDER_BIN="$PRECOMPILED_BIN_DIR/nixcache-builder"
+        echo ">>> Using precompiled builder binary from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-builder &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        BUILDER_BIN="$(command -v nixcache-builder)"
+        echo ">>> Using builder binary found in PATH: $BUILDER_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building nixcache-builder..."
+    cargo build --bin nixcache-builder
+    BUILDER_BIN="./target/debug/nixcache-builder"
+}
+
+find_binaries
 
 # 2. Launch Mock Registry
 echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."

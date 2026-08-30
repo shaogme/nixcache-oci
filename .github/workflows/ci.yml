@@ -1,0 +1,640 @@
+name: CI, Build & Release Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'nix/binaries.json'
+      - '**.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # =========================================================================
+  # 阶段 0: 静态质量与快速检查 (Fail-Fast)
+  # =========================================================================
+  static-and-lint:
+    name: 0. Static Quality & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo Cache
+        uses: actions/cache@main
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Rust Code Format Check
+        run: cargo fmt --check
+
+      - name: Clippy Linter Check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "./scripts ./test ./install"
+
+      - name: Run ActionLint
+        uses: raven-actions/actionlint@v2
+
+  cargo-unit-tests:
+    name: 0. Cargo Workspace Unit Tests
+    runs-on: ubuntu-latest
+    needs: static-and-lint
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo Cache
+        uses: actions/cache@main
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-unit-
+
+      - name: Run Cargo Unit & Mock Tests
+        run: cargo test --workspace --verbose
+
+  loom-concurrency:
+    name: 0. Loom Formal Concurrency Model Checking
+    runs-on: ubuntu-latest
+    needs: static-and-lint
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Loom Tests
+        run: RUSTFLAGS="--cfg loom" cargo test -p nixcache-oci --features loom --test token_loom -- --nocapture
+
+  # =========================================================================
+  # 阶段 1: 跨平台二进制矩阵构建 (Build Binaries Matrix)
+  # =========================================================================
+  build-linux-binaries:
+    name: 1. Build Linux Binaries (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: [static-and-lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Build Binaries
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-proxy
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-builder
+
+      - name: Prepare Artifact
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-x86_64-linux
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-x86_64-linux
+          else
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-aarch64-linux
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-aarch64-linux
+          fi
+
+      - name: Upload Linux Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+          overwrite: true
+
+  build-darwin-binaries:
+    name: 1. Build macOS Binaries (${{ matrix.target }})
+    runs-on: macos-latest
+    needs: [static-and-lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      - name: Build Binaries
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-proxy
+          cargo zigbuild --release --target ${{ matrix.target }} --bin nixcache-builder
+
+      - name: Prepare Artifact
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-x86_64-darwin
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-x86_64-darwin
+          else
+            cp target/${{ matrix.target }}/release/nixcache-proxy dist/nixcache-proxy-aarch64-darwin
+            cp target/${{ matrix.target }}/release/nixcache-builder dist/nixcache-builder-aarch64-darwin
+          fi
+
+      - name: Upload Darwin Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+          overwrite: true
+
+  # =========================================================================
+  # 阶段 2: 多架构缓存构建与原子发布 (Scatter-Gather)
+  # =========================================================================
+  publish-cache-matrix:
+    name: 2. Scatter Build Multi-Arch Cache (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    needs: [build-linux-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+            binary_target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+            binary_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Download Target Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.binary_target }}
+          path: ${{ runner.temp }}/bin
+
+      - name: Setup Pre-compiled Binaries in PATH
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          ln -sf "${{ runner.temp }}/bin/nixcache-builder-${{ matrix.system }}" "${{ runner.temp }}/bin/nixcache-builder"
+          ln -sf "${{ runner.temp }}/bin/nixcache-proxy-${{ matrix.system }}" "${{ runner.temp }}/bin/nixcache-proxy"
+          echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Signing Key
+        run: |
+          if [[ -n "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
+            echo "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
+            echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build Outputs and Push NAR Blobs
+        env:
+          NIXCACHE_SYSTEM: ${{ matrix.system }}
+          NIXCACHE_MODE: 'flake'
+          NIXCACHE_FLAKE_PATH: 'examples/flake'
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_REGISTRY: 'ghcr.io'
+          NIXCACHE_STRICT: 'true'
+          NIXCACHE_RUN_ID: ${{ github.run_id }}
+          NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt-${{ matrix.system }}.json
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nixcache-builder build
+
+      - name: Upload Receipt Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixcache-receipt-${{ matrix.system }}
+          path: ${{ runner.temp }}/receipt-${{ matrix.system }}.json
+          retention-days: 1
+          overwrite: true
+
+  publish-cache-index:
+    name: 2. Gather & Promote Multi-Arch Cache Index
+    runs-on: ubuntu-latest
+    needs: [publish-cache-matrix, build-linux-binaries]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Download Linux x86_64 Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+
+      - name: Setup Pre-compiled Binaries in PATH
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          ln -sf "${{ runner.temp }}/bin/nixcache-builder-x86_64-linux" "${{ runner.temp }}/bin/nixcache-builder"
+          ln -sf "${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux" "${{ runner.temp }}/bin/nixcache-proxy"
+          echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
+
+      - name: Download All Receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'nixcache-receipt-*'
+          path: ${{ runner.temp }}/receipts
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Promote Receipts & Publish Multi-Arch Index
+        env:
+          NIXCACHE_RUN_ID: ${{ github.run_id }}
+          NIXCACHE_RECEIPTS_DIR: ${{ runner.temp }}/receipts
+          NIXCACHE_TARGET_TAG: 'cache-index'
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_REGISTRY: 'ghcr.io'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nixcache-builder promote
+
+  # =========================================================================
+  # 阶段 3: 发布预编译二进制 (Release Pre-compiled Binaries)
+  # =========================================================================
+  release-binaries:
+    name: 3. Release Pre-compiled Binaries
+    runs-on: ubuntu-latest
+    needs: [publish-cache-index, build-linux-binaries, build-darwin-binaries]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download All Binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'binary-*'
+          path: all-binaries
+          merge-multiple: true
+
+      - name: Calculate SRI Hashes and Check Updates
+        id: calc_hashes
+        run: |
+          get_sri() {
+            local file="$1"
+            local b64
+            b64=$(openssl dgst -sha256 -binary "$file" | openssl base64 | tr -d '\n')
+            echo "sha256-$b64"
+          }
+          
+          cd all-binaries
+          HASH_PROXY_X86_64_LINUX=$(get_sri nixcache-proxy-x86_64-linux)
+          HASH_PROXY_AARCH64_LINUX=$(get_sri nixcache-proxy-aarch64-linux)
+          HASH_PROXY_X86_64_DARWIN=$(get_sri nixcache-proxy-x86_64-darwin)
+          HASH_PROXY_AARCH64_DARWIN=$(get_sri nixcache-proxy-aarch64-darwin)
+
+          HASH_BUILDER_X86_64_LINUX=$(get_sri nixcache-builder-x86_64-linux)
+          HASH_BUILDER_AARCH64_LINUX=$(get_sri nixcache-builder-aarch64-linux)
+          HASH_BUILDER_X86_64_DARWIN=$(get_sri nixcache-builder-x86_64-darwin)
+          HASH_BUILDER_AARCH64_DARWIN=$(get_sri nixcache-builder-aarch64-darwin)
+          cd ..
+
+          OLD_PROXY_X86_64_LINUX=$(jq -r '.["nixcache-proxy"]."x86_64-linux".hash // empty' nix/binaries.json)
+          OLD_PROXY_AARCH64_LINUX=$(jq -r '.["nixcache-proxy"]."aarch64-linux".hash // empty' nix/binaries.json)
+          OLD_PROXY_X86_64_DARWIN=$(jq -r '.["nixcache-proxy"]."x86_64-darwin".hash // empty' nix/binaries.json)
+          OLD_PROXY_AARCH64_DARWIN=$(jq -r '.["nixcache-proxy"]."aarch64-darwin".hash // empty' nix/binaries.json)
+
+          OLD_BUILDER_X86_64_LINUX=$(jq -r '.["nixcache-builder"]."x86_64-linux".hash // empty' nix/binaries.json)
+          OLD_BUILDER_AARCH64_LINUX=$(jq -r '.["nixcache-builder"]."aarch64-linux".hash // empty' nix/binaries.json)
+          OLD_BUILDER_X86_64_DARWIN=$(jq -r '.["nixcache-builder"]."x86_64-darwin".hash // empty' nix/binaries.json)
+          OLD_BUILDER_AARCH64_DARWIN=$(jq -r '.["nixcache-builder"]."aarch64-darwin".hash // empty' nix/binaries.json)
+
+          if [ "$HASH_PROXY_X86_64_LINUX" = "$OLD_PROXY_X86_64_LINUX" ] && \
+             [ "$HASH_PROXY_AARCH64_LINUX" = "$OLD_PROXY_AARCH64_LINUX" ] && \
+             [ "$HASH_PROXY_X86_64_DARWIN" = "$OLD_PROXY_X86_64_DARWIN" ] && \
+             [ "$HASH_PROXY_AARCH64_DARWIN" = "$OLD_PROXY_AARCH64_DARWIN" ] && \
+             [ "$HASH_BUILDER_X86_64_LINUX" = "$OLD_BUILDER_X86_64_LINUX" ] && \
+             [ "$HASH_BUILDER_AARCH64_LINUX" = "$OLD_BUILDER_AARCH64_LINUX" ] && \
+             [ "$HASH_BUILDER_X86_64_DARWIN" = "$OLD_BUILDER_X86_64_DARWIN" ] && \
+             [ "$HASH_BUILDER_AARCH64_DARWIN" = "$OLD_BUILDER_AARCH64_DARWIN" ]; then
+            echo "All hashes match existing ones. Skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          SHA="${{ github.sha }}"
+          URL_PREFIX="https://github.com/${{ github.repository }}/releases/download/bin-${SHA}"
+
+          jq --arg ver "$SHA" \
+             --arg px86_l "$HASH_PROXY_X86_64_LINUX" \
+             --arg paarch_l "$HASH_PROXY_AARCH64_LINUX" \
+             --arg px86_d "$HASH_PROXY_X86_64_DARWIN" \
+             --arg paarch_d "$HASH_PROXY_AARCH64_DARWIN" \
+             --arg bx86_l "$HASH_BUILDER_X86_64_LINUX" \
+             --arg baarch_l "$HASH_BUILDER_AARCH64_LINUX" \
+             --arg bx86_d "$HASH_BUILDER_X86_64_DARWIN" \
+             --arg baarch_d "$HASH_BUILDER_AARCH64_DARWIN" \
+             --arg url_prefix "$URL_PREFIX" \
+             '.version = $ver |
+              .["nixcache-proxy"]."x86_64-linux".hash = $px86_l |
+              .["nixcache-proxy"]."x86_64-linux".url = ($url_prefix + "/nixcache-proxy-x86_64-linux") |
+              .["nixcache-proxy"]."aarch64-linux".hash = $paarch_l |
+              .["nixcache-proxy"]."aarch64-linux".url = ($url_prefix + "/nixcache-proxy-aarch64-linux") |
+              .["nixcache-proxy"]."x86_64-darwin".hash = $px86_d |
+              .["nixcache-proxy"]."x86_64-darwin".url = ($url_prefix + "/nixcache-proxy-x86_64-darwin") |
+              .["nixcache-proxy"]."aarch64-darwin".hash = $paarch_d |
+              .["nixcache-proxy"]."aarch64-darwin".url = ($url_prefix + "/nixcache-proxy-aarch64-darwin") |
+              .["nixcache-builder"]."x86_64-linux".hash = $bx86_l |
+              .["nixcache-builder"]."x86_64-linux".url = ($url_prefix + "/nixcache-builder-x86_64-linux") |
+              .["nixcache-builder"]."aarch64-linux".hash = $baarch_l |
+              .["nixcache-builder"]."aarch64-linux".url = ($url_prefix + "/nixcache-builder-aarch64-linux") |
+              .["nixcache-builder"]."x86_64-darwin".hash = $bx86_d |
+              .["nixcache-builder"]."x86_64-darwin".url = ($url_prefix + "/nixcache-builder-x86_64-darwin") |
+              .["nixcache-builder"]."aarch64-darwin".hash = $baarch_d |
+              .["nixcache-builder"]."aarch64-darwin".url = ($url_prefix + "/nixcache-builder-aarch64-darwin")' \
+             nix/binaries.json > temp.json && mv temp.json nix/binaries.json
+
+      - name: Create GitHub Release
+        if: steps.calc_hashes.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bin-${{ github.sha }}
+          name: "Pre-compiled Binaries (${{ github.sha }})"
+          prerelease: true
+          files: |
+            all-binaries/nixcache-proxy-x86_64-linux
+            all-binaries/nixcache-proxy-aarch64-linux
+            all-binaries/nixcache-proxy-x86_64-darwin
+            all-binaries/nixcache-proxy-aarch64-darwin
+            all-binaries/nixcache-builder-x86_64-linux
+            all-binaries/nixcache-builder-aarch64-linux
+            all-binaries/nixcache-builder-x86_64-darwin
+            all-binaries/nixcache-builder-aarch64-darwin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit and Push binary hashes
+        if: steps.calc_hashes.outputs.skip != 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add nix/binaries.json
+          if git diff --cached --quiet; then
+            echo "No changes to binaries.json"
+          else
+            git commit -m "chore: update pre-compiled binary hashes [skip ci]"
+            git push origin main
+          fi
+
+  # =========================================================================
+  # 阶段 4: 全套集成测试 (直接复用已构建 Binaries，零重复编译)
+  # =========================================================================
+  nix-static-checks:
+    name: 4. Nix Module Static Checks
+    runs-on: ubuntu-latest
+    needs: [build-linux-binaries]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Run NixOS Module evalConfig Static Check
+        run: nix-build default.nix -A tests.static --no-out-link
+
+  nixos-vm-tests:
+    name: 4. NixOS VM Driver & Service Tests
+    runs-on: ubuntu-latest
+    needs: [nix-static-checks]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Run NixOS VM Test
+        run: nix-build default.nix -A tests.vmtest --no-out-link
+
+  single-runner-e2e:
+    name: 4. Single Runner E2E (${{ matrix.build_mode }} / ${{ matrix.test_mode }})
+    runs-on: ubuntu-latest
+    needs: [build-linux-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        build_mode: [cargo, nix-source, nix-bin]
+        test_mode: [flake, legacy]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Download Pre-compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+
+      - name: Setup Binaries
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          cp "${{ runner.temp }}/bin/nixcache-builder-x86_64-linux" "${{ runner.temp }}/bin/nixcache-builder"
+          cp "${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux" "${{ runner.temp }}/bin/nixcache-proxy"
+
+      - name: Run E2E Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-e2e.sh
+          ./test/test-e2e.sh ${{ matrix.build_mode }} ${{ matrix.test_mode }}
+
+  multiarch-e2e:
+    name: 4. Multi-Arch Scatter-Gather E2E Test
+    runs-on: ubuntu-latest
+    needs: [build-linux-binaries]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Download Pre-compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+
+      - name: Run Multi-Arch E2E Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+          BUILDER_BIN: ${{ runner.temp }}/bin/nixcache-builder-x86_64-linux
+          PROXY_BIN: ${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          chmod +x test/test-multiarch-e2e.sh
+          ./test/test-multiarch-e2e.sh
+
+  resilience-e2e:
+    name: 4. Resilience & Multi-Backend E2E Tests
+    runs-on: ubuntu-latest
+    needs: [build-linux-binaries]
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Download Pre-compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/bin
+
+      - name: Setup Binaries
+        run: |
+          chmod +x ${{ runner.temp }}/bin/*
+          cp "${{ runner.temp }}/bin/nixcache-builder-x86_64-linux" "${{ runner.temp }}/bin/nixcache-builder"
+          cp "${{ runner.temp }}/bin/nixcache-proxy-x86_64-linux" "${{ runner.temp }}/bin/nixcache-proxy"
+          echo "${{ runner.temp }}/bin" >> "$GITHUB_PATH"
+
+      - name: Run OCI Multi-Backend Determinism Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-backends-determinism.sh
+          ./test/test-backends-determinism.sh
+
+      - name: Run Fault Tolerance & Upstream Fallback Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-fault-tolerance.sh
+          ./test/test-fault-tolerance.sh
+
+      - name: Run Security Signature Verification Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-security-signature.sh
+          ./test/test-security-signature.sh
+
+      - name: Run Concurrency Merge & GC Roots Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-concurrency-merge.sh
+          ./test/test-concurrency-merge.sh
+
+      - name: Run Schema v4 Session CAS & Cascading Pipeline Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-pipeline-session-cas.sh
+          ./test/test-pipeline-session-cas.sh
+
+      - name: Run Cache Purge & Invalidation CAS Integration Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-purge-cas.sh
+          ./test/test-purge-cas.sh
+
+      - name: Run Install Action & Script Test
+        run: |
+          chmod +x test/test-install-action.sh
+          ./test/test-install-action.sh
+
+  test-worker:
+    name: 4. Cloudflare Worker E2E Test
+    runs-on: ubuntu-latest
+    needs: [build-linux-binaries]
+    if: github.repository == 'shaogme/nixcache-oci'
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Run Worker E2E Test
+        env:
+          TEST_WORKER_URL: ${{ secrets.TEST_WORKER_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x test/test-worker.sh
+          ./test/test-worker.sh

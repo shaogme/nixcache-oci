@@ -67,11 +67,34 @@ BUILD_MODE="${1:-cargo}"
 TEST_MODE="${2:-flake}"
 echo ">>> Building in mode: $BUILD_MODE, Testing in mode: $TEST_MODE"
 
-if [[ "$BUILD_MODE" == "cargo" ]]; then
-    echo ">>> Building cargo workspace..."
+find_binaries() {
+    if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" && -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
+        echo ">>> Using binaries from environment variables: BUILDER_BIN=$BUILDER_BIN, PROXY_BIN=$PROXY_BIN"
+        return 0
+    fi
+
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-builder" && -x "$PRECOMPILED_BIN_DIR/nixcache-proxy" ]]; then
+        BUILDER_BIN="$PRECOMPILED_BIN_DIR/nixcache-builder"
+        PROXY_BIN="$PRECOMPILED_BIN_DIR/nixcache-proxy"
+        echo ">>> Using precompiled binaries from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-builder &>/dev/null && command -v nixcache-proxy &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        BUILDER_BIN="$(command -v nixcache-builder)"
+        PROXY_BIN="$(command -v nixcache-proxy)"
+        echo ">>> Using binaries found in PATH: $BUILDER_BIN, $PROXY_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building cargo workspace..."
     cargo build --workspace
     BUILDER_BIN="./target/debug/nixcache-builder"
     PROXY_BIN="./target/debug/nixcache-proxy"
+}
+
+if [[ "$BUILD_MODE" == "cargo" ]]; then
+    find_binaries
 elif [[ "$BUILD_MODE" == "nix-source" ]]; then
     echo ">>> Building packages from Nix source..."
     nix-build default.nix -A cache-builder --out-link result-builder

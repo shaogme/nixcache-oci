@@ -51,11 +51,33 @@ for _ in {1..20}; do
 done
 
 # 3. Build builder and proxy binaries
-echo ">>> Building cargo workspace..."
-cargo build --workspace
+find_binaries() {
+    if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" && -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
+        echo ">>> Using binaries from environment variables: BUILDER_BIN=$BUILDER_BIN, PROXY_BIN=$PROXY_BIN"
+        return 0
+    fi
 
-BUILDER_BIN="./target/debug/nixcache-builder"
-PROXY_BIN="./target/debug/nixcache-proxy"
+    if [[ -n "${PRECOMPILED_BIN_DIR:-}" && -x "$PRECOMPILED_BIN_DIR/nixcache-builder" && -x "$PRECOMPILED_BIN_DIR/nixcache-proxy" ]]; then
+        BUILDER_BIN="$PRECOMPILED_BIN_DIR/nixcache-builder"
+        PROXY_BIN="$PRECOMPILED_BIN_DIR/nixcache-proxy"
+        echo ">>> Using precompiled binaries from $PRECOMPILED_BIN_DIR"
+        return 0
+    fi
+
+    if command -v nixcache-builder &>/dev/null && command -v nixcache-proxy &>/dev/null && [[ "${FORCE_BUILD:-false}" != "true" ]]; then
+        BUILDER_BIN="$(command -v nixcache-builder)"
+        PROXY_BIN="$(command -v nixcache-proxy)"
+        echo ">>> Using binaries found in PATH: $BUILDER_BIN, $PROXY_BIN"
+        return 0
+    fi
+
+    echo ">>> No pre-compiled binaries found. Building cargo workspace..."
+    cargo build --workspace
+    BUILDER_BIN="./target/debug/nixcache-builder"
+    PROXY_BIN="./target/debug/nixcache-proxy"
+}
+
+find_binaries
 
 # 4. Build a test package and publish to mock registry
 echo ">>> Building package with legitimate signature..."

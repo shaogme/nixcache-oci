@@ -6,7 +6,7 @@
 
 ## 工作原理与核心架构
 
-1. **多架构声明与自动过滤**：在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
+1. **多架构声明与自动过滤**：**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
 
 2. **多后端原生驱动与静态确定性（Static Determinism）**：
    - **多态后端驱动体系（First-Class Provider Drivers）**：原生支持 GitHub Packages (GHCR)、Docker Hub、AWS ECR、Google Cloud Artifact Registry (GAR)、Azure ACR 与通用 OCI (Harbor / Zot / Distribution / Quay)。
@@ -48,9 +48,7 @@
 
 ### 发布缓存
 
-你可以选择以下方式之一来发布二进制缓存：
-
-#### 方式一：直接在你的 GitHub 仓库中使用 GitHub Action（推荐，无需 fork）
+#### 使用 GitHub Actions 自动构建与发布缓存（推荐）
 
 你可以在你现有的 Flake 项目仓库中，直接在 GitHub Actions 工作流中调用本项目的 Action 来构建并发布缓存。
 
@@ -308,17 +306,6 @@ jobs:
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
 
 - 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
-
-
-#### 方式二：Fork 本项目（声明式管理）
-
-1. Fork 本项目，并克隆到本地。
-2. 不建议修改 `examples/*`，而是修改 `env/default.env` 环境变量文件来进行配置：
-   - 将 `NIXCACHE_EXAMPLE` 设置为 `0` 以停用示例配置。
-   - 根据需求配置 `NIXCACHE_MODE`（如 `flake`）以及 `NIXCACHE_CONFIG_DIR`（例如指向您的 Flake 目录路径）。
-   - 在您指定的目录中编写 `flake.nix`（或 `default.nix` 等）来声明需要缓存的软件、系统配置或开发环境。
-3. 推送更改到 `main` 分支。GitHub Actions 工作流会自动构建并发布仅本地编译过的 store 路径。
-4. 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
 ### 签名配置
 
