@@ -1,4 +1,8 @@
-use crate::{error::BuilderError, nix::driver::NixCli};
+use crate::{
+    error::BuilderError,
+    nix::{driver::NixCli, filter::NixPathInfoItem},
+    session::init::FastStoreScanner,
+};
 use clap::ValueEnum;
 use nixcache_core::StoreHash;
 use serde::{Deserialize, Serialize};
@@ -47,6 +51,15 @@ impl fmt::Display for CaptureMode {
     }
 }
 
+/// 强类型闭包计算结果集 (包含完整元数据，下游零二次查询)
+#[derive(Debug, Clone, Default)]
+pub struct ClosureCandidateResult {
+    /// 候选产物的完整强类型元数据 (直接复用，避免二次 path-info)
+    pub items: Vec<NixPathInfoItem>,
+    /// 提纯后的顶层 Active GC Roots (严格仅包含目标根节点)
+    pub active_gc_roots: Vec<StoreHash>,
+}
+
 /// 基于 Nix DAG 依赖图论的精准闭包引擎
 pub struct ClosureEngine;
 
@@ -63,32 +76,32 @@ impl ClosureEngine {
         roots
     }
 
-    /// 纯函数：计算闭包集合与差集路径的交集 (若差集为空则保留全量闭包)
-    pub fn compute_intersection(
-        closure_set: &HashSet<String>,
-        diff_paths: &[String],
-    ) -> Vec<String> {
-        let mut result: Vec<String> = if diff_paths.is_empty() {
-            closure_set.iter().cloned().collect()
-        } else {
-            let diff_set: HashSet<&str> = diff_paths.iter().map(|s| s.as_str()).collect();
-            closure_set
-                .iter()
-                .filter(|p| diff_set.contains(p.as_str()))
-                .cloned()
-                .collect()
-        };
-        result.sort();
-        result
+    /// 纯函数：根据构建前快照集合过滤掉已存在的项目
+    pub fn filter_snapshot_diff(
+        items: Vec<NixPathInfoItem>,
+        snapshot_before_set: &HashSet<String>,
+    ) -> Vec<NixPathInfoItem> {
+        items
+            .into_iter()
+            .filter(|item| {
+                let file_name = Path::new(&item.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&item.path);
+                // 仅保留未在构建前快照中出现的路径
+                !snapshot_before_set.contains(file_name)
+                    && !snapshot_before_set.contains(&item.path)
+            })
+            .collect()
     }
 
-    /// 计算精准候选路径集与根节点集合
-    pub async fn compute_candidate_paths(
+    /// 一次性完成依赖闭包递归解析、快照差集过滤与 GC Roots 提纯
+    pub async fn compute_candidate_closure(
         target_roots: &[String],
-        diff_paths: &[String],
+        snapshot_before_set: Option<&HashSet<String>>,
         mode: CaptureMode,
         strict_closure: bool,
-    ) -> Result<(Vec<String>, Vec<StoreHash>), BuilderError> {
+    ) -> Result<ClosureCandidateResult, BuilderError> {
         if target_roots.is_empty() {
             if strict_closure && mode != CaptureMode::DiffAll {
                 return Err(BuilderError::NixCli(
@@ -99,31 +112,69 @@ impl ClosureEngine {
             }
 
             warn!("No target roots identified; falling back to unconstrained diff-all mode.");
-            let roots = Self::extract_gc_roots(diff_paths);
-            return Ok((diff_paths.to_vec(), roots));
+            if let Some(snap_set) = snapshot_before_set {
+                let current_names = FastStoreScanner::scan_store_names(Path::new("/nix/store"))
+                    .await
+                    .unwrap_or_default();
+                let diff_paths: Vec<String> = current_names
+                    .difference(snap_set)
+                    .map(|name| format!("/nix/store/{}", name))
+                    .collect();
+                let raw_items = NixCli.get_path_infos_typed(&diff_paths).await?;
+                let active_gc_roots = Self::extract_gc_roots(&diff_paths);
+                return Ok(ClosureCandidateResult {
+                    items: raw_items,
+                    active_gc_roots,
+                });
+            } else {
+                return Ok(ClosureCandidateResult::default());
+            }
         }
 
-        // 1. 提取真正的 Active GC Roots (严格仅来自 target_roots)
+        // 1. 提纯 Active GC Roots (严格来自 target_roots 顶级产物)
         let active_gc_roots = Self::extract_gc_roots(target_roots);
 
-        // 2. 根据捕获模式计算候选路径集合
-        let candidate_paths = match mode {
-            CaptureMode::RootsOnly => target_roots.to_vec(),
+        // 2. 单次查询获取强类型完整元数据
+        let raw_items = match mode {
+            CaptureMode::RootsOnly => {
+                // 仅查询顶层根节点自身的 path-info (单批次非递归)
+                NixCli.get_path_infos_typed(target_roots).await?
+            }
             CaptureMode::RuntimeClosure => {
-                let closure_items = NixCli.get_recursive_path_infos(target_roots).await?;
-                let closure_set: HashSet<String> =
-                    closure_items.into_iter().map(|i| i.path).collect();
-                Self::compute_intersection(&closure_set, diff_paths)
+                // 仅在此处调用 1 次 nix path-info --recursive --json
+                NixCli.get_recursive_path_infos(target_roots).await?
             }
             CaptureMode::BuildClosure => {
-                let build_closure = NixCli.get_build_closure(target_roots).await?;
-                let build_set: HashSet<String> = build_closure.into_iter().collect();
-                Self::compute_intersection(&build_set, diff_paths)
+                let build_paths = NixCli.get_build_closure(target_roots).await?;
+                NixCli.get_path_infos_typed(&build_paths).await?
             }
-            CaptureMode::DiffAll => diff_paths.to_vec(),
+            CaptureMode::DiffAll => {
+                if let Some(snap_set) = snapshot_before_set {
+                    let current_names = FastStoreScanner::scan_store_names(Path::new("/nix/store"))
+                        .await
+                        .unwrap_or_default();
+                    let diff_paths: Vec<String> = current_names
+                        .difference(snap_set)
+                        .map(|name| format!("/nix/store/{}", name))
+                        .collect();
+                    NixCli.get_path_infos_typed(&diff_paths).await?
+                } else {
+                    NixCli.get_recursive_path_infos(target_roots).await?
+                }
+            }
         };
 
-        Ok((candidate_paths, active_gc_roots))
+        // 3. 基于数学等价定理执行内存差集过滤: C(R) ∖ U_snapshot
+        let filtered_items = if let Some(snap_set) = snapshot_before_set {
+            Self::filter_snapshot_diff(raw_items, snap_set)
+        } else {
+            raw_items
+        };
+
+        Ok(ClosureCandidateResult {
+            items: filtered_items,
+            active_gc_roots,
+        })
     }
 }
 
@@ -187,40 +238,75 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_intersection_with_diff() {
-        let mut closure = HashSet::new();
-        closure.insert("/nix/store/11111111111111111111111111111111-app".to_string());
-        closure.insert("/nix/store/22222222222222222222222222222222-runtime-lib".to_string());
-        closure.insert("/nix/store/33333333333333333333333333333333-glibc-upstream".to_string());
-
-        // 模拟 Diff：仅本地编译了 app、runtime-lib 以及中间编译期工具 custom-compiler
-        let diff = vec![
-            "/nix/store/11111111111111111111111111111111-app".to_string(),
-            "/nix/store/22222222222222222222222222222222-runtime-lib".to_string(),
-            "/nix/store/44444444444444444444444444444444-custom-compiler".to_string(),
+    fn test_filter_snapshot_diff() {
+        let items = vec![
+            NixPathInfoItem {
+                path: "/nix/store/11111111111111111111111111111111-app".to_string(),
+                nar_hash: "sha256:1111".to_string(),
+                ..Default::default()
+            },
+            NixPathInfoItem {
+                path: "/nix/store/22222222222222222222222222222222-runtime-lib".to_string(),
+                nar_hash: "sha256:2222".to_string(),
+                ..Default::default()
+            },
+            NixPathInfoItem {
+                path: "/nix/store/33333333333333333333333333333333-glibc-upstream".to_string(),
+                nar_hash: "sha256:3333".to_string(),
+                ..Default::default()
+            },
         ];
 
-        let result = ClosureEngine::compute_intersection(&closure, &diff);
-        assert_eq!(result.len(), 2);
-        assert!(result.contains(&"/nix/store/11111111111111111111111111111111-app".to_string()));
-        assert!(
-            result.contains(&"/nix/store/22222222222222222222222222222222-runtime-lib".to_string())
+        // 模拟快照中已经存在 glibc-upstream (测试 basename 形式和全路径形式)
+        let mut snapshot_set = HashSet::new();
+        snapshot_set.insert("33333333333333333333333333333333-glibc-upstream".to_string());
+
+        let filtered = ClosureEngine::filter_snapshot_diff(items, &snapshot_set);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(
+            filtered[0].path,
+            "/nix/store/11111111111111111111111111111111-app"
         );
-        // 关键断言：编译期工具 custom-compiler 被 100% 过滤剔除
-        assert!(
-            !result.contains(
-                &"/nix/store/44444444444444444444444444444444-custom-compiler".to_string()
-            )
+        assert_eq!(
+            filtered[1].path,
+            "/nix/store/22222222222222222222222222222222-runtime-lib"
         );
     }
 
     #[test]
-    fn test_compute_intersection_empty_diff_returns_full_closure() {
-        let mut closure = HashSet::new();
-        closure.insert("/nix/store/11111111111111111111111111111111-app".to_string());
-        closure.insert("/nix/store/22222222222222222222222222222222-runtime-lib".to_string());
+    fn test_filter_snapshot_diff_high_volume() {
+        // 构造包含 10,000 个伪路径的快照文件集合
+        let mut snapshot_set = HashSet::with_capacity(10_000);
+        for i in 0..10_000 {
+            snapshot_set.insert(format!("{:032x}-old-pkg-{}", i, i));
+        }
 
-        let result = ClosureEngine::compute_intersection(&closure, &[]);
-        assert_eq!(result.len(), 2);
+        let mut items = Vec::with_capacity(100);
+        for i in 0..50 {
+            items.push(NixPathInfoItem {
+                path: format!("/nix/store/{:032x}-old-pkg-{}", i, i),
+                ..Default::default()
+            });
+        }
+        for i in 10_000..10_050 {
+            items.push(NixPathInfoItem {
+                path: format!("/nix/store/{:032x}-new-pkg-{}", i, i),
+                ..Default::default()
+            });
+        }
+
+        let start = std::time::Instant::now();
+        let filtered = ClosureEngine::filter_snapshot_diff(items, &snapshot_set);
+        let elapsed = start.elapsed();
+
+        assert_eq!(filtered.len(), 50);
+        assert!(
+            elapsed.as_millis() < 50,
+            "Snapshot diff should take < 50ms, took {:?}",
+            elapsed
+        );
+        for item in &filtered {
+            assert!(item.path.contains("new-pkg"));
+        }
     }
 }

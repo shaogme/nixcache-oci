@@ -210,7 +210,14 @@ impl SessionCaptureArgs {
     pub fn resolve_export_concurrency(&self) -> usize {
         self.export_concurrency
             .or_else(|| Env::parse("NIXCACHE_EXPORT_CONCURRENCY"))
-            .unwrap_or_else(|| num_cpus::get().clamp(2, 8))
+            .unwrap_or_else(|| {
+                let cpus = num_cpus::get();
+                match cpus {
+                    0..=2 => 2,
+                    3..=4 => 3,
+                    _ => 4,
+                }
+            })
     }
 }
 
@@ -371,7 +378,14 @@ impl BuildArgs {
     pub fn resolve_export_concurrency(&self) -> usize {
         self.export_concurrency
             .or_else(|| Env::parse("NIXCACHE_EXPORT_CONCURRENCY"))
-            .unwrap_or_else(|| num_cpus::get().clamp(2, 8))
+            .unwrap_or_else(|| {
+                let cpus = num_cpus::get();
+                match cpus {
+                    0..=2 => 2,
+                    3..=4 => 3,
+                    _ => 4,
+                }
+            })
     }
 }
 

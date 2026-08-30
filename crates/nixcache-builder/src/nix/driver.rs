@@ -336,6 +336,43 @@ impl NixCli {
         }
     }
 
+    /// 批量查询强类型 NixPathInfoItem 元数据 (单批次或分批)
+    pub async fn get_path_infos_typed(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<NixPathInfoItem>, BuilderError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut all_items = Vec::with_capacity(paths.len());
+        const BATCH_SIZE: usize = 128;
+
+        for chunk in paths.chunks(BATCH_SIZE) {
+            let mut cmd = Command::new("nix");
+            cmd.args(["path-info", "--json"]);
+            for p in chunk {
+                cmd.arg(p);
+            }
+
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                return Err(BuilderError::NixCli(format!(
+                    "nix path-info failed: {}",
+                    err_msg
+                )));
+            }
+
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let items = parse_path_info_items_typed(&json_str)?;
+            all_items.extend(items);
+        }
+
+        all_items.sort_by(|a, b| a.path.cmp(&b.path));
+        all_items.dedup_by(|a, b| a.path == b.path);
+        Ok(all_items)
+    }
+
     /// 递归获取指定 Store 路径的完整强类型运行时闭包元数据
     pub async fn get_recursive_path_infos(
         &self,
@@ -373,6 +410,87 @@ impl NixCli {
         Ok(all_items)
     }
 
+    /// 尝试单次批量 path-info 解析目标
+    pub async fn try_batch_path_info(&self, targets: &[&str]) -> Result<Vec<String>, BuilderError> {
+        let mut cmd = Command::new("nix");
+        cmd.args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "path-info",
+            "--json",
+            "--accept-flake-config",
+        ]);
+        for target in targets {
+            cmd.arg(target);
+        }
+
+        let output = cmd.output().await?;
+        if output.status.success() {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(items) = parse_path_info_items_typed(&json_str) {
+                let mut paths = Vec::new();
+                for item in items {
+                    if !item.path.is_empty() {
+                        paths.push(item.path);
+                    }
+                }
+                return Ok(paths);
+            }
+        }
+        Err(BuilderError::NixCli("Batch path-info failed".to_string()))
+    }
+
+    /// 解析单个目标（用于并发回退解析）
+    pub async fn resolve_single_target(target: &str) -> Result<Vec<String>, BuilderError> {
+        let mut resolved = Vec::new();
+
+        let mut eval_cmd = Command::new("nix");
+        eval_cmd.args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "eval",
+            "--accept-flake-config",
+            "--raw",
+            &format!("{}.outPath", target),
+        ]);
+        if let Ok(eval_out) = eval_cmd.output().await
+            && eval_out.status.success()
+        {
+            let path = String::from_utf8_lossy(&eval_out.stdout).trim().to_string();
+            if path.starts_with("/nix/store/") {
+                resolved.push(path);
+                return Ok(resolved);
+            }
+        }
+
+        let mut single_cmd = Command::new("nix");
+        single_cmd.args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "path-info",
+            "--accept-flake-config",
+            target,
+        ]);
+        if let Ok(single_out) = single_cmd.output().await
+            && single_out.status.success()
+        {
+            for line in String::from_utf8_lossy(&single_out.stdout).lines() {
+                let p = line.trim();
+                if p.starts_with("/nix/store/") {
+                    resolved.push(p.to_string());
+                }
+            }
+            if !resolved.is_empty() {
+                return Ok(resolved);
+            }
+        }
+
+        Err(BuilderError::NixCli(format!(
+            "Failed to resolve target expression: {}",
+            target
+        )))
+    }
+
     /// 解析 Flake 表达式或属性目标为确定的 Store 路径
     pub async fn resolve_flake_or_attr_targets(
         &self,
@@ -393,78 +511,36 @@ impl NixCli {
             if trimmed.starts_with("/nix/store/") {
                 resolved.push(trimmed.to_string());
             } else {
-                to_query.push(trimmed);
+                to_query.push(trimmed.to_string());
             }
         }
 
-        if !to_query.is_empty() {
-            let mut cmd = Command::new("nix");
-            cmd.args([
-                "--extra-experimental-features",
-                "nix-command flakes",
-                "path-info",
-                "--json",
-                "--accept-flake-config",
-            ]);
-            for target in &to_query {
-                cmd.arg(target);
-            }
+        if to_query.is_empty() {
+            resolved.sort();
+            resolved.dedup();
+            return Ok(resolved);
+        }
 
-            let output = cmd.output().await?;
-            if output.status.success() {
-                let json_str = String::from_utf8_lossy(&output.stdout);
-                if let Ok(items) = parse_path_info_items_typed(&json_str) {
-                    for item in items {
-                        if !item.path.is_empty() {
-                            resolved.push(item.path);
-                        }
-                    }
-                }
-            } else {
-                for target in &to_query {
-                    let mut eval_cmd = Command::new("nix");
-                    eval_cmd.args([
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        "eval",
-                        "--accept-flake-config",
-                        "--raw",
-                        &format!("{}.outPath", target),
-                    ]);
-                    if let Ok(eval_out) = eval_cmd.output().await
-                        && eval_out.status.success()
-                    {
-                        let path = String::from_utf8_lossy(&eval_out.stdout).trim().to_string();
-                        if path.starts_with("/nix/store/") {
-                            resolved.push(path);
-                            continue;
-                        }
-                    }
+        // 1. 优先尝试单次批量 path-info
+        let to_query_refs: Vec<&str> = to_query.iter().map(|s| s.as_str()).collect();
+        if let Ok(paths) = self.try_batch_path_info(&to_query_refs).await {
+            resolved.extend(paths);
+            resolved.sort();
+            resolved.dedup();
+            return Ok(resolved);
+        }
 
-                    let mut single_cmd = Command::new("nix");
-                    single_cmd.args([
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        "path-info",
-                        "--accept-flake-config",
-                        target,
-                    ]);
-                    if let Ok(single_out) = single_cmd.output().await
-                        && single_out.status.success()
-                    {
-                        for line in String::from_utf8_lossy(&single_out.stdout).lines() {
-                            let p = line.trim();
-                            if p.starts_with("/nix/store/") {
-                                resolved.push(p.to_string());
-                            }
-                        }
-                    } else {
-                        return Err(BuilderError::NixCli(format!(
-                            "Failed to resolve target expression: {}",
-                            target
-                        )));
-                    }
-                }
+        // 2. 批量失败时，采用 JoinSet 进行全并发回退解析
+        let mut join_set = tokio::task::JoinSet::new();
+        for target in to_query {
+            join_set.spawn(async move { Self::resolve_single_target(&target).await });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(paths)) => resolved.extend(paths),
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => return Err(BuilderError::Other(join_err.to_string())),
             }
         }
 

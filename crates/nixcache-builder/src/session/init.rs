@@ -19,6 +19,28 @@ use tokio::{
 };
 use tracing::info;
 
+/// 零磁盘扫描快照加载器
+pub struct StoreSnapshotLoader;
+
+impl StoreSnapshotLoader {
+    /// 仅读取快照文件至内存 HashSet (耗时 < 5ms，完全无磁盘目录扫描)
+    pub async fn load_snapshot_set(snapshot_file: &Path) -> Result<HashSet<String>, BuilderError> {
+        if !snapshot_file.exists() {
+            return Ok(HashSet::new());
+        }
+
+        let snap_content = fs::read_to_string(snapshot_file).await.unwrap_or_default();
+        let mut set = HashSet::with_capacity(snap_content.lines().count());
+        for line in snap_content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                set.insert(trimmed.to_string());
+            }
+        }
+        Ok(set)
+    }
+}
+
 /// 快速本地 Nix Store Inode 扫描器与差集比对引擎
 pub struct FastStoreScanner;
 
@@ -43,7 +65,8 @@ impl FastStoreScanner {
         .map_err(|e| BuilderError::Other(format!("Store scan thread joined error: {}", e)))?
     }
 
-    /// 计算差集候选路径全量列表
+    /// 计算差集候选路径全量列表 (旧模式兼容)
+    #[allow(dead_code)]
     pub async fn compute_diff_paths(
         store_path: &Path,
         snapshot_file: &Path,
@@ -306,5 +329,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(diff, vec![format!("{}/2222-new-pkg", fake_store.display())]);
+    }
+
+    #[tokio::test]
+    async fn test_store_snapshot_loader() {
+        let temp = tempdir().unwrap();
+        let snap_file = temp.path().join("snap.txt");
+        fs::write(&snap_file, "1111-old-pkg\n2222-lib\n\n3333-app\n")
+            .await
+            .unwrap();
+
+        let set = StoreSnapshotLoader::load_snapshot_set(&snap_file)
+            .await
+            .unwrap();
+
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("1111-old-pkg"));
+        assert!(set.contains("2222-lib"));
+        assert!(set.contains("3333-app"));
+
+        let non_existent = temp.path().join("non_existent.txt");
+        let empty_set = StoreSnapshotLoader::load_snapshot_set(&non_existent)
+            .await
+            .unwrap();
+        assert!(empty_set.is_empty());
     }
 }

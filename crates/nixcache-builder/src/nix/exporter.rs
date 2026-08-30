@@ -1,6 +1,9 @@
 use crate::{
     error::BuilderError,
-    nix::{driver::parse_path_info_items_typed, filter::NixPathInfoItem},
+    nix::{
+        driver::{NixCli, parse_path_info_items_typed},
+        filter::NixPathInfoItem,
+    },
 };
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::Utc;
@@ -9,6 +12,7 @@ use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
 use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use nixcache_oci_backend::ReqwestTransport;
 use std::{
+    collections::HashMap,
     io,
     path::Path,
     process::Stdio,
@@ -63,16 +67,31 @@ pub struct ParallelExportConfig {
     pub origin_job: Option<String>,
 }
 
-impl Default for ParallelExportConfig {
-    fn default() -> Self {
+impl ParallelExportConfig {
+    pub fn default_adaptive() -> Self {
+        let cpus = num_cpus::get();
+        // 在 2 核机器上使用 2 并发，4 核使用 3 并发，8 核及以上最高限制为 4 并发
+        // 防止 nix-store --dump 与 zstd 压缩线程争抢耗尽 CPU 时间片
+        let concurrency = match cpus {
+            0..=2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        };
+
         Self {
-            concurrency: num_cpus::get().clamp(2, 8),
+            concurrency,
             signing_key_file: None,
             strict: false,
             upload_config: UploadConfig::default(),
-            system: SystemArch::from("x86_64-linux"),
+            system: SystemArch::detect_current(),
             origin_job: None,
         }
+    }
+}
+
+impl Default for ParallelExportConfig {
+    fn default() -> Self {
+        Self::default_adaptive()
     }
 }
 
@@ -367,6 +386,45 @@ impl ParallelExporter {
             index_entry,
             file_size: nar_size,
         })
+    }
+
+    /// 批量签名并将新生成的签名实时注入到内存中的 NixPathInfoItem 结构中
+    pub async fn batch_sign_and_inject_signatures(
+        items: &mut [NixPathInfoItem],
+        signing_key_file: &str,
+    ) -> Result<(), BuilderError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let paths: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
+        // 1. 调用 nix store sign 执行底层签名
+        Self::batch_sign_paths(&paths, signing_key_file).await?;
+
+        // 2. 读取私钥文件校验其存在性
+        let _key_content = tokio::fs::read_to_string(signing_key_file)
+            .await
+            .map_err(|e| {
+                BuilderError::Other(format!(
+                    "Failed to read signing key {}: {}",
+                    signing_key_file, e
+                ))
+            })?;
+
+        // 3. 一次性获取签名后的最新 sigs 并直接在内存结构中更新
+        let updated_infos = NixCli.get_path_infos_typed(&paths).await?;
+        let sig_map: HashMap<String, Vec<String>> = updated_infos
+            .into_iter()
+            .map(|info| (info.path, info.signatures))
+            .collect();
+
+        for item in items.iter_mut() {
+            if let Some(sigs) = sig_map.get(&item.path) {
+                item.signatures = sigs.clone();
+            }
+        }
+
+        Ok(())
     }
 
     /// 分批执行 `nix store sign` 签名
@@ -749,5 +807,26 @@ mod tests {
         assert_eq!(report.successful.len(), paths.len());
         assert!(report.failed.is_empty());
         assert!(report.total_bytes_uploaded > 0);
+    }
+
+    #[test]
+    fn test_parallel_export_config_adaptive() {
+        let config = super::ParallelExportConfig::default_adaptive();
+        let cpus = num_cpus::get();
+        let expected = match cpus {
+            0..=2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        };
+        assert_eq!(config.concurrency, expected);
+    }
+
+    #[tokio::test]
+    async fn test_batch_sign_and_inject_signatures_empty() {
+        let mut items = Vec::new();
+        let res =
+            ParallelExporter::batch_sign_and_inject_signatures(&mut items, "/non/existent/key")
+                .await;
+        assert!(res.is_ok());
     }
 }
