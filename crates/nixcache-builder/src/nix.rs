@@ -1,13 +1,17 @@
 use crate::error::BuilderError;
 
+pub mod closure;
 pub mod discovery;
 pub mod driver;
 pub mod exporter;
 pub mod filter;
+pub mod resolver;
 
+pub use closure::{CaptureMode, ClosureEngine};
 pub use discovery::{discover_outputs, resolve_flake_output_hashes};
 pub use driver::{BuildConfig, BuildMode, BuildTarget, NixCli};
 pub use exporter::{ParallelExportConfig, ParallelExporter};
+pub use resolver::TargetResolver;
 
 /// 便捷函数：获取当前系统架构
 pub async fn get_system() -> Result<String, BuilderError> {

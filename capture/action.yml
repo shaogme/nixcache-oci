@@ -1,6 +1,22 @@
 name: 'NixCache OCI Session Capture'
 description: 'Capture newly built store paths since setup/snapshot, upload NAR blobs to GHCR, update workflow session, and hot-register to local proxy'
 inputs:
+  out-link:
+    description: 'Target symlink paths or glob patterns (e.g., ./result, ./result-*)'
+    required: false
+    default: './result*'
+  targets:
+    description: 'Explicit build target expressions (e.g., .#frontend .#backend)'
+    required: false
+    default: ''
+  capture-mode:
+    description: 'Capture mode: runtime-closure (default), build-closure, roots-only, diff-all'
+    required: false
+    default: 'runtime-closure'
+  strict-closure:
+    description: 'Enforce strict closure validation'
+    required: false
+    default: 'true'
   system:
     description: 'Target platform system architecture (e.g., x86_64-linux, aarch64-linux)'
     required: false
@@ -38,7 +54,7 @@ inputs:
     required: false
     default: 'http://127.0.0.1:37515'
   snapshot-path:
-    description: 'Path to baseline store snapshot'
+    description: 'Path to baseline store paths snapshot'
     required: false
     default: '/tmp/nixcache-snapshot-before.txt'
   export-concurrency:
@@ -78,6 +94,10 @@ runs:
     - name: Capture newly built paths and upload session cache
       shell: bash
       env:
+        NIXCACHE_OUT_LINK: ${{ inputs.out-link }}
+        NIXCACHE_TARGETS: ${{ inputs.targets }}
+        NIXCACHE_CAPTURE_MODE: ${{ inputs.capture-mode }}
+        NIXCACHE_STRICT_CLOSURE: ${{ inputs.strict-closure }}
         NIXCACHE_SYSTEM: ${{ inputs.system }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}

@@ -335,6 +335,210 @@ impl NixCli {
             }
         }
     }
+
+    /// 递归获取指定 Store 路径的完整强类型运行时闭包元数据
+    pub async fn get_recursive_path_infos(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<NixPathInfoItem>, BuilderError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut all_items = Vec::new();
+        const BATCH_SIZE: usize = 128;
+
+        for chunk in paths.chunks(BATCH_SIZE) {
+            let mut cmd = Command::new("nix");
+            cmd.args(["path-info", "--recursive", "--json"]);
+            for p in chunk {
+                cmd.arg(p);
+            }
+
+            let output = cmd.output().await?;
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                return Err(BuilderError::NixCli(format!(
+                    "nix path-info --recursive failed: {}",
+                    err_msg
+                )));
+            }
+
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let items = parse_path_info_items_typed(&json_str)?;
+            all_items.extend(items);
+        }
+
+        all_items.sort_by(|a, b| a.path.cmp(&b.path));
+        all_items.dedup_by(|a, b| a.path == b.path);
+        Ok(all_items)
+    }
+
+    /// 解析 Flake 表达式或属性目标为确定的 Store 路径
+    pub async fn resolve_flake_or_attr_targets(
+        &self,
+        targets: &[&str],
+    ) -> Result<Vec<String>, BuilderError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut resolved = Vec::new();
+        let mut to_query = Vec::new();
+
+        for t in targets {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("/nix/store/") {
+                resolved.push(trimmed.to_string());
+            } else {
+                to_query.push(trimmed);
+            }
+        }
+
+        if !to_query.is_empty() {
+            let mut cmd = Command::new("nix");
+            cmd.args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "path-info",
+                "--json",
+                "--accept-flake-config",
+            ]);
+            for target in &to_query {
+                cmd.arg(target);
+            }
+
+            let output = cmd.output().await?;
+            if output.status.success() {
+                let json_str = String::from_utf8_lossy(&output.stdout);
+                if let Ok(items) = parse_path_info_items_typed(&json_str) {
+                    for item in items {
+                        if !item.path.is_empty() {
+                            resolved.push(item.path);
+                        }
+                    }
+                }
+            } else {
+                for target in &to_query {
+                    let mut eval_cmd = Command::new("nix");
+                    eval_cmd.args([
+                        "--extra-experimental-features",
+                        "nix-command flakes",
+                        "eval",
+                        "--accept-flake-config",
+                        "--raw",
+                        &format!("{}.outPath", target),
+                    ]);
+                    if let Ok(eval_out) = eval_cmd.output().await
+                        && eval_out.status.success()
+                    {
+                        let path = String::from_utf8_lossy(&eval_out.stdout).trim().to_string();
+                        if path.starts_with("/nix/store/") {
+                            resolved.push(path);
+                            continue;
+                        }
+                    }
+
+                    let mut single_cmd = Command::new("nix");
+                    single_cmd.args([
+                        "--extra-experimental-features",
+                        "nix-command flakes",
+                        "path-info",
+                        "--accept-flake-config",
+                        target,
+                    ]);
+                    if let Ok(single_out) = single_cmd.output().await
+                        && single_out.status.success()
+                    {
+                        for line in String::from_utf8_lossy(&single_out.stdout).lines() {
+                            let p = line.trim();
+                            if p.starts_with("/nix/store/") {
+                                resolved.push(p.to_string());
+                            }
+                        }
+                    } else {
+                        return Err(BuilderError::NixCli(format!(
+                            "Failed to resolve target expression: {}",
+                            target
+                        )));
+                    }
+                }
+            }
+        }
+
+        resolved.sort();
+        resolved.dedup();
+        Ok(resolved)
+    }
+
+    /// 递归获取目标产物的完整构建闭包 (包含 Derivation 及 buildInputs 等编译期依赖图)
+    pub async fn get_build_closure(&self, paths: &[String]) -> Result<Vec<String>, BuilderError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut build_paths = HashSet::new();
+
+        // 1. 获取运行时闭包与 deriver
+        let items = self.get_recursive_path_infos(paths).await?;
+        let mut derivers = Vec::new();
+
+        for item in &items {
+            build_paths.insert(item.path.clone());
+            if let Some(ref drv) = item.deriver
+                && !drv.is_empty()
+            {
+                derivers.push(drv.clone());
+            }
+        }
+
+        // 2. 递归查询 Deriver 的前向构建依赖
+        if !derivers.is_empty() {
+            derivers.sort();
+            derivers.dedup();
+
+            for chunk in derivers.chunks(128) {
+                let mut cmd = Command::new("nix-store");
+                cmd.args(["--query", "--requisites"]);
+                for drv in chunk {
+                    cmd.arg(drv);
+                }
+
+                if let Ok(output) = cmd.output().await
+                    && output.status.success()
+                {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("/nix/store/") {
+                            build_paths.insert(trimmed.to_string());
+                        }
+                    }
+                } else {
+                    let mut path_info_cmd = Command::new("nix");
+                    path_info_cmd.args(["path-info", "--recursive"]);
+                    for drv in chunk {
+                        path_info_cmd.arg(drv);
+                    }
+                    if let Ok(pi_out) = path_info_cmd.output().await
+                        && pi_out.status.success()
+                    {
+                        for line in String::from_utf8_lossy(&pi_out.stdout).lines() {
+                            let trimmed = line.trim();
+                            if trimmed.starts_with("/nix/store/") {
+                                build_paths.insert(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<String> = build_paths.into_iter().collect();
+        result.sort();
+        Ok(result)
+    }
 }
 
 pub fn parse_path_info_items_typed(json_str: &str) -> Result<Vec<NixPathInfoItem>, BuilderError> {
@@ -353,7 +557,14 @@ pub fn parse_path_info_value_typed(parsed: &Value) -> Result<Vec<NixPathInfoItem
     } else if let Some(obj) = parsed.as_object() {
         let mut list = Vec::with_capacity(obj.len());
         for (path, v) in obj {
-            let mut item: NixPathInfoItem = serde_json::from_value(v.clone())?;
+            let mut item: NixPathInfoItem = if v.is_null() {
+                NixPathInfoItem {
+                    path: path.clone(),
+                    ..Default::default()
+                }
+            } else {
+                serde_json::from_value(v.clone())?
+            };
             if item.path.is_empty() {
                 item.path = path.clone();
             }

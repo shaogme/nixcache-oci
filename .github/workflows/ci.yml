@@ -316,6 +316,13 @@ jobs:
           chmod +x test/test-purge-cas.sh
           ./test/test-purge-cas.sh
 
+      - name: Run Capture Redesign & Runtime Closure Test
+        env:
+          PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          chmod +x test/test-capture-closure.sh
+          ./test/test-capture-closure.sh
+
       - name: Run Install Action & Script Test
         run: |
           chmod +x test/test-install-action.sh

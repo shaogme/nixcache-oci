@@ -1,4 +1,4 @@
-use crate::nix::BuildMode;
+use crate::nix::{BuildMode, CaptureMode};
 use clap::{Parser, Subcommand};
 use nixcache_cli::{
     AuthTokenArgs, CachePolicyArgs, CacheSelectorArgs, ListArgs, OciTargetArgs, PurgeArgs,
@@ -92,6 +92,33 @@ pub struct SessionCaptureArgs {
     #[command(flatten)]
     pub signing: SigningKeyArgs,
 
+    /// 目标产物符号链接路径模式 (如 ./result, ./result-*)
+    #[arg(long, help = "Out-link path glob patterns [env: NIXCACHE_OUT_LINK]")]
+    pub out_link: Option<String>,
+
+    /// 显式 Flake 目标或属性列表 (如 .#app1 .#app2)
+    #[arg(
+        long,
+        help = "Explicit build target expressions [env: NIXCACHE_TARGETS]"
+    )]
+    pub targets: Option<String>,
+
+    /// 产物捕获模式
+    #[arg(long, help = "Capture mode [env: NIXCACHE_CAPTURE_MODE]")]
+    pub capture_mode: Option<CaptureMode>,
+
+    /// 是否开启严格闭包校验
+    #[arg(
+        long,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        help = "Enforce strict closure validation (default true) [env: NIXCACHE_STRICT_CLOSURE]"
+    )]
+    pub strict_closure: Option<bool>,
+
+    #[arg(long, help = "Disable strict closure validation")]
+    pub no_strict_closure: bool,
+
     #[arg(
         long,
         help = "Output path for the BuildReceipt JSON file [env: NIXCACHE_OUTPUT_RECEIPT]"
@@ -106,6 +133,7 @@ pub struct SessionCaptureArgs {
 
     #[arg(
         long,
+        alias = "snapshot-path",
         help = "Path to baseline store paths snapshot [env: NIXCACHE_SNAPSHOT_PATH]"
     )]
     pub snapshot_before: Option<PathBuf>,
@@ -121,6 +149,38 @@ pub struct SessionCaptureArgs {
 }
 
 impl SessionCaptureArgs {
+    pub fn resolve_out_link(&self) -> Option<String> {
+        self.out_link
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_OUT_LINK"))
+    }
+
+    pub fn resolve_targets(&self) -> Option<String> {
+        self.targets
+            .as_deref()
+            .and_then(Env::non_empty_str)
+            .map(|s| s.to_string())
+            .or_else(|| Env::get("NIXCACHE_TARGETS"))
+    }
+
+    pub fn resolve_capture_mode(&self) -> CaptureMode {
+        self.capture_mode
+            .or_else(|| Env::parse("NIXCACHE_CAPTURE_MODE"))
+            .unwrap_or_default()
+    }
+
+    pub fn resolve_strict_closure(&self) -> bool {
+        if self.no_strict_closure {
+            return false;
+        }
+        if let Some(s) = self.strict_closure {
+            return s;
+        }
+        Env::get_bool("NIXCACHE_STRICT_CLOSURE").unwrap_or(true)
+    }
+
     pub fn resolve_proxy_url(&self) -> String {
         self.proxy_url
             .as_deref()
@@ -532,6 +592,73 @@ mod tests {
                 assert!(!args.resolve_strict());
             }
             _ => panic!("Expected build command"),
+        }
+    }
+
+    #[test]
+    fn test_session_capture_args_resolution() {
+        let default_args = SessionCaptureArgs::default();
+        assert_eq!(
+            default_args.resolve_capture_mode(),
+            CaptureMode::RuntimeClosure
+        );
+        assert!(default_args.resolve_strict_closure());
+        assert_eq!(default_args.resolve_out_link(), None);
+        assert_eq!(default_args.resolve_targets(), None);
+
+        let custom_args = SessionCaptureArgs {
+            out_link: Some("./result*".to_string()),
+            targets: Some(".#app1 .#app2".to_string()),
+            capture_mode: Some(CaptureMode::BuildClosure),
+            strict_closure: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            custom_args.resolve_capture_mode(),
+            CaptureMode::BuildClosure
+        );
+        assert!(!custom_args.resolve_strict_closure());
+        assert_eq!(custom_args.resolve_out_link().as_deref(), Some("./result*"));
+        assert_eq!(
+            custom_args.resolve_targets().as_deref(),
+            Some(".#app1 .#app2")
+        );
+
+        let no_strict_args = SessionCaptureArgs {
+            no_strict_closure: true,
+            ..Default::default()
+        };
+        assert!(!no_strict_args.resolve_strict_closure());
+    }
+
+    #[test]
+    fn test_session_capture_args_clap_parse() {
+        let parsed = Cli::try_parse_from([
+            "nixcache-builder",
+            "session",
+            "capture",
+            "--out-link",
+            "./result-app*",
+            "--targets",
+            ".#my-app",
+            "--capture-mode",
+            "roots-only",
+            "--no-strict-closure",
+        ])
+        .unwrap();
+
+        match parsed.command {
+            Commands::Session(session_cli) => match session_cli.command {
+                SessionCommands::Capture(args) => {
+                    assert_eq!(args.out_link.as_deref(), Some("./result-app*"));
+                    assert_eq!(args.targets.as_deref(), Some(".#my-app"));
+                    assert_eq!(args.capture_mode, Some(CaptureMode::RootsOnly));
+                    assert!(args.no_strict_closure);
+                    assert!(!args.resolve_strict_closure());
+                }
+                _ => panic!("Expected capture command"),
+            },
+            _ => panic!("Expected session command"),
         }
     }
 }

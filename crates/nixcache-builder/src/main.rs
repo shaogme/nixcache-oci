@@ -1,7 +1,7 @@
 use clap::Parser;
 use mimalloc::MiMalloc;
 use nixcache_cli::{DEFAULT_NIXCACHE_REPO, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT};
-use std::{error::Error, process};
+use std::{error::Error, path::Path, process};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -85,6 +85,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let proxy_url = args.resolve_proxy_url();
                 let snapshot_before = args.resolve_snapshot_before();
                 let export_concurrency = args.resolve_export_concurrency();
+                let out_link = args.resolve_out_link();
+                let targets = args.resolve_targets();
+                let capture_mode = args.resolve_capture_mode();
+                let strict_closure = args.resolve_strict_closure();
+                let workspace_root = Path::new(".");
 
                 let capture_opts = SessionCaptureOptions {
                     repo: &repo,
@@ -99,6 +104,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     snapshot_before: Some(&snapshot_before),
                     export_concurrency,
                     explicit_paths: &args.paths,
+                    out_link_pattern: out_link.as_deref(),
+                    targets_expr: targets.as_deref(),
+                    capture_mode,
+                    strict_closure,
+                    workspace_root,
                 };
 
                 if let Err(e) = run_session_capture(&capture_opts).await {

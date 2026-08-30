@@ -6,7 +6,7 @@
 
 ## 工作原理与核心架构
 
-1. **多架构声明与自动过滤**：**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
+1. **基于图论依赖分析的运行时闭包精准捕获（Runtime Closure Capture）**：**GitHub Actions** 构建完成后，基于 Nix DAG 图论可达性分析自动计算目标产物的纯净运行时闭包 $C(R)$ 与本地构建差集 $\Delta$ 的交集，**彻底剔除 `rustc`、`cargo`、`gcc` 等重型编译期工具（`nativeBuildInputs`）与中间派生构建产物**，提纯 `active_gc_roots` 严格仅保留目标根节点，并自动过滤 `cache.nixos.org` 上已存在的 store 路径，将真正属于运行时的本地构建 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
 
 2. **多后端原生驱动与静态确定性（Static Determinism）**：
    - **多态后端驱动体系（First-Class Provider Drivers）**：原生支持 GitHub Packages (GHCR)、Docker Hub、AWS ECR、Google Cloud Artifact Registry (GAR)、Azure ACR 与通用 OCI (Harbor / Zot / Distribution / Quay)。
@@ -218,14 +218,17 @@ jobs:
       - name: Build Flake Outputs
         run: nix build .#my-app
 
-      # 构建完成后，差异捕获并原子上传新生成的 Store 路径
+      # 构建完成后，基于运行时闭包图论精确捕获目标产物（自动 100% 剔除编译期工具与中间派生产物）
       - name: Capture & Upload Cache
         if: success() && github.ref == 'refs/heads/main'
         uses: shaogme/nixcache-oci/capture@main
         with:
+          out-link: './result*'    # 可选，产物软链接 Glob 匹配模式（默认 './result*'）
+          targets: ''              # 可选，显式 Flake 目标（如 '.#my-app'，适用于 nix build --no-link）
+          capture-mode: 'runtime-closure' # 可选，'runtime-closure'(默认)、'build-closure'、'roots-only'、'diff-all'
+          strict-closure: 'true'   # 可选，严格模式（默认 'true'，无产物时报错拦截，避免静默误传）
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          export-concurrency: '4' # 可选，并发导出与上传 Worker 数量
-
+          export-concurrency: '4'  # 可选，并发导出与上传 Worker 数量
 ```
 
 ##### 4. 自定义 OCI 注册表配置（支持 Docker Hub / AWS ECR / Harbor 等）
@@ -575,6 +578,10 @@ nixcache-builder session clean
 | `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID |
 | `--job-id <JOB_ID>` | `NIXCACHE_JOB_ID` | （无） | 当前 GitHub Actions Job 标识符 |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台系统架构 |
+| `--out-link <PATTERN>` | `NIXCACHE_OUT_LINK` | `./result*` | 产物软链接匹配 Glob 模式（自动发现目标根节点） |
+| `--targets <EXPR>` | `NIXCACHE_TARGETS` | （无） | 显式 Flake 目标表达式（如 `.#my-app` 或 `.#pkg1 .#pkg2`） |
+| `--capture-mode <MODE>` | `NIXCACHE_CAPTURE_MODE` | `runtime-closure` | 捕获模式：`runtime-closure`(默认)、`build-closure`、`roots-only`、`diff-all` |
+| `--strict-closure` / `--no-strict-closure` | `NIXCACHE_STRICT_CLOSURE` | `true` | 严格模式（默认开启，无产物时报错退出；关闭时回退为全量 diff 模式） |
 | `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（可选） |
 | `--proxy-url <URL>` | `NIXCACHE_PROXY_URL` | `http://127.0.0.1:37515` | 本地 Proxy 代理地址（用于热注册新产物） |
@@ -1086,6 +1093,9 @@ nix-build default.nix -A tests.vmtest --no-out-link
 
 # 5. 验证流水线 Session 级联与 CAS 并发冲突退避重试机制
 ./test/test-pipeline-session-cas.sh
+
+# 6. 验证基于图论的运行时闭包精准捕获、编译期依赖剥离 (Rust 软件包零中间产物泄漏) 与替代执行
+./test/test-capture-closure.sh
 ```
 
 #### 端到端（E2E）与替换器测试
