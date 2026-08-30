@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream::BoxStream};
 use http::{
@@ -6,11 +5,11 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    BlobUploadStrategy, BoxBodyStream, OciBackendDriver, OciClient, OciError, OciTransport,
-    RegistryKind, TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
+    BlobUploadStrategy, BoxBodyStream, OciClient, OciDriver, OciError, OciTransport, RegistryKind,
+    TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
 };
 use reqwest::Client;
-use std::{io::SeekFrom, path::Path, sync::Arc, time::Duration};
+use std::{io::SeekFrom, path::Path, time::Duration};
 use tokio::{
     fs::{File, metadata, read},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -53,8 +52,6 @@ impl ReqwestTransport {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OciTransport for ReqwestTransport {
     type BodyStream = BoxBodyStream;
 
@@ -398,7 +395,7 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
-#[async_trait]
+#[allow(async_fn_in_trait)]
 pub trait OciClientExt {
     async fn push_blob_file(&self, file_path: &Path) -> Result<String, OciError>;
 
@@ -410,7 +407,6 @@ pub trait OciClientExt {
     ) -> Result<String, OciError>;
 }
 
-#[async_trait]
 impl OciClientExt for OciClient<ReqwestTransport> {
     async fn push_blob_file(&self, file_path: &Path) -> Result<String, OciError> {
         let data = read(file_path).await?;
@@ -619,7 +615,7 @@ pub fn create_tokio_reqwest_client_with_driver(
     repo: &str,
     github_token: &str,
     write_access: bool,
-    driver: Arc<dyn OciBackendDriver>,
+    driver: impl Into<OciDriver>,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
     OciClient::new(
@@ -649,9 +645,9 @@ mod tests {
     use super::{
         OciClientExt, create_tokio_reqwest_client, create_tokio_reqwest_client_with_driver,
     };
-    use nixcache_oci::{BlobUploadStrategy, GhcrDriver, RegistryCapabilities, UploadConfig};
+    use nixcache_oci::{GenericOciDriver, GhcrDriver, UploadConfig};
     use serde_json::json;
-    use std::{io::Write, sync::Arc};
+    use std::io::Write;
     use tempfile::NamedTempFile;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -677,13 +673,13 @@ mod tests {
 
         let client = create_tokio_reqwest_client(&host, "test/repo", "secret-gh-token", true);
         let token = client.get_token().await.expect("Failed to fetch token");
-        assert_eq!(token, "mocked-jwt-token");
+        assert_eq!(token.as_ref(), "mocked-jwt-token");
 
         let cached_token = client
             .get_token()
             .await
             .expect("Failed to get cached token");
-        assert_eq!(cached_token, "mocked-jwt-token");
+        assert_eq!(cached_token.as_ref(), "mocked-jwt-token");
     }
 
     #[tokio::test]
@@ -778,47 +774,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // 构造一个配置了 ResumableChunkedPatch 能力的 Mock 驱动
-        #[derive(Debug, Clone)]
-        struct MockChunkedDriver;
-        static MOCK_CHUNKED_CAPS: RegistryCapabilities = RegistryCapabilities {
-            supports_chunked_patch: true,
-            supports_monolithic_post_1rtt: false,
-            supports_manifest_cas_if_match: true,
-            requires_library_namespace_expansion: false,
-            fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
-            custom_auth_endpoint: None,
-        };
-        impl nixcache_oci::OciBackendDriver for MockChunkedDriver {
-            fn kind(&self) -> nixcache_oci::RegistryKind {
-                nixcache_oci::RegistryKind::GenericOci
-            }
-            fn capabilities(&self) -> &'static RegistryCapabilities {
-                &MOCK_CHUNKED_CAPS
-            }
-            fn canonicalize_endpoint(&self, r: &str) -> String {
-                r.to_string()
-            }
-            fn canonicalize_repository(&self, r: &str) -> String {
-                r.to_string()
-            }
-            fn format_auth_scope(&self, repo: &str, write: bool) -> String {
-                let action = if write { "pull,push" } else { "pull" };
-                format!("repository:{}/nix-cache:{}", repo, action)
-            }
-            fn resolve_token_endpoint(&self, reg: &str, repo: &str, write: bool) -> String {
-                let scope = self.format_auth_scope(repo, write);
-                format!("http://{}/token?scope={}", reg, scope)
-            }
-        }
-
-        let client = create_tokio_reqwest_client_with_driver(
-            &host,
-            "test/repo",
-            "",
-            true,
-            Arc::new(MockChunkedDriver),
-        );
+        let client =
+            create_tokio_reqwest_client_with_driver(&host, "test/repo", "", true, GenericOciDriver);
         let config = UploadConfig {
             chunk_threshold_bytes: 1024 * 1024,
             chunk_size_bytes: 1024 * 1024,
@@ -871,13 +828,8 @@ mod tests {
             .await;
 
         // 使用 GhcrDriver
-        let client = create_tokio_reqwest_client_with_driver(
-            &host,
-            "test/repo",
-            "",
-            true,
-            Arc::new(GhcrDriver),
-        );
+        let client =
+            create_tokio_reqwest_client_with_driver(&host, "test/repo", "", true, GhcrDriver);
         let config = UploadConfig {
             chunk_threshold_bytes: 1024 * 1024,
             chunk_size_bytes: 1024 * 1024,

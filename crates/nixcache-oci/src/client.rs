@@ -1,6 +1,6 @@
 use crate::{
     backend::{
-        BlobUploadStrategy, OciBackendDriver, RegistryCapabilities, RegistryKind, detect_driver,
+        BlobUploadStrategy, OciDriver, RegistryCapabilities, RegistryKind, detect_driver,
         driver_for_kind,
     },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
@@ -14,7 +14,7 @@ use crate::{
     transport::{HashingStream, OciBlobStream, OciTransport},
     upload::UploadConfig,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
@@ -25,7 +25,7 @@ use nixcache_core::{
 use nixcache_utils::get_process_id;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{pin::pin, sync::Arc, time::Duration};
+use std::{pin::pin, str::from_utf8, sync::Arc, time::Duration};
 use tracing::{error, info, warn};
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
@@ -50,7 +50,7 @@ pub struct FetchedOciArtifact {
 pub struct OciClient<T: OciTransport> {
     registry: String,
     repo: String,
-    driver: Arc<dyn OciBackendDriver>,
+    driver: OciDriver,
     token_manager: TokenManager,
     transport: T,
 }
@@ -62,9 +62,10 @@ impl<T: OciTransport> OciClient<T> {
         repo: &str,
         auth_token: &str,
         write_access: bool,
-        driver: Arc<dyn OciBackendDriver>,
+        driver: impl Into<OciDriver>,
         transport: T,
     ) -> Self {
+        let driver = driver.into();
         let canonical_registry = driver.canonicalize_endpoint(registry);
         let canonical_repo = driver.canonicalize_repository(repo);
         let token_manager = TokenManager::new(
@@ -72,7 +73,7 @@ impl<T: OciTransport> OciClient<T> {
             &canonical_repo,
             auth_token,
             write_access,
-            driver.clone(),
+            driver,
         );
 
         Self {
@@ -109,7 +110,7 @@ impl<T: OciTransport> OciClient<T> {
         Self::new(registry, repo, auth_token, write_access, driver, transport)
     }
 
-    pub fn driver(&self) -> &Arc<dyn OciBackendDriver> {
+    pub fn driver(&self) -> &OciDriver {
         &self.driver
     }
 
@@ -149,7 +150,7 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
-    pub async fn get_token(&self) -> Result<String, OciError> {
+    pub async fn get_token(&self) -> Result<Arc<str>, OciError> {
         self.token_manager.get_token(&self.transport).await
     }
 
@@ -399,7 +400,7 @@ impl<T: OciTransport> OciClient<T> {
 
         let chunk_limit = config.chunk_size_bytes.max(1024 * 1024);
         let threshold = config.chunk_threshold_bytes.max(chunk_limit as u64) as usize;
-        let mut buffer = Vec::new();
+        let mut buffer = BytesMut::with_capacity(threshold.max(chunk_limit * 2));
 
         // 判定是否应当启用分块上传：仅当 Driver 明确支持分块且策略配置为 ResumableChunkedPatch 时
         let allow_chunked = capabilities.supports_chunked_patch
@@ -431,7 +432,7 @@ impl<T: OciTransport> OciClient<T> {
             }
 
             // 2. 依据 Driver 静态确定的策略直传完整 Payload
-            let complete_bytes = Bytes::from(buffer);
+            let complete_bytes = buffer.freeze();
             let pushed_digest = self
                 .push_blob_bytes_with_digest(&final_digest, complete_bytes)
                 .await?;
@@ -494,7 +495,7 @@ impl<T: OciTransport> OciClient<T> {
                 chunk_limit.min(chunk_buf.len())
             };
 
-            let send_bytes = Bytes::from(chunk_buf.drain(..send_len).collect::<Vec<u8>>());
+            let send_bytes = chunk_buf.split_to(send_len).freeze();
             let end_offset = current_offset + send_bytes.len() as u64 - 1;
             let headers = self.get_auth_headers().await?;
             let resp = self
@@ -593,12 +594,12 @@ impl<T: OciTransport> OciClient<T> {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            let body = String::from_utf8(bytes.to_vec())
+            let body = from_utf8(&bytes)
                 .map_err(|e| OciError::Other(format!("Invalid UTF-8 manifest: {}", e)))?;
 
-            let digest = digest_header.unwrap_or_else(|| compute_sha256_digest(body.as_bytes()));
+            let digest = digest_header.unwrap_or_else(|| compute_sha256_digest(&bytes));
 
-            Ok(Some((body, digest)))
+            Ok(Some((body.to_string(), digest)))
         } else if status == StatusCode::NOT_FOUND {
             Ok(None)
         } else {

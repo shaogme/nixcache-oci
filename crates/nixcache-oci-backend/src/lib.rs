@@ -1,6 +1,6 @@
 pub use nixcache_oci::backend::{
     AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
-    GenericOciDriver, GhcrDriver, OciBackendDriver, RegistryCapabilities, RegistryKind,
+    GenericOciDriver, GhcrDriver, OciBackendDriver, OciDriver, RegistryCapabilities, RegistryKind,
     detect_driver, driver_for_kind,
 };
 

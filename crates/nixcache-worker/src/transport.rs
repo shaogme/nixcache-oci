@@ -1,12 +1,13 @@
-use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, TryStreamExt};
+use futures_util::TryStreamExt;
 use http::{
     HeaderMap, StatusCode,
     header::{HeaderName, HeaderValue},
 };
-use nixcache_oci::{OciTransport, TransportError, UploadChunkResponse, parse_range_header};
-use std::{pin::Pin, time::Duration};
+use nixcache_oci::{
+    BoxBodyStream, OciTransport, TransportError, UploadChunkResponse, parse_range_header,
+};
+use std::time::Duration;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 #[derive(Clone, Default)]
@@ -37,9 +38,8 @@ fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, Transport
     Ok(http_headers)
 }
 
-#[async_trait(?Send)]
 impl OciTransport for WorkerFetchTransport {
-    type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + 'static>>;
+    type BodyStream = BoxBodyStream;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
         let worker_headers = convert_to_worker_headers(&headers)?;

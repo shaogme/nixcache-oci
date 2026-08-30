@@ -1,7 +1,7 @@
 pub mod sync;
 
 use crate::{
-    backend::driver::OciBackendDriver,
+    backend::driver::OciDriver,
     error::OciError,
     token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
     transport::OciTransport,
@@ -24,7 +24,7 @@ pub struct TokenManager {
     repo: String,
     github_token: String,
     write_access: bool,
-    driver: Arc<dyn OciBackendDriver>,
+    driver: OciDriver,
     storage: TokenStorage,
     in_flight: InFlightState,
     broadcaster: TokenBroadcaster,
@@ -36,8 +36,9 @@ impl TokenManager {
         repo: &str,
         github_token: &str,
         write_access: bool,
-        driver: Arc<dyn OciBackendDriver>,
+        driver: impl Into<OciDriver>,
     ) -> Self {
+        let driver = driver.into();
         let clean_registry = driver.canonicalize_endpoint(registry);
         let clean_repo = driver.canonicalize_repository(repo);
         Self {
@@ -52,9 +53,9 @@ impl TokenManager {
         }
     }
 
-    /// 核心鉴权方法：99.9% 场景为 Wait-Free 无锁读取
-    pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<String, OciError> {
-        // 1. Fast Path: Wait-Free 读取原子快照 (0 锁争用)
+    /// 核心鉴权方法：99.9% 场景为 Wait-Free 无锁读取，返回不可变共享 Arc<str>
+    pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<Arc<str>, OciError> {
+        // 1. Fast Path: Wait-Free 读取原子快照 (0 锁争用，0 堆内存深拷贝)
         if let Some(cached) = self.storage.load() {
             return Ok(cached);
         }
@@ -69,16 +70,17 @@ impl TokenManager {
 
             // Leader: 发起网络获取
             let maybe_fetched = self.fetch_token_network(transport).await;
-            let result_token = match maybe_fetched {
+            let result_token: Arc<str> = match maybe_fetched {
                 Some(tok) => {
-                    self.storage.store(tok.clone());
-                    tok
+                    let arc_tok: Arc<str> = Arc::from(tok.as_str());
+                    self.storage.store(Arc::clone(&arc_tok));
+                    arc_tok
                 }
-                None => self.github_token.clone(),
+                None => Arc::from(self.github_token.as_str()),
             };
 
             // 广播通知所有等待中的协程
-            self.broadcaster.broadcast(result_token.clone());
+            self.broadcaster.broadcast(Arc::clone(&result_token));
             self.in_flight.release_leader();
 
             return Ok(result_token);
@@ -181,7 +183,7 @@ mod tests {
 
         // 验证 2: 所有 50 个协程获取到的 Token 必定一致且正确
         for tok in &tokens {
-            assert_eq!(tok, "singleflight-jwt-token");
+            assert_eq!(tok.as_ref(), "singleflight-jwt-token");
         }
     }
 
@@ -194,12 +196,12 @@ mod tests {
 
         // 第一次调用：执行网络 Fetch
         let t1 = token_mgr.get_token(&transport).await.unwrap();
-        assert_eq!(t1, "singleflight-jwt-token");
+        assert_eq!(t1.as_ref(), "singleflight-jwt-token");
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
 
         // 第二次调用：0 锁快路径原子快照直接返回（网络调用次数依然为 1）
         let t2 = token_mgr.get_token(&transport).await.unwrap();
-        assert_eq!(t2, "singleflight-jwt-token");
+        assert_eq!(t2.as_ref(), "singleflight-jwt-token");
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -227,7 +229,7 @@ mod tests {
 
         // 首次调用网络失败，安全回退到 fallback token，不发生死锁或 panic
         let t1 = token_mgr.get_token(&transport).await.unwrap();
-        assert_eq!(t1, "fallback_token");
+        assert_eq!(t1.as_ref(), "fallback_token");
 
         // 路由恢复正常
         transport.add_route(
@@ -242,20 +244,20 @@ mod tests {
 
         // 随后的请求能够重新竞选 Leader 并成功获取新 Token
         let t2 = token_mgr.get_token(&transport).await.unwrap();
-        assert_eq!(t2, "recovered-token");
+        assert_eq!(t2.as_ref(), "recovered-token");
     }
 
     #[tokio::test]
     async fn test_token_manager_scope_and_write_access() {
         let transport = MockRouterTransport::default();
-        let driver = Arc::new(GhcrDriver);
-        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true, driver.clone());
+        let driver = GhcrDriver;
+        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true, driver);
         let read_mgr = TokenManager::new("ghcr.io", "org/repo", "token", false, driver);
 
         let t_write = write_mgr.get_token(&transport).await.unwrap();
         let t_read = read_mgr.get_token(&transport).await.unwrap();
 
-        assert_eq!(t_write, "token");
-        assert_eq!(t_read, "token");
+        assert_eq!(t_write.as_ref(), "token");
+        assert_eq!(t_read.as_ref(), "token");
     }
 }

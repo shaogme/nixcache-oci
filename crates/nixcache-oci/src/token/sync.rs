@@ -60,7 +60,7 @@ mod imp {
 
     #[derive(Clone)]
     struct CachedToken {
-        token: String,
+        token: Arc<str>,
         created_at: Instant,
     }
 
@@ -88,16 +88,16 @@ mod imp {
             }
         }
 
-        pub fn load(&self) -> Option<String> {
+        pub fn load(&self) -> Option<Arc<str>> {
             self.inner
                 .load_full()
                 .filter(|c| c.created_at.elapsed() < Duration::from_secs(240))
-                .map(|c| c.token.clone())
+                .map(|c| Arc::clone(&c.token))
         }
 
-        pub fn store(&self, token: String) {
+        pub fn store(&self, token: impl Into<Arc<str>>) {
             self.inner.store(Some(Arc::new(CachedToken {
-                token,
+                token: token.into(),
                 created_at: Instant::now(),
             })));
         }
@@ -105,8 +105,8 @@ mod imp {
 
     #[derive(Clone)]
     pub struct TokenBroadcaster {
-        tx: Arc<watch::Sender<Option<String>>>,
-        rx: watch::Receiver<Option<String>>,
+        tx: Arc<watch::Sender<Option<Arc<str>>>>,
+        rx: watch::Receiver<Option<Arc<str>>>,
     }
 
     impl fmt::Debug for TokenBroadcaster {
@@ -130,14 +130,14 @@ mod imp {
             }
         }
 
-        pub fn broadcast(&self, token: String) {
-            let _ = self.tx.send(Some(token));
+        pub fn broadcast(&self, token: impl Into<Arc<str>>) {
+            let _ = self.tx.send(Some(token.into()));
         }
 
-        pub async fn wait(&self) -> Result<String, OciError> {
+        pub async fn wait(&self) -> Result<Arc<str>, OciError> {
             let mut rx = self.rx.clone();
-            if let Some(token) = rx.borrow().as_ref() {
-                return Ok(token.clone());
+            if let Some(ref token) = *rx.borrow() {
+                return Ok(Arc::clone(token));
             }
             if rx.changed().await.is_err() {
                 return Err(OciError::AuthFailed);
@@ -151,17 +151,17 @@ mod imp {
 mod imp {
     use crate::error::OciError;
     use loom::sync::{
-        Arc, Condvar, Mutex,
+        Arc as LoomArc, Condvar, Mutex,
         atomic::{AtomicU8, Ordering},
     };
-    use std::fmt;
+    use std::{fmt, sync::Arc};
 
     const STATE_IDLE: u8 = 0;
     const STATE_FETCHING: u8 = 1;
 
     #[derive(Clone)]
     pub struct InFlightState {
-        inner: Arc<AtomicU8>,
+        inner: LoomArc<AtomicU8>,
     }
 
     impl fmt::Debug for InFlightState {
@@ -179,7 +179,7 @@ mod imp {
     impl InFlightState {
         pub fn new() -> Self {
             Self {
-                inner: Arc::new(AtomicU8::new(STATE_IDLE)),
+                inner: LoomArc::new(AtomicU8::new(STATE_IDLE)),
             }
         }
 
@@ -201,7 +201,7 @@ mod imp {
 
     #[derive(Clone)]
     pub struct TokenStorage {
-        inner: Arc<Mutex<Option<String>>>,
+        inner: LoomArc<Mutex<Option<Arc<str>>>>,
     }
 
     impl fmt::Debug for TokenStorage {
@@ -219,22 +219,22 @@ mod imp {
     impl TokenStorage {
         pub fn new() -> Self {
             Self {
-                inner: Arc::new(Mutex::new(None)),
+                inner: LoomArc::new(Mutex::new(None)),
             }
         }
 
-        pub fn load(&self) -> Option<String> {
+        pub fn load(&self) -> Option<Arc<str>> {
             self.inner.lock().unwrap().clone()
         }
 
-        pub fn store(&self, token: String) {
-            *self.inner.lock().unwrap() = Some(token);
+        pub fn store(&self, token: impl Into<Arc<str>>) {
+            *self.inner.lock().unwrap() = Some(token.into());
         }
     }
 
     #[derive(Clone)]
     pub struct TokenBroadcaster {
-        channel: Arc<(Mutex<Option<String>>, Condvar)>,
+        channel: LoomArc<(Mutex<Option<Arc<str>>>, Condvar)>,
     }
 
     impl fmt::Debug for TokenBroadcaster {
@@ -252,22 +252,22 @@ mod imp {
     impl TokenBroadcaster {
         pub fn new() -> Self {
             Self {
-                channel: Arc::new((Mutex::new(None), Condvar::new())),
+                channel: LoomArc::new((Mutex::new(None), Condvar::new())),
             }
         }
 
-        pub fn broadcast(&self, token: String) {
+        pub fn broadcast(&self, token: impl Into<Arc<str>>) {
             let (lock, cvar) = &*self.channel;
             let mut broadcast = lock.lock().unwrap();
-            *broadcast = Some(token);
+            *broadcast = Some(token.into());
             cvar.notify_all();
         }
 
-        pub async fn wait(&self) -> Result<String, OciError> {
+        pub async fn wait(&self) -> Result<Arc<str>, OciError> {
             let (lock, cvar) = &*self.channel;
             let mut broadcast = lock.lock().unwrap();
-            if let Some(val) = broadcast.clone() {
-                return Ok(val);
+            if let Some(ref val) = *broadcast {
+                return Ok(Arc::clone(val));
             }
             broadcast = cvar.wait(broadcast).unwrap();
             broadcast.clone().ok_or(OciError::AuthFailed)

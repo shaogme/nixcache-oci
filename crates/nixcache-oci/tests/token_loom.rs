@@ -84,7 +84,7 @@ fn loom_verify_token_manager_singleflight_invariant() {
             "test/repo",
             "secret_tok",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         let threads: Vec<_> = (0..2)
@@ -95,14 +95,14 @@ fn loom_verify_token_manager_singleflight_invariant() {
             })
             .collect();
 
-        let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证 1: 严格单飞，并发请求下网络 fetch 发生且仅发生 1 次
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
 
         // 验证 2: 内存一致性，所有线程获取结果完全一致
-        assert_eq!(results[0], "loom-jwt-token");
-        assert_eq!(results[1], "loom-jwt-token");
+        assert_eq!(results[0].as_ref(), "loom-jwt-token");
+        assert_eq!(results[1].as_ref(), "loom-jwt-token");
     });
 }
 
@@ -118,7 +118,7 @@ fn loom_verify_token_manager_three_threads_storm() {
             "test/repo",
             "secret_tok",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         let threads: Vec<_> = (0..3)
@@ -129,14 +129,14 @@ fn loom_verify_token_manager_three_threads_storm() {
             })
             .collect();
 
-        let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证 1: 3 线程争抢下网络 fetch 依然严格仅有 1 次
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
 
         // 验证 2: 所有 3 个线程全部被唤醒且数据一致
         for res in &results {
-            assert_eq!(res, "three-threads-jwt");
+            assert_eq!(res.as_ref(), "three-threads-jwt");
         }
     });
 }
@@ -151,12 +151,12 @@ fn loom_verify_token_manager_fast_path_cached() {
             "test/repo",
             "secret_tok",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         // 预热：首次调用填充缓存
         let initial_tok = loom_block_on(token_mgr.get_token(&*transport)).unwrap();
-        assert_eq!(initial_tok, "fast-path-token");
+        assert_eq!(initial_tok.as_ref(), "fast-path-token");
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
 
         // 2 个线程并发调用已缓存的 TokenManager
@@ -168,12 +168,12 @@ fn loom_verify_token_manager_fast_path_cached() {
             })
             .collect();
 
-        let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证: 快路径 0 争用直接返回，无额外网络调用
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
-        assert_eq!(results[0], "fast-path-token");
-        assert_eq!(results[1], "fast-path-token");
+        assert_eq!(results[0].as_ref(), "fast-path-token");
+        assert_eq!(results[1].as_ref(), "fast-path-token");
     });
 }
 
@@ -187,7 +187,7 @@ fn loom_verify_token_manager_fallback_on_network_failure() {
             "test/repo",
             "github_fallback_key",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         let threads: Vec<_> = (0..2)
@@ -198,15 +198,15 @@ fn loom_verify_token_manager_fallback_on_network_failure() {
             })
             .collect();
 
-        let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证 1: 发生 1 次或 2 次网络请求失败（并发单飞为 1 次，串行重试为 2 次）
         let calls = transport.call_count.load(Ordering::SeqCst);
         assert!(calls == 1 || calls == 2);
 
         // 验证 2: 所有线程安全回退到 fallback token，无死锁
-        assert_eq!(results[0], "github_fallback_key");
-        assert_eq!(results[1], "github_fallback_key");
+        assert_eq!(results[0].as_ref(), "github_fallback_key");
+        assert_eq!(results[1].as_ref(), "github_fallback_key");
     });
 }
 
@@ -220,7 +220,7 @@ fn loom_verify_token_manager_multi_generation_sequential() {
             "test/repo",
             "secret_tok",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         // 第 1 轮并发获取
@@ -236,8 +236,8 @@ fn loom_verify_token_manager_multi_generation_sequential() {
         };
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
-        assert_eq!(r1, "multi-gen-token");
-        assert_eq!(r2, "multi-gen-token");
+        assert_eq!(r1.as_ref(), "multi-gen-token");
+        assert_eq!(r2.as_ref(), "multi-gen-token");
 
         // 第 2 轮并发获取
         let t3 = {
@@ -246,7 +246,7 @@ fn loom_verify_token_manager_multi_generation_sequential() {
             thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
         };
         let r3 = t3.join().unwrap();
-        assert_eq!(r3, "multi-gen-token");
+        assert_eq!(r3.as_ref(), "multi-gen-token");
 
         // 网络调用总次数依然为 1
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
@@ -263,7 +263,7 @@ fn loom_verify_token_manager_empty_github_token_fallback() {
             "test/repo",
             "",
             false,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
         ));
 
         let threads: Vec<_> = (0..2)
@@ -274,11 +274,11 @@ fn loom_verify_token_manager_empty_github_token_fallback() {
             })
             .collect();
 
-        let results: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证: 即使无 token 且网络失败，所有线程均获得空字符串，不产生 panic 或死锁
-        assert_eq!(results[0], "");
-        assert_eq!(results[1], "");
+        assert_eq!(results[0].as_ref(), "");
+        assert_eq!(results[1].as_ref(), "");
     });
 }
 
@@ -357,7 +357,7 @@ fn loom_verify_token_storage_concurrent_load_store() {
         let writer = {
             let s = storage.clone();
             thread::spawn(move || {
-                s.store("stored_token".to_string());
+                s.store("stored_token");
             })
         };
 
@@ -366,11 +366,11 @@ fn loom_verify_token_storage_concurrent_load_store() {
 
         // 验证读取结果要么是 None（存储前读取），要么是 Some("stored_token")（存储后读取）
         if let Some(val) = read_val {
-            assert_eq!(val, "stored_token");
+            assert_eq!(val.as_ref(), "stored_token");
         }
 
         // 最终状态必为 Some("stored_token")
-        assert_eq!(storage.load(), Some("stored_token".to_string()));
+        assert_eq!(storage.load().as_deref(), Some("stored_token"));
     });
 }
 
@@ -393,7 +393,7 @@ fn loom_verify_token_broadcaster_wait_and_broadcast() {
         let sender = {
             let b = broadcaster.clone();
             thread::spawn(move || {
-                b.broadcast("broadcast_val".to_string());
+                b.broadcast("broadcast_val");
             })
         };
 
@@ -401,8 +401,8 @@ fn loom_verify_token_broadcaster_wait_and_broadcast() {
         let res2 = w2.join().unwrap();
         sender.join().unwrap();
 
-        assert_eq!(res1, "broadcast_val");
-        assert_eq!(res2, "broadcast_val");
+        assert_eq!(res1.as_ref(), "broadcast_val");
+        assert_eq!(res2.as_ref(), "broadcast_val");
     });
 }
 
@@ -411,9 +411,9 @@ fn loom_verify_token_broadcaster_wait_and_broadcast() {
 fn loom_verify_token_broadcaster_pre_broadcast() {
     loom::model(|| {
         let broadcaster = TokenBroadcaster::new();
-        broadcaster.broadcast("pre_broadcast_val".to_string());
+        broadcaster.broadcast("pre_broadcast_val");
 
         let res = loom_block_on(broadcaster.wait()).unwrap();
-        assert_eq!(res, "pre_broadcast_val");
+        assert_eq!(res.as_ref(), "pre_broadcast_val");
     });
 }

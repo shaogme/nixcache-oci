@@ -1,5 +1,5 @@
 use crate::error::BuilderError;
-use async_compression::tokio::write::XzEncoder;
+use async_compression::tokio::write::ZstdEncoder;
 use chrono::Utc;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
@@ -21,12 +21,13 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 
+/// 导出管道环形缓冲区大小 (256KB)
+pub const DUPLEX_BUFFER_SIZE: usize = 256 * 1024;
+
 /// 原生流式单向复制数据并写入压缩编码器。
 ///
-/// 避免使用通用 `tokio::io::copy`，因为其在 Reader 返回 `Poll::Pending` 时会默认调用
-/// `writer.poll_flush()`，而 `liblzma` 在 `LZMA_SYNC_FLUSH` 后无法无缝切换回 `LZMA_RUN`，
-/// 进而导致 `liblzma internal error`。本函数采用 64KB 缓冲区进行流式传输，
-/// 仅在流完全结束（EOF）后由调用方执行最终的 `shutdown`。
+/// 避免使用通用 `tokio::io::copy` 在 Reader 产生 `Poll::Pending` 时频繁触发 flush。
+/// 本函数采用 64KB 缓冲区进行流式传输，仅在流完全结束（EOF）后由调用方执行最终的 `shutdown`。
 pub async fn copy_nar_stream<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -312,10 +313,11 @@ impl ParallelExporter {
             .take()
             .ok_or_else(|| BuilderError::Other("Failed to capture nix-store stdout".to_string()))?;
 
-        let (reader, writer) = tokio::io::duplex(8 * 1024 * 1024);
+        let (reader, writer) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
 
         let compress_handle = tokio::spawn(async move {
-            let mut encoder = XzEncoder::new(writer);
+            let mut encoder =
+                ZstdEncoder::with_quality(writer, async_compression::Level::Precise(3));
             let mut reader = dump_stdout;
             let res = copy_nar_stream(&mut reader, &mut encoder).await;
             let shutdown_res = encoder.shutdown().await;
@@ -370,8 +372,8 @@ impl ParallelExporter {
 
         let narinfo_meta = NarInfoMeta {
             store_path: store_path.to_string(),
-            nar_basename: format!("{}.nar.xz", hash),
-            compression: Some("xz".to_string()),
+            nar_basename: format!("{}.nar.zst", hash),
+            compression: Some("zstd".to_string()),
             file_hash: Some(format!("sha256:{}", raw_hash)),
             file_size: Some(nar_size),
             nar_hash: path_info.nar_hash.clone(),
@@ -470,7 +472,7 @@ impl ParallelExporter {
 #[cfg(test)]
 mod tests {
     use super::{ExportedStorePath, ParallelExporter, copy_nar_stream};
-    use async_compression::tokio::{bufread::XzDecoder, write::XzEncoder};
+    use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
     use nixcache_core::{IndexEntry, NarDigest, StoreHash, SystemArch};
     use serde_json::json;
     use std::{
@@ -535,8 +537,8 @@ mod tests {
         );
         let meta = nixcache_core::NarInfoMeta {
             store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
-            nar_basename: "s66mzxpvicwk07gjbjfw9izjfa797vsw.nar.xz".to_string(),
-            compression: Some("xz".to_string()),
+            nar_basename: "s66mzxpvicwk07gjbjfw9izjfa797vsw.nar.zst".to_string(),
+            compression: Some("zstd".to_string()),
             file_hash: Some(
                 "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                     .to_string(),
@@ -604,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_nar_stream_prevents_liblzma_flush_conflict_regression() {
+    async fn test_copy_nar_stream_zstd() {
         let mut original_data = Vec::new();
         let mut chunks = Vec::new();
         for i in 0..10 {
@@ -621,11 +623,12 @@ mod tests {
         };
 
         let compressed_buf = Vec::new();
-        let mut encoder = XzEncoder::new(compressed_buf);
+        let mut encoder =
+            ZstdEncoder::with_quality(compressed_buf, async_compression::Level::Precise(3));
 
         let copied_bytes = copy_nar_stream(&mut pending_reader, &mut encoder)
             .await
-            .expect("copy_nar_stream should succeed without liblzma error");
+            .expect("copy_nar_stream should succeed without error");
         assert_eq!(copied_bytes, original_data.len() as u64);
 
         encoder
@@ -636,7 +639,7 @@ mod tests {
         let compressed = encoder.into_inner();
         assert!(!compressed.is_empty());
 
-        let mut decoder = XzDecoder::new(&compressed[..]);
+        let mut decoder = ZstdDecoder::new(&compressed[..]);
         let mut decompressed = Vec::new();
         decoder
             .read_to_end(&mut decompressed)
@@ -803,7 +806,7 @@ mod tests {
             "test/repo",
             "",
             true,
-            std::sync::Arc::new(nixcache_oci::GhcrDriver),
+            nixcache_oci::GhcrDriver,
         );
         let config = super::ParallelExportConfig {
             concurrency: 2,

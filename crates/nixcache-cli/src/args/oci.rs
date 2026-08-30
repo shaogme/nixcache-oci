@@ -1,7 +1,6 @@
 use clap::Args;
-use nixcache_oci::{OciBackendDriver, RegistryKind, driver_for_kind};
+use nixcache_oci::{OciDriver, RegistryKind, driver_for_kind};
 use nixcache_utils::Env;
-use std::sync::Arc;
 
 pub const DEFAULT_NIXCACHE_REPO: &str = "shaogme/nixcache-oci";
 pub const DEFAULT_NIXCACHE_REGISTRY: &str = "ghcr.io";
@@ -60,10 +59,7 @@ impl OciTargetArgs {
     }
 
     /// 获取对应的 OCI 后端抽象驱动
-    pub fn resolve_driver(
-        &self,
-        default_repo: &str,
-    ) -> (String, String, Arc<dyn OciBackendDriver>) {
+    pub fn resolve_driver(&self, default_repo: &str) -> (String, String, OciDriver) {
         let repo = self.resolve_repo(default_repo);
         let registry = self.resolve_registry(DEFAULT_NIXCACHE_REGISTRY);
         let kind = self.resolve_kind(DEFAULT_NIXCACHE_REGISTRY);

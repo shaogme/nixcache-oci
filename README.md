@@ -639,7 +639,7 @@ nixcache-builder gc \
 |---|---|---|---|
 | `/nix-cache-info` | GET | `text/x-nix-cache-info` | Nix 替代器握手端点（返回 StoreDir、WantMassQuery、Priority 等元数据） |
 | `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持 Tier 0~3 级联与上游透明回退） |
-| `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/x-xz` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
+| `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/zstd` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
 
 #### 2. 代理管理与运维端点
 | 端点路径 | HTTP 方法 | 描述 |

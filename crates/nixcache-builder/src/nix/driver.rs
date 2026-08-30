@@ -2,7 +2,13 @@ use crate::{env_injector::NixEnvInjector, error::BuilderError};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{env, fmt, path::Path, process::Stdio, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fmt,
+    path::Path,
+    process::Stdio,
+    str::FromStr,
+};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 use tracing::{error, info};
 
@@ -97,54 +103,57 @@ impl NixCli {
         &self,
         targets: &[BuildTarget],
     ) -> Result<Vec<String>, BuilderError> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut all_paths = Vec::new();
-        for target in targets {
-            info!("Building target: {}", target);
+        let nix_config = env::var("NIX_CONFIG").ok();
+
+        // 1. 处理 Flake 目标 (统一合并为单次 nix build 调用)
+        let flake_targets: Vec<&BuildTarget> = targets
+            .iter()
+            .filter(|t| matches!(t, BuildTarget::Flake { .. }))
+            .collect();
+
+        if !flake_targets.is_empty() {
+            info!("Batch building {} flake target(s)", flake_targets.len());
             let mut cmd = Command::new("nix");
             cmd.arg("build");
-            if let Ok(config) = env::var("NIX_CONFIG") {
-                NixEnvInjector::apply_to_command(&mut cmd, &config);
+            if let Some(ref config) = nix_config {
+                NixEnvInjector::apply_to_command(&mut cmd, config);
             }
 
-            match target {
-                BuildTarget::Flake {
+            for target in &flake_targets {
+                if let BuildTarget::Flake {
                     flake_ref,
                     attribute,
-                } => {
+                } = target
+                {
                     cmd.arg(format!("{}#{}", flake_ref, attribute));
-                    cmd.args(["--no-link", "--accept-flake-config", "--json"]);
-                }
-                BuildTarget::NonFlake { file, attribute } => {
-                    cmd.args(["--file", file]);
-                    if let Some(attr) = attribute {
-                        cmd.arg(attr);
-                    }
-                    cmd.args(["--no-link", "--json"]);
                 }
             }
+            cmd.args(["--no-link", "--accept-flake-config", "--json"]);
 
             let output = cmd.output().await?;
-
-            if !output.status.success() {
+            if output.status.success() {
+                let json_str = String::from_utf8_lossy(&output.stdout);
+                Self::extract_outputs_from_json(&json_str, &mut all_paths)?;
+            } else {
                 error!(
-                    "nix build failed: {}",
+                    "Batch nix build for flake targets failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
                 // Fallback to nix path-info
                 let mut path_info_cmd = Command::new("nix");
                 path_info_cmd.arg("path-info");
-                match target {
-                    BuildTarget::Flake {
+                for target in &flake_targets {
+                    if let BuildTarget::Flake {
                         flake_ref,
                         attribute,
-                    } => {
+                    } = target
+                    {
                         path_info_cmd.arg(format!("{}#{}", flake_ref, attribute));
-                    }
-                    BuildTarget::NonFlake { file, attribute } => {
-                        path_info_cmd.args(["--file", file]);
-                        if let Some(attr) = attribute {
-                            path_info_cmd.arg(attr);
-                        }
                     }
                 }
 
@@ -152,40 +161,99 @@ impl NixCli {
                 if path_info_out.status.success() {
                     let paths = String::from_utf8_lossy(&path_info_out.stdout);
                     for p in paths.lines() {
-                        if !p.trim().is_empty() {
-                            all_paths.push(p.trim().to_string());
+                        let trimmed = p.trim();
+                        if !trimmed.is_empty() {
+                            all_paths.push(trimmed.to_string());
                         }
                     }
-                    continue;
+                } else {
+                    return Err(BuilderError::NixCli(
+                        "Failed to build flake targets and fallback path-info failed".to_string(),
+                    ));
                 }
-                return Err(BuilderError::NixCli(format!(
-                    "Failed to build target: {}",
-                    target
-                )));
-            }
-
-            let json_str = String::from_utf8_lossy(&output.stdout);
-            if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
-                if let Some(arr) = val.as_array() {
-                    for item in arr {
-                        if let Some(outputs) = item.get("outputs").and_then(|o| o.as_object()) {
-                            for val in outputs.values() {
-                                if let Some(p) = val.as_str() {
-                                    all_paths.push(p.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                return Err(BuilderError::NixCli(format!(
-                    "Failed to parse build JSON output for target: {}",
-                    target
-                )));
             }
         }
 
+        // 2. 处理 NonFlake 目标 (按 file 分组批量构建)
+        let mut non_flake_groups: HashMap<&str, Vec<Option<&str>>> = HashMap::new();
+        for target in targets {
+            if let BuildTarget::NonFlake { file, attribute } = target {
+                non_flake_groups
+                    .entry(file.as_str())
+                    .or_default()
+                    .push(attribute.as_deref());
+            }
+        }
+
+        for (file, attrs) in non_flake_groups {
+            info!("Batch building non-flake targets for file: {}", file);
+            let mut cmd = Command::new("nix");
+            cmd.arg("build");
+            if let Some(ref config) = nix_config {
+                NixEnvInjector::apply_to_command(&mut cmd, config);
+            }
+            cmd.args(["--file", file]);
+            for a in attrs.iter().flatten() {
+                cmd.arg(*a);
+            }
+            cmd.args(["--no-link", "--json"]);
+
+            let output = cmd.output().await?;
+            if output.status.success() {
+                let json_str = String::from_utf8_lossy(&output.stdout);
+                Self::extract_outputs_from_json(&json_str, &mut all_paths)?;
+            } else {
+                error!(
+                    "Batch nix build for non-flake targets failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Fallback to nix path-info
+                let mut path_info_cmd = Command::new("nix");
+                path_info_cmd.args(["path-info", "--file", file]);
+                for a in attrs.iter().flatten() {
+                    path_info_cmd.arg(*a);
+                }
+
+                let path_info_out = path_info_cmd.output().await?;
+                if path_info_out.status.success() {
+                    let paths = String::from_utf8_lossy(&path_info_out.stdout);
+                    for p in paths.lines() {
+                        let trimmed = p.trim();
+                        if !trimmed.is_empty() {
+                            all_paths.push(trimmed.to_string());
+                        }
+                    }
+                } else {
+                    return Err(BuilderError::NixCli(format!(
+                        "Failed to build non-flake targets for {}",
+                        file
+                    )));
+                }
+            }
+        }
+
+        all_paths.sort();
+        all_paths.dedup();
         Ok(all_paths)
+    }
+
+    fn extract_outputs_from_json(
+        json_str: &str,
+        all_paths: &mut Vec<String>,
+    ) -> Result<(), BuilderError> {
+        let val: Value = serde_json::from_str(json_str)?;
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(outputs) = item.get("outputs").and_then(|o| o.as_object()) {
+                    for v in outputs.values() {
+                        if let Some(p) = v.as_str() {
+                            all_paths.push(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn find_locally_built_paths(
@@ -267,6 +335,7 @@ pub fn parse_path_info_items(parsed: &Value) -> Result<Vec<Value>, BuilderError>
 }
 
 pub fn filter_locally_built_paths(items: &[Value], own_hashes: &[String]) -> Vec<String> {
+    let own_hashes_set: HashSet<&str> = own_hashes.iter().map(|s| s.as_str()).collect();
     let mut locally_built = Vec::new();
     for item in items {
         if let Some(path) = item.get("path").and_then(|p| p.as_str()) {
@@ -285,7 +354,7 @@ pub fn filter_locally_built_paths(items: &[Value], own_hashes: &[String]) -> Vec
                 && name.len() >= 32
             {
                 let hash = &name[..32];
-                if !own_hashes.iter().any(|h| h == hash) {
+                if !own_hashes_set.contains(hash) {
                     locally_built.push(path.to_string());
                 }
             }
@@ -303,8 +372,90 @@ pub async fn get_own_public_key(signing_key_file: Option<&str>) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildTarget, filter_locally_built_paths, parse_path_info_items};
+    use super::{
+        BuildMode, BuildTarget, NixCli, filter_locally_built_paths, parse_path_info_items,
+    };
     use serde_json::json;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_build_mode_parsing() {
+        assert_eq!(BuildMode::from_str("flake").unwrap(), BuildMode::Flake);
+        assert_eq!(BuildMode::from_str("FLAKE ").unwrap(), BuildMode::Flake);
+        assert_eq!(
+            BuildMode::from_str("non-flake").unwrap(),
+            BuildMode::NonFlake
+        );
+        assert_eq!(
+            BuildMode::from_str("nonflake").unwrap(),
+            BuildMode::NonFlake
+        );
+        assert_eq!(
+            BuildMode::from_str("Non-Flake").unwrap(),
+            BuildMode::NonFlake
+        );
+        assert!(BuildMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_extract_outputs_from_json() {
+        let json_str = r#"[
+            {
+                "outputs": {
+                    "out": "/nix/store/11111111111111111111111111111111-pkg-a",
+                    "dev": "/nix/store/22222222222222222222222222222222-pkg-a-dev"
+                }
+            },
+            {
+                "outputs": {
+                    "bin": "/nix/store/33333333333333333333333333333333-pkg-b"
+                }
+            },
+            {
+                "outputs": {}
+            }
+        ]"#;
+
+        let mut paths = Vec::new();
+        NixCli::extract_outputs_from_json(json_str, &mut paths).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&"/nix/store/11111111111111111111111111111111-pkg-a".to_string()));
+        assert!(
+            paths.contains(&"/nix/store/22222222222222222222222222222222-pkg-a-dev".to_string())
+        );
+        assert!(paths.contains(&"/nix/store/33333333333333333333333333333333-pkg-b".to_string()));
+    }
+
+    #[test]
+    fn test_filter_locally_built_paths_edge_cases() {
+        let json_data = json!([
+            {
+                "path": "/nix/store/short",
+                "signatures": []
+            },
+            {
+                "path": "/nix/store/44444444444444444444444444444444-no-sigs-field"
+            },
+            {
+                "path": "/nix/store/55555555555555555555555555555555-sigs-null",
+                "signatures": null
+            },
+            {
+                "path": "/nix/store/66666666666666666666666666666666-sigs-alias",
+                "sigs": ["key1:sig"]
+            }
+        ]);
+
+        let items = parse_path_info_items(&json_data).unwrap();
+        let filtered = filter_locally_built_paths(&items, &[]);
+        assert_eq!(
+            filtered,
+            vec![
+                "/nix/store/44444444444444444444444444444444-no-sigs-field".to_string(),
+                "/nix/store/55555555555555555555555555555555-sigs-null".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn test_build_target_display() {

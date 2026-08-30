@@ -2,7 +2,6 @@ use crate::{
     error::TransportError,
     transport::{BoxBodyStream, OciTransport, UploadChunkResponse},
 };
-use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -41,8 +40,6 @@ impl MockRouterTransport {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OciTransport for MockRouterTransport {
     type BodyStream = BoxBodyStream;
 

@@ -11,7 +11,7 @@ pub mod upload;
 
 pub use backend::{
     AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
-    GenericOciDriver, GhcrDriver, OciBackendDriver, RegistryCapabilities, RegistryKind,
+    GenericOciDriver, GhcrDriver, OciBackendDriver, OciDriver, RegistryCapabilities, RegistryKind,
     detect_driver, driver_for_kind,
 };
 pub use client::{FetchedOciArtifact, OciClient};
@@ -44,15 +44,15 @@ mod tests {
     use super::{
         AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, GenericOciDriver, GhcrDriver,
         HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest, NarInfoMeta,
-        OciBackendDriver, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
-        RegistryKind, SessionMutationRequest, StoreHash, SystemArch, TransportError, UploadConfig,
-        build_image_index, parse_range_header,
+        OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryKind,
+        SessionMutationRequest, StoreHash, StreamHashState, SystemArch, TransportError,
+        UploadConfig, build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
     use http::{HeaderMap, StatusCode};
     use sha2::{Digest, Sha256};
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
 
     #[test]
     fn test_driver_capabilities_and_canonicalization() {
@@ -136,7 +136,7 @@ mod tests {
             .get_token()
             .await
             .expect("Should fallback to github_token");
-        assert_eq!(token, "fallback-token");
+        assert_eq!(token.as_ref(), "fallback-token");
     }
 
     #[tokio::test]
@@ -261,7 +261,7 @@ mod tests {
             "test/repo",
             "",
             true,
-            Arc::new(GenericOciDriver),
+            GenericOciDriver,
             transport,
         );
         let err = client
@@ -456,7 +456,7 @@ mod tests {
             "test/repo",
             "token123",
             true,
-            Arc::new(DockerHubDriver),
+            DockerHubDriver,
             transport,
         );
         let pushed_digest = client
@@ -486,7 +486,7 @@ mod tests {
             "test/repo",
             "token123",
             true,
-            Arc::new(GhcrDriver),
+            GhcrDriver,
             transport,
         );
 
@@ -503,5 +503,105 @@ mod tests {
 
         assert_eq!(total_size, data.len() as u64);
         assert!(pushed_digest.starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_hash_state_single_arc_inner() {
+        let state = StreamHashState::new();
+        assert_eq!(state.bytes_streamed(), 0);
+        assert_eq!(state.digest(), None);
+
+        let chunk1 = Bytes::from_static(b"chunk1 ");
+        let chunk2 = Bytes::from_static(b"chunk2");
+        let input_stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TransportError>(chunk1),
+            Ok::<Bytes, TransportError>(chunk2),
+        ]);
+
+        let (mut stream, stream_state) = HashingStream::new(input_stream);
+        let state_clone = stream_state.clone();
+
+        while let Some(item) = stream.next().await {
+            assert!(item.is_ok());
+        }
+
+        assert_eq!(stream_state.bytes_streamed(), 13);
+        assert_eq!(state_clone.bytes_streamed(), 13);
+        assert!(stream_state.digest().is_some());
+        assert_eq!(stream_state.digest(), state_clone.digest());
+    }
+
+    #[tokio::test]
+    async fn test_push_blob_streaming_resumable_chunked_bytesmut() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::new(
+            "generic.registry",
+            "test/repo",
+            "token",
+            true,
+            GenericOciDriver,
+            transport,
+        );
+
+        let data = vec![0x42u8; 3 * 1024 * 1024]; // 3MB
+        let chunks: Vec<Result<Bytes, TransportError>> = data
+            .chunks(512 * 1024)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let input_stream = futures_util::stream::iter(chunks);
+        let boxed_stream = Box::pin(input_stream);
+
+        let config = UploadConfig {
+            chunk_size_bytes: 1024 * 1024,
+            chunk_threshold_bytes: 1024 * 1024,
+            max_retry_attempts: 3,
+        };
+
+        let (pushed_digest, total_size) = client
+            .push_blob_streaming_resumable(boxed_stream, &config)
+            .await
+            .expect("Resumable chunked upload should succeed");
+
+        assert_eq!(total_size, 3 * 1024 * 1024);
+        assert!(pushed_digest.starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn test_get_manifest_with_digest_utf8_validation() {
+        let transport = MockRouterTransport::default();
+        // 1. 合法 UTF-8
+        transport.add_route(
+            "GET",
+            "/manifests/valid-tag",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(b"{\"schemaVersion\":2}"),
+            },
+        );
+        // 2. 非法 UTF-8
+        transport.add_route(
+            "GET",
+            "/manifests/invalid-utf8",
+            MockResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(&[0xFF, 0xFE, 0xFD]),
+            },
+        );
+
+        let client = OciClient::with_transport("example.com", "test/repo", "", false, transport);
+
+        let valid = client.get_manifest_with_digest("valid-tag").await.unwrap();
+        assert!(valid.is_some());
+        let (body, digest) = valid.unwrap();
+        assert_eq!(body, "{\"schemaVersion\":2}");
+        assert!(digest.starts_with("sha256:"));
+
+        let invalid_err = client
+            .get_manifest_with_digest("invalid-utf8")
+            .await
+            .unwrap_err();
+        assert!(format!("{}", invalid_err).contains("Invalid UTF-8 manifest"));
     }
 }

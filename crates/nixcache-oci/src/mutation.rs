@@ -3,7 +3,7 @@ use nixcache_core::{
     ArchRunSessionManifest, IndexEntry, JobSummaryMetadata, RunSessionManifest, StoreHash,
     SystemArch,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct SessionMutationRequest {
@@ -89,11 +89,9 @@ impl SessionMutationRequest {
 
         session.entries.extend(self.new_entries.clone());
         let roots_entry = session.gc_roots.entry(self.system).or_default();
-        let mut set: HashSet<StoreHash> = roots_entry.iter().cloned().collect();
-        set.extend(self.new_roots.clone());
-        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
-        sorted.sort();
-        *roots_entry = sorted;
+        roots_entry.extend_from_slice(&self.new_roots);
+        roots_entry.sort_unstable();
+        roots_entry.dedup();
         session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         session.completed_jobs.push(JobSummaryMetadata {
@@ -124,11 +122,9 @@ impl SessionMutationRequest {
         }
 
         session.entries.extend(self.new_entries.clone());
-        let mut set: HashSet<StoreHash> = session.gc_roots.iter().cloned().collect();
-        set.extend(self.new_roots.clone());
-        let mut sorted: Vec<StoreHash> = set.into_iter().collect();
-        sorted.sort();
-        session.gc_roots = sorted;
+        session.gc_roots.extend_from_slice(&self.new_roots);
+        session.gc_roots.sort_unstable();
+        session.gc_roots.dedup();
         session.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         session.completed_jobs.push(JobSummaryMetadata {
@@ -138,5 +134,40 @@ impl SessionMutationRequest {
             uploaded_bytes: self.uploaded_bytes,
             timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionMutationRequest;
+    use nixcache_core::{ArchRunSessionManifest, RunSessionManifest, StoreHash, SystemArch};
+
+    fn h(id: u8) -> StoreHash {
+        format!("{:032x}", id).parse().unwrap()
+    }
+
+    #[test]
+    fn test_gc_roots_merge_and_dedup() {
+        let mut manifest = RunSessionManifest::default();
+        manifest
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![h(2), h(1)]);
+
+        let req = SessionMutationRequest::new(1, "job1", SystemArch::X86_64Linux)
+            .with_roots(vec![h(3), h(2)]);
+
+        req.apply_to(&mut manifest);
+
+        let roots = manifest.gc_roots.get(&SystemArch::X86_64Linux).unwrap();
+        assert_eq!(roots, &vec![h(1), h(2), h(3)]);
+
+        let mut arch_manifest = ArchRunSessionManifest::new(1, SystemArch::X86_64Linux);
+        arch_manifest.gc_roots = vec![h(3), h(1)];
+
+        let req_arch = SessionMutationRequest::new(1, "job1", SystemArch::X86_64Linux)
+            .with_roots(vec![h(2), h(1)]);
+
+        req_arch.apply_to_arch(&mut arch_manifest);
+        assert_eq!(arch_manifest.gc_roots, vec![h(1), h(2), h(3)]);
     }
 }

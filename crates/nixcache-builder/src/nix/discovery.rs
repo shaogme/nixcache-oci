@@ -2,9 +2,20 @@ use crate::{
     error::BuilderError,
     nix::driver::{BuildConfig, BuildMode, BuildTarget, NixCli},
 };
+use serde::Deserialize;
 use std::path::Path;
 use tokio::{fs, process::Command};
 use tracing::info;
+
+#[derive(Deserialize, Debug, Default)]
+struct DiscoveredFlakeOutputs {
+    #[serde(default)]
+    pkgs: Vec<String>,
+    #[serde(rename = "devShells", default)]
+    dev_shells: Vec<String>,
+    #[serde(default)]
+    nixos: Vec<String>,
+}
 
 /// 发现 Nix 构建目标
 pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, BuilderError> {
@@ -45,82 +56,68 @@ pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, 
 
             let mut targets = Vec::new();
 
-            // 1. Packages
-            let expr = format!("{}#packages.{}", flake_ref, system);
-            let output = Command::new("nix")
-                .args([
-                    "eval",
-                    &expr,
-                    "--apply",
-                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-                    "--raw",
-                ])
-                .output()
-                .await;
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let names = String::from_utf8_lossy(&out.stdout);
-                for name in names.lines() {
-                    if !name.trim().is_empty() {
-                        targets.push(BuildTarget::Flake {
-                            flake_ref: flake_ref.clone(),
-                            attribute: format!("packages.{}.{}", system, name.trim()),
-                        });
-                    }
-                }
-            }
-
-            // 2. NixOS Configurations
-            let expr = format!("{}#nixosConfigurations", flake_ref);
-            let filter_expr = format!(
-                "attrs: builtins.concatStringsSep \"\\n\" (builtins.filter (name: (attrs.${{name}}.config.nixpkgs.system or attrs.${{name}}.pkgs.system or \"{}\") == \"{}\") (builtins.attrNames attrs))",
-                system, system
+            // 一次性求值 Packages, NixOS Configurations 与 DevShells
+            let expr = format!(
+                r#"let
+  flake = builtins.getFlake "{}";
+  sys = "{}";
+  pkgs = builtins.attrNames (flake.packages.${{sys}} or {{}});
+  devShells = builtins.attrNames (flake.devShells.${{sys}} or {{}});
+  allNixos = flake.nixosConfigurations or {{}};
+  nixos = builtins.filter (name:
+    let cfg = allNixos.${{name}};
+    in (cfg.config.nixpkgs.system or cfg.pkgs.system or sys) == sys
+  ) (builtins.attrNames allNixos);
+in {{ inherit pkgs devShells nixos; }}"#,
+                flake_ref, system
             );
+
             let output = Command::new("nix")
-                .args(["eval", &expr, "--apply", &filter_expr, "--raw"])
+                .args(["eval", "--json", "--impure", "--expr", &expr])
                 .output()
-                .await;
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let names = String::from_utf8_lossy(&out.stdout);
-                for name in names.lines() {
-                    if !name.trim().is_empty() {
-                        targets.push(BuildTarget::Flake {
-                            flake_ref: flake_ref.clone(),
-                            attribute: format!(
-                                "nixosConfigurations.{}.config.system.build.toplevel",
-                                name.trim()
-                            ),
-                        });
-                    }
+                .await?;
+
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                return Err(BuilderError::NixCli(format!(
+                    "nix eval for flake discovery failed: {}",
+                    err_msg
+                )));
+            }
+
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let discovered: DiscoveredFlakeOutputs = serde_json::from_str(&json_str)?;
+
+            for name in discovered.pkgs {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    targets.push(BuildTarget::Flake {
+                        flake_ref: flake_ref.clone(),
+                        attribute: format!("packages.{}.{}", system, trimmed),
+                    });
                 }
             }
 
-            // 3. DevShells
-            let expr = format!("{}#devShells.{}", flake_ref, system);
-            let output = Command::new("nix")
-                .args([
-                    "eval",
-                    &expr,
-                    "--apply",
-                    "attrs: builtins.concatStringsSep \"\\n\" (builtins.attrNames attrs)",
-                    "--raw",
-                ])
-                .output()
-                .await;
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let names = String::from_utf8_lossy(&out.stdout);
-                for name in names.lines() {
-                    if !name.trim().is_empty() {
-                        targets.push(BuildTarget::Flake {
-                            flake_ref: flake_ref.clone(),
-                            attribute: format!("devShells.{}.{}", system, name.trim()),
-                        });
-                    }
+            for name in discovered.nixos {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    targets.push(BuildTarget::Flake {
+                        flake_ref: flake_ref.clone(),
+                        attribute: format!(
+                            "nixosConfigurations.{}.config.system.build.toplevel",
+                            trimmed
+                        ),
+                    });
+                }
+            }
+
+            for name in discovered.dev_shells {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    targets.push(BuildTarget::Flake {
+                        flake_ref: flake_ref.clone(),
+                        attribute: format!("devShells.{}.{}", system, trimmed),
+                    });
                 }
             }
 
@@ -156,8 +153,21 @@ pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, 
 
 #[cfg(test)]
 mod tests {
-    use super::discover_outputs;
+    use super::{DiscoveredFlakeOutputs, discover_outputs};
     use crate::nix::driver::{BuildConfig, BuildMode, BuildTarget};
+
+    #[test]
+    fn test_discovered_flake_outputs_deserialization() {
+        let json_str = r#"{
+            "pkgs": ["pkgA", "pkgB"],
+            "devShells": ["default"],
+            "nixos": ["host1"]
+        }"#;
+        let outputs: DiscoveredFlakeOutputs = serde_json::from_str(json_str).unwrap();
+        assert_eq!(outputs.pkgs, vec!["pkgA", "pkgB"]);
+        assert_eq!(outputs.dev_shells, vec!["default"]);
+        assert_eq!(outputs.nixos, vec!["host1"]);
+    }
 
     #[tokio::test]
     async fn test_non_flake_discovery() {

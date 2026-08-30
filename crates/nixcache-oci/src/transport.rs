@@ -1,5 +1,4 @@
 use crate::error::TransportError;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, ready, stream::BoxStream};
 use http::{HeaderMap, StatusCode};
@@ -63,11 +62,16 @@ pub struct UploadSessionInfo {
     pub last_range_end: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+struct StreamHashInner {
+    bytes_streamed: AtomicU64,
+    finalized_digest: OnceLock<String>,
+}
+
 /// 零锁流式哈希与进度观察句柄
 #[derive(Clone, Default, Debug)]
 pub struct StreamHashState {
-    bytes_streamed: Arc<AtomicU64>,
-    finalized_digest: Arc<OnceLock<String>>,
+    inner: Arc<StreamHashInner>,
 }
 
 impl StreamHashState {
@@ -77,20 +81,20 @@ impl StreamHashState {
 
     #[inline]
     pub fn bytes_streamed(&self) -> u64 {
-        self.bytes_streamed.load(Ordering::Relaxed)
+        self.inner.bytes_streamed.load(Ordering::Relaxed)
     }
 
     #[inline]
     pub fn digest(&self) -> Option<String> {
-        self.finalized_digest.get().cloned()
+        self.inner.finalized_digest.get().cloned()
     }
 
     /// 若流提前终止需要强制计算已传输部分的哈希
     pub fn force_finalize(&self) -> String {
-        if let Some(d) = self.finalized_digest.get() {
+        if let Some(d) = self.inner.finalized_digest.get() {
             return d.clone();
         }
-        let d = self.finalized_digest.get_or_init(|| {
+        let d = self.inner.finalized_digest.get_or_init(|| {
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()
         });
         d.clone()
@@ -138,6 +142,7 @@ where
                 // 100% 零锁操作！直接更新本地独占的 hasher
                 this.hasher.update(&bytes);
                 this.state
+                    .inner
                     .bytes_streamed
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Poll::Ready(Some(Ok(bytes)))
@@ -145,7 +150,7 @@ where
             Some(Err(e)) => Poll::Ready(Some(Err(e))),
             None => {
                 // 流结束，一次性无锁计算并存入 OnceLock
-                this.state.finalized_digest.get_or_init(|| {
+                this.state.inner.finalized_digest.get_or_init(|| {
                     let hash = this.hasher.clone().finalize();
                     format!(
                         "sha256:{}",
@@ -181,10 +186,9 @@ pub fn parse_range_header(header_val: &str) -> Option<(u64, u64)> {
 }
 
 /// 纯协议层 OCI 传输抽象特征（零条件编译，Rust 2024 原生 Trait 异步方法）
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait OciTransport: 'static {
-    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + 'static;
+#[allow(async_fn_in_trait)]
+pub trait OciTransport: Send + Sync + 'static {
+    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Send + 'static;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
 

@@ -8,7 +8,12 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{fs, process::Command, time::sleep};
+use tokio::{
+    fs,
+    io::{AsyncWriteExt, BufWriter},
+    process::Command,
+    time::{Instant, sleep},
+};
 use tracing::info;
 
 pub fn find_proxy_binary() -> PathBuf {
@@ -28,8 +33,15 @@ pub fn find_proxy_binary() -> PathBuf {
 }
 
 pub async fn record_store_snapshot(snap_path: &Path) -> Result<(), BuilderError> {
+    record_store_snapshot_from_dir(Path::new("/nix/store"), snap_path).await
+}
+
+pub async fn record_store_snapshot_from_dir(
+    store_dir: &Path,
+    snap_path: &Path,
+) -> Result<(), BuilderError> {
     let mut paths = Vec::new();
-    if let Ok(mut entries) = fs::read_dir("/nix/store").await {
+    if let Ok(mut entries) = fs::read_dir(store_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(name) = entry.file_name().to_str() {
                 paths.push(name.to_string());
@@ -40,8 +52,13 @@ pub async fn record_store_snapshot(snap_path: &Path) -> Result<(), BuilderError>
     if let Some(parent) = snap_path.parent() {
         let _ = fs::create_dir_all(parent).await;
     }
-    let content = paths.join("\n");
-    fs::write(snap_path, content).await?;
+    let file = fs::File::create(snap_path).await?;
+    let mut writer = BufWriter::new(file);
+    for path in &paths {
+        writer.write_all(path.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await?;
     info!(
         "Recorded store snapshot with {} paths to {:?}",
         paths.len(),
@@ -103,14 +120,20 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
     let client = reqwest::Client::new();
     let probe_url = format!("http://{}:{}/nix-cache-info", opts.listen, opts.port);
     let mut ready = false;
-    for _ in 1..=20 {
+    let mut backoff = Duration::from_millis(10);
+    let max_backoff = Duration::from_millis(100);
+    let max_wait = Duration::from_secs(10);
+    let start_time = Instant::now();
+
+    while start_time.elapsed() < max_wait {
         if let Ok(res) = client.get(&probe_url).send().await
             && res.status().is_success()
         {
             ready = true;
             break;
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
     }
 
     if !ready {
@@ -142,4 +165,35 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
 
     write_session_init_summary(opts.repo, opts.run_id, opts.branch.as_deref(), opts.port).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_record_store_snapshot_from_dir() {
+        let temp = tempdir().unwrap();
+        let fake_store = temp.path().join("store");
+        fs::create_dir_all(&fake_store).await.unwrap();
+
+        fs::write(fake_store.join("cccc-pkg"), b"").await.unwrap();
+        fs::write(fake_store.join("aaaa-pkg"), b"").await.unwrap();
+        fs::write(fake_store.join("bbbb-pkg"), b"").await.unwrap();
+
+        let snap_file = temp.path().join("snap/snapshot.txt");
+        record_store_snapshot_from_dir(&fake_store, &snap_file)
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(&snap_file).await.unwrap();
+        assert_eq!(content, "aaaa-pkg\nbbbb-pkg\ncccc-pkg\n");
+    }
+
+    #[tokio::test]
+    async fn test_find_proxy_binary_fallback() {
+        let bin = find_proxy_binary();
+        assert!(!bin.as_os_str().is_empty());
+    }
 }
