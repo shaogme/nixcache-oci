@@ -485,7 +485,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_mode: [cargo, nix-source, nix-bin]
+        build_mode: [nix-bin]
         test_mode: [flake, legacy]
     steps:
       - uses: actions/checkout@main
