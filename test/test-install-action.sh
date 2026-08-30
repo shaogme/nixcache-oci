@@ -11,8 +11,10 @@ echo "=== Testing NixCache Install Action & Script ==="
 TMP_DIR=$(mktemp -d /tmp/nixcache-install-test-XXXXXX)
 cleanup() {
     rm -rf "$TMP_DIR"
+    rm -rf /homeless-shelter 2>/dev/null || true
 }
 trap cleanup EXIT
+rm -rf /homeless-shelter 2>/dev/null || true
 
 # 1. 测试默认安装 (binary)
 echo ">>> Test 1: Default Binary Installation..."
@@ -65,6 +67,7 @@ echo ">>> Test 3 Passed."
 
 # 4. 测试从源码安装 (SOURCE=source)
 echo ">>> Test 4: Source installation..."
+rm -rf /homeless-shelter 2>/dev/null || true
 export RUNNER_TEMP="$TMP_DIR/run4"
 : > "$GITHUB_OUTPUT"
 SOURCE=source FORCE=true ./install/install.sh

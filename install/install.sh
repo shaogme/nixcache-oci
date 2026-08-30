@@ -76,7 +76,9 @@ install_nixcache() {
     echo ">>> Building nixcache target: $target"
     local out_dir="${RUNNER_TEMP:-/tmp}/nixcache-bin-install"
     mkdir -p "$out_dir"
+    rm -rf /homeless-shelter 2>/dev/null || true
     nix build --accept-flake-config "$target" --out-link "$out_dir/result"
+    rm -rf /homeless-shelter 2>/dev/null || true
 
     local bin_dir="$out_dir/result/bin"
     if [[ ! -d "$bin_dir" ]]; then
