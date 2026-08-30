@@ -153,9 +153,9 @@ echo ">>> Promoting initial receipt to establish baseline index..."
 echo ">>> Testing Purge in Dry-Run mode for *lib1*..."
 "$BUILDER_BIN" purge --patterns "*lib1*" --cascade dependents --dry-run
 
-# 5. Test Actual Purge for lib1 with Cascade Dependents & Strict Flag
+# 5. Test Actual Purge for lib1 with Cascade Dependents
 echo ">>> Executing actual Purge for *lib1* with cascade dependents and strict mode..."
-"$BUILDER_BIN" purge --patterns "*lib1*" --cascade dependents --delete-blobs --allow-unsupported-blob-deletion
+"$BUILDER_BIN" purge --patterns "*lib1*" --cascade dependents --delete-blobs
 
 # 6. Test Purge All to reset baseline
 echo ">>> Testing Purge All to clear baseline..."

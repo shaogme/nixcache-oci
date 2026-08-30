@@ -423,12 +423,6 @@ pub struct GcArgs {
 
     #[arg(
         long,
-        help = "Allow skipping physical blob deletion if registry does not support it (e.g. GHCR) [env: NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION]"
-    )]
-    pub allow_unsupported_blob_deletion: bool,
-
-    #[arg(
-        long,
         default_missing_value = "true",
         num_args = 0..=1,
         help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
@@ -456,13 +450,6 @@ impl GcArgs {
         Env::get_bool("NIXCACHE_DELETE_BLOBS").unwrap_or(false)
     }
 
-    pub fn resolve_allow_unsupported_blob_deletion(&self) -> bool {
-        if self.allow_unsupported_blob_deletion {
-            return true;
-        }
-        Env::get_bool("NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION").unwrap_or(false)
-    }
-
     pub fn resolve_strict(&self) -> bool {
         if self.no_strict {
             return false;
@@ -484,7 +471,6 @@ impl GcArgs {
                 ..Default::default()
             },
             delete_blobs: self.resolve_delete_blobs(),
-            allow_unsupported_blob_deletion: self.resolve_allow_unsupported_blob_deletion(),
             strict: Some(self.resolve_strict()),
             no_strict: self.no_strict,
             dry_run: self.dry_run,

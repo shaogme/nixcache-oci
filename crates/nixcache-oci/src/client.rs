@@ -1334,7 +1334,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 return Err(OciError::OperationNotSupported {
                     backend: self.kind(),
                     reason: format!(
-                        "Backend '{}' does not support standalone physical OCI blob deletion. Pass --allow-unsupported-blob-deletion to bypass.",
+                        "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
                         self.kind()
                     ),
                 });

@@ -41,10 +41,6 @@ inputs:
     description: 'Attempt physical OCI blob deletion'
     required: false
     default: 'false'
-  allow-unsupported-blob-deletion:
-    description: 'Allow skipping blob deletion if registry does not support standalone blob deletion (e.g. GHCR)'
-    required: false
-    default: 'false'
   strict:
     description: 'Strict error handling mode (default true)'
     required: false
@@ -100,7 +96,6 @@ runs:
         NIXCACHE_CASCADE: ${{ inputs.cascade }}
         NIXCACHE_MIN_SIZE: ${{ inputs.min-size }}
         NIXCACHE_DELETE_BLOBS: ${{ inputs.delete-blobs }}
-        NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION: ${{ inputs.allow-unsupported-blob-deletion }}
         NIXCACHE_STRICT: ${{ inputs.strict }}
         NIXCACHE_DRY_RUN: ${{ inputs.dry-run }}
         NIXCACHE_REPO: ${{ inputs.repo }}
@@ -117,9 +112,6 @@ runs:
         fi
         if [[ "${{ inputs.delete-blobs }}" == "true" ]]; then
           EXTRA_ARGS+=(--delete-blobs)
-        fi
-        if [[ "${{ inputs.allow-unsupported-blob-deletion }}" == "true" ]]; then
-          EXTRA_ARGS+=(--allow-unsupported-blob-deletion)
         fi
         if [[ "${{ inputs.strict }}" == "false" ]]; then
           EXTRA_ARGS+=(--no-strict)

@@ -34,7 +34,6 @@ pub async fn run_purge(
 ) -> Result<(), BuilderError> {
     let dry_run = args.resolve_dry_run();
     let delete_blobs = args.resolve_delete_blobs();
-    let allow_unsupported_blobs = args.resolve_allow_unsupported_blob_deletion();
     let strict_mode = args.resolve_strict();
     let is_all = args.selector.resolve_all();
 
@@ -201,12 +200,12 @@ pub async fn run_purge(
     let mut deleted_blobs = 0;
     if delete_blobs && !purge_result.purged_nar_digests.is_empty() {
         if !oci.capabilities().supports_blob_physical_deletion {
-            if !allow_unsupported_blobs {
+            if strict_mode {
                 return Err(BuilderError::Oci(
                     nixcache_oci::OciError::OperationNotSupported {
                         backend: oci.kind(),
                         reason: format!(
-                            "Backend '{}' does not support standalone OCI blob deletion. Blobs are managed via package versions. To delete unused data on GHCR, use tag deletion or 'purge --all'. Pass --allow-unsupported-blob-deletion to bypass this error.",
+                            "Backend '{}' does not support standalone OCI blob deletion. Blobs are managed via package versions. To delete unused data on GHCR, use tag deletion or 'purge --all'.",
                             oci.kind()
                         ),
                     },

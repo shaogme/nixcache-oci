@@ -23,12 +23,6 @@ pub struct PurgeArgs {
 
     #[arg(
         long,
-        help = "Allow skipping physical blob deletion if registry does not support it (e.g. GHCR) [env: NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION]"
-    )]
-    pub allow_unsupported_blob_deletion: bool,
-
-    #[arg(
-        long,
         default_missing_value = "true",
         num_args = 0..=1,
         help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
@@ -51,13 +45,6 @@ impl PurgeArgs {
             return true;
         }
         Env::get_bool("NIXCACHE_DELETE_BLOBS").unwrap_or(false)
-    }
-
-    pub fn resolve_allow_unsupported_blob_deletion(&self) -> bool {
-        if self.allow_unsupported_blob_deletion {
-            return true;
-        }
-        Env::get_bool("NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION").unwrap_or(false)
     }
 
     pub fn resolve_strict(&self) -> bool {
@@ -108,7 +95,6 @@ mod tests {
                 ..Default::default()
             },
             delete_blobs: true,
-            allow_unsupported_blob_deletion: true,
             strict: Some(true),
             no_strict: false,
             dry_run: true,
@@ -131,7 +117,6 @@ mod tests {
         assert!(args.selector.resolve_origin_jobs().contains("job1"));
         assert!(args.selector.resolve_origin_runs().contains(&12345));
         assert!(args.resolve_delete_blobs());
-        assert!(args.resolve_allow_unsupported_blob_deletion());
         assert!(args.resolve_strict());
         assert!(args.selector.resolve_protect_gc_roots());
         assert!(args.resolve_dry_run());

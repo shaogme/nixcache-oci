@@ -261,7 +261,7 @@ jobs:
 ```
 
 - **全量清空与彻底重置 (`--all`)**：若指定 `--all`，GHCR 后端将通过 GitHub Packages REST API 直接彻底物理删除远程 Package 容器包及其所有历史版本；Generic OCI 后端将清空索引并物理回收 Blobs。
-- **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收（若在 GHCR 开启 `--delete-blobs`，可搭配 `--allow-unsupported-blob-deletion` 跳过不支持的独立 Blob 删除阶段）。
+- **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收。
 - **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
 
 
@@ -661,7 +661,6 @@ nixcache-builder gc \
 |---|---|---|---|
 | `--retention-days <DAYS>`| `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
 | `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 请求物理删除 OCI Blobs（在支持的后端如 Generic OCI 执行；在 GHCR 上 Blob 随版本回收） |
-| `--allow-unsupported-blob-deletion` | `NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION` | `false` | 若后端不支持独立 Blob 物理删除（如 GHCR），跳过该阶段而非报错中断 |
 | `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇权限不足或远程异常立即报错退出） |
 | `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
@@ -694,7 +693,6 @@ nixcache-builder purge \
 | `--origin-job <JOB>` | `NIXCACHE_ORIGIN_JOB` | （无） | 按 CI Job ID 过滤 |
 | `--origin-run <RUN_ID>` | `NIXCACHE_ORIGIN_RUN` | （无） | 按 CI Run ID 过滤 |
 | `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 请求物理删除 OCI Blobs（在支持的后端如 Generic OCI 执行；在 GHCR 上 Blob 随版本回收） |
-| `--allow-unsupported-blob-deletion` | `NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION` | `false` | 若后端不支持独立 Blob 物理删除（如 GHCR），跳过该阶段而非报错中断 |
 | `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇权限不足或远程异常立即报错退出） |
 | `--dry-run` | `NIXCACHE_DRY_RUN` | `false` | 试运行模式（仅输出审查报告，不修改远端） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
