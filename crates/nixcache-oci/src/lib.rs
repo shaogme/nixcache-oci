@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod client;
 pub mod codec;
 pub mod error;
@@ -6,8 +7,14 @@ pub mod mock;
 pub mod mutation;
 pub mod token;
 pub mod transport;
+pub mod upload;
 
-pub use client::{FetchedOciArtifact, OciClient, UploadConfig, UploadStrategy};
+pub use backend::{
+    AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
+    GenericOciDriver, GhcrDriver, OciBackendDriver, RegistryCapabilities, RegistryKind,
+    detect_driver, driver_for_kind,
+};
+pub use client::{FetchedOciArtifact, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TransportError};
 pub use manifest::{
@@ -30,19 +37,80 @@ pub use transport::{
     BoxBodyStream, HashingStream, OciBlobStream, OciTransport, StreamHashState,
     UploadChunkResponse, UploadSessionInfo, parse_range_header,
 };
+pub use upload::{BlobPayload, UploadConfig};
 
 #[cfg(test)]
 mod tests {
     use super::{
+        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, GenericOciDriver, GhcrDriver,
         HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest, NarInfoMeta,
-        OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, SessionMutationRequest,
-        StoreHash, SystemArch, TransportError, build_image_index, parse_range_header,
+        OciBackendDriver, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
+        RegistryKind, SessionMutationRequest, StoreHash, SystemArch, TransportError, UploadConfig,
+        build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
     use http::{HeaderMap, StatusCode};
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn test_driver_capabilities_and_canonicalization() {
+        let ghcr = GhcrDriver;
+        assert_eq!(ghcr.kind(), RegistryKind::Ghcr);
+        assert!(!ghcr.capabilities().supports_chunked_patch);
+        assert_eq!(
+            ghcr.capabilities().fixed_upload_strategy,
+            BlobUploadStrategy::FixedTwoStepPut
+        );
+        assert_eq!(ghcr.canonicalize_endpoint("  GHCR.IO "), "ghcr.io");
+        assert_eq!(ghcr.canonicalize_repository("/Owner/Repo/"), "owner/repo");
+        assert_eq!(
+            ghcr.format_auth_scope("owner/repo", true),
+            "repository:owner/repo/nix-cache:pull,push"
+        );
+        assert_eq!(
+            ghcr.resolve_token_endpoint("ghcr.io", "owner/repo", true),
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:owner/repo/nix-cache:pull,push"
+        );
+
+        let docker = DockerHubDriver;
+        assert_eq!(docker.kind(), RegistryKind::DockerHub);
+        assert!(docker.capabilities().supports_chunked_patch);
+        assert_eq!(
+            docker.capabilities().fixed_upload_strategy,
+            BlobUploadStrategy::PreferMonolithicPost
+        );
+        assert_eq!(
+            docker.canonicalize_endpoint("docker.io"),
+            "registry-1.docker.io"
+        );
+        assert_eq!(
+            docker.canonicalize_endpoint("index.docker.io"),
+            "registry-1.docker.io"
+        );
+        assert_eq!(docker.canonicalize_repository("ubuntu"), "library/ubuntu");
+        assert_eq!(docker.canonicalize_repository("user/repo"), "user/repo");
+        assert_eq!(
+            docker.format_auth_scope("ubuntu", false),
+            "repository:library/ubuntu/nix-cache:pull"
+        );
+        assert_eq!(
+            docker.resolve_token_endpoint("docker.io", "ubuntu", false),
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu/nix-cache:pull"
+        );
+
+        let generic = GenericOciDriver;
+        assert_eq!(generic.kind(), RegistryKind::GenericOci);
+        assert_eq!(
+            generic.resolve_token_endpoint("localhost:5000", "myrepo", true),
+            "http://localhost:5000/token?service=localhost:5000&scope=repository:myrepo/nix-cache:pull,push"
+        );
+
+        let aws = AwsEcrDriver;
+        assert_eq!(aws.kind(), RegistryKind::AwsEcr);
+        assert!(!aws.capabilities().supports_chunked_patch);
+    }
 
     #[tokio::test]
     async fn test_oci_client_token_fallback() {
@@ -187,7 +255,15 @@ mod tests {
             },
         );
 
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        // 使用支持 CAS If-Match 的 Generic 驱动
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            Arc::new(GenericOciDriver),
+            transport,
+        );
         let err = client
             .put_manifest_conditional("run-123", "{}", Some("sha256:old"))
             .await
@@ -374,13 +450,58 @@ mod tests {
         let data = Bytes::from_static(b"fast monolithic payload");
         let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-        let client =
-            OciClient::with_transport("example.com", "test/repo", "token123", true, transport);
+        // Docker Hub 支持 PreferMonolithicPost
+        let client = OciClient::new(
+            "docker.io",
+            "test/repo",
+            "token123",
+            true,
+            Arc::new(DockerHubDriver),
+            transport,
+        );
         let pushed_digest = client
             .push_blob_bytes_with_digest(digest, data)
             .await
             .unwrap();
 
         assert_eq!(pushed_digest, digest);
+    }
+
+    #[tokio::test]
+    async fn test_ghcr_driver_deterministic_two_step_put_without_patch() {
+        let transport = MockRouterTransport::default();
+        // 如果发送 PATCH 请求则返回 416
+        transport.add_route(
+            "PATCH",
+            "/uploads/",
+            MockResponse {
+                status: StatusCode::RANGE_NOT_SATISFIABLE,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+
+        let client = OciClient::new(
+            "ghcr.io",
+            "test/repo",
+            "token123",
+            true,
+            Arc::new(GhcrDriver),
+            transport,
+        );
+
+        let data = Bytes::from_static(b"streamed nar xz chunk data for test");
+        let input_stream =
+            futures_util::stream::iter(vec![Ok::<Bytes, TransportError>(data.clone())]);
+        let boxed_stream = Box::pin(input_stream);
+
+        let config = UploadConfig::default();
+        let (pushed_digest, total_size) = client
+            .push_blob_streaming_resumable(boxed_stream, &config)
+            .await
+            .expect("GHCR upload must succeed deterministically without ever sending PATCH");
+
+        assert_eq!(total_size, data.len() as u64);
+        assert!(pushed_digest.starts_with("sha256:"));
     }
 }

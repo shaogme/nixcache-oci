@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 nixcache-core = { workspace = true }
+nixcache-oci = { workspace = true }
 nixcache-utils = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["process"] }

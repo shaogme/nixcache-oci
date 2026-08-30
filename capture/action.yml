@@ -13,6 +13,10 @@ inputs:
     description: 'OCI Registry to push cache to'
     required: false
     default: 'ghcr.io'
+  registry-kind:
+    description: 'OCI Registry backend kind (ghcr, docker_hub, aws_ecr, gcp_artifact_registry, azure_acr, generic_oci). Leave empty to autodetect from registry host.'
+    required: false
+    default: ''
   run-id:
     description: 'Workflow run ID for Tier 1 session'
     required: false
@@ -76,6 +80,7 @@ runs:
         NIXCACHE_SYSTEM: ${{ inputs.system }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_JOB_ID: ${{ inputs.job-id }}
         NIXCACHE_OUTPUT_RECEIPT: ${{ inputs.output-receipt }}

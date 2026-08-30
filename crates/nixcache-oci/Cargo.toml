@@ -40,6 +40,7 @@ thiserror = { workspace = true }
 web-time = { workspace = true }
 
 [dev-dependencies]
+loom = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [lints.rust]

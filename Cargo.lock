@@ -1202,6 +1202,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "nixcache-core",
+ "nixcache-oci",
  "nixcache-utils",
  "tempfile",
  "thiserror",

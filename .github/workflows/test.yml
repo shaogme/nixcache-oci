@@ -176,7 +176,7 @@ jobs:
           ./test/test-multiarch-e2e.sh
 
   resilience-e2e:
-    name: 7. Resilience & Fault Injection E2E Tests
+    name: 7. Resilience & Multi-Backend E2E Tests
     runs-on: ubuntu-latest
     needs: nixos-vm-tests
     steps:
@@ -187,6 +187,11 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+
+      - name: Run OCI Multi-Backend Determinism Test
+        run: |
+          chmod +x test/test-backends-determinism.sh
+          ./test/test-backends-determinism.sh
 
       - name: Run Fault Tolerance & Upstream Fallback Test
         run: |
@@ -203,7 +208,7 @@ jobs:
           chmod +x test/test-concurrency-merge.sh
           ./test/test-concurrency-merge.sh
 
-      - name: Run Schema v3 Session CAS & Cascading Pipeline Test
+      - name: Run Schema v4 Session CAS & Cascading Pipeline Test
         run: |
           chmod +x test/test-pipeline-session-cas.sh
           ./test/test-pipeline-session-cas.sh
@@ -229,4 +234,3 @@ jobs:
         run: |
           chmod +x test/test-worker.sh
           ./test/test-worker.sh
-

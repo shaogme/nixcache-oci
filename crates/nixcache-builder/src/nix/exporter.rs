@@ -736,4 +736,90 @@ mod tests {
         assert!(report.failed.is_empty());
         assert!(report.total_bytes_uploaded > 0);
     }
+
+    #[tokio::test]
+    async fn test_parallel_exporter_prevents_ghcr_416_regression() {
+        let nix_store_available = tokio::process::Command::new("nix-store")
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success());
+
+        if !nix_store_available {
+            return;
+        }
+
+        let mut paths = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir("/nix/store").await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str()
+                    && !name.ends_with(".drv")
+                    && !name.ends_with(".lock")
+                {
+                    paths.push(format!("/nix/store/{}", name));
+                    if paths.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if paths.is_empty() {
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let host = server.address().to_string();
+
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v2/test/repo/nix-cache/blobs/uploads/",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/session-mock",
+            ))
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        // 模拟 GHCR 对所有 PATCH 请求返回 416
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(416))
+            .mount(&server)
+            .await;
+
+        let oci = nixcache_oci_backend::create_tokio_reqwest_client_with_driver(
+            &host,
+            "test/repo",
+            "",
+            true,
+            std::sync::Arc::new(nixcache_oci::GhcrDriver),
+        );
+        let config = super::ParallelExportConfig {
+            concurrency: 2,
+            signing_key_file: None,
+            fail_fast: true,
+            upload_config: nixcache_oci::UploadConfig::default(),
+            system: nixcache_core::SystemArch::from("x86_64-linux"),
+            origin_job: Some("job:test".to_string()),
+        };
+
+        let report = ParallelExporter::export_and_upload_paths(&paths, &oci, &config)
+            .await
+            .expect("Parallel export must succeed without failing on GHCR 416");
+
+        assert_eq!(report.successful.len(), paths.len());
+        assert!(report.failed.is_empty());
+        assert!(report.total_bytes_uploaded > 0);
+    }
 }

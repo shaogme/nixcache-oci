@@ -1,6 +1,7 @@
 pub mod sync;
 
 use crate::{
+    backend::driver::OciBackendDriver,
     error::OciError,
     token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
     transport::OciTransport,
@@ -8,10 +9,12 @@ use crate::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
+    access_token: Option<String>,
 }
 
 /// OCI 注册表鉴权令牌管理器（零锁 Singleflight 状态机）
@@ -21,33 +24,31 @@ pub struct TokenManager {
     repo: String,
     github_token: String,
     write_access: bool,
+    driver: Arc<dyn OciBackendDriver>,
     storage: TokenStorage,
     in_flight: InFlightState,
     broadcaster: TokenBroadcaster,
 }
 
 impl TokenManager {
-    pub fn new(registry: &str, repo: &str, github_token: &str, write_access: bool) -> Self {
+    pub fn new(
+        registry: &str,
+        repo: &str,
+        github_token: &str,
+        write_access: bool,
+        driver: Arc<dyn OciBackendDriver>,
+    ) -> Self {
+        let clean_registry = driver.canonicalize_endpoint(registry);
+        let clean_repo = driver.canonicalize_repository(repo);
         Self {
-            registry: registry.to_string(),
-            repo: repo.to_string(),
+            registry: clean_registry,
+            repo: clean_repo,
             github_token: github_token.to_string(),
             write_access,
+            driver,
             storage: TokenStorage::new(),
             in_flight: InFlightState::new(),
             broadcaster: TokenBroadcaster::new(),
-        }
-    }
-
-    fn url_scheme(&self) -> &str {
-        if self.registry.starts_with("localhost:")
-            || self.registry.starts_with("127.0.0.1:")
-            || self.registry == "localhost"
-            || self.registry == "127.0.0.1"
-        {
-            "http"
-        } else {
-            "https"
         }
     }
 
@@ -94,20 +95,9 @@ impl TokenManager {
     }
 
     async fn fetch_token_network<T: OciTransport>(&self, transport: &T) -> Option<String> {
-        let scope = if self.write_access {
-            "pull,push"
-        } else {
-            "pull"
-        };
-
-        let token_url = format!(
-            "{}://{}/token?scope=repository:{}/nix-cache:{}&service={}",
-            self.url_scheme(),
-            self.registry,
-            self.repo,
-            scope,
-            self.registry
-        );
+        let token_url =
+            self.driver
+                .resolve_token_endpoint(&self.registry, &self.repo, self.write_access);
 
         let mut headers = HeaderMap::new();
         if !self.github_token.is_empty() {
@@ -120,10 +110,9 @@ impl TokenManager {
 
         match transport.get(&token_url, headers).await {
             Ok((status, _resp_headers, bytes)) if status.is_success() => {
-                let parsed = serde_json::from_slice::<TokenResponse>(&bytes)
-                    .ok()
-                    .and_then(|r| r.token);
-                parsed.or_else(|| {
+                let parsed = serde_json::from_slice::<TokenResponse>(&bytes).ok();
+                let token_opt = parsed.and_then(|r| r.token.or(r.access_token));
+                token_opt.or_else(|| {
                     if !self.github_token.is_empty() {
                         Some(self.github_token.clone())
                     } else {
@@ -139,7 +128,10 @@ impl TokenManager {
 #[cfg(test)]
 mod tests {
     use super::TokenManager;
-    use crate::mock::{MockResponse, MockRouterTransport};
+    use crate::{
+        backend::driver::{GhcrDriver, detect_driver},
+        mock::{MockResponse, MockRouterTransport},
+    };
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
     use std::sync::{Arc, atomic::Ordering};
@@ -161,11 +153,13 @@ mod tests {
     #[tokio::test]
     async fn test_token_manager_singleflight_concurrent_storm() {
         let transport = Arc::new(make_test_transport());
+        let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
             "test.registry.io",
             "test/repo",
             "secret_tok",
             false,
+            driver,
         ));
 
         let mut handles = Vec::new();
@@ -194,7 +188,9 @@ mod tests {
     #[tokio::test]
     async fn test_token_manager_fast_path_cache_and_double_check() {
         let transport = make_test_transport();
-        let token_mgr = TokenManager::new("test.registry.io", "test/repo", "secret_tok", true);
+        let driver = detect_driver("test.registry.io");
+        let token_mgr =
+            TokenManager::new("test.registry.io", "test/repo", "secret_tok", true, driver);
 
         // 第一次调用：执行网络 Fetch
         let t1 = token_mgr.get_token(&transport).await.unwrap();
@@ -220,7 +216,14 @@ mod tests {
             },
         );
 
-        let token_mgr = TokenManager::new("test.registry.io", "test/repo", "fallback_token", false);
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "fallback_token",
+            false,
+            driver,
+        );
 
         // 首次调用网络失败，安全回退到 fallback token，不发生死锁或 panic
         let t1 = token_mgr.get_token(&transport).await.unwrap();
@@ -245,8 +248,9 @@ mod tests {
     #[tokio::test]
     async fn test_token_manager_scope_and_write_access() {
         let transport = MockRouterTransport::default();
-        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true);
-        let read_mgr = TokenManager::new("ghcr.io", "org/repo", "token", false);
+        let driver = Arc::new(GhcrDriver);
+        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true, driver.clone());
+        let read_mgr = TokenManager::new("ghcr.io", "org/repo", "token", false, driver);
 
         let t_write = write_mgr.get_token(&transport).await.unwrap();
         let t_read = read_mgr.get_token(&transport).await.unwrap();

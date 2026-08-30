@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use scc::HashMap as SccHashMap;
 use std::{
     sync::{
@@ -106,7 +106,16 @@ impl OciTransport for MockRouterTransport {
                 true
             }
         });
-        Ok(found.unwrap_or((StatusCode::ACCEPTED, HeaderMap::new())))
+        if let Some((status, headers)) = found {
+            Ok((status, headers))
+        } else {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Location",
+                HeaderValue::from_static("/v2/test/repo/nix-cache/blobs/uploads/session-mock"),
+            );
+            Ok((StatusCode::ACCEPTED, headers))
+        }
     }
 
     async fn post_bytes(
@@ -142,18 +151,37 @@ impl OciTransport for MockRouterTransport {
 
     async fn patch_chunk(
         &self,
-        _url: &str,
+        url: &str,
         _headers: HeaderMap,
         _chunk: Bytes,
         byte_range: (u64, u64),
     ) -> Result<UploadChunkResponse, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(UploadChunkResponse {
-            status: StatusCode::ACCEPTED,
-            headers: HeaderMap::new(),
-            location: None,
-            range: Some(byte_range),
-        })
+        let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+        let mut found = None;
+        self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "PATCH" && path.ends_with(suffix) {
+                found = Some((resp.status, resp.headers.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if let Some((status, headers)) = found {
+            Ok(UploadChunkResponse {
+                status,
+                headers,
+                location: None,
+                range: Some(byte_range),
+            })
+        } else {
+            Ok(UploadChunkResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                location: None,
+                range: Some(byte_range),
+            })
+        }
     }
 
     async fn patch_chunk_stream(

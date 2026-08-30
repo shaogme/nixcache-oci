@@ -6,11 +6,11 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    BoxBodyStream, OciClient, OciError, OciTransport, TransportError, UploadChunkResponse,
-    UploadConfig, UploadStrategy, parse_range_header,
+    BlobUploadStrategy, BoxBodyStream, OciBackendDriver, OciClient, OciError, OciTransport,
+    RegistryKind, TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
 };
 use reqwest::Client;
-use std::{io::SeekFrom, path::Path, time::Duration};
+use std::{io::SeekFrom, path::Path, sync::Arc, time::Duration};
 use tokio::{
     fs::{File, metadata, read},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -413,17 +413,10 @@ pub trait OciClientExt {
 #[async_trait]
 impl OciClientExt for OciClient<ReqwestTransport> {
     async fn push_blob_file(&self, file_path: &Path) -> Result<String, OciError> {
-        let meta = metadata(file_path).await?;
-        let size = meta.len();
-        if size < 64 * 1024 * 1024 {
-            let data = read(file_path).await?;
-            self.push_blob_bytes(Bytes::from(data)).await
-        } else {
-            let data = read(file_path).await?;
-            let digest = compute_sha256_digest(&data);
-            self.push_blob_file_resumable(file_path, &digest, &UploadConfig::default())
-                .await
-        }
+        let data = read(file_path).await?;
+        let digest = compute_sha256_digest(&data);
+        self.push_blob_file_resumable(file_path, &digest, &UploadConfig::default())
+            .await
     }
 
     async fn push_blob_file_resumable(
@@ -440,9 +433,14 @@ impl OciClientExt for OciClient<ReqwestTransport> {
         let file_meta = metadata(file_path).await?;
         let file_size = file_meta.len();
 
-        if file_size < config.chunk_threshold_bytes
-            && config.strategy != UploadStrategy::ForceChunked
-        {
+        let capabilities = self.driver().capabilities();
+        let strategy = capabilities.fixed_upload_strategy;
+
+        let allow_chunked = capabilities.supports_chunked_patch
+            && strategy == BlobUploadStrategy::ResumableChunkedPatch;
+
+        // 若当前后端不支持分块或文件小于阈值，确定性直传（两阶段 PUT 或单阶段 POST）
+        if !allow_chunked || file_size < config.chunk_threshold_bytes {
             let data = read(file_path).await?;
             return self
                 .push_blob_bytes_with_digest(digest, Bytes::from(data))
@@ -450,7 +448,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
         }
 
         info!(
-            "Initiating resumable chunked upload for blob {} (size: {} bytes, chunk: {} bytes)",
+            "Initiating standard chunked upload for blob {} (size: {} bytes, chunk: {} bytes)",
             digest, file_size, config.chunk_size_bytes
         );
 
@@ -604,6 +602,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
     }
 }
 
+/// 自动根据 registry 域名探测驱动并创建 Tokio Reqwest OCI 客户端
 pub fn create_tokio_reqwest_client(
     registry: &str,
     repo: &str,
@@ -614,12 +613,45 @@ pub fn create_tokio_reqwest_client(
     OciClient::with_transport(registry, repo, github_token, write_access, transport)
 }
 
+/// 基于指定 Driver 创建 Tokio Reqwest OCI 客户端
+pub fn create_tokio_reqwest_client_with_driver(
+    registry: &str,
+    repo: &str,
+    github_token: &str,
+    write_access: bool,
+    driver: Arc<dyn OciBackendDriver>,
+) -> OciClient<ReqwestTransport> {
+    let transport = ReqwestTransport::default();
+    OciClient::new(
+        registry,
+        repo,
+        github_token,
+        write_access,
+        driver,
+        transport,
+    )
+}
+
+/// 基于指定 RegistryKind 创建 Tokio Reqwest OCI 客户端
+pub fn create_tokio_reqwest_client_from_kind(
+    kind: RegistryKind,
+    registry: &str,
+    repo: &str,
+    github_token: &str,
+    write_access: bool,
+) -> OciClient<ReqwestTransport> {
+    let transport = ReqwestTransport::default();
+    OciClient::from_kind(kind, registry, repo, github_token, write_access, transport)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OciClientExt, create_tokio_reqwest_client};
-    use nixcache_oci::{UploadConfig, UploadStrategy};
+    use super::{
+        OciClientExt, create_tokio_reqwest_client, create_tokio_reqwest_client_with_driver,
+    };
+    use nixcache_oci::{BlobUploadStrategy, GhcrDriver, RegistryCapabilities, UploadConfig};
     use serde_json::json;
-    use std::io::Write;
+    use std::{io::Write, sync::Arc};
     use tempfile::NamedTempFile;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -746,18 +778,119 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = create_tokio_reqwest_client(&host, "test/repo", "", true);
+        // 构造一个配置了 ResumableChunkedPatch 能力的 Mock 驱动
+        #[derive(Debug, Clone)]
+        struct MockChunkedDriver;
+        static MOCK_CHUNKED_CAPS: RegistryCapabilities = RegistryCapabilities {
+            supports_chunked_patch: true,
+            supports_monolithic_post_1rtt: false,
+            supports_manifest_cas_if_match: true,
+            requires_library_namespace_expansion: false,
+            fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
+            custom_auth_endpoint: None,
+        };
+        impl nixcache_oci::OciBackendDriver for MockChunkedDriver {
+            fn kind(&self) -> nixcache_oci::RegistryKind {
+                nixcache_oci::RegistryKind::GenericOci
+            }
+            fn capabilities(&self) -> &'static RegistryCapabilities {
+                &MOCK_CHUNKED_CAPS
+            }
+            fn canonicalize_endpoint(&self, r: &str) -> String {
+                r.to_string()
+            }
+            fn canonicalize_repository(&self, r: &str) -> String {
+                r.to_string()
+            }
+            fn format_auth_scope(&self, repo: &str, write: bool) -> String {
+                let action = if write { "pull,push" } else { "pull" };
+                format!("repository:{}/nix-cache:{}", repo, action)
+            }
+            fn resolve_token_endpoint(&self, reg: &str, repo: &str, write: bool) -> String {
+                let scope = self.format_auth_scope(repo, write);
+                format!("http://{}/token?scope={}", reg, scope)
+            }
+        }
+
+        let client = create_tokio_reqwest_client_with_driver(
+            &host,
+            "test/repo",
+            "",
+            true,
+            Arc::new(MockChunkedDriver),
+        );
         let config = UploadConfig {
             chunk_threshold_bytes: 1024 * 1024,
             chunk_size_bytes: 1024 * 1024,
             max_retry_attempts: 3,
-            strategy: UploadStrategy::ForceChunked,
         };
 
         let res_digest = client
             .push_blob_file_resumable(file_path, &digest, &config)
             .await
             .unwrap();
+        assert_eq!(res_digest, digest);
+    }
+
+    #[tokio::test]
+    async fn test_oci_client_ext_ghcr_driver_deterministic_without_patch() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let payload = vec![0xCDu8; 2 * 1024 * 1024]; // 2MB
+        temp_file.write_all(&payload).unwrap();
+        let file_path = temp_file.path();
+
+        let digest = super::compute_sha256_digest(&payload);
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
+            .respond_with(ResponseTemplate::new(202).insert_header(
+                "Location",
+                "/v2/test/repo/nix-cache/blobs/uploads/ghcr-session",
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/v2/test/repo/nix-cache/blobs/uploads/ghcr-session"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        // 如果发送 PATCH，直接返回 416 报错
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(416))
+            .mount(&server)
+            .await;
+
+        // 使用 GhcrDriver
+        let client = create_tokio_reqwest_client_with_driver(
+            &host,
+            "test/repo",
+            "",
+            true,
+            Arc::new(GhcrDriver),
+        );
+        let config = UploadConfig {
+            chunk_threshold_bytes: 1024 * 1024,
+            chunk_size_bytes: 1024 * 1024,
+            max_retry_attempts: 3,
+        };
+
+        let res_digest = client
+            .push_blob_file_resumable(file_path, &digest, &config)
+            .await
+            .expect(
+                "GhcrDriver must succeed deterministically with two-step PUT without sending PATCH",
+            );
+
         assert_eq!(res_digest, digest);
     }
 }

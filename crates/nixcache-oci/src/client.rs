@@ -1,4 +1,8 @@
 use crate::{
+    backend::{
+        BlobUploadStrategy, OciBackendDriver, RegistryCapabilities, RegistryKind, detect_driver,
+        driver_for_kind,
+    },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
@@ -8,6 +12,7 @@ use crate::{
     mutation::SessionMutationRequest,
     token::TokenManager,
     transport::{HashingStream, OciBlobStream, OciTransport},
+    upload::UploadConfig,
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -20,44 +25,8 @@ use nixcache_core::{
 use nixcache_utils::get_process_id;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{mem, pin::pin, time::Duration};
+use std::{pin::pin, sync::Arc, time::Duration};
 use tracing::{error, info, warn};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UploadStrategy {
-    /// 自动决策：< 64MB 且已知 Digest 时采用 Monolithic 1-RTT，否则启用 Chunked Resumable
-    #[default]
-    Auto,
-    /// 强制单阶段 1-RTT POST 直传
-    ForceMonolithic,
-    /// 强制两阶段 PUT
-    ForceTwoStepPut,
-    /// 强制分块断点续传
-    ForceChunked,
-}
-
-#[derive(Debug, Clone)]
-pub struct UploadConfig {
-    /// 分块阈值，超过此大小触发分块上传（默认 64MB）
-    pub chunk_threshold_bytes: u64,
-    /// 单个分块大小（默认 32MB，最小 1MB）
-    pub chunk_size_bytes: usize,
-    /// 最大网络中断重试次数（默认 5 次）
-    pub max_retry_attempts: usize,
-    /// 上传策略
-    pub strategy: UploadStrategy,
-}
-
-impl Default for UploadConfig {
-    fn default() -> Self {
-        Self {
-            chunk_threshold_bytes: 64 * 1024 * 1024,
-            chunk_size_bytes: 32 * 1024 * 1024,
-            max_retry_attempts: 5,
-            strategy: UploadStrategy::Auto,
-        }
-    }
-}
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -77,29 +46,79 @@ pub struct FetchedOciArtifact {
     pub digest: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OciClient<T: OciTransport> {
     registry: String,
     repo: String,
+    driver: Arc<dyn OciBackendDriver>,
     token_manager: TokenManager,
     transport: T,
 }
 
 impl<T: OciTransport> OciClient<T> {
-    pub fn with_transport(
+    /// 基于指定驱动构造 OCI 客户端
+    pub fn new(
         registry: &str,
         repo: &str,
-        github_token: &str,
+        auth_token: &str,
         write_access: bool,
+        driver: Arc<dyn OciBackendDriver>,
         transport: T,
     ) -> Self {
-        let token_manager = TokenManager::new(registry, repo, github_token, write_access);
+        let canonical_registry = driver.canonicalize_endpoint(registry);
+        let canonical_repo = driver.canonicalize_repository(repo);
+        let token_manager = TokenManager::new(
+            &canonical_registry,
+            &canonical_repo,
+            auth_token,
+            write_access,
+            driver.clone(),
+        );
+
         Self {
-            registry: registry.to_string(),
-            repo: repo.to_string(),
+            registry: canonical_registry,
+            repo: canonical_repo,
+            driver,
             token_manager,
             transport,
         }
+    }
+
+    /// 基于指定的 RegistryKind 构造 OCI 客户端
+    pub fn from_kind(
+        kind: RegistryKind,
+        registry: &str,
+        repo: &str,
+        auth_token: &str,
+        write_access: bool,
+        transport: T,
+    ) -> Self {
+        let driver = driver_for_kind(kind);
+        Self::new(registry, repo, auth_token, write_access, driver, transport)
+    }
+
+    /// 自动根据 registry 域名推导后端类型并构造 OCI 客户端
+    pub fn with_transport(
+        registry: &str,
+        repo: &str,
+        auth_token: &str,
+        write_access: bool,
+        transport: T,
+    ) -> Self {
+        let driver = detect_driver(registry);
+        Self::new(registry, repo, auth_token, write_access, driver, transport)
+    }
+
+    pub fn driver(&self) -> &Arc<dyn OciBackendDriver> {
+        &self.driver
+    }
+
+    pub fn kind(&self) -> RegistryKind {
+        self.driver.kind()
+    }
+
+    pub fn capabilities(&self) -> &'static RegistryCapabilities {
+        self.driver.capabilities()
     }
 
     pub fn registry(&self) -> &str {
@@ -178,62 +197,8 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
-    pub async fn push_blob_bytes_with_digest(
-        &self,
-        digest: &str,
-        bytes: Bytes,
-    ) -> Result<String, OciError> {
-        if self.head_blob(digest).await? {
-            info!("Blob {} already exists, skipping upload.", digest);
-            return Ok(digest.to_string());
-        }
-
-        info!("Initiating 1-RTT / session upload for blob {}", digest);
-
-        // 1. 尝试 1-RTT Monolithic POST 直传
-        let monolithic_url = format!(
-            "{}://{}/v2/{}/nix-cache/blobs/uploads/?digest={}",
-            self.url_scheme(),
-            self.registry,
-            self.repo,
-            digest
-        );
-
-        let mut headers = self.get_auth_headers().await?;
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_static("application/octet-stream"),
-        );
-
-        match self
-            .transport
-            .post_bytes(&monolithic_url, headers.clone(), bytes.clone())
-            .await
-        {
-            Ok((status, _resp_headers))
-                if status == StatusCode::CREATED || status == StatusCode::OK =>
-            {
-                info!(
-                    "Successfully uploaded blob via 1-RTT Monolithic POST: {}",
-                    digest
-                );
-                return Ok(digest.to_string());
-            }
-            Ok((status, _)) => {
-                warn!(
-                    "Monolithic POST returned status {}, falling back to two-step upload for blob {}",
-                    status, digest
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Monolithic POST failed ({}), falling back to two-step upload for blob {}",
-                    e, digest
-                );
-            }
-        }
-
-        // 2. 回退到标准两阶段会话上传
+    /// 执行确定性两阶段会话 PUT 上传 (POST /uploads/ -> PUT <location>?digest=...)
+    async fn execute_two_step_put(&self, digest: &str, bytes: Bytes) -> Result<String, OciError> {
         let upload_init_url = format!(
             "{}://{}/v2/{}/nix-cache/blobs/uploads/",
             self.url_scheme(),
@@ -278,6 +243,72 @@ impl<T: OciTransport> OciClient<T> {
             Ok(digest.to_string())
         } else {
             Err(OciError::BlobUploadFailed(put_status))
+        }
+    }
+
+    pub async fn push_blob_bytes_with_digest(
+        &self,
+        digest: &str,
+        bytes: Bytes,
+    ) -> Result<String, OciError> {
+        if self.head_blob(digest).await? {
+            info!("Blob {} already exists, skipping upload.", digest);
+            return Ok(digest.to_string());
+        }
+
+        let strategy = self.driver.capabilities().fixed_upload_strategy;
+        match strategy {
+            BlobUploadStrategy::FixedTwoStepPut => {
+                // GHCR 等固化两阶段后端：严禁 Monolithic POST，100% 走两阶段 PUT
+                self.execute_two_step_put(digest, bytes).await
+            }
+            BlobUploadStrategy::PreferMonolithicPost
+            | BlobUploadStrategy::ResumableChunkedPatch => {
+                // 1. 尝试 1-RTT Monolithic POST 直传
+                let monolithic_url = format!(
+                    "{}://{}/v2/{}/nix-cache/blobs/uploads/?digest={}",
+                    self.url_scheme(),
+                    self.registry,
+                    self.repo,
+                    digest
+                );
+
+                let mut headers = self.get_auth_headers().await?;
+                headers.insert(
+                    "Content-Type",
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+
+                match self
+                    .transport
+                    .post_bytes(&monolithic_url, headers.clone(), bytes.clone())
+                    .await
+                {
+                    Ok((status, _resp_headers))
+                        if status == StatusCode::CREATED || status == StatusCode::OK =>
+                    {
+                        info!(
+                            "Successfully uploaded blob via 1-RTT Monolithic POST: {}",
+                            digest
+                        );
+                        Ok(digest.to_string())
+                    }
+                    Ok((status, _)) => {
+                        warn!(
+                            "Monolithic POST returned status {}, falling back to two-step upload for blob {}",
+                            status, digest
+                        );
+                        self.execute_two_step_put(digest, bytes).await
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Monolithic POST failed ({}), falling back to two-step upload for blob {}",
+                            e, digest
+                        );
+                        self.execute_two_step_put(digest, bytes).await
+                    }
+                }
+            }
         }
     }
 
@@ -348,6 +379,7 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
+    /// 确定性无盘流式上传管道 (依据后端 Driver 能力矩阵静态调度，彻底废除 416 运行时降级)
     pub async fn push_blob_streaming_resumable(
         &self,
         stream: T::BodyStream,
@@ -356,7 +388,63 @@ impl<T: OciTransport> OciClient<T> {
         let (hashing_stream, hash_state) = HashingStream::new(stream);
         let mut pinned_stream = pin!(hashing_stream);
 
-        info!("Initiating streaming resumable chunked upload");
+        let capabilities = self.driver.capabilities();
+        let strategy = capabilities.fixed_upload_strategy;
+
+        info!(
+            "Initiating deterministic streaming upload (backend: {:?}, strategy: {:?})",
+            self.driver.kind(),
+            strategy
+        );
+
+        let chunk_limit = config.chunk_size_bytes.max(1024 * 1024);
+        let threshold = config.chunk_threshold_bytes.max(chunk_limit as u64) as usize;
+        let mut buffer = Vec::new();
+
+        // 判定是否应当启用分块上传：仅当 Driver 明确支持分块且策略配置为 ResumableChunkedPatch 时
+        let allow_chunked = capabilities.supports_chunked_patch
+            && strategy == BlobUploadStrategy::ResumableChunkedPatch;
+
+        // 阶段 1：缓冲流数据
+        while let Some(item) = pinned_stream.next().await {
+            let bytes: Bytes = item?;
+            buffer.extend_from_slice(&bytes);
+            if buffer.len() >= threshold && allow_chunked {
+                break;
+            }
+        }
+
+        // 情况 A：流数据完整缓冲或当前后端不支持分块 (GHCR / PreferMonolithicPost)
+        if buffer.len() < threshold || !allow_chunked {
+            while let Some(item) = pinned_stream.next().await {
+                let bytes: Bytes = item?;
+                buffer.extend_from_slice(&bytes);
+            }
+
+            let final_digest = hash_state.force_finalize();
+            let total_size = hash_state.bytes_streamed();
+
+            // 1. 先 HEAD 检查是否已存在，如已存在直接秒级复用
+            if self.head_blob(&final_digest).await? {
+                info!("Blob {} already exists, skipping upload.", final_digest);
+                return Ok((final_digest, total_size));
+            }
+
+            // 2. 依据 Driver 静态确定的策略直传完整 Payload
+            let complete_bytes = Bytes::from(buffer);
+            let pushed_digest = self
+                .push_blob_bytes_with_digest(&final_digest, complete_bytes)
+                .await?;
+
+            info!(
+                "Successfully uploaded streaming blob {} ({} bytes)",
+                pushed_digest, total_size
+            );
+            return Ok((pushed_digest, total_size));
+        }
+
+        // 情况 B：确定性分块断点续传 (仅在支持分块的后端执行，无需任何 416 猜测降级)
+        info!("Executing standard chunked resumable upload for large stream");
         let upload_init_url = format!(
             "{}://{}/v2/{}/nix-cache/blobs/uploads/",
             self.url_scheme(),
@@ -381,51 +469,32 @@ impl<T: OciTransport> OciClient<T> {
             location.to_string()
         };
 
-        let chunk_limit = config.chunk_size_bytes.max(1024 * 1024);
         let mut current_offset = 0u64;
-        let mut chunk_buf = Vec::with_capacity(chunk_limit);
+        let mut chunk_buf = buffer;
+        let mut stream_ended = false;
 
-        while let Some(item) = pinned_stream.next().await {
-            let bytes: Bytes = item?;
-            chunk_buf.extend_from_slice(&bytes);
-
-            if chunk_buf.len() >= chunk_limit {
-                let send_bytes = Bytes::from(mem::replace(
-                    &mut chunk_buf,
-                    Vec::with_capacity(chunk_limit),
-                ));
-                let end_offset = current_offset + send_bytes.len() as u64 - 1;
-                let headers = self.get_auth_headers().await?;
-                let resp = self
-                    .transport
-                    .patch_chunk(
-                        &session_url,
-                        headers,
-                        send_bytes,
-                        (current_offset, end_offset),
-                    )
-                    .await?;
-
-                if !resp.status.is_success()
-                    && resp.status != StatusCode::ACCEPTED
-                    && resp.status != StatusCode::NO_CONTENT
-                {
-                    return Err(OciError::BlobUploadFailed(resp.status));
+        while !stream_ended {
+            while chunk_buf.len() < chunk_limit {
+                if let Some(item) = pinned_stream.next().await {
+                    let bytes: Bytes = item?;
+                    chunk_buf.extend_from_slice(&bytes);
+                } else {
+                    stream_ended = true;
+                    break;
                 }
-
-                if let Some(new_loc) = resp.location {
-                    session_url = if new_loc.starts_with('/') {
-                        format!("{}://{}{}", self.url_scheme(), self.registry, new_loc)
-                    } else {
-                        new_loc
-                    };
-                }
-                current_offset = end_offset + 1;
             }
-        }
 
-        if !chunk_buf.is_empty() {
-            let send_bytes = Bytes::from(chunk_buf);
+            if chunk_buf.is_empty() {
+                break;
+            }
+
+            let send_len = if stream_ended {
+                chunk_buf.len()
+            } else {
+                chunk_limit.min(chunk_buf.len())
+            };
+
+            let send_bytes = Bytes::from(chunk_buf.drain(..send_len).collect::<Vec<u8>>());
             let end_offset = current_offset + send_bytes.len() as u64 - 1;
             let headers = self.get_auth_headers().await?;
             let resp = self
@@ -452,6 +521,7 @@ impl<T: OciTransport> OciClient<T> {
                     new_loc
                 };
             }
+            current_offset = end_offset + 1;
         }
 
         let final_digest = hash_state.force_finalize();
@@ -960,7 +1030,8 @@ impl<T: OciTransport> OciClient<T> {
             HeaderValue::from_static(OCI_IMAGE_MANIFEST_MEDIA_TYPE),
         );
 
-        if let Some(prev) = previous_digest
+        if self.driver.capabilities().supports_manifest_cas_if_match
+            && let Some(prev) = previous_digest
             && let Ok(val) = HeaderValue::from_str(prev)
         {
             headers.insert(IF_MATCH, val);
@@ -1004,7 +1075,8 @@ impl<T: OciTransport> OciClient<T> {
             HeaderValue::from_static(OCI_IMAGE_INDEX_MEDIA_TYPE),
         );
 
-        if let Some(prev) = previous_digest
+        if self.driver.capabilities().supports_manifest_cas_if_match
+            && let Some(prev) = previous_digest
             && let Ok(val) = HeaderValue::from_str(prev)
         {
             headers.insert(IF_MATCH, val);

@@ -5,6 +5,10 @@ inputs:
     description: 'OCI Registry'
     required: false
     default: 'ghcr.io'
+  registry-kind:
+    description: 'OCI Registry backend kind (ghcr, docker_hub, aws_ecr, gcp_artifact_registry, azure_acr, generic_oci). Leave empty to autodetect from registry host.'
+    required: false
+    default: ''
   repo:
     description: 'Target repository name (owner/repo)'
     required: false
@@ -61,6 +65,7 @@ runs:
         NIXCACHE_TARGET_TAG: ${{ inputs.target-tag }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         REF=""

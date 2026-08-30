@@ -13,7 +13,7 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use loom::{model::Builder, sync::atomic::Ordering, thread};
 use nixcache_oci::{
-    MockResponse, MockRouterTransport, TokenManager,
+    GenericOciDriver, MockResponse, MockRouterTransport, TokenManager,
     token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
 };
 use std::{
@@ -84,6 +84,7 @@ fn loom_verify_token_manager_singleflight_invariant() {
             "test/repo",
             "secret_tok",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         let threads: Vec<_> = (0..2)
@@ -117,6 +118,7 @@ fn loom_verify_token_manager_three_threads_storm() {
             "test/repo",
             "secret_tok",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         let threads: Vec<_> = (0..3)
@@ -149,6 +151,7 @@ fn loom_verify_token_manager_fast_path_cached() {
             "test/repo",
             "secret_tok",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         // 预热：首次调用填充缓存
@@ -184,6 +187,7 @@ fn loom_verify_token_manager_fallback_on_network_failure() {
             "test/repo",
             "github_fallback_key",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         let threads: Vec<_> = (0..2)
@@ -216,6 +220,7 @@ fn loom_verify_token_manager_multi_generation_sequential() {
             "test/repo",
             "secret_tok",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         // 第 1 轮并发获取
@@ -258,6 +263,7 @@ fn loom_verify_token_manager_empty_github_token_fallback() {
             "test/repo",
             "",
             false,
+            Arc::new(GenericOciDriver),
         ));
 
         let threads: Vec<_> = (0..2)

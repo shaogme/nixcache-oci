@@ -5,6 +5,10 @@ inputs:
     description: 'OCI Registry to fetch/push cache'
     required: false
     default: 'ghcr.io'
+  registry-kind:
+    description: 'OCI Registry backend kind (ghcr, docker_hub, aws_ecr, gcp_artifact_registry, azure_acr, generic_oci). Leave empty to autodetect from registry host.'
+    required: false
+    default: ''
   repo:
     description: 'Target repository name (owner/repo)'
     required: false
@@ -71,6 +75,7 @@ runs:
       env:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_BRANCH: ${{ inputs.branch }}
         NIXCACHE_SESSION_TTL: ${{ inputs.session-ttl }}

@@ -1,14 +1,18 @@
 # nixcache-oci
 
-将任何 GitHub 仓库转变为 Nix 二进制缓存（Binary Cache）。推送你的 Flake，即可自动获得专属的二进制缓存。对公开仓库完全免费。
+将任何 GitHub 仓库或企业私有 OCI 镜像仓库转变为高性能 Nix 二进制缓存（Binary Cache）。推送你的 Flake，即可自动获得专属的二进制缓存。对公开仓库完全免费。
 
-本项目使用 GitHub Container Registry (GHCR) 作为存储后端 —— NAR 包将作为 OCI blob 存储，并结合单文件索引清单（Index Manifest）实现极速的路径查找。无需运行额外的外部服务器、CDN 或数据库。
+本项目以 OCI 镜像分发协议为基础 —— NAR 包将作为 OCI blob 存储，并结合单文件压缩索引清单（Index Manifest）实现极速的路径查找。无需维护专用的外部二进制缓存服务、CDN 或复杂数据库。
 
 ## 工作原理与核心架构
 
-1. **多架构声明与自动过滤**：在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 GHCR。
+1. **多架构声明与自动过滤**：在指定的配置目录（如您在 `env/default.env` 中配置的 `NIXCACHE_CONFIG_DIR`）中声明需要缓存的软件包（packages）、NixOS 主机（hosts）或开发环境（dev shells）。**GitHub Actions** 并行构建产物，自动过滤 `cache.nixos.org` 上已存在的 store 路径，将本地构建的 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
 
-2. **4 级级联缓存与 $O(1)$ 极速解析（Cascading Resolver）**：
+2. **多后端原生驱动与静态确定性（Static Determinism）**：
+   - **多态后端驱动体系（First-Class Provider Drivers）**：原生支持 GitHub Packages (GHCR)、Docker Hub、AWS ECR、Google Cloud Artifact Registry (GAR)、Azure ACR 与通用 OCI (Harbor / Zot / Distribution / Quay)。
+   - **Docker Hub 原生适配**：自动规范化 `docker.io` 域名为 `registry-1.docker.io`，自动扩展官方单段镜像为 `library/<name>` 命名空间，专用 Token Auth 路由。
+
+3. **4 级级联缓存与 $O(1)$ 极速解析（Cascading Resolver）**：
    - **Tier 0（即时内存热缓存）**：流水线当前构建步骤产生的产物，动态注册后 $0\text{ ms}$ 极速穿透供后续步骤使用。
    - **Tier 1（工作流会话缓存 `run-<run_id>`）**：同一 Workflow Run 中各矩阵并行 Job 共享的会话级缓存。
    - **Tier 2（分支/PR 会话缓存 `branch-<name>`）**：同分支或 PR 历史迭代的快速增量缓存。
@@ -16,17 +20,28 @@
    - **Upstream（上游透明回退）**：请求不存在于任何 Tier 时，透明重定向并回退至 `cache.nixos.org` 等公共缓存源。
    - 全链路在内存中维护双向哈希与 NAR Basename 映射表，彻底消除线性扫描，将路径与 NAR Blob 寻址降为 **$O(1)$ 常数时间**。
 
-3. **直通式流传输与零常驻开销**：从 GHCR 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
+4. **直通式流传输与零常驻开销**：从 OCI Registry 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
 
-4. **解耦的 8-Crate 架构体系**：
+5. **解耦的 8-Crate 架构体系**：
    - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
    - `nixcache-utils`：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口，零 tokio/clap 依赖）。
-   - `nixcache-cli`：共享 CLI 参数组件（`OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs` 等）与声明式强类型领域配置转换体系。
-   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、CAS 并发安全更新器与并发防击穿 Token 管理器。
-   - `nixcache-oci-backend`：通用 OCI 后端抽象层与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
+   - `nixcache-cli`：共享 CLI 参数组件（`OciTargetArgs` 支持 `--registry-kind` 自动推导、`AuthTokenArgs`、`ServerBindArgs` 等）与声明式强类型领域配置转换体系。
+   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、CAS 并发安全更新器与并发防击穿 Token 管理器。
+   - `nixcache-oci-backend`：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
    - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum 与 `nixcache-cli`）。
    - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与 `nixcache-cli`）。
-   - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 GHCR 3 级穿透）。
+   - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 OCI 3 级穿透）。
+
+## 主流 OCI 注册表支持矩阵
+
+| 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | 特性说明 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | 严禁 PATCH，无 416 风险，零降级试错 RTT |
+| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | 自动规范化域名为 `registry-1.docker.io` |
+| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生适配 AWS ECR 端点与权限 |
+| **GCP GAR** (`gcp_artifact_registry`)| `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生支持 Google Cloud Artifact Registry |
+| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生支持 Azure 容器注册表 |
+| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | 严格遵循 OCI Distribution Spec，支持 CAS |
 
 ## 快速开始
 
@@ -214,7 +229,24 @@ jobs:
 
 ```
 
-##### 4. 版本控制与配置
+##### 4. 自定义 OCI 注册表配置（支持 Docker Hub / AWS ECR / Harbor 等）
+
+所有 Action 均支持通过 `registry`、`repo` 以及 `registry-kind` 接入任意符合 OCI 规范的镜像仓库：
+```yaml
+      - name: Build & Push to Custom Harbor Registry
+        uses: shaogme/nixcache-oci/build@main
+        with:
+          system: x86_64-linux
+          registry: 'harbor.mycompany.internal' # 自建 Harbor 或其它 OCI Registry
+          registry-kind: 'generic_oci'          # 可选，自动探测或显式指定 (ghcr, docker_hub, aws_ecr, gcp_artifact_registry, azure_acr, generic_oci)
+          repo: 'nix/binary-cache'
+          github-token: ${{ secrets.REGISTRY_PASSWORD }}
+```
+
+> [!TIP]
+> **注册表种类智能自动探测**：当您设置 `registry: 'docker.io'`、`registry: '<account>.dkr.ecr.<region>.amazonaws.com'` 或 `registry: '<region>-docker.pkg.dev'` 时，程序会自动推导出对应的强类型后端驱动（`DockerHub`、`AwsEcr`、`GcpArtifactRegistry`），无需手动填写 `registry-kind`。对于自建私有 Registry（如 Harbor、Zot、Distribution），默认也会安全回退至 `GenericOci` 驱动。
+
+##### 5. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
@@ -436,6 +468,7 @@ npins update
 |---|---|---|---|
 | `--repo <REPO>` | `NIXCACHE_REPO` | （无） | OCI 仓库名称 (例如: `shaogme/nixcache-oci`) |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
 | `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可对局域网提供服务） |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测宿主机） | 目标平台系统架构（例如 `x86_64-linux`） |
@@ -477,6 +510,7 @@ nixcache-builder session clean
 |---|---|---|---|
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID（Tier 1 会话） |
 | `--branch <BRANCH>` | `NIXCACHE_BRANCH` | （无） | 分支名称或 PR 编号（Tier 2 会话） |
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | Proxy 代理后台守护进程监听端口 |
@@ -494,6 +528,7 @@ nixcache-builder session clean
 |---|---|---|---|
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID |
 | `--job-id <JOB_ID>` | `NIXCACHE_JOB_ID` | （无） | 当前 GitHub Actions Job 标识符 |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台系统架构 |
@@ -533,6 +568,7 @@ nixcache-builder build \
 | `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 非 Flake 模式下要构建的属性 |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | `receipt-<system>.json` | 生成的收据 JSON 文件路径 |
 | `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | Proxy 启动失败时是否立即报错退出 |
@@ -565,6 +601,7 @@ nixcache-builder promote \
 | `--cleanup-session` / `--no-cleanup-session` | - | `true` | 晋升成功后是否清理临时 Session Tag |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 4. `gc` (跨平台垃圾回收阶段)
@@ -582,6 +619,7 @@ nixcache-builder gc \
 | `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 ---
@@ -749,12 +787,12 @@ flowchart TD
 
 - **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `CacheIndexData`、`ArchCacheIndexData`、`RunSessionManifest`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
 - **`crates/nixcache-utils`**：跨平台底层系统调用、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
-- **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
-- **`crates/nixcache-oci`**：OCI 注册表交互与规范定义层，提供强类型 Manifest/Descriptor 构建、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
-- **`crates/nixcache-oci-backend`**：通用 OCI 存储后端抽象层与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引（Compressed Index）分片读写与高并发流式下载。
+- **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`（包含 `--registry-kind` 强类型后端种类与自动探测）、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
+- **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
+- **`crates/nixcache-oci-backend`**：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引（Compressed Index）分片读写与高并发确定性流式传输。
 - **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
-- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
-- **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器代理，共享 `nixcache-core` 与 `nixcache-utils`，通过内存 -> KV -> GHCR 3 级穿透提供边缘低延迟加速。
+- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过驱动特性矩阵执行确定性无降级上传，并通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
+- **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器代理，共享 `nixcache-core` 与 `nixcache-utils`，通过内存 -> KV -> OCI 3 级穿透提供边缘低延迟加速。
 
 ---
 
@@ -814,14 +852,14 @@ GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的�
 
 ### 哪些路径会被缓存
 
-为了节省存储空间，**只有本地构建生成的 store 路径**会被上传到 GHCR。如果在 `cache.nixos.org` 上已经存在该路径，工作流在上传时会自动跳过它。本地代理会自动重定向并向上游请求这些公共路径，使得客户端能够获取完整的依赖关系，而无需占用你个人的 GHCR 存储空间。
+为了节省存储空间，**只有本地构建生成的 store 路径**会被上传到 OCI 注册表。如果在 `cache.nixos.org` 上已经存在该路径，工作流在上传时会自动跳过它。本地代理会自动重定向并向上游请求这些公共路径，使得客户端能够获取完整的依赖关系，而无需占用你个人的 OCI 存储空间。
 
-### 为什么选择 OCI / GHCR
+### 为什么选择 OCI 注册表 (GHCR / Docker Hub / 自建 Harbor 等)
 
 - **天然的内容寻址**：NAR 包的 sha256 哈希值可以直接映射为 OCI blob 的哈希，天然实现去重。
+- **广泛的生态兼容性**：不仅支持 GitHub 官方托管的 GHCR（公开仓库完全免费且无容量限制），还可无缝迁移至 Docker Hub、AWS ECR、Google Cloud Artifact Registry、Azure ACR 或企业内网自建 Harbor/Zot。
 - **无文件数限制**：OCI 仓库允许存储任意数量的 blob，无需担心传统存储服务的分区限制。
-- **完全免费**：GHCR 对于公开仓库的包提供无限的存储容量和网络带宽。
-- **单一索引清单**：所有的 `.narinfo` 元数据全部合并存在一个单独的 blob 索引中，本地代理在初始化或刷新时一次性拉取，后续查询全部在本地内存中完成，消除了逐个网络请求的开销。
+- **单一压缩索引清单**：所有的 `.narinfo` 元数据全部合并存在一个单独的 blob 索引中，本地代理在初始化或刷新时一次性拉取，后续查询全部在本地内存中完成，消除了逐个网络请求的开销。
 - **超大文件支持**：单个 blob 支持最大约 10 GiB，能够轻松应对超大型软件包。
 
 ### 垃圾回收（Garbage Collection）
@@ -834,7 +872,7 @@ GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的�
 
 ## 测试与质量保障（Testing & QA）
 
-本项目构建了包含 **8 层严格测试金字塔** 的全方位质量防护网，涵盖单元测试、Mock 仿真、NixOS 模块静态评估、QEMU VM 虚拟机测试、全场景端到端测试与故障注入测试：
+本项目构建了包含 **8 层严格测试金字塔** 的全方位质量防护网，涵盖单元测试、Mock 仿真、NixOS 模块静态评估、QEMU VM 虚拟机测试、全场景端到端测试与多后端故障注入测试：
 
 ```mermaid
 flowchart TB
@@ -842,7 +880,7 @@ flowchart TB
         T8["8. Cloudflare Worker 边缘端到端测试"]
     end
     subgraph L4 ["4. 容错与集成测试 (Resilience & E2E)"]
-        T7["7. 异常注入与容错测试 (503 回退 / 签名防篡改 / 12 节点并发合并 / CAS 重试)"]
+        T7["7. 异常注入与多后端容错测试 (OCI 后端确定性 / 503 回退 / 签名防篡改 / 12 节点并发合并 / CAS 重试)"]
         T6["6. 多架构 Scatter-Gather 并行构建与发布测试"]
         T5["5. 单机全模式 (Cargo / Nix-Src / Nix-Bin) 构建测试"]
     end
@@ -898,16 +936,19 @@ nix-build default.nix -A tests.vmtest --no-out-link
 
 #### 异常注入与容错安全测试（Fault Injection & Resilience）
 ```bash
-# 1. 模拟 OCI Registry 503 宕机，验证 Proxy 优雅降级并透明回退至上游二进制缓存
+# 1. 验证 OCI 多后端确定性（GHCR 两阶段 PUT 零 416、Docker Hub 命名空间转换与 1-RTT 直传、Generic OCI 分块断点续传）
+./test/test-backends-determinism.sh
+
+# 2. 模拟 OCI Registry 503 宕机，验证 Proxy 优雅降级并透明回退至上游二进制缓存
 ./test/test-fault-tolerance.sh
 
-# 2. 模拟供应链篡改与非法密钥，验证 Nix 客户端精准拦截损坏 NAR 与未授权签名
+# 3. 模拟供应链篡改与非法密钥，验证 Nix 客户端精准拦截损坏 NAR 与未授权签名
 ./test/test-security-signature.sh
 
-# 3. 模拟 12 节点并发生成 Receipts，验证原子合并的幂等性与多架构 GC 根聚合
+# 4. 模拟 12 节点并发生成 Receipts，验证原子合并的幂等性与多架构 GC 根聚合
 ./test/test-concurrency-merge.sh
 
-# 4. 验证流水线 Session 级联与 CAS 并发冲突退避重试机制
+# 5. 验证流水线 Session 级联与 CAS 并发冲突退避重试机制
 ./test/test-pipeline-session-cas.sh
 ```
 
@@ -941,7 +982,7 @@ nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh scripts/*.sh && a
 ## 局限性
 
 - **需通过协议桥接代理**：Nix 客户端原生无法直接通过 OCI 镜像协议拉取包，因此需要通过代理服务桥接协议。用户可根据实际场景选择：在客户端运行轻量级 `nixcache-proxy` 本地常驻服务，或将 `nixcache-worker` 一键部署于 Cloudflare Workers 无服务器边缘网络（完全无需本地运行任何后台守护进程）。
-- **GitHub 接口频率限制**：GitHub 的 API 对于未认证的用户有限制，已认证用户为每小时 5,000 次。代理通过本地内存索引和 Nix 自带的缓存机制来大幅减少对 GitHub API 的直接请求，从而缓解这一限制。
-- **私有仓库限制**：私有仓库的 GHCR 存储和带宽超出免费额度（500 MB 存储，1 GB/月流量）后将按量计费。公开仓库则完全免费。
-- **GitHub 依赖性**：如果 GitHub 或 GHCR 发生宕机，你的自定义软件包缓存将暂时不可用（但上游缓存如 `cache.nixos.org` 中的官方软件包依然可以通过代理透明回退访问）。
+- **注册表接口配额与限制**：GitHub 的 API 对于未认证的用户有限制，已认证用户为每小时 5,000 次；Docker Hub 或公有云 ECR 可能会有拉取/推送速率配额。代理通过本地内存索引和 Nix 自带的缓存机制来大幅减少对远程 API 的直接请求，从而有效避免命中限流。
+- **私有仓库成本**：如果使用私有 GHCR 或云端付费 Registry，超出免费额度后将按服务商标准产生存储与流量费用。若在公开 GitHub 仓库配合 GHCR 使用，则完全免费。
+- **服务依赖性**：如果上游 OCI Registry 发生短暂不可用，自定义软件包缓存将暂时不可用（但上游缓存如 `cache.nixos.org` 中的官方软件包依然可以通过代理透明回退访问）。
 
