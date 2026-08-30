@@ -9,6 +9,10 @@ inputs:
     description: 'Dry run mode (show what would be deleted without deleting)'
     required: false
     default: 'false'
+  delete-blobs:
+    description: 'Attempt physical OCI blob deletion (best-effort)'
+    required: false
+    default: 'false'
   repo:
     description: 'Target repository name (owner/repo)'
     required: false
@@ -45,6 +49,7 @@ runs:
       shell: bash
       env:
         NIXCACHE_RETENTION_DAYS: ${{ inputs.retention-days }}
+        NIXCACHE_DELETE_BLOBS: ${{ inputs.delete-blobs }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
@@ -68,6 +73,9 @@ runs:
         EXTRA_ARGS=()
         if [[ "${{ inputs.dry-run }}" == "true" ]]; then
           EXTRA_ARGS+=(--dry-run)
+        fi
+        if [[ "${{ inputs.delete-blobs }}" == "true" ]]; then
+          EXTRA_ARGS+=(--delete-blobs)
         fi
         
         nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- gc "${EXTRA_ARGS[@]}"

@@ -2,6 +2,7 @@ pub mod error;
 pub mod gc;
 pub mod lookup;
 pub mod narinfo;
+pub mod purge;
 pub mod types;
 
 pub use error::{CoreError, GcError, NarInfoParseError, TypeError};
@@ -10,6 +11,10 @@ pub use lookup::{
     build_nar_lookup_map, extract_nar_basename, extract_store_hash, extract_store_hash_str,
 };
 pub use narinfo::NarInfo;
+pub use purge::{
+    CachePurgeFilter, CascadeMode, PurgeEvaluationResult, SizeFilter, TimeFilter,
+    evaluate_cache_purge, matches_pattern,
+};
 pub use types::{
     ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
     CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfoMeta, RECEIPT_VERSION,
@@ -20,13 +25,14 @@ pub use types::{
 mod tests {
     use super::{
         ArchCacheIndexData, ArchRunSessionManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-        CacheIndexData, IndexEntry, JobSummaryMetadata, NarDigest, NarInfo, NarInfoMeta,
-        RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, StoreHash, SystemArch, TypeError,
-        build_nar_lookup_map, evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash,
-        extract_store_hash_str,
+        CacheIndexData, CachePurgeFilter, CascadeMode, IndexEntry, JobSummaryMetadata, NarDigest,
+        NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, RunSessionManifest, SizeFilter,
+        StoreHash, SystemArch, TimeFilter, TypeError, build_nar_lookup_map, evaluate_cache_purge,
+        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
+        matches_pattern,
     };
-    use chrono::{Duration, Utc};
-    use std::collections::HashMap;
+    use chrono::{DateTime, Duration, Utc};
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_strong_types_validation() {
@@ -477,5 +483,610 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let loaded_receipt: BuildReceipt = serde_json::from_str(&receipt_json).unwrap();
         assert_eq!(loaded_receipt.job_id, Some("job1".to_string()));
         assert_eq!(loaded_receipt.stats.uploaded_blobs, 2);
+    }
+
+    #[test]
+    fn test_pattern_wildcard_matching() {
+        assert!(matches_pattern("*chromium*", "chromium-120.0"));
+        assert!(matches_pattern(
+            "*chromium*",
+            "/nix/store/hash-chromium-120"
+        ));
+        assert!(matches_pattern("*-debug", "app-debug"));
+        assert!(!matches_pattern("*-debug", "app-release"));
+        assert!(matches_pattern("linux-6.1.*", "linux-6.1.100"));
+        assert!(matches_pattern("libA", "libA.so"));
+        assert!(matches_pattern("?", "a"));
+        assert!(!matches_pattern("?", "ab"));
+    }
+
+    #[test]
+    fn test_purge_all_clears_everything() {
+        let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
+        let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
+
+        let mut index = CacheIndexData::default();
+        index.entries.insert(
+            hash1.clone(),
+            IndexEntry {
+                name: "pkg1".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", hash1),
+                    nar_basename: "pkg1.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob1"),
+                nar_size: 1000,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+        index.entries.insert(
+            hash2.clone(),
+            IndexEntry {
+                name: "pkg2".to_string(),
+                system: Some(SystemArch::Aarch64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg2", hash2),
+                    nar_basename: "pkg2.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob2"),
+                nar_size: 2000,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+        index
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
+        index
+            .gc_roots
+            .insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
+
+        let filter = CachePurgeFilter {
+            purge_all: true,
+            ..Default::default()
+        };
+
+        let result = evaluate_cache_purge(&index, &filter);
+        assert!(result.kept_entries.is_empty());
+        assert_eq!(result.purged_entries.len(), 2);
+        assert_eq!(result.purged_hashes.len(), 2);
+        assert_eq!(result.purged_nar_digests.len(), 2);
+        assert_eq!(result.estimated_freed_bytes, 3000);
+        assert!(result.updated_gc_roots.is_empty());
+    }
+
+    #[test]
+    fn test_purge_exact_preserves_dependents() {
+        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
+        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
+        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+
+        let mut index = CacheIndexData::default();
+        index
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![app.clone()]);
+
+        index.entries.insert(
+            app.clone(),
+            IndexEntry {
+                name: "app".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-app", app),
+                    nar_basename: "app.nar.xz".to_string(),
+                    references: vec![format!("{}-liba", lib_a)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_size: 500,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            lib_a.clone(),
+            IndexEntry {
+                name: "liba".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-liba", lib_a),
+                    nar_basename: "liba.nar.xz".to_string(),
+                    references: vec![format!("{}-core", core)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_size: 300,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            core.clone(),
+            IndexEntry {
+                name: "core".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-core", core),
+                    nar_basename: "core.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_size: 200,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        let mut hashes = HashSet::new();
+        hashes.insert(lib_a.clone());
+
+        let filter = CachePurgeFilter {
+            store_hashes: hashes,
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+
+        let result = evaluate_cache_purge(&index, &filter);
+        assert_eq!(result.purged_hashes, vec![lib_a.clone()]);
+        assert_eq!(result.estimated_freed_bytes, 300);
+        assert!(result.kept_entries.contains_key(&app));
+        assert!(result.kept_entries.contains_key(&core));
+
+        // GC Roots 同步修剪：因为 app 依赖的 lib_a 被删除，app 发生断链，app 被从 roots 剔除
+        assert!(result.updated_gc_roots.is_empty());
+    }
+
+    #[test]
+    fn test_purge_cascade_dependents_invalidates_closure() {
+        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
+        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
+        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+
+        let mut index = CacheIndexData::default();
+        index
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![app.clone()]);
+
+        index.entries.insert(
+            app.clone(),
+            IndexEntry {
+                name: "app".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-app", app),
+                    nar_basename: "app.nar.xz".to_string(),
+                    references: vec![format!("{}-liba", lib_a)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_size: 500,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            lib_a.clone(),
+            IndexEntry {
+                name: "liba".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-liba", lib_a),
+                    nar_basename: "liba.nar.xz".to_string(),
+                    references: vec![format!("{}-core", core)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_size: 300,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            core.clone(),
+            IndexEntry {
+                name: "core".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-core", core),
+                    nar_basename: "core.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_size: 200,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        let mut hashes = HashSet::new();
+        hashes.insert(lib_a.clone());
+
+        let filter = CachePurgeFilter {
+            store_hashes: hashes,
+            cascade_mode: CascadeMode::Dependents,
+            ..Default::default()
+        };
+
+        let result = evaluate_cache_purge(&index, &filter);
+        assert_eq!(result.purged_entries.len(), 2);
+        assert!(result.purged_entries.contains_key(&lib_a));
+        assert!(result.purged_entries.contains_key(&app));
+        assert!(result.kept_entries.contains_key(&core));
+        assert_eq!(result.estimated_freed_bytes, 800);
+        assert!(result.updated_gc_roots.is_empty());
+    }
+
+    #[test]
+    fn test_purge_cascade_transitive_and_full_tree() {
+        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
+        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
+        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+
+        let mut index = CacheIndexData::default();
+        index.entries.insert(
+            app.clone(),
+            IndexEntry {
+                name: "app".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-app", app),
+                    nar_basename: "app.nar.xz".to_string(),
+                    references: vec![format!("{}-liba", lib_a)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_size: 500,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+        index.entries.insert(
+            lib_a.clone(),
+            IndexEntry {
+                name: "liba".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-liba", lib_a),
+                    nar_basename: "liba.nar.xz".to_string(),
+                    references: vec![format!("{}-core", core)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_size: 300,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+        index.entries.insert(
+            core.clone(),
+            IndexEntry {
+                name: "core".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-core", core),
+                    nar_basename: "core.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_size: 200,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        let mut hashes = HashSet::new();
+        hashes.insert(lib_a.clone());
+
+        // Transitive: lib_a + core
+        let filter_transitive = CachePurgeFilter {
+            store_hashes: hashes.clone(),
+            cascade_mode: CascadeMode::Transitive,
+            ..Default::default()
+        };
+        let res_transitive = evaluate_cache_purge(&index, &filter_transitive);
+        assert_eq!(res_transitive.purged_entries.len(), 2);
+        assert!(res_transitive.purged_entries.contains_key(&lib_a));
+        assert!(res_transitive.purged_entries.contains_key(&core));
+        assert!(res_transitive.kept_entries.contains_key(&app));
+
+        // FullTree: app + lib_a + core
+        let filter_full = CachePurgeFilter {
+            store_hashes: hashes,
+            cascade_mode: CascadeMode::FullTree,
+            ..Default::default()
+        };
+        let res_full = evaluate_cache_purge(&index, &filter_full);
+        assert_eq!(res_full.purged_entries.len(), 3);
+        assert!(res_full.purged_entries.contains_key(&app));
+        assert!(res_full.purged_entries.contains_key(&lib_a));
+        assert!(res_full.purged_entries.contains_key(&core));
+        assert!(res_full.kept_entries.is_empty());
+    }
+
+    #[test]
+    fn test_purge_pattern_and_time_and_size_filter() {
+        let hash_chromium = StoreHash::new_unchecked("hash00000000000000000000chromium");
+        let hash_small = StoreHash::new_unchecked("hash00000000000000000000000small");
+        let hash_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
+
+        let mut index = CacheIndexData::default();
+        index.entries.insert(
+            hash_chromium.clone(),
+            IndexEntry {
+                name: "chromium-120.0".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-chromium-120.0", hash_chromium),
+                    nar_basename: "chromium-120.0.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-chromium"),
+                nar_size: 500_000_000,
+                added: "2026-08-25T10:00:00Z".to_string(),
+                origin_job: Some("run:1001:job:build-x86".to_string()),
+            },
+        );
+
+        index.entries.insert(
+            hash_small.clone(),
+            IndexEntry {
+                name: "small-lib".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-small-lib", hash_small),
+                    nar_basename: "small-lib.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-small"),
+                nar_size: 1_000,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: Some("run:1002:job:build-x86".to_string()),
+            },
+        );
+
+        index.entries.insert(
+            hash_old.clone(),
+            IndexEntry {
+                name: "old-lib".to_string(),
+                system: Some(SystemArch::Aarch64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-old-lib", hash_old),
+                    nar_basename: "old-lib.nar.xz".to_string(),
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-old"),
+                nar_size: 2_000,
+                added: "2026-07-01T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        // Pattern filter
+        let filter_pat = CachePurgeFilter {
+            patterns: vec!["*chromium*".to_string()],
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+        let res_pat = evaluate_cache_purge(&index, &filter_pat);
+        assert_eq!(res_pat.purged_hashes, vec![hash_chromium.clone()]);
+
+        // Size filter: MinBytes(100MB)
+        let filter_size = CachePurgeFilter {
+            size_filter: Some(SizeFilter::MinBytes(100_000_000)),
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+        let res_size = evaluate_cache_purge(&index, &filter_size);
+        assert_eq!(res_size.purged_hashes, vec![hash_chromium.clone()]);
+
+        // Time filter: Before 2026-08-01
+        let filter_time = CachePurgeFilter {
+            time_filter: Some(TimeFilter::Before(
+                DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )),
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+        let res_time = evaluate_cache_purge(&index, &filter_time);
+        assert_eq!(res_time.purged_hashes, vec![hash_old.clone()]);
+
+        // System filter
+        let mut sys_filter = HashSet::new();
+        sys_filter.insert(SystemArch::Aarch64Linux);
+        let filter_sys = CachePurgeFilter {
+            systems: sys_filter,
+            patterns: vec!["*lib*".to_string()],
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+        let res_sys = evaluate_cache_purge(&index, &filter_sys);
+        assert_eq!(res_sys.purged_hashes, vec![hash_old.clone()]);
+    }
+
+    #[test]
+    fn test_purge_gc_roots_resynchronization() {
+        let root_x86 = StoreHash::new_unchecked("000000000000000000000000000root1");
+        let root_arm = StoreHash::new_unchecked("000000000000000000000000000root2");
+        let dep_x86 = StoreHash::new_unchecked("0000000000000000000000000000dep1");
+
+        let mut index = CacheIndexData::default();
+        index
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![root_x86.clone()]);
+        index
+            .gc_roots
+            .insert(SystemArch::Aarch64Linux, vec![root_arm.clone()]);
+
+        index.entries.insert(
+            root_x86.clone(),
+            IndexEntry {
+                name: "root-x86".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-root-x86", root_x86),
+                    nar_basename: "root-x86.nar.xz".to_string(),
+                    references: vec![format!("{}-dep-x86", dep_x86)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-root-x86"),
+                nar_size: 100,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            dep_x86.clone(),
+            IndexEntry {
+                name: "dep-x86".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-dep-x86", dep_x86),
+                    nar_basename: "dep-x86.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-dep-x86"),
+                nar_size: 100,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            root_arm.clone(),
+            IndexEntry {
+                name: "root-arm".to_string(),
+                system: Some(SystemArch::Aarch64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-root-arm", root_arm),
+                    nar_basename: "root-arm.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:blob-root-arm"),
+                nar_size: 100,
+                added: "2026-08-29T10:00:00Z".to_string(),
+                origin_job: None,
+            },
+        );
+
+        // Purge dep_x86 with Exact mode
+        let mut hashes = HashSet::new();
+        hashes.insert(dep_x86.clone());
+        let filter = CachePurgeFilter {
+            store_hashes: hashes,
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+
+        let result = evaluate_cache_purge(&index, &filter);
+        // root_x86 should be pruned because its dependency dep_x86 was purged!
+        // root_arm should remain untouched!
+        assert_eq!(
+            result.updated_gc_roots.get(&SystemArch::Aarch64Linux),
+            Some(&vec![root_arm])
+        );
+        assert_eq!(result.updated_gc_roots.get(&SystemArch::X86_64Linux), None);
+    }
+
+    #[test]
+    fn test_purge_with_protect_gc_roots() {
+        let root_app = StoreHash::new_unchecked("hash0000000000000000000000000app");
+        let shared_dep = StoreHash::new_unchecked("hash0000000000000000000000000dep");
+        let orphan_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
+
+        let mut index = CacheIndexData::default();
+        index
+            .gc_roots
+            .insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
+
+        let sixty_days_ago = (Utc::now() - Duration::days(60)).to_rfc3339();
+
+        index.entries.insert(
+            root_app.clone(),
+            IndexEntry {
+                name: "root-app".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-root-app", root_app),
+                    nar_basename: "root-app.nar.xz".to_string(),
+                    references: vec![format!("{}-shared-dep", shared_dep)],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:root-blob"),
+                nar_size: 100,
+                added: sixty_days_ago.clone(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            shared_dep.clone(),
+            IndexEntry {
+                name: "shared-dep".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-shared-dep", shared_dep),
+                    nar_basename: "shared-dep.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:dep-blob"),
+                nar_size: 100,
+                added: sixty_days_ago.clone(),
+                origin_job: None,
+            },
+        );
+
+        index.entries.insert(
+            orphan_old.clone(),
+            IndexEntry {
+                name: "orphan-old".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-orphan-old", orphan_old),
+                    nar_basename: "orphan-old.nar.xz".to_string(),
+                    references: vec![],
+                    ..Default::default()
+                },
+                nar_digest: NarDigest::new_unchecked("sha256:old-blob"),
+                nar_size: 100,
+                added: sixty_days_ago.clone(),
+                origin_job: None,
+            },
+        );
+
+        // When protect_gc_roots is true, root_app and shared_dep must be protected even if older_than / patterns match
+        let cutoff = Utc::now() - Duration::days(30);
+        let filter = CachePurgeFilter {
+            time_filter: Some(TimeFilter::Before(cutoff)),
+            protect_gc_roots: true,
+            cascade_mode: CascadeMode::Exact,
+            ..Default::default()
+        };
+
+        let result = evaluate_cache_purge(&index, &filter);
+        assert_eq!(result.purged_hashes, vec![orphan_old]);
+        assert_eq!(result.kept_entries.len(), 2);
+        assert!(result.kept_entries.contains_key(&root_app));
+        assert!(result.kept_entries.contains_key(&shared_dep));
+        assert_eq!(
+            result.updated_gc_roots.get(&SystemArch::X86_64Linux),
+            Some(&vec![root_app])
+        );
     }
 }

@@ -23,13 +23,13 @@
 4. **直通式流传输与零常驻开销**：从 OCI Registry 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
 
 5. **解耦的 8-Crate 架构体系**：
-   - `nixcache-core`：纯核心数据模型、Schema v3 规范、NarInfo 解析器与纯函数 GC 算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
+   - `nixcache-core`：纯核心数据模型、Schema v4 规范、NarInfo 解析器、统一的依赖图闭包分析与 Purge/GC 核心算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
    - `nixcache-utils`：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口，零 tokio/clap 依赖）。
-   - `nixcache-cli`：共享 CLI 参数组件（`OciTargetArgs` 支持 `--registry-kind` 自动推导、`AuthTokenArgs`、`ServerBindArgs` 等）与声明式强类型领域配置转换体系。
-   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、CAS 并发安全更新器与并发防击穿 Token 管理器。
+   - `nixcache-cli`：共享 CLI 参数组件（`PurgeFilterArgs`、`OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs` 等）与声明式强类型领域配置转换体系。
+   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`BlobUploadStrategy`、CAS 并发安全更新器、批量物理删除与并发防击穿 Token 管理器。
    - `nixcache-oci-backend`：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
    - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum 与 `nixcache-cli`）。
-   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（基于 NixDriver 与 `nixcache-cli`）。
+   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（统一收敛的 Purge/GC 执行引擎、NixDriver 与 CAS 更新器）。
    - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 OCI 3 级穿透）。
 
 ## 主流 OCI 注册表支持矩阵
@@ -246,7 +246,22 @@ jobs:
 > [!TIP]
 > **注册表种类智能自动探测**：当您设置 `registry: 'docker.io'`、`registry: '<account>.dkr.ecr.<region>.amazonaws.com'` 或 `registry: '<region>-docker.pkg.dev'` 时，程序会自动推导出对应的强类型后端驱动（`DockerHub`、`AwsEcr`、`GcpArtifactRegistry`），无需手动填写 `registry-kind`。对于自建私有 Registry（如 Harbor、Zot、Distribution），默认也会安全回退至 `GenericOci` 驱动。
 
-##### 5. 版本控制与配置
+##### 5. 构建缓存主动清理与失效（Purge Cache）
+
+当遇到产物损坏、需要强制穿透重新构建或重置冷启动时，可以使用官方 `purge` Action 或调用交互式工作流主动剔除指定产物与依赖闭包（允许且优先破坏当前闭包）：
+
+```yaml
+      # 主动清理指定匹配模式的缓存，并级联失效下游依赖 (支持 dry-run 预览)
+      - name: Purge Broken Cache Entries
+        uses: shaogme/nixcache-oci/purge@main
+        with:
+          patterns: '*broken-pkg*'
+          cascade: 'dependents'
+          dry-run: 'false'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+##### 6. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
   * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
@@ -605,18 +620,51 @@ nixcache-builder promote \
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 4. `gc` (跨平台垃圾回收阶段)
-聚合保留所有平台的活性根（GC Roots），基于纯函数图可达性算法清理失效孤立包：
+聚合保留所有平台的活性根（GC Roots），底层统一复用 `purge` 引擎并启用 GC Roots 闭包保护，清理失效孤立包：
 ```bash
 nixcache-builder gc \
   --repo owner/repo \
   --registry ghcr.io \
-  --retention-days 30
+  --retention-days 30 \
+  --delete-blobs
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 |---|---|---|---|
 | `--retention-days <DAYS>`| `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
+| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 尽力而为（Best-effort）尝试物理删除 OCI Blobs |
 | `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
+| `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
+| `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
+| `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
+| `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+#### 5. `purge` (构建缓存主动清理与失效)
+多维精准定位或彻底清空生产基线索引，支持双向依赖级联失效、GC Roots 保护模式与同步重构：
+```bash
+nixcache-builder purge \
+  --patterns "*chromium*" \
+  --cascade dependents \
+  --repo owner/repo \
+  --registry ghcr.io
+```
+
+| 命令行参数 | 环境变量 | 默认值 | 描述 |
+|---|---|---|---|
+| `--all` | `NIXCACHE_PURGE_ALL` | `false` | **一键清空所有**：重置并清空所有生产基线索引与根 |
+| `--hashes <HASHES>` | `NIXCACHE_PURGE_HASHES` | （无） | 指定要清理的 Store Hash（逗号或空格分隔） |
+| `--patterns <PATTERN...>` | `NIXCACHE_PURGE_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
+| `--system <SYSTEM...>` | `NIXCACHE_SYSTEM` | （全部） | 限制目标架构（如 `x86_64-linux`） |
+| `--flake-path <PATH>` | `NIXCACHE_FLAKE_PATH` | （无） | 指向 Flake 目录，自动评估其输出并作为清理目标 |
+| `--attributes <ATTRS>` | `NIXCACHE_ATTRIBUTES` | （无） | 指定要清理的 Flake 属性（逗号或空格分隔） |
+| `--older-than <TIME>` | `NIXCACHE_OLDER_THAN` | （无） | 按时间筛选（支持 `30d`、`12h`、ISO8601 时间戳） |
+| `--cascade <MODE>` | `NIXCACHE_CASCADE` | `dependents` | 级联模式：`exact`、`dependents`、`transitive`、`full` |
+| `--protect-gc-roots` | `NIXCACHE_PROTECT_GC_ROOTS` | `false` | 保护活跃 GC Roots 及其正向传递可达闭包不被清理 |
+| `--min-size <BYTES>` | `NIXCACHE_MIN_SIZE` | （无） | 仅清理大于等于指定大小（支持 `500M`、`1G`）的条目 |
+| `--origin-job <JOB>` | `NIXCACHE_ORIGIN_JOB` | （无） | 按 CI Job ID 过滤 |
+| `--origin-run <RUN_ID>` | `NIXCACHE_ORIGIN_RUN` | （无） | 按 CI Run ID 过滤 |
+| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 尽力而为（Best-effort）尝试物理删除 OCI Blobs |
+| `--dry-run` | `NIXCACHE_DRY_RUN` | `false` | 试运行模式（仅输出审查报告，不修改远端） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
@@ -862,13 +910,25 @@ GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的�
 - **单一压缩索引清单**：所有的 `.narinfo` 元数据全部合并存在一个单独的 blob 索引中，本地代理在初始化或刷新时一次性拉取，后续查询全部在本地内存中完成，消除了逐个网络请求的开销。
 - **超大文件支持**：单个 blob 支持最大约 10 GiB，能够轻松应对超大型软件包。
 
-### 垃圾回收（Garbage Collection）
+### 垃圾回收与主动清理（GC vs. Purge 统一架构）
 
-`gc-cache.yml` 工作流每周会自动运行，用于清理不需要的旧缓存，判定标准为：
-- 该缓存路径不属于当前 Flake 任意输出的依赖闭包（Closure）。
-- 且该缓存已超过保留期限（默认 30 天）。
+`nixcache-oci` 在底层全面统一收敛至同一套**图论依赖分析、CAS 原子提交流程与 OCI 物理 Blob 清理引擎**。GC 子命令与工作流直接作为 Purge 引擎在开启 `protect_gc_roots = true` 模式下的安全特例：
 
-你可以通过以下命令手动触发垃圾回收：`gh workflow run gc-cache.yml`。
+| 核心维度 | 垃圾回收 (`gc` / `gc-cache.yml`) | 主动清理与失效 (`purge` / `clean-cache.yml`) |
+| :--- | :--- | :--- |
+| **底层实现** | **直接复用 Purge 引擎** (`protect_gc_roots = true`) | 原生 Purge 引擎 (`protect_gc_roots = false` 默认) |
+| **设计哲学** | 保守安全、被动维护、防止误删 | 主动控制、精准打击、允许破坏性重置 |
+| **对当前 Flake 闭包的态度** | **绝对保护**（通过 `protect_gc_roots` 保护可达闭包） | **允许强行清理**（直接支持清理当前 Flake 的任何包/闭包） |
+| **GC Roots 交互** | 以当前 Flake 的 GC Roots 为起点计算可达图并保护 | 主动**剔除/修剪**匹配到的 GC Roots，同步重构活跃根集合 |
+| **触发方式** | 每周定时自动巡检 (`schedule`) 或手动触发 | 主要是手动交互式触发 (`workflow_dispatch`) 或 API 驱动 |
+| **筛选维度** | 仅支持按保留天数（`retention-days`）和图可达性 | 支持按 Hash、包名模式、架构、时间窗口、CI Job、大小阈值、Flake 输出等 |
+| **依赖级联能力** | 锁定为 `exact` 模式 | 支持 `exact`（仅自身）、`dependents`（下游反向）、`transitive`（前向闭包）、`full`（双向全树） |
+| **清理范围** | 仅限全局生产基线 `cache-index` | 支持全局基线 (`cache-index`)、单架构分片、会话标签与历史产物 |
+| **Blob 物理删除** | 支持通过 `--delete-blobs` 进行物理删除 | 支持通过 `--delete-blobs` 进行物理删除 |
+| **默认安全模式** | 默认直接执行（生产推荐） | 默认开启 `--dry-run`（预览变更并输出审计报告后由用户确认） |
+
+- **被动垃圾回收 (`gc-cache.yml`)**：每周自动运行，清理超过保留天数（默认 30 天）且不属于当前闭包的孤立条目。手动触发：`gh workflow run gc-cache.yml`。
+- **主动清理与失效 (`clean-cache.yml`)**：支持破坏性清理、单包/单架构重置或全局清空。手动触发：`gh workflow run clean-cache.yml`。
 
 ## 测试与质量保障（Testing & QA）
 
@@ -914,7 +974,7 @@ flowchart TB
 
 #### Rust 单元测试与形式化并发检验
 ```bash
-# 运行工作区全部 70+ 单元与集成测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
+# 运行工作区全部 100+ 单元与集成测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
 cargo test --workspace
 
 # 运行 Loom 形式化并发模型检验（验证 CAS 状态机与 Token 并发竞态无锁安全性）

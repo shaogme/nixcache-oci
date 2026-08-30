@@ -20,7 +20,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{
-    ArchCacheIndexData, ArchRunSessionManifest, CACHE_INDEX_VERSION, CacheIndexData,
+    ArchCacheIndexData, ArchRunSessionManifest, CACHE_INDEX_VERSION, CacheIndexData, NarDigest,
     RUN_SESSION_VERSION, RunSessionManifest, SystemArch,
 };
 use nixcache_utils::get_process_id;
@@ -1123,9 +1123,15 @@ impl<T: OciTransport> OciClient<T> {
         let headers = self.get_auth_headers().await?;
         let status = self.transport.delete(&url, headers).await?;
 
-        if status.is_success() {
+        if status.is_success() || status == StatusCode::ACCEPTED {
             Ok(true)
         } else if status == StatusCode::NOT_FOUND {
+            Ok(false)
+        } else if status == StatusCode::METHOD_NOT_ALLOWED {
+            warn!(
+                "Registry does not support direct manifest deletion: {}",
+                status
+            );
             Ok(false)
         } else {
             Err(OciError::Other(format!(
@@ -1133,6 +1139,69 @@ impl<T: OciTransport> OciClient<T> {
                 status
             )))
         }
+    }
+
+    /// 物理删除指定 Digest 的 OCI Blob (支持遵循 OCI Distribution Spec 1.1 的 Registry)
+    pub async fn delete_blob(&self, digest: &str) -> Result<bool, OciError> {
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/blobs/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            digest
+        );
+
+        let headers = self.get_auth_headers().await?;
+        let status = self.transport.delete(&url, headers).await?;
+
+        if status.is_success() || status == StatusCode::ACCEPTED {
+            Ok(true)
+        } else if status == StatusCode::NOT_FOUND {
+            Ok(false)
+        } else if status == StatusCode::METHOD_NOT_ALLOWED {
+            warn!("Registry does not support direct blob deletion: {}", status);
+            Ok(false)
+        } else {
+            Err(OciError::Other(format!(
+                "Failed to delete blob {}: status {}",
+                digest, status
+            )))
+        }
+    }
+
+    /// 高并发批量物理删除 Blobs (基于 Stream buffer_unordered)
+    pub async fn batch_delete_blobs(
+        &self,
+        digests: &[NarDigest],
+        concurrency: usize,
+    ) -> Result<(usize, usize), OciError> {
+        if digests.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let concurrency = concurrency.clamp(1, 32);
+        let mut stream = futures_util::stream::iter(digests)
+            .map(|digest| async move {
+                let digest_str = digest.to_string();
+                self.delete_blob(&digest_str).await
+            })
+            .buffer_unordered(concurrency);
+
+        let mut deleted_count = 0;
+        let mut skipped_or_failed_count = 0;
+
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok(true) => deleted_count += 1,
+                Ok(false) => skipped_or_failed_count += 1,
+                Err(e) => {
+                    warn!("Error deleting blob: {}", e);
+                    skipped_or_failed_count += 1;
+                }
+            }
+        }
+
+        Ok((deleted_count, skipped_or_failed_count))
     }
 
     pub async fn update_image_index_cas<F>(

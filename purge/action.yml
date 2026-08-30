@@ -1,0 +1,150 @@
+name: 'NixCache OCI Cache Purge & Invalidator'
+description: 'Purge, clean, or invalidate specific/all Nix build cache entries (supports breaking current closure)'
+inputs:
+  all:
+    description: 'Purge all baseline cache entries and reset global index'
+    required: false
+    default: 'false'
+  hashes:
+    description: 'Specific store hashes to purge (comma separated)'
+    required: false
+    default: ''
+  patterns:
+    description: 'Name or store path patterns to match for purging'
+    required: false
+    default: ''
+  system:
+    description: 'Target system architecture (leave empty for all)'
+    required: false
+    default: ''
+  flake-path:
+    description: 'Path to flake to evaluate outputs for purging'
+    required: false
+    default: ''
+  attributes:
+    description: 'Flake attributes to evaluate and purge'
+    required: false
+    default: ''
+  older-than:
+    description: 'Purge entries older than duration/date (e.g. 30d, 7d)'
+    required: false
+    default: ''
+  cascade:
+    description: 'Cascade mode: exact, dependents, transitive, full'
+    required: false
+    default: 'dependents'
+  min-size:
+    description: 'Minimum NAR size threshold (e.g., 500M, 1G)'
+    required: false
+    default: ''
+  delete-blobs:
+    description: 'Attempt physical OCI blob deletion (best-effort)'
+    required: false
+    default: 'false'
+  dry-run:
+    description: 'Preview changes without modifying remote index'
+    required: false
+    default: 'true'
+  repo:
+    description: 'Target repository name (owner/repo)'
+    required: false
+    default: ${{ github.repository }}
+  registry:
+    description: 'OCI Registry'
+    required: false
+    default: 'ghcr.io'
+  registry-kind:
+    description: 'OCI Registry backend kind'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token with package write permissions'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Nix Installation
+      shell: bash
+      run: |
+        if ! command -v nix &> /dev/null; then
+          echo "::error::Nix is not installed. Please use DeterminateSystems/nix-installer-action before calling this action."
+          exit 1
+        fi
+
+    - name: Log in to OCI Registry
+      shell: bash
+      run: |
+        echo "${{ inputs.github-token }}" | docker login ${{ inputs.registry }} -u "${{ github.actor }}" --password-stdin
+
+    - name: Execute Cache Purge
+      shell: bash
+      env:
+        NIXCACHE_PURGE_ALL: ${{ inputs.all }}
+        NIXCACHE_PURGE_HASHES: ${{ inputs.hashes }}
+        NIXCACHE_PURGE_PATTERNS: ${{ inputs.patterns }}
+        NIXCACHE_SYSTEM: ${{ inputs.system }}
+        NIXCACHE_FLAKE_PATH: ${{ inputs.flake-path }}
+        NIXCACHE_ATTRIBUTES: ${{ inputs.attributes }}
+        NIXCACHE_OLDER_THAN: ${{ inputs.older-than }}
+        NIXCACHE_CASCADE: ${{ inputs.cascade }}
+        NIXCACHE_MIN_SIZE: ${{ inputs.min-size }}
+        NIXCACHE_DELETE_BLOBS: ${{ inputs.delete-blobs }}
+        NIXCACHE_DRY_RUN: ${{ inputs.dry-run }}
+        NIXCACHE_REPO: ${{ inputs.repo }}
+        NIXCACHE_REGISTRY: ${{ inputs.registry }}
+        NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REF=""
+        if [[ -f .nixcache-version ]]; then
+          REF=$(cat .nixcache-version | tr -d '[:space:]')
+          if [[ -n "$REF" ]]; then
+            echo ">>> Found .nixcache-version file, using version: $REF"
+          fi
+        fi
+        if [[ -z "$REF" ]]; then
+          REF="${{ github.action_ref }}"
+          if [[ -z "$REF" ]]; then
+            REF="main"
+          fi
+          echo ">>> Using fallback version: $REF"
+        fi
+        
+        EXTRA_ARGS=()
+        if [[ "${{ inputs.all }}" == "true" ]]; then
+          EXTRA_ARGS+=(--all)
+        fi
+        if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+          EXTRA_ARGS+=(--dry-run)
+        fi
+        if [[ "${{ inputs.delete-blobs }}" == "true" ]]; then
+          EXTRA_ARGS+=(--delete-blobs)
+        fi
+        if [[ -n "${{ inputs.hashes }}" ]]; then
+          EXTRA_ARGS+=(--hashes "${{ inputs.hashes }}")
+        fi
+        if [[ -n "${{ inputs.patterns }}" ]]; then
+          EXTRA_ARGS+=(--patterns "${{ inputs.patterns }}")
+        fi
+        if [[ -n "${{ inputs.system }}" ]]; then
+          EXTRA_ARGS+=(--system "${{ inputs.system }}")
+        fi
+        if [[ -n "${{ inputs.flake-path }}" ]]; then
+          EXTRA_ARGS+=(--flake-path "${{ inputs.flake-path }}")
+        fi
+        if [[ -n "${{ inputs.attributes }}" ]]; then
+          EXTRA_ARGS+=(--attributes "${{ inputs.attributes }}")
+        fi
+        if [[ -n "${{ inputs.cascade }}" ]]; then
+          EXTRA_ARGS+=(--cascade "${{ inputs.cascade }}")
+        fi
+        if [[ -n "${{ inputs.older-than }}" ]]; then
+          EXTRA_ARGS+=(--older-than "${{ inputs.older-than }}")
+        fi
+        if [[ -n "${{ inputs.min-size }}" ]]; then
+          EXTRA_ARGS+=(--min-size "${{ inputs.min-size }}")
+        fi
+
+        nix run --accept-flake-config "github:shaogme/nixcache-oci/$REF#cache-builder-bin" -- purge "${EXTRA_ARGS[@]}"

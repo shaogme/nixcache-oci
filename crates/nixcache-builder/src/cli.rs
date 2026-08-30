@@ -1,8 +1,8 @@
 use crate::nix::BuildMode;
 use clap::{Parser, Subcommand};
 use nixcache_cli::{
-    AuthTokenArgs, CachePolicyArgs, OciTargetArgs, ServerBindArgs, SessionContextArgs,
-    SigningKeyArgs,
+    AuthTokenArgs, CachePolicyArgs, OciTargetArgs, PurgeFilterArgs, ServerBindArgs,
+    SessionContextArgs, SigningKeyArgs,
 };
 use nixcache_utils::Env;
 use std::path::PathBuf;
@@ -31,6 +31,9 @@ pub enum Commands {
 
     /// Perform cross-architecture garbage collection on cache-index
     Gc(GcArgs),
+
+    /// Purge, clean, or invalidate specific or all cache entries
+    Purge(PurgeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -412,6 +415,12 @@ pub struct GcArgs {
     )]
     pub retention_days: Option<u64>,
 
+    #[arg(
+        long,
+        help = "Attempt physical OCI blob deletion (best-effort) [env: NIXCACHE_DELETE_BLOBS]"
+    )]
+    pub delete_blobs: bool,
+
     #[arg(long, help = "Dry run mode for garbage collection")]
     pub dry_run: bool,
 }
@@ -422,6 +431,36 @@ impl GcArgs {
             .or_else(|| Env::parse("NIXCACHE_RETENTION_DAYS"))
             .unwrap_or(30)
     }
+
+    pub fn resolve_delete_blobs(&self) -> bool {
+        if self.delete_blobs {
+            return true;
+        }
+        Env::get_bool("NIXCACHE_DELETE_BLOBS").unwrap_or(false)
+    }
+
+    pub fn to_purge_filter_args(&self) -> PurgeFilterArgs {
+        PurgeFilterArgs {
+            older_than: Some(format!("{}d", self.resolve_retention_days())),
+            protect_gc_roots: true,
+            cascade: Some("exact".to_string()),
+            delete_blobs: self.resolve_delete_blobs(),
+            dry_run: self.dry_run,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct PurgeArgs {
+    #[command(flatten)]
+    pub oci: OciTargetArgs,
+
+    #[command(flatten)]
+    pub auth: AuthTokenArgs,
+
+    #[command(flatten)]
+    pub filter: PurgeFilterArgs,
 }
 
 #[cfg(test)]

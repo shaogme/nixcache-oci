@@ -1,0 +1,135 @@
+name: Clean & Invalidate Build Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      purge_mode:
+        description: 'Purge Scope Mode'
+        required: true
+        default: 'filter'
+        type: choice
+        options:
+          - 'filter'      # 按条件/模式/时间筛选清理
+          - 'outputs'     # 清理当前 Flake 指定输出的闭包
+          - 'all'         # 彻底清空重置所有基线缓存
+      patterns:
+        description: 'Patterns to match (e.g. *debug*, linux-kernel*, my-pkg)'
+        required: false
+        default: ''
+        type: string
+      system:
+        description: 'Target System Architecture (leave blank for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - 'x86_64-linux'
+          - 'aarch64-linux'
+          - 'aarch64-darwin'
+          - 'x86_64-darwin'
+      older_than:
+        description: 'Purge entries older than (e.g. 30d, 7d, 12h)'
+        required: false
+        default: ''
+        type: string
+      cascade:
+        description: 'Cascade Mode'
+        required: true
+        default: 'dependents'
+        type: choice
+        options:
+          - 'dependents'  # 下游依赖级联 (推荐)
+          - 'exact'       # 仅自身
+          - 'transitive'  # 前向依赖闭包
+          - 'full'        # 双向全树
+      delete_blobs:
+        description: 'Attempt physical OCI Blob deletion'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Dry Run (Preview changes without applying)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  clean-cache:
+    name: Purge Cache (${{ github.event.inputs.purge_mode }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build NixCache Builder
+        run: |
+          nix build .#cache-builder .#cache-proxy
+          echo "${{ github.workspace }}/result/bin" >> "$GITHUB_PATH"
+          echo "${{ github.workspace }}/result-1/bin" >> "$GITHUB_PATH"
+
+      - name: Load Environment Variables
+        run: |
+          chmod +x scripts/load-env.sh
+          ./scripts/load-env.sh flake
+          
+          if [[ -z "${NIXCACHE_REPO:-}" ]]; then
+            echo "NIXCACHE_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
+          fi
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Execute Purge
+        run: |
+          MODE="${{ github.event.inputs.purge_mode }}"
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          DELETE_BLOBS="${{ github.event.inputs.delete_blobs }}"
+          CASCADE="${{ github.event.inputs.cascade }}"
+          PATTERNS="${{ github.event.inputs.patterns }}"
+          SYSTEM="${{ github.event.inputs.system }}"
+          OLDER_THAN="${{ github.event.inputs.older_than }}"
+
+          ARGS=()
+          if [[ "$DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          if [[ "$DELETE_BLOBS" == "true" ]]; then
+            ARGS+=(--delete-blobs)
+          fi
+          if [[ -n "$CASCADE" ]]; then
+            ARGS+=(--cascade "$CASCADE")
+          fi
+          if [[ -n "$SYSTEM" ]]; then
+            ARGS+=(--system "$SYSTEM")
+          fi
+          if [[ -n "$OLDER_THAN" ]]; then
+            ARGS+=(--older-than "$OLDER_THAN")
+          fi
+
+          if [[ "$MODE" == "all" ]]; then
+            echo ">>> Running in PURGE ALL mode"
+            nixcache-builder purge --all "${ARGS[@]}"
+          elif [[ "$MODE" == "outputs" ]]; then
+            echo ">>> Running in FLAKE OUTPUTS mode"
+            nixcache-builder purge --flake-path . "${ARGS[@]}"
+          else
+            echo ">>> Running in FILTER mode"
+            if [[ -n "$PATTERNS" ]]; then
+              ARGS+=(--patterns "$PATTERNS")
+            fi
+            nixcache-builder purge "${ARGS[@]}"
+          fi

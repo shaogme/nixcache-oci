@@ -11,7 +11,11 @@ on:
         type: string
       dry_run:
         description: 'Show what would be deleted without deleting'
-        default: 'true'
+        default: true
+        type: boolean
+      delete_blobs:
+        description: 'Attempt physical OCI blob deletion (best-effort)'
+        default: false
         type: boolean
 
 permissions:
@@ -52,10 +56,14 @@ jobs:
         run: |
           RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          DELETE_BLOBS="${{ github.event.inputs.delete_blobs || 'false' }}"
           
           EXTRA_ARGS=()
           if [[ "$DRY_RUN" == "true" ]]; then
             EXTRA_ARGS+=(--dry-run)
+          fi
+          if [[ "$DELETE_BLOBS" == "true" ]]; then
+            EXTRA_ARGS+=(--delete-blobs)
           fi
           
           nixcache-builder gc --retention-days "$RETENTION_DAYS" "${EXTRA_ARGS[@]}"

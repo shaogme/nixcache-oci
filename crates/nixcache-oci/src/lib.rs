@@ -300,6 +300,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_delete_blob_and_batch_delete_mock() {
+        let transport = MockRouterTransport::default();
+        transport.add_route(
+            "DELETE",
+            "/blobs/sha256:blob1",
+            MockResponse {
+                status: StatusCode::ACCEPTED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        transport.add_route(
+            "DELETE",
+            "/blobs/sha256:blob2",
+            MockResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+        transport.add_route(
+            "DELETE",
+            "/blobs/sha256:blob3",
+            MockResponse {
+                status: StatusCode::METHOD_NOT_ALLOWED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        );
+
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        assert!(client.delete_blob("sha256:blob1").await.unwrap());
+        assert!(!client.delete_blob("sha256:blob2").await.unwrap());
+        assert!(!client.delete_blob("sha256:blob3").await.unwrap());
+
+        let digests = vec![
+            NarDigest::new_unchecked("sha256:blob1"),
+            NarDigest::new_unchecked("sha256:blob2"),
+            NarDigest::new_unchecked("sha256:blob3"),
+        ];
+        let (deleted, skipped) = client.batch_delete_blobs(&digests, 2).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(skipped, 2);
+    }
+
+    #[tokio::test]
     async fn test_update_run_session_with_cas_mock() {
         let transport = MockRouterTransport::default();
         let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);

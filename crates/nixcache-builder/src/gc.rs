@@ -1,131 +1,24 @@
-use crate::error::BuilderError;
-use chrono::Utc;
-use nixcache_core::{CACHE_INDEX_VERSION, CacheIndexData, evaluate_multi_arch_gc};
-use nixcache_oci::{
-    EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor,
-    OciPlatform, build_arch_index_manifest, build_image_index,
-};
-use nixcache_oci_backend::create_tokio_reqwest_client;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use crate::{cli::GcArgs, error::BuilderError, purge::run_purge};
 use tracing::info;
 
-fn compute_sha256_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let hash = hasher.finalize();
-    format!(
-        "sha256:{}",
-        hash.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    )
-}
-
-/// 阶段 3: 跨平台垃圾回收阶段 (适配 OCI Image Index 与单架构 Sub-Manifest)
+/// 阶段 3: 跨平台垃圾回收阶段 (统一复用 purge 执行引擎)
 pub async fn run_gc(
-    retention_days: u64,
-    dry_run: bool,
+    args: &GcArgs,
     repo: &str,
     registry: &str,
     github_token: &str,
 ) -> Result<(), BuilderError> {
+    let filter_args = args.to_purge_filter_args();
     info!(
-        "Running multi-arch garbage collection for {}/{}",
-        registry, repo
-    );
-    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
-
-    let (index_data, _) = match oci.get_cache_index("cache-index").await? {
-        Some(pair) => pair,
-        None => {
-            info!("No cache index found or index is empty, nothing to GC");
-            return Ok(());
-        }
-    };
-
-    if index_data.entries.is_empty() {
-        info!("Cache index is empty, nothing to GC");
-        return Ok(());
-    }
-
-    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
-    let gc_result = evaluate_multi_arch_gc(&index_data, &cutoff);
-
-    info!(
-        "GC Evaluation: Total: {}, Live Roots: {}, Kept: {}, To Delete: {}",
-        index_data.entries.len(),
-        gc_result.reachable_roots.len(),
-        gc_result.kept_entries.len(),
-        gc_result.deleted_hashes.len()
+        "Running multi-arch garbage collection via purge engine for {}/{} (retention: {} days, dry_run: {}, delete_blobs: {})",
+        registry,
+        repo,
+        args.resolve_retention_days(),
+        filter_args.dry_run,
+        filter_args.delete_blobs
     );
 
-    if dry_run {
-        info!("Dry run complete. No modifications pushed.");
-        return Ok(());
-    }
-
-    // 将保留的 entries 和 roots 按架构拆分写回
-    let kept_data = CacheIndexData {
-        version: CACHE_INDEX_VERSION,
-        repo: repo.to_string(),
-        registry: registry.to_string(),
-        image: format!("{}/{}/nix-cache", registry, repo),
-        generated: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        public_key: index_data.public_key.clone(),
-        entries: gc_result.kept_entries,
-        gc_roots: index_data.gc_roots.clone(),
-        last_promoted_run: index_data.last_promoted_run,
-    };
-
-    let partitioned = kept_data.into_arch_partitioned();
-    let config_digest = EMPTY_CONFIG_DIGEST;
-    let config_size = EMPTY_CONFIG_SIZE;
-
-    let mut manifest_descriptors: Vec<OciDescriptor> = Vec::new();
-
-    for (sys, arch_data) in partitioned {
-        let (blob_digest, compressed_size, uncompressed_size) =
-            oci.push_zstd_blob(&arch_data).await?;
-        let sub_manifest = build_arch_index_manifest(
-            &blob_digest,
-            compressed_size,
-            uncompressed_size,
-            config_digest,
-            config_size,
-            &sys,
-        );
-        let sub_manifest_json = sub_manifest.to_json_string()?;
-        let sub_manifest_digest = compute_sha256_digest(sub_manifest_json.as_bytes());
-
-        let arch_tag = format!("cache-index-{}", sys.as_str());
-        oci.push_manifest(&arch_tag, &sub_manifest_json).await?;
-
-        let mut desc_annotations = HashMap::new();
-        desc_annotations.insert("org.nixos.nixcache.system".to_string(), sys.to_string());
-
-        manifest_descriptors.push(OciDescriptor {
-            media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-            digest: sub_manifest_digest,
-            size: sub_manifest_json.len() as u64,
-            platform: Some(OciPlatform::from_system(&sys)),
-            annotations: Some(desc_annotations),
-        });
-    }
-
-    let final_descriptors = manifest_descriptors;
-    oci.update_image_index_cas("cache-index", 5, |_existing| {
-        let mut index = build_image_index(
-            final_descriptors.clone(),
-            "NixCache Multi-Architecture Global Index",
-        );
-        index.schema_version = 2;
-        Ok(index)
-    })
-    .await?;
-
-    info!("Successfully updated multi-arch cache-index after GC.");
-    Ok(())
+    run_purge(&filter_args, repo, registry, github_token).await
 }
 
 #[cfg(test)]

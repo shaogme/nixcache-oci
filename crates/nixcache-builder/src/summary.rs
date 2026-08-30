@@ -122,6 +122,45 @@ pub async fn write_promote_step_summary_to(
     append_summary(content, file_opt).await;
 }
 
+/// 为 Purge 步骤生成并写入 GitHub Actions Step Summary
+pub async fn write_purge_step_summary(
+    dry_run: bool,
+    purged_count: usize,
+    kept_count: usize,
+    freed_bytes: u64,
+    blobs_deleted: usize,
+) {
+    write_purge_step_summary_to(
+        dry_run,
+        purged_count,
+        kept_count,
+        freed_bytes,
+        blobs_deleted,
+        None,
+    )
+    .await;
+}
+
+pub async fn write_purge_step_summary_to(
+    dry_run: bool,
+    purged_count: usize,
+    kept_count: usize,
+    freed_bytes: u64,
+    blobs_deleted: usize,
+    file_opt: Option<&str>,
+) {
+    let mode_str = if dry_run {
+        " (Dry Run - Preview Only)"
+    } else {
+        ""
+    };
+    let content = format!(
+        "### 🧹 NixCache Cache Purge Report{}\n\n- **Purged Entries:** `{}`\n- **Kept Entries:** `{}`\n- **Estimated Space Freed:** `{}` bytes\n- **Physical Blobs Deleted:** `{}`\n",
+        mode_str, purged_count, kept_count, freed_bytes, blobs_deleted
+    );
+    append_summary(content, file_opt).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

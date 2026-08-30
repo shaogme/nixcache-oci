@@ -12,6 +12,7 @@ mod error;
 mod gc;
 mod nix;
 mod promote;
+mod purge;
 mod session;
 mod summary;
 mod worker;
@@ -20,6 +21,7 @@ use cli::{Cli, Commands, SessionCommands};
 use gc::run_gc;
 use nix::BuildConfig;
 use promote::run_promote;
+use purge::run_purge;
 use session::{
     SessionCaptureOptions, SessionInitOptions, run_session_capture, run_session_clean,
     run_session_init,
@@ -176,18 +178,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Commands::Gc(args) => {
             let active_token = args.auth.resolve_token().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
-            let retention_days = args.resolve_retention_days();
 
-            if let Err(e) = run_gc(
-                retention_days,
-                args.dry_run,
-                &repo,
-                &registry,
-                &active_token,
-            )
-            .await
-            {
+            if let Err(e) = run_gc(&args, &repo, &registry, &active_token).await {
                 eprintln!("Garbage collection failed: {}", e);
+                process::exit(1);
+            }
+        }
+
+        Commands::Purge(args) => {
+            let active_token = args.auth.resolve_token().await;
+            let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
+
+            if let Err(e) = run_purge(&args.filter, &repo, &registry, &active_token).await {
+                eprintln!("Purge failed: {}", e);
                 process::exit(1);
             }
         }
