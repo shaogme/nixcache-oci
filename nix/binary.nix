@@ -45,7 +45,7 @@ pkgs.stdenv.mkDerivation {
     description = "Pre-compiled ${pname} binary";
     homepage = "https://github.com/shaogme/nixcache-oci";
     license = licenses.mit;
-    platforms = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+    platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
     mainProgram = pname;
   };
 }

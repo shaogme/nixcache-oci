@@ -76,11 +76,11 @@ find_binaries
 # 3. Simulate 12 concurrent workers generating receipts with overlapping and distinct packages
 echo ">>> Simulating 12 concurrent workers generating build receipts..."
 
-SYSTEMS=("x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin")
+SYSTEMS=("x86_64-linux" "aarch64-linux" "aarch64-darwin")
 WORKER_PIDS=()
 
 for worker_id in {1..12}; do
-    SYS_INDEX=$(( (worker_id - 1) % 4 ))
+    SYS_INDEX=$(( (worker_id - 1) % 3 ))
     SYS="${SYSTEMS[$SYS_INDEX]}"
     RECEIPT_FILE="$RECEIPTS_DIR/receipt-worker-${worker_id}-${SYS}.json"
     
@@ -94,7 +94,6 @@ receipt_file = sys.argv[3]
 sys_codes = {
     'x86_64-linux': '11111111',
     'aarch64-linux': '22222222',
-    'x86_64-darwin': '33333333',
     'aarch64-darwin': '44444444'
 }
 
@@ -179,7 +178,7 @@ import json, subprocess, sys
 
 manifest_index = json.loads('''$MANIFEST_INDEX_JSON''')
 manifests = manifest_index.get('manifests', [])
-assert len(manifests) >= 4, f'Expected at least 4 architecture manifests, got {len(manifests)}'
+assert len(manifests) >= 3, f'Expected at least 3 architecture manifests, got {len(manifests)}'
 
 all_entries = {}
 gc_roots = {}
@@ -205,12 +204,12 @@ for m in manifests:
         all_entries[k] = v
 
 print(f'>>> Merged cache index contains {len(all_entries)} unique entries across all architectures.')
-assert len(all_entries) == 17, f'Expected 17 entries, got {len(all_entries)}'
+assert len(all_entries) == 16, f'Expected 16 entries, got {len(all_entries)}'
 
-for sys_name in ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']:
+for sys_name in ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin']:
     assert sys_name in gc_roots, f'Missing gc_roots for {sys_name}'
     roots = gc_roots[sys_name]
-    assert len(roots) == 5, f'Expected 5 roots for {sys_name}, got {len(roots)}: {roots}'
+    assert len(roots) == 6, f'Expected 6 roots for {sys_name}, got {len(roots)}: {roots}'
     assert '00000000000000000000000000000099' in roots
 "
 echo ">>> Entry count, deduplication and GC roots aggregation verified."
@@ -226,7 +225,7 @@ import json, subprocess, sys
 
 manifest_index = json.loads('''$MANIFEST_INDEX_JSON_2''')
 manifests = manifest_index.get('manifests', [])
-assert len(manifests) >= 4, f'Expected at least 4 architecture manifests, got {len(manifests)}'
+assert len(manifests) >= 3, f'Expected at least 3 architecture manifests, got {len(manifests)}'
 
 all_entries = {}
 for m in manifests:
@@ -244,7 +243,7 @@ for m in manifests:
     for k, v in arch_data['entries'].items():
         all_entries[k] = v
 
-assert len(all_entries) == 17, f'Expected 17 entries on idempotency check, got {len(all_entries)}'
+assert len(all_entries) == 16, f'Expected 16 entries on idempotency check, got {len(all_entries)}'
 "
 echo ">>> Idempotency verified."
 

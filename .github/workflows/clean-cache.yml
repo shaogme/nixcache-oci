@@ -27,7 +27,6 @@ on:
           - 'x86_64-linux'
           - 'aarch64-linux'
           - 'aarch64-darwin'
-          - 'x86_64-darwin'
       older_than:
         description: 'Purge entries older than (e.g. 30d, 7d, 12h)'
         required: false

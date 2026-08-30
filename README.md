@@ -459,7 +459,7 @@ nix.settings.substituters = [
 
 ### 使用预编译的二进制包（推荐，免编译）
 
-本项目在 GitHub Actions 中配置了跨架构（`x86_64-linux`、`aarch64-linux`、`x86_64-darwin`、`aarch64-darwin`）的预编译二进制发布流水线，并且与 Git Commit SHA 强绑定以保证版本控制的严密性。如果您的系统为上述支持的架构之一，建议使用预编译包以节省本地编译时间和内存资源。
+本项目在 GitHub Actions 中配置了跨架构（`x86_64-linux`、`aarch64-linux`、`aarch64-darwin`）的预编译二进制发布流水线，并且与 Git Commit SHA 强绑定以保证版本控制的严密性。如果您的系统为上述支持的架构之一，建议使用预编译包以节省本地编译时间和内存资源。
 
 在不同场景下，只需在原包名后加上 `-bin` 后缀即可使用：
 
@@ -1112,62 +1112,9 @@ nix-build default.nix -A tests.vmtest --no-out-link
 nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh install/*.sh && actionlint"
 ```
 
-
----
-
-## 权限与故障排查指南 (Permissions & Troubleshooting)
-
-### 1. GitHub Packages (GHCR) 权限配置
-
-在 GHCR 上发布缓存、清理会话 Tag 或执行主动 Purge / GC 时，需确保 Token 拥有足够的权限：
-
-#### GitHub Actions 工作流内置 `GITHUB_TOKEN`
-在工作流 YAML 顶部或对应 Job 显式声明 `packages: write` 权限：
-```yaml
-permissions:
-  contents: read
-  packages: write
-```
-
-> [!NOTE]
-> **自动包关联与权限继承**：首次通过 GitHub Actions 推送 OCI 包后，GitHub 会自动将该 Package 绑定到触发构建的 GitHub 仓库。后续同仓库的工作流将天然具备该 Package 对应版本的删除与更新权限。
-
-#### 本地开发者与外部 CI (Personal Access Token, PAT)
-若在本地终端运行 `nixcache-builder purge`、`gc` 或 `promote`：
-- **Classic Token (推荐)**：创建 PAT 时务必勾选 `write:packages` 与 **`delete:packages`** 作用域（删除 Package Version 必须具备 `delete:packages`）。
-- **Fine-grained Token**：将目标仓库的 **Packages** 权限设置为 `Read and write`。
-
----
-
-### 2. 常见错误排查与修复
-
-#### 403 Forbidden: `InsufficientPermission`
-- **错误特征**：`Insufficient permissions to delete ... Required scope: 'delete:packages'`
-- **可能原因**：
-  1. 使用了未授权 `delete:packages` 范围的 PAT 密钥；
-  2. 该 Package 由组织（Organization）托管，但当前用户或 Token 在该 Package 的访问策略中仅具备读取权限；
-  3. GitHub Actions 中的 `GITHUB_TOKEN` 缺少 `packages: write` 权限声明。
-- **修复方案**：
-  1. 进入 GitHub -> **Your Profile / Organization** -> **Packages** -> 打开对应的容器包；
-  2. 点击 **Package settings** -> **Manage Actions access** (或 **Collaborators**)；
-  3. 将当前仓库或工作流赋予 **Admin** 或 **Write** 权限；
-  4. 重新生成并配置带有 `delete:packages` 权限的 Token。
-
-#### 405 Method Not Allowed: `OperationNotSupported`
-- **错误特征**：`Registry returned 405 Method Not Allowed ...`
-- **可能原因**：
-  1. 目标通用 OCI 镜像仓库（如企业私有 Harbor / Distribution）在配置中关闭了直接删除 Manifest 或 Blob 的开关。
-- **修复方案**：
-  1. 在 Harbor 或自建 Registry 项目管理界面中，开启 **"Allow deletion"** / **"允许软删除与垃圾回收"** 功能；
-  2. 若使用的是 GHCR，`nixcache-oci` 现已自动无缝切换为 GitHub Packages REST API，杜绝了 405 警告。
-
----
-
 ## 局限性
 
 - **需通过协议桥接代理**：Nix 客户端原生无法直接通过 OCI 镜像协议拉取包，因此需要通过代理服务桥接协议。用户可根据实际场景选择：在客户端运行轻量级 `nixcache-proxy` 本地常驻服务，或将 `nixcache-worker` 一键部署于 Cloudflare Workers 无服务器边缘网络（完全无需本地运行任何后台守护进程）。
 - **注册表接口配额与限制**：GitHub 的 API 对于未认证的用户有限制，已认证用户为每小时 5,000 次；Docker Hub 或公有云 ECR 可能会有拉取/推送速率配额。代理通过本地内存索引和 Nix 自带的缓存机制来大幅减少对远程 API 的直接请求，从而有效避免命中限流。
 - **私有仓库成本**：如果使用私有 GHCR 或云端付费 Registry，超出免费额度后将按服务商标准产生存储与流量费用。若在公开 GitHub 仓库配合 GHCR 使用，则完全免费。
 - **服务依赖性**：如果上游 OCI Registry 发生短暂不可用，自定义软件包缓存将暂时不可用（但上游缓存如 `cache.nixos.org` 中的官方软件包依然可以通过代理透明回退访问）。
-
-

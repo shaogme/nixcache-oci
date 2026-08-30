@@ -1,0 +1,70 @@
+name: Daily npins Update & PR
+
+on:
+  schedule:
+    # 每天 18:00 UTC (北京时间凌晨 02:00) 自动执行
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-npins:
+    name: Update npins & Open PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@main
+        with:
+          token: ${{ secrets.GH_PAT || secrets.PAT }}
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Install npins CLI
+        run: |
+          nix profile install nixpkgs#npins
+
+      - name: Update npins Dependencies
+        id: npins-update
+        run: |
+          echo ">>> Updating npins dependencies..."
+          npins update
+          
+          if git diff --quiet npins/sources.json; then
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo ">>> npins dependencies are already up-to-date."
+          else
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo ">>> npins dependencies have been updated."
+          fi
+
+      - name: Create Branch, PR and Enable Auto-Merge via PAT
+        if: steps.npins-update.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.PAT }}
+        run: |
+          BRANCH="update-npins-dependencies"
+          git checkout -B "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add npins/sources.json
+          git commit -m "chore(deps): daily npins update"
+          git push -u origin "$BRANCH" --force
+          
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --base main --json number -q '.[0].number')
+          if [ -z "$EXISTING_PR" ]; then
+            PR_URL=$(gh pr create \
+              --title "chore(deps): daily npins update" \
+              --body "Daily automated npins update for mise and nixpkgs upstream tracking." \
+              --base main \
+              --head "$BRANCH")
+            echo "Created PR: $PR_URL"
+            gh pr merge "$PR_URL" --auto --squash || true
+          else
+            echo "PR #$EXISTING_PR already exists, enabling auto-merge."
+            gh pr merge "$EXISTING_PR" --auto --squash || true
+          fi
