@@ -53,6 +53,10 @@ impl TokenManager {
         }
     }
 
+    pub fn auth_token(&self) -> &str {
+        &self.github_token
+    }
+
     /// 核心鉴权方法：99.9% 场景为 Wait-Free 无锁读取，返回不可变共享 Arc<str>
     pub async fn get_token<T: OciTransport>(&self, transport: &T) -> Result<Arc<str>, OciError> {
         // 1. Fast Path: Wait-Free 读取原子快照 (0 锁争用，0 堆内存深拷贝)

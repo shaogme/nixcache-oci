@@ -34,14 +34,15 @@
 
 ## 主流 OCI 注册表支持矩阵
 
-| 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | 特性说明 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | 严禁 PATCH，无 416 风险，零降级试错 RTT |
-| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | 自动规范化域名为 `registry-1.docker.io` |
-| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生适配 AWS ECR 端点与权限 |
-| **GCP GAR** (`gcp_artifact_registry`)| `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生支持 Google Cloud Artifact Registry |
-| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **固化两阶段 PUT** (`FixedTwoStepPut`) | 原生支持 Azure 容器注册表 |
-| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | 严格遵循 OCI Distribution Spec，支持 CAS |
+| 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | 删除与清理机制 (`DeletionStrategy`) | 特性说明 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 严禁 PATCH，无 416 风险；原生支持 Tag 与 Package 物理删除 |
+| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **Hub 专有 REST API** (`DockerHubRestApi`) | 自动规范化域名为 `registry-1.docker.io` |
+| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **AWS ECR API** (`AwsEcrApi`) | 原生适配 AWS ECR 端点与 BatchDeleteImage |
+| **GCP GAR** (`gcp_artifact_registry`)| `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
+| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Azure 容器注册表 |
+| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 严格遵循 OCI Distribution Spec，支持 Manifest 与 Blob 物理删除 |
+
 
 ## 快速开始
 
@@ -105,7 +106,7 @@ jobs:
           flake-path: '.'
           signing-key: ${{ secrets.NIX_SIGNING_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fail-fast: 'true'
+          strict: 'true'
           export-concurrency: '4' # 可选，自定义并发导出与上传数量（默认自适应 2~8）
 
   # =========================================================================
@@ -153,7 +154,7 @@ jobs:
             mode: 'flake'
             flake-path: '.' # 你的 flake.nix 所在的目录路径，默认为当前目录
             signing-key: ${{ secrets.NIX_SIGNING_KEY }} # 可选，签名私钥
-            fail-fast: 'true' # 可选，默认为 'true'
+            strict: 'true' # 可选，默认为 'true'
   ```
 
 - **非 Flake 模式：**
@@ -184,7 +185,7 @@ jobs:
             file: 'default.nix'
             attributes: 'my-package another-package'
             signing-key: ${{ secrets.NIX_SIGNING_KEY }}
-            fail-fast: 'true'
+            strict: 'true'
   ```
 
 ##### 3. 复杂流水线即时缓存与会话加速（setup Action）
@@ -261,7 +262,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-##### 6. 构建缓存查询与洞察（List / Inspect Cache）
+- **全量清空与彻底重置 (`--all`)**：若指定 `--all`，GHCR 后端将通过 GitHub Packages REST API 直接彻底物理删除远程 Package 容器包及其所有历史版本；Generic OCI 后端将清空索引并物理回收 Blobs。
+- **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收（若在 GHCR 开启 `--delete-blobs`，可搭配 `--allow-unsupported-blob-deletion` 跳过不支持的独立 Blob 删除阶段）。
+- **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
+
 
 你可以通过官方 `list` Action 或直接触发 `List & Inspect Build Cache` 交互式工作流，实时查询、过滤并审查远程 OCI 镜像仓库中的构建缓存状态：
 
@@ -607,7 +611,7 @@ nixcache-builder build \
   --repo owner/repo \
   --registry ghcr.io \
   --output-receipt receipt-x86_64-linux.json \
-  --fail-fast
+  --strict
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
@@ -623,7 +627,7 @@ nixcache-builder build \
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | `receipt-<system>.json` | 生成的收据 JSON 文件路径 |
-| `--fail-fast <BOOL>` / `--no-fail-fast` | `NIXCACHE_FAIL_FAST` | `true` | Proxy 启动失败时是否立即报错退出 |
+| `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇到 Proxy 或构建/导出异常立即报错退出） |
 | `--export-concurrency <NUM>` | `NIXCACHE_EXPORT_CONCURRENCY` | 自适应 (`num_cpus.clamp(2, 8)`) | 并行导出与上传的最大并发 Worker 数 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
@@ -669,7 +673,9 @@ nixcache-builder gc \
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 |---|---|---|---|
 | `--retention-days <DAYS>`| `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
-| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 尽力而为（Best-effort）尝试物理删除 OCI Blobs |
+| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 请求物理删除 OCI Blobs（在支持的后端如 Generic OCI 执行；在 GHCR 上 Blob 随版本回收） |
+| `--allow-unsupported-blob-deletion` | `NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION` | `false` | 若后端不支持独立 Blob 物理删除（如 GHCR），跳过该阶段而非报错中断 |
+| `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇权限不足或远程异常立即报错退出） |
 | `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
@@ -688,7 +694,7 @@ nixcache-builder purge \
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 |---|---|---|---|
-| `--all` | `NIXCACHE_PURGE_ALL` | `false` | **一键清空所有**：重置并清空所有生产基线索引与根 |
+| `--all` | `NIXCACHE_PURGE_ALL` | `false` | **彻底清空/重置**：GHCR 下通过 REST API 直接删除整个 Package；Generic OCI 下重置生产基线索引 |
 | `--hashes <HASHES>` | `NIXCACHE_PURGE_HASHES` | （无） | 指定要清理的 Store Hash（逗号或空格分隔） |
 | `--patterns <PATTERN...>` | `NIXCACHE_PURGE_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
 | `--system <SYSTEM...>` | `NIXCACHE_SYSTEM` | （全部） | 限制目标架构（如 `x86_64-linux`） |
@@ -700,7 +706,9 @@ nixcache-builder purge \
 | `--min-size <BYTES>` | `NIXCACHE_MIN_SIZE` | （无） | 仅清理大于等于指定大小（支持 `500M`、`1G`）的条目 |
 | `--origin-job <JOB>` | `NIXCACHE_ORIGIN_JOB` | （无） | 按 CI Job ID 过滤 |
 | `--origin-run <RUN_ID>` | `NIXCACHE_ORIGIN_RUN` | （无） | 按 CI Run ID 过滤 |
-| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 尽力而为（Best-effort）尝试物理删除 OCI Blobs |
+| `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 请求物理删除 OCI Blobs（在支持的后端如 Generic OCI 执行；在 GHCR 上 Blob 随版本回收） |
+| `--allow-unsupported-blob-deletion` | `NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION` | `false` | 若后端不支持独立 Blob 物理删除（如 GHCR），跳过该阶段而非报错中断 |
+| `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇权限不足或远程异常立即报错退出） |
 | `--dry-run` | `NIXCACHE_DRY_RUN` | `false` | 试运行模式（仅输出审查报告，不修改远端） |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
@@ -886,7 +894,7 @@ curl -X POST http://localhost:37515/_refresh
 
 ```mermaid
 flowchart TD
-    Core["crates/nixcache-core<br>(纯核心模型 / Schema v3 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
+    Core["crates/nixcache-core<br>(纯核心模型 / Schema v4 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
     Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 纯标准库 Env 工具)"]
     CLI["crates/nixcache-cli<br>(共享 CLI 参数组件 / 认证探测 / 强类型配置转换)"]
     OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
@@ -949,7 +957,7 @@ flowchart TD
 
     subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
         Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
-        MergedIndex["全局 Cache Index v3<br>(合并 entries + 跨平台 gc_roots)"]
+        MergedIndex["全局 Cache Index v4<br>(合并 entries + 跨平台 gc_roots)"]
         TagPush["更新 GHCR tag: cache-index"]
     end
 
@@ -971,7 +979,7 @@ flowchart TD
 
 - **多架构分片索引（Arch-scoped Index / Session）**：在并行 Matrix 阶段，各 Runner 独立构建目标平台产物（如 `x86_64-linux`、`aarch64-linux`），并将架构专有索引保存为特定 Tag（如 `session-<run_id>-<system>`），避免多架构节点在构建期相互干扰。
 - **CAS（Compare-And-Swap）原子更新与指数退避**：所有 OCI 清单的更新均通过 CAS 条件写入机制进行，在并发竞争时采用抖动指数退避自动重试，确保多节点无锁并发提交时绝对不会发生数据覆盖或丢失。
-- **Coordinator 汇聚与 GC 活性根聚合**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session 分片，合并为全局统一的 `cache-index`（Schema v3），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
+- **Coordinator 汇聚与 GC 活性根聚合**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session 分片，合并为全局统一的 `cache-index`（Schema v4），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
 
 
 ### 输出自动发现机制
@@ -1122,10 +1130,59 @@ nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh scripts/*.sh && a
 
 ---
 
+## 权限与故障排查指南 (Permissions & Troubleshooting)
+
+### 1. GitHub Packages (GHCR) 权限配置
+
+在 GHCR 上发布缓存、清理会话 Tag 或执行主动 Purge / GC 时，需确保 Token 拥有足够的权限：
+
+#### GitHub Actions 工作流内置 `GITHUB_TOKEN`
+在工作流 YAML 顶部或对应 Job 显式声明 `packages: write` 权限：
+```yaml
+permissions:
+  contents: read
+  packages: write
+```
+
+> [!NOTE]
+> **自动包关联与权限继承**：首次通过 GitHub Actions 推送 OCI 包后，GitHub 会自动将该 Package 绑定到触发构建的 GitHub 仓库。后续同仓库的工作流将天然具备该 Package 对应版本的删除与更新权限。
+
+#### 本地开发者与外部 CI (Personal Access Token, PAT)
+若在本地终端运行 `nixcache-builder purge`、`gc` 或 `promote`：
+- **Classic Token (推荐)**：创建 PAT 时务必勾选 `write:packages` 与 **`delete:packages`** 作用域（删除 Package Version 必须具备 `delete:packages`）。
+- **Fine-grained Token**：将目标仓库的 **Packages** 权限设置为 `Read and write`。
+
+---
+
+### 2. 常见错误排查与修复
+
+#### 403 Forbidden: `InsufficientPermission`
+- **错误特征**：`Insufficient permissions to delete ... Required scope: 'delete:packages'`
+- **可能原因**：
+  1. 使用了未授权 `delete:packages` 范围的 PAT 密钥；
+  2. 该 Package 由组织（Organization）托管，但当前用户或 Token 在该 Package 的访问策略中仅具备读取权限；
+  3. GitHub Actions 中的 `GITHUB_TOKEN` 缺少 `packages: write` 权限声明。
+- **修复方案**：
+  1. 进入 GitHub -> **Your Profile / Organization** -> **Packages** -> 打开对应的容器包；
+  2. 点击 **Package settings** -> **Manage Actions access** (或 **Collaborators**)；
+  3. 将当前仓库或工作流赋予 **Admin** 或 **Write** 权限；
+  4. 重新生成并配置带有 `delete:packages` 权限的 Token。
+
+#### 405 Method Not Allowed: `OperationNotSupported`
+- **错误特征**：`Registry returned 405 Method Not Allowed ...`
+- **可能原因**：
+  1. 目标通用 OCI 镜像仓库（如企业私有 Harbor / Distribution）在配置中关闭了直接删除 Manifest 或 Blob 的开关。
+- **修复方案**：
+  1. 在 Harbor 或自建 Registry 项目管理界面中，开启 **"Allow deletion"** / **"允许软删除与垃圾回收"** 功能；
+  2. 若使用的是 GHCR，`nixcache-oci` 现已自动无缝切换为 GitHub Packages REST API，杜绝了 405 警告。
+
+---
+
 ## 局限性
 
 - **需通过协议桥接代理**：Nix 客户端原生无法直接通过 OCI 镜像协议拉取包，因此需要通过代理服务桥接协议。用户可根据实际场景选择：在客户端运行轻量级 `nixcache-proxy` 本地常驻服务，或将 `nixcache-worker` 一键部署于 Cloudflare Workers 无服务器边缘网络（完全无需本地运行任何后台守护进程）。
 - **注册表接口配额与限制**：GitHub 的 API 对于未认证的用户有限制，已认证用户为每小时 5,000 次；Docker Hub 或公有云 ECR 可能会有拉取/推送速率配额。代理通过本地内存索引和 Nix 自带的缓存机制来大幅减少对远程 API 的直接请求，从而有效避免命中限流。
 - **私有仓库成本**：如果使用私有 GHCR 或云端付费 Registry，超出免费额度后将按服务商标准产生存储与流量费用。若在公开 GitHub 仓库配合 GHCR 使用，则完全免费。
 - **服务依赖性**：如果上游 OCI Registry 发生短暂不可用，自定义软件包缓存将暂时不可用（但上游缓存如 `cache.nixos.org` 中的官方软件包依然可以通过代理透明回退访问）。
+
 

@@ -54,7 +54,7 @@ pub struct ParallelExportConfig {
     /// 签名私钥文件路径
     pub signing_key_file: Option<String>,
     /// 是否在遇到单个产物导出失败时立即中止退出
-    pub fail_fast: bool,
+    pub strict: bool,
     /// OCI 上传底层配置
     pub upload_config: UploadConfig,
     /// 目标平台系统架构
@@ -68,7 +68,7 @@ impl Default for ParallelExportConfig {
         Self {
             concurrency: num_cpus::get().clamp(2, 8),
             signing_key_file: None,
-            fail_fast: false,
+            strict: false,
             upload_config: UploadConfig::default(),
             system: SystemArch::from("x86_64-linux"),
             origin_job: None,
@@ -133,10 +133,10 @@ impl ParallelExporter {
 
         let start_time = Instant::now();
         info!(
-            "Starting parallel export with pre-info for {} items (concurrency: {}, fail_fast: {})",
+            "Starting parallel export with pre-info for {} items (concurrency: {}, strict: {})",
             items.len(),
             config.concurrency,
-            config.fail_fast
+            config.strict
         );
 
         if let Some(ref key) = config.signing_key_file {
@@ -179,7 +179,7 @@ impl ParallelExporter {
                 }
                 Err(e) => {
                     error!("  [FAIL] Failed to export {}: {}", path, e);
-                    if config.fail_fast {
+                    if config.strict {
                         return Err(e);
                     }
                     report.failed.push((path, e.to_string()));
@@ -650,7 +650,7 @@ mod tests {
         let config = super::ParallelExportConfig {
             concurrency: 4,
             signing_key_file: None,
-            fail_fast: true,
+            strict: true,
             upload_config: nixcache_oci::UploadConfig::default(),
             system: nixcache_core::SystemArch::from("x86_64-linux"),
             origin_job: Some("job:test".to_string()),
@@ -736,7 +736,7 @@ mod tests {
         let config = super::ParallelExportConfig {
             concurrency: 2,
             signing_key_file: None,
-            fail_fast: true,
+            strict: true,
             upload_config: nixcache_oci::UploadConfig::default(),
             system: nixcache_core::SystemArch::from("x86_64-linux"),
             origin_job: Some("job:test".to_string()),

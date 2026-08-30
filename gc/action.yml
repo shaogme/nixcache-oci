@@ -10,9 +10,17 @@ inputs:
     required: false
     default: 'false'
   delete-blobs:
-    description: 'Attempt physical OCI blob deletion (best-effort)'
+    description: 'Attempt physical OCI blob deletion'
     required: false
     default: 'false'
+  allow-unsupported-blob-deletion:
+    description: 'Allow skipping blob deletion if registry does not support standalone blob deletion (e.g. GHCR)'
+    required: false
+    default: 'false'
+  strict:
+    description: 'Strict error handling mode (default true)'
+    required: false
+    default: 'true'
   repo:
     description: 'Target repository name (owner/repo)'
     required: false
@@ -56,6 +64,8 @@ runs:
       env:
         NIXCACHE_RETENTION_DAYS: ${{ inputs.retention-days }}
         NIXCACHE_DELETE_BLOBS: ${{ inputs.delete-blobs }}
+        NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION: ${{ inputs.allow-unsupported-blob-deletion }}
+        NIXCACHE_STRICT: ${{ inputs.strict }}
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
@@ -68,5 +78,11 @@ runs:
         if [[ "${{ inputs.delete-blobs }}" == "true" ]]; then
           EXTRA_ARGS+=(--delete-blobs)
         fi
+        if [[ "${{ inputs.allow-unsupported-blob-deletion }}" == "true" ]]; then
+          EXTRA_ARGS+=(--allow-unsupported-blob-deletion)
+        fi
+        if [[ "${{ inputs.strict }}" == "false" ]]; then
+          EXTRA_ARGS+=(--no-strict)
+        fi
         
-        nixcache-builder gc "${EXTRA_ARGS[@]}"
+        nixcache-builder gc --retention-days "$NIXCACHE_RETENTION_DAYS" "${EXTRA_ARGS[@]}"

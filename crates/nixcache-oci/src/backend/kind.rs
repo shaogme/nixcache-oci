@@ -139,4 +139,57 @@ pub struct RegistryCapabilities {
     pub fixed_upload_strategy: BlobUploadStrategy,
     /// 专用 Token Auth Server 覆盖地址
     pub custom_auth_endpoint: Option<&'static str>,
+
+    // === 新增核心删除能力字段 ===
+    /// 当前后端采用的删除调度策略
+    pub deletion_strategy: RegistryDeletionStrategy,
+    /// 是否支持物理删除 OCI NAR Blobs
+    pub supports_blob_physical_deletion: bool,
+    /// 是否支持物理删除整个 Package / Repository
+    pub supports_package_deletion: bool,
+}
+
+/// 注册表后端删除策略分类
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryDeletionStrategy {
+    /// 基于 GitHub Packages REST API 进行包、版本与 Tag 物理删除 (GHCR)
+    #[default]
+    GitHubPackagesRestApi,
+    /// 基于 Docker Hub 专用 REST API 进行 Tag 删除 (Docker Hub)
+    DockerHubRestApi,
+    /// 基于 AWS ECR API (BatchDeleteImage) 进行删除
+    AwsEcrApi,
+    /// 遵循标准 OCI Distribution Spec 1.1 的 HTTP DELETE 端点 (Generic OCI, Harbor, Zot, Azure ACR 等)
+    StandardOciDelete,
+    /// 明确不支持任何物理删除操作的后端
+    Unsupported,
+}
+
+impl fmt::Display for RegistryDeletionStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GitHubPackagesRestApi => write!(f, "github_packages_rest_api"),
+            Self::DockerHubRestApi => write!(f, "docker_hub_rest_api"),
+            Self::AwsEcrApi => write!(f, "aws_ecr_api"),
+            Self::StandardOciDelete => write!(f, "standard_oci_delete"),
+            Self::Unsupported => write!(f, "unsupported"),
+        }
+    }
+}
+
+impl FromStr for RegistryDeletionStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let clean = s.trim().to_lowercase().replace('-', "_");
+        match clean.as_str() {
+            "github_packages_rest_api" | "ghcr" | "github" => Ok(Self::GitHubPackagesRestApi),
+            "docker_hub_rest_api" | "dockerhub" | "docker" => Ok(Self::DockerHubRestApi),
+            "aws_ecr_api" | "ecr" | "aws" => Ok(Self::AwsEcrApi),
+            "standard_oci_delete" | "standard" | "oci" => Ok(Self::StandardOciDelete),
+            "unsupported" | "none" => Ok(Self::Unsupported),
+            _ => Err(format!("Unknown registry deletion strategy: '{}'", s)),
+        }
+    }
 }

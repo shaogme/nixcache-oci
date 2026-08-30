@@ -365,11 +365,9 @@ pub async fn run_promote(
 
         let delete_futures = delete_tags.into_iter().map(|tag| {
             let oci = oci.clone();
-            async move {
-                let _ = oci.delete_manifest(&tag).await;
-            }
+            async move { oci.delete_tag_strict(&tag).await }
         });
-        join_all(delete_futures).await;
+        try_join_all(delete_futures).await?;
         info!("Cleaned up session tags for run-{}", rid);
     }
 

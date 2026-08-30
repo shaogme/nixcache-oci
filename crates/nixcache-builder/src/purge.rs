@@ -34,15 +34,48 @@ pub async fn run_purge(
 ) -> Result<(), BuilderError> {
     let dry_run = args.resolve_dry_run();
     let delete_blobs = args.resolve_delete_blobs();
+    let allow_unsupported_blobs = args.resolve_allow_unsupported_blob_deletion();
+    let strict_mode = args.resolve_strict();
+    let is_all = args.selector.resolve_all();
 
     info!(
-        "Starting cache purge workflow for {}/{} (dry_run: {}, delete_blobs: {})",
-        registry, repo, dry_run, delete_blobs
+        "Starting cache purge workflow for {}/{} (dry_run: {}, delete_blobs: {}, strict: {}, is_all: {})",
+        registry, repo, dry_run, delete_blobs, strict_mode, is_all
     );
 
     let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
 
-    let (index_data, _) = match oci.get_cache_index("cache-index").await? {
+    // 1. 若指定了 --all 且后端支持原生包删除 (如 GHCR)，直接执行彻底重置/删除
+    if is_all && oci.capabilities().supports_package_deletion {
+        if dry_run {
+            info!(
+                "Dry run mode active: would delete entire remote package {}/{} on backend '{}'",
+                registry,
+                repo,
+                oci.kind()
+            );
+            write_purge_step_summary(true, 0, 0, 0, 0).await;
+            return Ok(());
+        }
+
+        info!(
+            "Executing complete package deletion for {}/{} on backend '{}'...",
+            registry,
+            repo,
+            oci.kind()
+        );
+        oci.delete_entire_package_strict().await?;
+        info!(
+            "Successfully deleted entire remote package {}/{}",
+            registry, repo
+        );
+        write_purge_step_summary(false, 0, 0, 0, 0).await;
+        return Ok(());
+    }
+
+    // 2. 拉取现存 cache-index
+    let index_data_opt = oci.get_cache_index("cache-index").await?;
+    let (index_data, _) = match index_data_opt {
         Some(pair) => pair,
         None => {
             info!("No cache index found, nothing to purge.");
@@ -103,7 +136,7 @@ pub async fn run_purge(
         return Ok(());
     }
 
-    // 将保留的 entries 和 roots 按架构拆分写回
+    // 3. 将保留的 entries 和 roots 按架构拆分写回
     let kept_data = CacheIndexData {
         version: CACHE_INDEX_VERSION,
         repo: repo.to_string(),
@@ -164,20 +197,40 @@ pub async fn run_purge(
 
     info!("Successfully updated multi-arch cache-index after purge.");
 
+    // 4. 处理 Blobs 物理删除
     let mut deleted_blobs = 0;
     if delete_blobs && !purge_result.purged_nar_digests.is_empty() {
-        info!(
-            "Attempting physical deletion of {} OCI NAR blobs...",
-            purge_result.purged_nar_digests.len()
-        );
-        let (del, skipped) = oci
-            .batch_delete_blobs(&purge_result.purged_nar_digests, 8)
-            .await?;
-        info!(
-            "Blob deletion complete: {} physically deleted, {} skipped / unsupported.",
-            del, skipped
-        );
-        deleted_blobs = del;
+        if !oci.capabilities().supports_blob_physical_deletion {
+            if !allow_unsupported_blobs {
+                return Err(BuilderError::Oci(
+                    nixcache_oci::OciError::OperationNotSupported {
+                        backend: oci.kind(),
+                        reason: format!(
+                            "Backend '{}' does not support standalone OCI blob deletion. Blobs are managed via package versions. To delete unused data on GHCR, use tag deletion or 'purge --all'. Pass --allow-unsupported-blob-deletion to bypass this error.",
+                            oci.kind()
+                        ),
+                    },
+                ));
+            } else {
+                info!(
+                    "Notice: backend '{}' does not support standalone blob deletion; skipping blob physical deletion stage.",
+                    oci.kind()
+                );
+            }
+        } else {
+            info!(
+                "Attempting physical deletion of {} OCI NAR blobs...",
+                purge_result.purged_nar_digests.len()
+            );
+            let summary = oci
+                .batch_delete_blobs_strict(&purge_result.purged_nar_digests, 8, strict_mode)
+                .await?;
+            info!(
+                "Blob deletion complete: {} physically deleted, {} failed/skipped.",
+                summary.deleted_count, summary.failed_count
+            );
+            deleted_blobs = summary.deleted_count;
+        }
     }
 
     write_purge_step_summary(

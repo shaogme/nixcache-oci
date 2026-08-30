@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let flake_path = args.resolve_flake_path();
             let file = args.resolve_file();
             let attributes = args.resolve_attributes();
-            let fail_fast = args.resolve_fail_fast();
+            let strict = args.resolve_strict();
             let receipt_path = args.resolve_output_receipt(system_name.as_deref());
             let export_concurrency = args.resolve_export_concurrency();
 
@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 signing_key_file: signing_key.as_deref(),
                 github_token: &active_token,
                 output_receipt_path: &receipt_path,
-                fail_fast,
+                strict,
                 export_concurrency,
             };
 

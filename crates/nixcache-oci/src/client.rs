@@ -1,7 +1,7 @@
 use crate::{
     backend::{
-        BlobUploadStrategy, OciDriver, RegistryCapabilities, RegistryKind, detect_driver,
-        driver_for_kind,
+        BlobUploadStrategy, GitHubPackagesClient, OciDriver, RegistryCapabilities,
+        RegistryDeletionStrategy, RegistryKind, detect_driver, driver_for_kind,
     },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
@@ -41,6 +41,14 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeletionSummary {
+    pub deleted_count: usize,
+    pub not_found_count: usize,
+    pub failed_count: usize,
+    pub freed_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedOciArtifact {
     pub manifest: OciArtifactManifest,
@@ -56,7 +64,7 @@ pub struct OciClient<T: OciTransport> {
     transport: T,
 }
 
-impl<T: OciTransport> OciClient<T> {
+impl<T: OciTransport + Clone> OciClient<T> {
     /// 基于指定驱动构造 OCI 客户端
     pub fn new(
         registry: &str,
@@ -1124,38 +1132,147 @@ impl<T: OciTransport> OciClient<T> {
         self.put_manifest_conditional(tag, manifest, None).await
     }
 
-    pub async fn delete_manifest(&self, tag_or_digest: &str) -> Result<bool, OciError> {
+    pub fn ghcr_client(&self) -> GitHubPackagesClient<T> {
+        GitHubPackagesClient::new(
+            self.transport.clone(),
+            self.token_manager.auth_token(),
+            &self.repo,
+        )
+    }
+
+    /// 严格删除指定 Tag：
+    /// - GHCR: 走 GitHub Packages REST API 查找并删除对应的 Package Version；
+    /// - Generic OCI: 两阶段安全删除（先 HEAD/GET /manifests/<tag> 获得 Manifest Digest，再 DELETE /manifests/<digest>）；
+    /// - 若资源不存在 (404) 视为幂等成功返回 Ok(())；若遇到 401/403/405/5xx 坚决返回 Err。
+    pub async fn delete_tag_strict(&self, tag: &str) -> Result<(), OciError> {
+        match self.capabilities().deletion_strategy {
+            RegistryDeletionStrategy::GitHubPackagesRestApi => {
+                self.ghcr_client().delete_by_tag(tag).await
+            }
+            RegistryDeletionStrategy::StandardOciDelete
+            | RegistryDeletionStrategy::DockerHubRestApi
+            | RegistryDeletionStrategy::AwsEcrApi => {
+                // 两阶段删除：先获取 Tag 指向的 Manifest Digest
+                let head_url = format!(
+                    "{}://{}/v2/{}/nix-cache/manifests/{}",
+                    self.url_scheme(),
+                    self.registry,
+                    self.repo,
+                    tag
+                );
+                let headers = self.get_auth_headers().await?;
+                let (status, resp_headers, body) =
+                    match self.transport.get(&head_url, headers).await {
+                        Ok(res) => res,
+                        Err(e) => return Err(OciError::Transport(e)),
+                    };
+
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(());
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    return Err(OciError::InsufficientPermission {
+                        target: tag.to_string(),
+                        required_scope: "pull,delete:manifest",
+                        details: format!("HTTP {} when checking manifest tag {}", status, tag),
+                    });
+                } else if !status.is_success() {
+                    return Err(OciError::DeletionFailed {
+                        target: tag.to_string(),
+                        status,
+                        details: format!("HTTP {} when retrieving tag manifest {}", status, tag),
+                    });
+                }
+
+                let digest = resp_headers
+                    .get("Docker-Content-Digest")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| compute_sha256_digest(&body));
+
+                self.delete_manifest_strict(&digest).await?;
+
+                // 部分 Registry 允许直接删除 tag，尝试顺带删除 tag (若不支持忽略该次 direct tag delete)
+                let tag_url = format!(
+                    "{}://{}/v2/{}/nix-cache/manifests/{}",
+                    self.url_scheme(),
+                    self.registry,
+                    self.repo,
+                    tag
+                );
+                let tag_headers = self.get_auth_headers().await?;
+                let _ = self.transport.delete(&tag_url, tag_headers).await;
+
+                Ok(())
+            }
+            RegistryDeletionStrategy::Unsupported => Err(OciError::OperationNotSupported {
+                backend: self.kind(),
+                reason: format!(
+                    "Registry backend '{}' does not support tag deletion",
+                    self.kind()
+                ),
+            }),
+        }
+    }
+
+    /// 严格删除指定 Manifest Digest (DELETE /v2/<repo>/manifests/<digest>)
+    pub async fn delete_manifest_strict(&self, digest: &str) -> Result<(), OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
             self.registry,
             self.repo,
-            tag_or_digest
+            digest
         );
 
         let headers = self.get_auth_headers().await?;
         let status = self.transport.delete(&url, headers).await?;
 
-        if status.is_success() || status == StatusCode::ACCEPTED {
-            Ok(true)
-        } else if status == StatusCode::NOT_FOUND {
-            Ok(false)
+        if status.is_success()
+            || status == StatusCode::ACCEPTED
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_FOUND
+        {
+            Ok(())
+        } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            Err(OciError::InsufficientPermission {
+                target: digest.to_string(),
+                required_scope: "delete:manifest",
+                details: format!(
+                    "HTTP {} from registry when deleting manifest {}",
+                    status, digest
+                ),
+            })
         } else if status == StatusCode::METHOD_NOT_ALLOWED {
-            warn!(
-                "Registry does not support direct manifest deletion: {}",
-                status
-            );
-            Ok(false)
+            Err(OciError::OperationNotSupported {
+                backend: self.kind(),
+                reason: format!(
+                    "Registry returned 405 Method Not Allowed for manifest deletion on {}. Backend deletion strategy: {:?}",
+                    digest,
+                    self.capabilities().deletion_strategy
+                ),
+            })
         } else {
-            Err(OciError::Other(format!(
-                "Failed to delete manifest with status: {}",
-                status
-            )))
+            Err(OciError::DeletionFailed {
+                target: digest.to_string(),
+                status,
+                details: format!("HTTP {} when deleting manifest {}", status, digest),
+            })
         }
     }
 
-    /// 物理删除指定 Digest 的 OCI Blob (支持遵循 OCI Distribution Spec 1.1 的 Registry)
-    pub async fn delete_blob(&self, digest: &str) -> Result<bool, OciError> {
+    /// 严格删除单个 OCI NAR Blob (DELETE /v2/<repo>/blobs/<digest>)
+    /// 若后端不支持物理删除 (如 GHCR)，抛出 OperationNotSupported 错误
+    pub async fn delete_blob_strict(&self, digest: &str) -> Result<(), OciError> {
+        if !self.capabilities().supports_blob_physical_deletion {
+            return Err(OciError::OperationNotSupported {
+                backend: self.kind(),
+                reason: format!(
+                    "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
+                    self.kind()
+                ),
+            });
+        }
+
         let url = format!(
             "{}://{}/v2/{}/nix-cache/blobs/{}",
             self.url_scheme(),
@@ -1167,54 +1284,153 @@ impl<T: OciTransport> OciClient<T> {
         let headers = self.get_auth_headers().await?;
         let status = self.transport.delete(&url, headers).await?;
 
-        if status.is_success() || status == StatusCode::ACCEPTED {
-            Ok(true)
-        } else if status == StatusCode::NOT_FOUND {
-            Ok(false)
+        if status.is_success()
+            || status == StatusCode::ACCEPTED
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_FOUND
+        {
+            Ok(())
+        } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            Err(OciError::InsufficientPermission {
+                target: digest.to_string(),
+                required_scope: "delete:blob",
+                details: format!(
+                    "HTTP {} from registry when deleting blob {}",
+                    status, digest
+                ),
+            })
         } else if status == StatusCode::METHOD_NOT_ALLOWED {
-            warn!("Registry does not support direct blob deletion: {}", status);
-            Ok(false)
+            Err(OciError::OperationNotSupported {
+                backend: self.kind(),
+                reason: format!(
+                    "Registry returned 405 Method Not Allowed for blob deletion {}",
+                    digest
+                ),
+            })
         } else {
-            Err(OciError::Other(format!(
-                "Failed to delete blob {}: status {}",
-                digest, status
-            )))
+            Err(OciError::DeletionFailed {
+                target: digest.to_string(),
+                status,
+                details: format!("HTTP {} when deleting blob {}", status, digest),
+            })
         }
     }
 
-    /// 高并发批量物理删除 Blobs (基于 Stream buffer_unordered)
+    /// 高并发批量物理删除 Blobs：
+    /// - 若 strict_mode 为 true 且后端不支持或删除失败，抛出错误终止；
+    /// - 若 strict_mode 为 false，记录 failed_count 并返回统计报告。
+    pub async fn batch_delete_blobs_strict(
+        &self,
+        digests: &[NarDigest],
+        concurrency: usize,
+        strict_mode: bool,
+    ) -> Result<DeletionSummary, OciError> {
+        if digests.is_empty() {
+            return Ok(DeletionSummary::default());
+        }
+
+        if !self.capabilities().supports_blob_physical_deletion {
+            if strict_mode {
+                return Err(OciError::OperationNotSupported {
+                    backend: self.kind(),
+                    reason: format!(
+                        "Backend '{}' does not support standalone physical OCI blob deletion. Pass --allow-unsupported-blob-deletion to bypass.",
+                        self.kind()
+                    ),
+                });
+            } else {
+                return Ok(DeletionSummary {
+                    failed_count: digests.len(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let concurrency = concurrency.clamp(1, 32);
+        let mut stream = futures_util::stream::iter(digests)
+            .map(|digest| {
+                let digest_str = digest.to_string();
+                async move { self.delete_blob_strict(&digest_str).await }
+            })
+            .buffer_unordered(concurrency);
+
+        let mut summary = DeletionSummary::default();
+
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok(()) => summary.deleted_count += 1,
+                Err(e) => {
+                    if strict_mode {
+                        return Err(e);
+                    } else {
+                        summary.failed_count += 1;
+                        warn!("Non-fatal error deleting blob: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    /// 彻底删除/重置远程 Package (适用于 purge --all)：
+    /// - GHCR: DELETE /orgs或users/{owner}/packages/container/{pkg}；
+    /// - Generic OCI: 遍历删除已知 index 和 manifests，并清空 blobs。
+    pub async fn delete_entire_package_strict(&self) -> Result<(), OciError> {
+        match self.capabilities().deletion_strategy {
+            RegistryDeletionStrategy::GitHubPackagesRestApi => {
+                self.ghcr_client().delete_entire_package().await
+            }
+            RegistryDeletionStrategy::StandardOciDelete
+            | RegistryDeletionStrategy::DockerHubRestApi
+            | RegistryDeletionStrategy::AwsEcrApi => {
+                // 标准 OCI: 尝试拉取 cache-index 并删除各子架构清单及顶层 index
+                if let Ok(Some(artifact)) = self.fetch_artifact("cache-index").await {
+                    match artifact.manifest {
+                        OciArtifactManifest::Index(idx) => {
+                            for sub in idx.manifests {
+                                let _ = self.delete_manifest_strict(&sub.digest).await;
+                            }
+                        }
+                        OciArtifactManifest::Manifest(_) => {}
+                    }
+                    let _ = self.delete_manifest_strict(&artifact.digest).await;
+                    let _ = self.delete_tag_strict("cache-index").await;
+                }
+                Ok(())
+            }
+            RegistryDeletionStrategy::Unsupported => Err(OciError::OperationNotSupported {
+                backend: self.kind(),
+                reason: format!(
+                    "Package deletion is not supported on backend '{}'",
+                    self.kind()
+                ),
+            }),
+        }
+    }
+
+    pub async fn delete_manifest(&self, tag_or_digest: &str) -> Result<bool, OciError> {
+        self.delete_manifest_strict(tag_or_digest)
+            .await
+            .map(|_| true)
+    }
+
+    pub async fn delete_blob(&self, digest: &str) -> Result<bool, OciError> {
+        self.delete_blob_strict(digest).await.map(|_| true)
+    }
+
     pub async fn batch_delete_blobs(
         &self,
         digests: &[NarDigest],
         concurrency: usize,
     ) -> Result<(usize, usize), OciError> {
-        if digests.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let concurrency = concurrency.clamp(1, 32);
-        let mut stream = futures_util::stream::iter(digests)
-            .map(|digest| async move {
-                let digest_str = digest.to_string();
-                self.delete_blob(&digest_str).await
-            })
-            .buffer_unordered(concurrency);
-
-        let mut deleted_count = 0;
-        let mut skipped_or_failed_count = 0;
-
-        while let Some(res) = stream.next().await {
-            match res {
-                Ok(true) => deleted_count += 1,
-                Ok(false) => skipped_or_failed_count += 1,
-                Err(e) => {
-                    warn!("Error deleting blob: {}", e);
-                    skipped_or_failed_count += 1;
-                }
-            }
-        }
-
-        Ok((deleted_count, skipped_or_failed_count))
+        let summary = self
+            .batch_delete_blobs_strict(digests, concurrency, false)
+            .await?;
+        Ok((
+            summary.deleted_count,
+            summary.failed_count + summary.not_found_count,
+        ))
     }
 
     pub async fn update_image_index_cas<F>(

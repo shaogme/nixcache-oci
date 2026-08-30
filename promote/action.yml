@@ -74,4 +74,8 @@ runs:
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        nixcache-builder promote
+        EXTRA_ARGS=()
+        if [[ "${{ inputs.cleanup-session }}" == "false" ]]; then
+          EXTRA_ARGS+=(--no-cleanup-session)
+        fi
+        nixcache-builder promote "${EXTRA_ARGS[@]}"

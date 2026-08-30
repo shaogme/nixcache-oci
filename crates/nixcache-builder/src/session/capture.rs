@@ -129,7 +129,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         let export_config = ParallelExportConfig {
             concurrency: opts.export_concurrency,
             signing_key_file: None, // 前序已完成精准签名
-            fail_fast: false,
+            strict: false,
             upload_config: UploadConfig::default(),
             system,
             origin_job: Some(format!("job:{}", opts.job_id)),

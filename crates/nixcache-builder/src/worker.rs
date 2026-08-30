@@ -44,7 +44,7 @@ pub async fn setup_self_substituter(
     registry: &str,
     github_token: &str,
     signing_key_file: Option<&str>,
-    fail_fast: bool,
+    strict: bool,
 ) -> Result<ProxyGuard, BuilderError> {
     let proxy_bin = find_proxy_binary();
     info!("Starting self-substituter proxy using {:?}", proxy_bin);
@@ -79,7 +79,7 @@ pub async fn setup_self_substituter(
             (Some(child), ready)
         }
         Err(e) => {
-            if fail_fast {
+            if strict {
                 return Err(BuilderError::Proxy(format!(
                     "Failed to spawn nixcache-proxy: {}",
                     e
@@ -104,7 +104,7 @@ pub async fn setup_self_substituter(
         let nix_config = NixEnvInjector::generate_nix_config(&["http://127.0.0.1:37515"], &keys);
         let _ = NixEnvInjector::export_to_github_env(&nix_config).await;
     } else if proxy_child.is_some() {
-        if fail_fast {
+        if strict {
             if let Some(mut child) = proxy_child {
                 let _ = child.kill().await;
             }
@@ -140,7 +140,7 @@ pub struct BuildWorkerOptions<'a> {
     pub signing_key_file: Option<&'a str>,
     pub github_token: &'a str,
     pub output_receipt_path: &'a Path,
-    pub fail_fast: bool,
+    pub strict: bool,
     pub export_concurrency: usize,
 }
 
@@ -162,7 +162,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         opts.registry,
         opts.github_token,
         opts.signing_key_file,
-        opts.fail_fast,
+        opts.strict,
     )
     .await?;
 
@@ -203,7 +203,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         let export_config = nix::ParallelExportConfig {
             concurrency: opts.export_concurrency,
             signing_key_file: opts.signing_key_file.map(|s| s.to_string()),
-            fail_fast: opts.fail_fast,
+            strict: opts.strict,
             upload_config: nixcache_oci::UploadConfig::default(),
             system,
             origin_job: env::var("GITHUB_JOB").ok().map(|j| format!("job:{}", j)),
@@ -223,7 +223,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
             for (path, err) in &report.failed {
                 error!("Failed to export & upload {}: {}", path, err);
             }
-            if opts.fail_fast {
+            if opts.strict {
                 return Err(BuilderError::Other(format!(
                     "Parallel export failed for {} path(s)",
                     report.failed.len()

@@ -1,4 +1,6 @@
-use crate::backend::kind::{BlobUploadStrategy, RegistryCapabilities, RegistryKind};
+use crate::backend::kind::{
+    BlobUploadStrategy, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind,
+};
 use std::fmt::Debug;
 
 /// OCI 后端抽象驱动 (Rust 2024 原生 Trait)
@@ -29,6 +31,9 @@ pub static GHCR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::FixedTwoStepPut,
     custom_auth_endpoint: Some("https://ghcr.io/token"),
+    deletion_strategy: RegistryDeletionStrategy::GitHubPackagesRestApi,
+    supports_blob_physical_deletion: false,
+    supports_package_deletion: true,
 };
 
 /// GitHub Container Registry 专属驱动 (ghcr.io)
@@ -113,6 +118,9 @@ pub static DOCKER_HUB_CAPABILITIES: RegistryCapabilities = RegistryCapabilities 
     requires_library_namespace_expansion: true,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: Some("https://auth.docker.io/token"),
+    deletion_strategy: RegistryDeletionStrategy::DockerHubRestApi,
+    supports_blob_physical_deletion: false,
+    supports_package_deletion: false,
 };
 
 /// Docker Hub 专属驱动 (docker.io / registry-1.docker.io)
@@ -205,6 +213,9 @@ pub static AWS_ECR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
+    deletion_strategy: RegistryDeletionStrategy::AwsEcrApi,
+    supports_blob_physical_deletion: false,
+    supports_package_deletion: false,
 };
 
 /// AWS ECR 驱动 (*.dkr.ecr.*.amazonaws.com)
@@ -288,6 +299,9 @@ pub static GCP_GAR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
+    deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
+    supports_blob_physical_deletion: true,
+    supports_package_deletion: false,
 };
 
 /// Google Cloud Artifact Registry 驱动 (*-docker.pkg.dev)
@@ -371,6 +385,9 @@ pub static AZURE_ACR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
+    deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
+    supports_blob_physical_deletion: true,
+    supports_package_deletion: false,
 };
 
 /// Azure Container Registry 驱动 (*.azurecr.io)
@@ -454,6 +471,9 @@ pub static GENERIC_OCI_CAPABILITIES: RegistryCapabilities = RegistryCapabilities
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
     custom_auth_endpoint: None,
+    deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
+    supports_blob_physical_deletion: true,
+    supports_package_deletion: false,
 };
 
 /// 通用符合 OCI 标准的驱动 (Harbor, Zot, Distribution, Quay 等)

@@ -14,8 +14,16 @@ on:
         default: true
         type: boolean
       delete_blobs:
-        description: 'Attempt physical OCI blob deletion (best-effort)'
+        description: 'Attempt physical OCI blob deletion'
         default: false
+        type: boolean
+      allow_unsupported_blob_deletion:
+        description: 'Allow skipping blob deletion if registry does not support it (e.g. GHCR)'
+        default: false
+        type: boolean
+      strict:
+        description: 'Strict error handling mode (default true)'
+        default: true
         type: boolean
 
 permissions:
@@ -54,6 +62,8 @@ jobs:
           RETENTION_DAYS="${{ github.event.inputs.retention_days || '30' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           DELETE_BLOBS="${{ github.event.inputs.delete_blobs || 'false' }}"
+          ALLOW_UNSUPPORTED="${{ github.event.inputs.allow_unsupported_blob_deletion || 'false' }}"
+          STRICT="${{ github.event.inputs.strict || 'true' }}"
           
           EXTRA_ARGS=()
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -61,6 +71,12 @@ jobs:
           fi
           if [[ "$DELETE_BLOBS" == "true" ]]; then
             EXTRA_ARGS+=(--delete-blobs)
+          fi
+          if [[ "$ALLOW_UNSUPPORTED" == "true" ]]; then
+            EXTRA_ARGS+=(--allow-unsupported-blob-deletion)
+          fi
+          if [[ "$STRICT" == "false" ]]; then
+            EXTRA_ARGS+=(--no-strict)
           fi
           
           nixcache-builder gc --retention-days "$RETENTION_DAYS" "${EXTRA_ARGS[@]}"

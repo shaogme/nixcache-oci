@@ -96,7 +96,7 @@ RECEIPT_1="$RECEIPTS_DIR/receipt-worker-1.json"
     --registry "$NIXCACHE_REGISTRY" \
     --signing-key-file "$NIXCACHE_SIGNING_KEY_FILE" \
     --output-receipt "$RECEIPT_1" \
-    --fail-fast
+    --strict
 
 if [[ ! -f "$RECEIPT_1" ]]; then
     echo "!!! Worker 1 failed to generate receipt: $RECEIPT_1"
@@ -128,7 +128,7 @@ RECEIPT_2="$RECEIPTS_DIR/receipt-worker-2.json"
     --registry "$NIXCACHE_REGISTRY" \
     --signing-key-file "$NIXCACHE_SIGNING_KEY_FILE" \
     --output-receipt "$RECEIPT_2" \
-    --fail-fast
+    --strict
 
 rm -f "$CUSTOM_PKG_FILE"
 

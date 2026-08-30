@@ -11,10 +11,11 @@ pub mod upload;
 
 pub use backend::{
     AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
-    GenericOciDriver, GhcrDriver, OciBackendDriver, OciDriver, RegistryCapabilities, RegistryKind,
-    detect_driver, driver_for_kind,
+    GenericOciDriver, GhcrDriver, GitHubContainerMetadata, GitHubPackageVersion,
+    GitHubPackageVersionMetadata, GitHubPackagesClient, OciBackendDriver, OciDriver,
+    RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver, driver_for_kind,
 };
-pub use client::{FetchedOciArtifact, OciClient};
+pub use client::{DeletionSummary, FetchedOciArtifact, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TransportError};
 pub use manifest::{
@@ -44,9 +45,9 @@ mod tests {
     use super::{
         AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
         GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
-        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryKind,
-        SessionMutationRequest, StoreHash, StreamHashState, SystemArch, TransportError,
-        UploadConfig, build_image_index, parse_range_header,
+        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
+        RegistryDeletionStrategy, RegistryKind, SessionMutationRequest, StoreHash, StreamHashState,
+        SystemArch, TransportError, UploadConfig, build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -63,6 +64,12 @@ mod tests {
             ghcr.capabilities().fixed_upload_strategy,
             BlobUploadStrategy::FixedTwoStepPut
         );
+        assert_eq!(
+            ghcr.capabilities().deletion_strategy,
+            RegistryDeletionStrategy::GitHubPackagesRestApi
+        );
+        assert!(!ghcr.capabilities().supports_blob_physical_deletion);
+        assert!(ghcr.capabilities().supports_package_deletion);
         assert_eq!(ghcr.canonicalize_endpoint("  GHCR.IO "), "ghcr.io");
         assert_eq!(ghcr.canonicalize_repository("/Owner/Repo/"), "owner/repo");
         assert_eq!(
@@ -81,6 +88,11 @@ mod tests {
             docker.capabilities().fixed_upload_strategy,
             BlobUploadStrategy::PreferMonolithicPost
         );
+        assert_eq!(
+            docker.capabilities().deletion_strategy,
+            RegistryDeletionStrategy::DockerHubRestApi
+        );
+        assert!(!docker.capabilities().supports_blob_physical_deletion);
         assert_eq!(
             docker.canonicalize_endpoint("docker.io"),
             "registry-1.docker.io"
@@ -103,6 +115,11 @@ mod tests {
         let generic = GenericOciDriver;
         assert_eq!(generic.kind(), RegistryKind::GenericOci);
         assert_eq!(
+            generic.capabilities().deletion_strategy,
+            RegistryDeletionStrategy::StandardOciDelete
+        );
+        assert!(generic.capabilities().supports_blob_physical_deletion);
+        assert_eq!(
             generic.resolve_token_endpoint("localhost:5000", "myrepo", true),
             "http://localhost:5000/token?service=localhost:5000&scope=repository:myrepo/nix-cache:pull,push"
         );
@@ -110,6 +127,11 @@ mod tests {
         let aws = AwsEcrDriver;
         assert_eq!(aws.kind(), RegistryKind::AwsEcr);
         assert!(!aws.capabilities().supports_chunked_patch);
+        assert_eq!(
+            aws.capabilities().deletion_strategy,
+            RegistryDeletionStrategy::AwsEcrApi
+        );
+        assert!(!aws.capabilities().supports_blob_physical_deletion);
     }
 
     #[tokio::test]
@@ -340,9 +362,16 @@ mod tests {
             },
         );
 
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
-        assert!(client.delete_manifest("run-old").await.unwrap());
-        assert!(!client.delete_manifest("run-missing").await.unwrap());
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            GenericOciDriver,
+            transport,
+        );
+        assert!(client.delete_manifest_strict("run-old").await.is_ok());
+        assert!(client.delete_manifest_strict("run-missing").await.is_ok());
     }
 
     #[tokio::test]
@@ -376,19 +405,36 @@ mod tests {
             },
         );
 
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
-        assert!(client.delete_blob("sha256:blob1").await.unwrap());
-        assert!(!client.delete_blob("sha256:blob2").await.unwrap());
-        assert!(!client.delete_blob("sha256:blob3").await.unwrap());
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            GenericOciDriver,
+            transport,
+        );
+        assert!(client.delete_blob_strict("sha256:blob1").await.is_ok());
+        assert!(client.delete_blob_strict("sha256:blob2").await.is_ok());
+        let err3 = client.delete_blob_strict("sha256:blob3").await.unwrap_err();
+        assert!(matches!(err3, OciError::OperationNotSupported { .. }));
 
         let digests = vec![
             NarDigest::new_unchecked("sha256:blob1"),
             NarDigest::new_unchecked("sha256:blob2"),
             NarDigest::new_unchecked("sha256:blob3"),
         ];
-        let (deleted, skipped) = client.batch_delete_blobs(&digests, 2).await.unwrap();
-        assert_eq!(deleted, 1);
-        assert_eq!(skipped, 2);
+        let summary = client
+            .batch_delete_blobs_strict(&digests, 2, false)
+            .await
+            .unwrap();
+        assert_eq!(summary.deleted_count, 2); // blob1 and blob2 (404 idempotent)
+        assert_eq!(summary.failed_count, 1); // blob3 (405 error)
+
+        let strict_err = client
+            .batch_delete_blobs_strict(&digests, 2, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(strict_err, OciError::OperationNotSupported { .. }));
     }
 
     #[tokio::test]

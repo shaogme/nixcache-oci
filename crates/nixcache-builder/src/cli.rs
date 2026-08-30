@@ -220,17 +220,12 @@ pub struct BuildArgs {
 
     #[arg(
         long,
-        default_missing_value = "true",
-        num_args = 0..=1,
-        help = "Fail fast if self-substituter proxy fails to start [env: NIXCACHE_FAIL_FAST]"
+        help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
     )]
-    pub fail_fast: Option<bool>,
+    pub strict: Option<bool>,
 
-    #[arg(
-        long,
-        help = "Allow self-substituter proxy failure (disables fail-fast)"
-    )]
-    pub no_fail_fast: bool,
+    #[arg(long, help = "Disable strict error handling mode")]
+    pub no_strict: bool,
 
     #[arg(
         long,
@@ -301,14 +296,14 @@ impl BuildArgs {
             })
     }
 
-    pub fn resolve_fail_fast(&self) -> bool {
-        if self.no_fail_fast {
+    pub fn resolve_strict(&self) -> bool {
+        if self.no_strict {
             return false;
         }
-        if let Some(ff) = self.fail_fast {
-            return ff;
+        if let Some(s) = self.strict {
+            return s;
         }
-        Env::get_bool("NIXCACHE_FAIL_FAST").unwrap_or(true)
+        Env::get_bool("NIXCACHE_STRICT").unwrap_or(true)
     }
 
     pub fn resolve_export_concurrency(&self) -> usize {
@@ -420,9 +415,24 @@ pub struct GcArgs {
 
     #[arg(
         long,
-        help = "Attempt physical OCI blob deletion (best-effort) [env: NIXCACHE_DELETE_BLOBS]"
+        help = "Attempt physical OCI blob deletion [env: NIXCACHE_DELETE_BLOBS]"
     )]
     pub delete_blobs: bool,
+
+    #[arg(
+        long,
+        help = "Allow skipping physical blob deletion if registry does not support it (e.g. GHCR) [env: NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION]"
+    )]
+    pub allow_unsupported_blob_deletion: bool,
+
+    #[arg(
+        long,
+        help = "Strict error handling mode (default true) [env: NIXCACHE_STRICT]"
+    )]
+    pub strict: Option<bool>,
+
+    #[arg(long, help = "Disable strict error handling mode")]
+    pub no_strict: bool,
 
     #[arg(long, help = "Dry run mode for garbage collection")]
     pub dry_run: bool,
@@ -442,6 +452,23 @@ impl GcArgs {
         Env::get_bool("NIXCACHE_DELETE_BLOBS").unwrap_or(false)
     }
 
+    pub fn resolve_allow_unsupported_blob_deletion(&self) -> bool {
+        if self.allow_unsupported_blob_deletion {
+            return true;
+        }
+        Env::get_bool("NIXCACHE_ALLOW_UNSUPPORTED_BLOB_DELETION").unwrap_or(false)
+    }
+
+    pub fn resolve_strict(&self) -> bool {
+        if self.no_strict {
+            return false;
+        }
+        if let Some(s) = self.strict {
+            return s;
+        }
+        Env::get_bool("NIXCACHE_STRICT").unwrap_or(true)
+    }
+
     pub fn to_purge_args(&self) -> PurgeArgs {
         PurgeArgs {
             oci: self.oci.clone(),
@@ -453,6 +480,9 @@ impl GcArgs {
                 ..Default::default()
             },
             delete_blobs: self.resolve_delete_blobs(),
+            allow_unsupported_blob_deletion: self.resolve_allow_unsupported_blob_deletion(),
+            strict: Some(self.resolve_strict()),
+            no_strict: self.no_strict,
             dry_run: self.dry_run,
         }
     }
@@ -466,5 +496,29 @@ mod tests {
     #[test]
     fn test_cli_clap_debug_assert() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_build_args_strict_resolution() {
+        let default_args = BuildArgs::default();
+        assert!(default_args.resolve_strict());
+
+        let strict_disabled = BuildArgs {
+            no_strict: true,
+            ..Default::default()
+        };
+        assert!(!strict_disabled.resolve_strict());
+
+        let strict_explicit_false = BuildArgs {
+            strict: Some(false),
+            ..Default::default()
+        };
+        assert!(!strict_explicit_false.resolve_strict());
+
+        let strict_explicit_true = BuildArgs {
+            strict: Some(true),
+            ..Default::default()
+        };
+        assert!(strict_explicit_true.resolve_strict());
     }
 }

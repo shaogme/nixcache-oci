@@ -1,3 +1,4 @@
+use crate::backend::RegistryKind;
 use http::StatusCode;
 use nixcache_core::CoreError;
 use serde_json::Error as JsonError;
@@ -24,6 +25,31 @@ pub enum TransportError {
 
 #[derive(Error, Debug)]
 pub enum OciError {
+    #[error("Registry operation not supported on backend '{backend}': {reason}")]
+    OperationNotSupported {
+        backend: RegistryKind,
+        reason: String,
+    },
+
+    #[error("Deletion failed for target '{target}' with status {status}: {details}")]
+    DeletionFailed {
+        target: String,
+        status: StatusCode,
+        details: String,
+    },
+
+    #[error(
+        "Insufficient permissions to delete '{target}'. Required scope: '{required_scope}'. Server response: {details}"
+    )]
+    InsufficientPermission {
+        target: String,
+        required_scope: &'static str,
+        details: String,
+    },
+
+    #[error("Target resource '{target}' not found on remote registry")]
+    ResourceNotFound { target: String },
+
     #[error("Transport error: {0}")]
     Transport(#[from] TransportError),
 

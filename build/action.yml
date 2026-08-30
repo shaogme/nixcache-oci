@@ -37,8 +37,8 @@ inputs:
     description: 'Nix secret key used to sign store paths'
     required: false
     default: ''
-  fail-fast:
-    description: 'Fail fast if self-substituter proxy fails to start or become ready'
+  strict:
+    description: 'Strict error handling mode (default true)'
     required: false
     default: 'true'
   export-concurrency:
@@ -101,7 +101,7 @@ runs:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
-        NIXCACHE_FAIL_FAST: ${{ inputs.fail-fast }}
+        NIXCACHE_STRICT: ${{ inputs.strict }}
         NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt.json
