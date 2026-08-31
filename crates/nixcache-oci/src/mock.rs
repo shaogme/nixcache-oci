@@ -1,6 +1,6 @@
 use crate::{
     error::TransportError,
-    transport::{BoxBodyStream, OciTransport, UploadChunkResponse},
+    transport::{OciTransport, UploadChunkResponse},
 };
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
@@ -14,6 +14,12 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::stream::BoxStream;
+
+#[cfg(target_arch = "wasm32")]
+use futures_util::stream::LocalBoxStream;
 
 fn mock_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -67,7 +73,11 @@ impl MockRouterTransport {
 }
 
 impl OciTransport for MockRouterTransport {
-    type BodyStream = BoxBodyStream;
+    #[cfg(not(target_arch = "wasm32"))]
+    type BodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
+
+    #[cfg(target_arch = "wasm32")]
+    type BodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
     async fn head(&self, url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -150,7 +160,8 @@ impl OciTransport for MockRouterTransport {
         headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
         let (status, headers, bytes) = self.get(url, headers).await?;
-        let stream: BoxBodyStream = Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
+        let stream: Self::BodyStream =
+            Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
         Ok((status, headers, stream))
     }
 

@@ -5,8 +5,8 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    BlobUploadStrategy, BoxBodyStream, OciClient, OciDriver, OciError, OciTransport, RegistryKind,
-    TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
+    BlobUploadStrategy, OciClient, OciDriver, OciError, OciTransport, RegistryKind, TransportError,
+    UploadChunkResponse, UploadConfig, parse_range_header,
 };
 use reqwest::Client;
 use std::{
@@ -74,7 +74,7 @@ impl ReqwestTransport {
 }
 
 impl OciTransport for ReqwestTransport {
-    type BodyStream = BoxBodyStream;
+    type BodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
         let resp = self

@@ -4,14 +4,15 @@ use http::{
     HeaderMap, StatusCode,
     header::{HeaderName, HeaderValue},
 };
-use nixcache_oci::{
-    BoxBodyStream, OciTransport, TransportError, UploadChunkResponse, parse_range_header,
-};
+use nixcache_oci::{OciTransport, TransportError, UploadChunkResponse, parse_range_header};
 use std::{fmt::Display, io::Error as IoError, time::Duration};
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::stream::BoxStream;
+
 #[cfg(target_arch = "wasm32")]
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::LocalBoxStream};
 
 #[derive(Clone, Default)]
 pub struct WorkerFetchTransport;
@@ -69,7 +70,11 @@ fn resolve_redirect_url(base_url: &str, location: &str) -> String {
 }
 
 impl OciTransport for WorkerFetchTransport {
-    type BodyStream = BoxBodyStream;
+    #[cfg(not(target_arch = "wasm32"))]
+    type BodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
+
+    #[cfg(target_arch = "wasm32")]
+    type BodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
         let mut current_url = url.to_string();

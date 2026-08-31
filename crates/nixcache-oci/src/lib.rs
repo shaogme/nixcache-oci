@@ -38,8 +38,8 @@ pub use nixcache_core::{
 };
 pub use token::TokenManager;
 pub use transport::{
-    BoxBodyStream, HashingStream, OciBlobStream, OciTransport, StreamHashState,
-    UploadChunkResponse, UploadSessionInfo, parse_range_header,
+    HashingStream, OciBlobStream, OciTransport, StreamHashState, UploadChunkResponse,
+    UploadSessionInfo, parse_range_header,
 };
 pub use upload::{BlobPayload, UploadConfig};
 

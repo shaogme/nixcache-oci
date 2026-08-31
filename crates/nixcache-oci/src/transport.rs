@@ -14,19 +14,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use futures_util::stream::BoxStream;
-
-#[cfg(target_arch = "wasm32")]
-use futures_util::stream::LocalBoxStream;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub type BoxBodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
-
-#[cfg(target_arch = "wasm32")]
-pub type BoxBodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
-
-pub struct OciBlobStream<S = BoxBodyStream> {
+pub struct OciBlobStream<S> {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub stream: S,
@@ -192,102 +180,6 @@ pub fn parse_range_header(header_val: &str) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(async_fn_in_trait)]
-pub trait OciTransport: Send + Sync + 'static {
-    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Send + Unpin + 'static;
-
-    async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
-
-    async fn get(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError>;
-
-    async fn stream(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError>;
-
-    async fn post(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap), TransportError>;
-
-    /// 1-RTT Monolithic POST 上传 (Bytes)
-    async fn post_bytes(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Result<(StatusCode, HeaderMap), TransportError>;
-
-    /// 1-RTT Monolithic POST 上传 (Stream)
-    async fn post_stream(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        stream: Self::BodyStream,
-        content_len: u64,
-    ) -> Result<(StatusCode, HeaderMap), TransportError>;
-
-    /// 分块上传 PATCH (发送单个分块)
-    async fn patch_chunk(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        chunk: Bytes,
-        byte_range: (u64, u64),
-    ) -> Result<UploadChunkResponse, TransportError>;
-
-    /// 分块流式 PATCH (用于零拷贝大分块推流)
-    async fn patch_chunk_stream(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        stream: Self::BodyStream,
-        byte_range: (u64, u64),
-    ) -> Result<UploadChunkResponse, TransportError>;
-
-    /// 探测当前断点会话状态 (GET session url 获取已接收的 Range 终止偏移量)
-    async fn probe_upload_session(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<Option<u64>, TransportError>;
-
-    /// 完成分块上传 (PUT finish，可带尾部数据或为空 Body)
-    async fn put_chunk_finish(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        final_chunk: Option<(Bytes, (u64, u64))>,
-    ) -> Result<StatusCode, TransportError>;
-
-    async fn put_bytes(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Result<StatusCode, TransportError>;
-
-    async fn put_stream(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        stream: Self::BodyStream,
-        content_len: u64,
-    ) -> Result<StatusCode, TransportError>;
-
-    async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
-
-    async fn sleep(&self, duration: Duration);
-}
-
-#[cfg(target_arch = "wasm32")]
 #[allow(async_fn_in_trait)]
 pub trait OciTransport: 'static {
     type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Unpin + 'static;
