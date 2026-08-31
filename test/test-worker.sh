@@ -114,21 +114,21 @@ echo ">>> Triggering Worker cache index refresh..."
 REFRESH_RESP=$(curl -fs -X POST "$TEST_WORKER_URL/_refresh")
 echo "Worker refresh response: $REFRESH_RESP"
 
-# 6. Verify Narinfo resolves on Worker (with retries for KV eventual consistency)
+# 6. Verify Narinfo resolves on Worker (with immediate consistency via Cache-Control: no-cache)
 echo ">>> Verifying .narinfo endpoint on Worker..."
 NARINFO_CONTENT=""
-for i in {1..12}; do
-    if NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
+for i in {1..5}; do
+    if NARINFO_CONTENT=$(curl -fs -H "Cache-Control: no-cache" "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
         echo ">>> Retrieved narinfo:"
         echo "$NARINFO_CONTENT"
         break
     fi
-    echo ">>> Stale or 404 response, retrying in 5 seconds ($i/12)..."
-    sleep 5
+    echo ">>> Stale or 404 response, retrying in 2 seconds ($i/5)..."
+    sleep 2
 done
 
 if [[ -z "${NARINFO_CONTENT:-}" ]]; then
-    echo "!!! Failed to retrieve narinfo from Worker after 60 seconds."
+    echo "!!! Failed to retrieve narinfo from Worker after retries."
     exit 1
 fi
 
@@ -138,10 +138,6 @@ if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
 fi
 
 # 7. Perform substitution test from Worker
-# Wait for Cloudflare KV replication & edge cache convergence
-echo ">>> Waiting 30 seconds for global KV replication and edge convergence..."
-sleep 30
-
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 

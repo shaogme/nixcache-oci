@@ -1,9 +1,9 @@
 use crate::error::ProxyIndexError;
 use arc_swap::ArcSwap;
 use nixcache_core::{
-    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
-    ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
-    diff_shard_descriptors, extract_nar_basename, extract_store_hash,
+    DeltaPatchData, IndexEntry, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash,
+    SystemArch, build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors,
+    extract_nar_basename, extract_store_hash,
 };
 use nixcache_oci::{CacheLayerMediaTypeV5, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
@@ -19,6 +19,9 @@ use std::{
 };
 use tokio::fs;
 use tracing::{error, info, warn};
+
+#[cfg(test)]
+use nixcache_core::FastBlockedBloomFilter;
 
 pub fn detect_current_system() -> SystemArch {
     SystemArch::detect_current()
@@ -84,16 +87,15 @@ impl CachedSession {
     }
 }
 
-/// 带有布隆过滤器与分片元数据的生产基线缓存模型
+/// 生产基线分片元数据缓存模型
 #[derive(Clone, Debug)]
 pub struct CachedBaseline {
     pub root: ShardedArchCacheIndexData,
-    pub bloom_filter: Arc<FastBlockedBloomFilter>,
 }
 
 impl CachedBaseline {
-    pub fn new(root: ShardedArchCacheIndexData, bloom_filter: Arc<FastBlockedBloomFilter>) -> Self {
-        Self { root, bloom_filter }
+    pub fn new(root: ShardedArchCacheIndexData) -> Self {
+        Self { root }
     }
 }
 
@@ -266,22 +268,15 @@ impl CacheIndex {
             return Some(entry.clone());
         }
 
-        // Tier 3: 生产主干基线分片索引
+        // Tier 3: 生产主干基线分片索引 - 确定性 O(1) 分片定位
         let baseline = self.get_baseline_data().await;
 
-        // Step 1: 布隆过滤器前置守卫 (False 判定则 100% 不存在，0ms 快速直通回退)
-        if !baseline.bloom_filter.contains(&parsed_hash) {
-            return None;
-        }
-
-        // Step 2: 定位分片 ID (0..1023)
         let shard_id = calculate_shard_id(&parsed_hash);
         let shard_desc = baseline.root.find_shard_by_id(shard_id)?;
         if shard_desc.is_empty() || shard_desc.blob_digest.is_empty() {
             return None;
         }
 
-        // Step 3: 按需获取分片并在分片内部完成 O(1) 检索
         let shard_payload = self
             .get_shard_data(shard_id, &shard_desc.blob_digest)
             .await?;
@@ -475,31 +470,6 @@ impl CacheIndex {
             Ok(Some((root_data, _manifest_digest))) => {
                 self.set_remote_status(true, None);
 
-                let bloom_filter = if !root_data.bloom_filter.blob_digest.is_empty() {
-                    match self
-                        .oci_client
-                        .get_bloom_filter(
-                            &root_data.bloom_filter.blob_digest,
-                            root_data.bloom_filter.num_entries,
-                            root_data.bloom_filter.num_hashes,
-                        )
-                        .await
-                    {
-                        Ok(f) => Arc::new(f),
-                        Err(e) => {
-                            warn!(
-                                "[nixcache-proxy] Failed to fetch bloom filter blob {}: {}",
-                                root_data.bloom_filter.blob_digest, e
-                            );
-                            Arc::new(FastBlockedBloomFilter::new_with_defaults(
-                                root_data.bloom_filter.num_entries,
-                            ))
-                        }
-                    }
-                } else {
-                    Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
-                };
-
                 // 增量失效发生变更的分片
                 if let Some(old_entry) = self.baseline_cache.read_sync(&cache_key, |_, v| v.clone())
                     && old_entry.baseline.root.merkle_root != root_data.merkle_root
@@ -511,7 +481,7 @@ impl CacheIndex {
                     }
                 }
 
-                // 保存本地单架构根索引与布隆过滤器备份
+                // 保存本地单架构根索引备份
                 let file_name = format!("cache-index-{}.json.zst", system_clone.as_str());
                 let file_path = self.config.index_dir.join(&file_name);
                 if let Some(parent) = file_path.parent() {
@@ -531,7 +501,7 @@ impl CacheIndex {
                     }
                 }
 
-                fetched_baseline = Some(CachedBaseline::new(root_data, bloom_filter));
+                fetched_baseline = Some(CachedBaseline::new(root_data));
             }
             Ok(None) => {
                 info!(
@@ -566,10 +536,7 @@ impl CacheIndex {
                                 "[nixcache-proxy] Loaded backup sharded root index from {:?}",
                                 arch_backup
                             );
-                            fetched_baseline = Some(CachedBaseline::new(
-                                root_data,
-                                Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
-                            ));
+                            fetched_baseline = Some(CachedBaseline::new(root_data));
                         }
                     }
                     Err(e) => {
@@ -587,14 +554,11 @@ impl CacheIndex {
             );
             Arc::new(baseline)
         } else {
-            Arc::new(CachedBaseline::new(
-                ShardedArchCacheIndexData::new(
-                    system_clone,
-                    &self.config.repo,
-                    &self.config.registry,
-                ),
-                Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
-            ))
+            Arc::new(CachedBaseline::new(ShardedArchCacheIndexData::new(
+                system_clone,
+                &self.config.repo,
+                &self.config.registry,
+            )))
         };
 
         let _ = self.baseline_cache.upsert_sync(
@@ -763,7 +727,7 @@ impl CacheIndex {
         );
         root.recalculate_merkle_root();
 
-        let baseline = Arc::new(CachedBaseline::new(root, Arc::new(bloom_filter)));
+        let baseline = Arc::new(CachedBaseline::new(root));
         let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
             CachedBaselineEntry {

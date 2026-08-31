@@ -1,6 +1,6 @@
 use crate::{error::BuilderError, summary::write_promote_step_summary};
 use chrono::Utc;
-use futures_util::future::{join_all, try_join_all};
+use futures_util::future::try_join_all;
 use nixcache_core::{
     BuildReceipt, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V5,
     ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
@@ -233,7 +233,10 @@ pub async fn run_promote(
             // 3.2 将新增条目按 1024 分片桶分区
             let mut partitioned_incoming = partition_entries_by_shard(new_entries);
 
-            // 3.3 遍历 1024 个分片执行局部压实
+            // 3.3 维护全量活跃分片内存映射 (用于零网络构建 Bloom Filter / 元数据)
+            let mut active_shards_map: HashMap<u16, ShardDataPayload> = HashMap::new();
+
+            // 3.4 遍历 1024 个分片执行局部压实
             for shard_id in 0..NUM_SHARDS as u16 {
                 if let Some(incoming_shard_entries) = partitioned_incoming.remove(&shard_id)
                     && !incoming_shard_entries.is_empty()
@@ -241,10 +244,7 @@ pub async fn run_promote(
                     let existing_desc = &root_index.shards[shard_id as usize];
                     let mut shard_payload =
                         if existing_desc.entry_count > 0 && !existing_desc.blob_digest.is_empty() {
-                            match oci.get_shard_data(&existing_desc.blob_digest).await {
-                                Ok(payload) => payload,
-                                Err(_) => ShardDataPayload::new(shard_id),
-                            }
+                            oci.get_shard_data(&existing_desc.blob_digest).await?
                         } else {
                             ShardDataPayload::new(shard_id)
                         };
@@ -260,35 +260,56 @@ pub async fn run_promote(
                     desc.uncompressed_size = uncomp_size;
                     desc.entry_count = shard_payload.len();
                     desc.merkle_hash = shard_payload.compute_merkle_hash();
+
+                    active_shards_map.insert(shard_id, shard_payload);
                 }
                 // 未发生变更的分片：完全复用原有 blob_digest、compressed_size 与 merkle_hash (零开销)
             }
 
-            // 3.4 合并 GC Roots 并重算全局 Merkle Root
+            // 3.5 合并 GC Roots 并重算全局 Merkle Root
             root_index.gc_roots.extend(new_roots);
             root_index.gc_roots.sort_unstable();
             root_index.gc_roots.dedup();
             root_index.recalculate_merkle_root();
 
-            // 3.5 构建/更新紧凑布隆过滤器
+            // 3.6 构建/更新紧凑布隆过滤器 (全内存单向闭环，零网络重新回读刚上传的 Blob)
             let total_entries = root_index.total_entries();
             let mut bloom_filter =
                 FastBlockedBloomFilter::new_with_defaults(total_entries.max(100));
 
-            // 从各个非空分片并发收集全量 hashes 以生成精准 Bloom Filter
-            let non_empty_shards: Vec<_> = root_index
+            // 对于未修改的分片，若在 active_shards_map 中不存在且 entry_count > 0，并发拉取并严格传播错误 '?'
+            let unmodified_shards: Vec<(u16, String)> = root_index
                 .shards
                 .iter()
-                .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
-                .map(|s| s.blob_digest.clone())
+                .enumerate()
+                .filter_map(|(id, s)| {
+                    let shard_id = id as u16;
+                    if s.entry_count > 0
+                        && !s.blob_digest.is_empty()
+                        && !active_shards_map.contains_key(&shard_id)
+                    {
+                        Some((shard_id, s.blob_digest.clone()))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
-            let shard_futures = non_empty_shards.into_iter().map(|digest| {
-                let oci = oci.clone();
-                async move { oci.get_shard_data(&digest).await.ok() }
-            });
-            let payloads = join_all(shard_futures).await;
-            for payload in payloads.into_iter().flatten() {
+            if !unmodified_shards.is_empty() {
+                let fetch_futures = unmodified_shards.into_iter().map(|(shard_id, digest)| {
+                    let oci = oci.clone();
+                    async move {
+                        let payload = oci.get_shard_data(&digest).await?;
+                        Ok::<(u16, ShardDataPayload), BuilderError>((shard_id, payload))
+                    }
+                });
+                let fetched = try_join_all(fetch_futures).await?;
+                for (shard_id, payload) in fetched {
+                    active_shards_map.insert(shard_id, payload);
+                }
+            }
+
+            for payload in active_shards_map.values() {
                 for hash in payload.entries.keys() {
                     bloom_filter.insert(hash);
                 }

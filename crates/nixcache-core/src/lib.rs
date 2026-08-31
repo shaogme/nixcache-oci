@@ -471,6 +471,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(deserialized.shards.len(), NUM_SHARDS);
         assert_eq!(deserialized.gc_roots, vec![h1.clone()]);
         assert_eq!(deserialized.merkle_root, root_index.merkle_root);
+        assert!(!deserialized.is_shard_empty(&h1));
+        let h_empty = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        assert!(deserialized.is_shard_empty(&h_empty));
 
         // ShardDataPayload
         let mut payload = ShardDataPayload::new(838);

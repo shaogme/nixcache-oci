@@ -2,7 +2,7 @@ use crate::{
     error::BuilderError, nix::resolve_flake_output_hashes, summary::write_purge_step_summary,
 };
 use chrono::Utc;
-use futures_util::future::{join_all, try_join_all};
+use futures_util::future::try_join_all;
 use nixcache_cli::PurgeArgs;
 use nixcache_core::{
     FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V5, ShardDataPayload,
@@ -107,8 +107,7 @@ pub async fn run_purge(
     let root_futures = target_systems.into_iter().map(|sys| {
         let oci = oci.clone();
         async move {
-            if let Ok(Some((root_data, _))) = oci.get_sharded_root_index("cache-index", &sys).await
-            {
+            if let Some((root_data, _)) = oci.get_sharded_root_index("cache-index", &sys).await? {
                 let non_empty_shards: Vec<_> = root_data
                     .shards
                     .iter()
@@ -118,21 +117,21 @@ pub async fn run_purge(
 
                 let shard_futures = non_empty_shards.into_iter().map(|digest| {
                     let oci = oci.clone();
-                    async move { oci.get_shard_data(&digest).await.ok() }
+                    async move { oci.get_shard_data(&digest).await }
                 });
-                let payloads = join_all(shard_futures).await;
+                let payloads = try_join_all(shard_futures).await?;
                 let mut entries = HashMap::new();
-                for p in payloads.into_iter().flatten() {
+                for p in payloads {
                     entries.extend(p.entries);
                 }
-                Some((sys, root_data, entries))
+                Ok::<_, BuilderError>(Some((sys, root_data, entries)))
             } else {
-                None
+                Ok(None)
             }
         }
     });
 
-    let loaded_archs = join_all(root_futures).await;
+    let loaded_archs = try_join_all(root_futures).await?;
     for (sys, root_data, entries) in loaded_archs.into_iter().flatten() {
         all_gc_roots.insert(sys, root_data.gc_roots.clone());
         all_entries.extend(entries.clone());

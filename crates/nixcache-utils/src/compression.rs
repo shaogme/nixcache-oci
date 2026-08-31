@@ -33,6 +33,8 @@ impl ZstdCodec {
         {
             let mut encoder = zstd::stream::Encoder::new(Vec::with_capacity(data.len() / 4), level)
                 .map_err(CompressionError::Io)?;
+            // 显式限制最大窗口尺寸为 8MB (23 bits)，确保 Wasm ruzstd 100% 安全解压
+            encoder.window_log(23).map_err(CompressionError::Io)?;
             encoder.write_all(data).map_err(CompressionError::Io)?;
             let compressed = encoder.finish().map_err(CompressionError::Io)?;
             Ok(Bytes::from(compressed))
@@ -145,5 +147,24 @@ mod tests {
             err,
             CompressionError::ZstdDecompress { .. } | CompressionError::Io(_)
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_dual_engine_libzstd_and_ruzstd_compatibility() {
+        use ruzstd::decoding::StreamingDecoder;
+        use std::io::Read;
+
+        let sample_payload =
+            b"Testing cross-platform compatibility between native libzstd and Wasm ruzstd with 8MB window log.";
+        let compressed = ZstdCodec::compress(sample_payload, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+            .expect("Compression should succeed");
+        let mut decoder = StreamingDecoder::new(&compressed[..])
+            .expect("ruzstd decoder initialization should succeed");
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .expect("ruzstd decompression should succeed");
+        assert_eq!(sample_payload.as_slice(), decompressed.as_slice());
     }
 }

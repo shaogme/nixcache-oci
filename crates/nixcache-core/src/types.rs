@@ -760,6 +760,14 @@ impl ShardedArchCacheIndexData {
     pub fn recalculate_merkle_root(&mut self) {
         self.merkle_root = compute_merkle_root(&self.shards);
     }
+
+    /// 直接判断 StoreHash 所在的分片是否为空 (O(1) 确定性硬件级零误杀硬过滤)
+    pub fn is_shard_empty(&self, hash: &StoreHash) -> bool {
+        match self.find_shard(hash) {
+            Some(shard) => shard.is_empty(),
+            None => true,
+        }
+    }
 }
 
 /// 单个分片内部的实际数据 Payload (独立 Zstd 压缩存储)

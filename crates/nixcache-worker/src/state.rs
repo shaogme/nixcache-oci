@@ -26,6 +26,7 @@ pub struct CachedSessionEntry {
 pub struct CachedBaselineEntry {
     pub root: ShardedArchCacheIndexData,
     pub bloom_filter: Arc<FastBlockedBloomFilter>,
+    pub manifest_digest: String,
     pub expires_at: f64,
 }
 
