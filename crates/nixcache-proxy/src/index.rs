@@ -97,11 +97,24 @@ impl CachedBaseline {
     }
 }
 
-pub type ShardCacheEntry = (
-    Arc<ShardDataPayload>,
-    Arc<HashMap<String, NarDigest>>,
-    Instant,
-);
+#[derive(Clone, Debug)]
+pub struct CachedSessionEntry {
+    pub session: Arc<CachedSession>,
+    pub expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedBaselineEntry {
+    pub baseline: Arc<CachedBaseline>,
+    pub expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShardCacheEntry {
+    pub payload: Arc<ShardDataPayload>,
+    pub nar_lookup: Arc<HashMap<String, NarDigest>>,
+    pub expires_at: Instant,
+}
 
 #[derive(Clone)]
 pub struct CacheIndex {
@@ -112,9 +125,9 @@ pub struct CacheIndex {
     hot_nar_lookup: Arc<SccHashMap<String, NarDigest>>,
     hot_count: Arc<AtomicUsize>,
     // Tier 1 & Tier 2: 工作流及分支/PR 会话缓存 (key 为 tag 如 "run-123", "branch-main")
-    session_cache: Arc<SccHashMap<String, (Arc<CachedSession>, Instant)>>,
+    session_cache: Arc<SccHashMap<String, CachedSessionEntry>>,
     // Tier 3: 生产主干分片根索引元数据缓存 (key 为 config.baseline_tag-system)
-    baseline_cache: Arc<SccHashMap<String, (Arc<CachedBaseline>, Instant)>>,
+    baseline_cache: Arc<SccHashMap<String, CachedBaselineEntry>>,
     // Tier 3: 二级分片缓存 (key 为 shard_id 0..1023)
     shard_cache: Arc<SccHashMap<u16, ShardCacheEntry>>,
     // 远端连接与错误状态 (RCU 无锁指针替换)
@@ -189,12 +202,10 @@ impl CacheIndex {
         shard_id: u16,
         blob_digest: &str,
     ) -> Option<Arc<ShardDataPayload>> {
-        if let Some((cached_payload, _, exp)) = self
-            .shard_cache
-            .read_sync(&shard_id, |_, v| (v.0.clone(), v.1.clone(), v.2))
-            && exp > Instant::now()
+        if let Some(cached) = self.shard_cache.read_sync(&shard_id, |_, v| v.clone())
+            && cached.expires_at > Instant::now()
         {
-            return Some(cached_payload);
+            return Some(cached.payload);
         }
 
         if blob_digest.is_empty() {
@@ -208,11 +219,11 @@ impl CacheIndex {
                 let arc_payload = Arc::new(payload);
                 let _ = self.shard_cache.upsert_sync(
                     shard_id,
-                    (
-                        arc_payload.clone(),
-                        Arc::new(nar_map),
-                        Instant::now() + self.config.baseline_ttl,
-                    ),
+                    ShardCacheEntry {
+                        payload: arc_payload.clone(),
+                        nar_lookup: Arc::new(nar_map),
+                        expires_at: Instant::now() + self.config.baseline_ttl,
+                    },
                 );
                 Some(arc_payload)
             }
@@ -311,8 +322,8 @@ impl CacheIndex {
 
         // 检查当前所有已加载分片的内存 NAR 查找表
         let mut found_digest = None;
-        self.shard_cache.iter_sync(|_, v| {
-            if let Some(digest) = v.1.get(normalized) {
+        self.shard_cache.iter_sync(|_, entry| {
+            if let Some(digest) = entry.nar_lookup.get(normalized) {
                 found_digest = Some(digest.clone());
                 return false;
             }
@@ -346,7 +357,7 @@ impl CacheIndex {
         let session_count = if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             self.session_cache
-                .read_sync(&tag, |_, v| v.0.delta.new_entries.len())
+                .read_sync(&tag, |_, v| v.session.delta.new_entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -359,7 +370,7 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             self.session_cache
-                .read_sync(&tag, |_, v| v.0.delta.new_entries.len())
+                .read_sync(&tag, |_, v| v.session.delta.new_entries.len())
                 .unwrap_or(0)
         } else {
             0
@@ -372,10 +383,12 @@ impl CacheIndex {
         );
         let baseline_count = self
             .baseline_cache
-            .read_sync(&cache_key, |_, v| v.0.root.total_entries())
+            .read_sync(&cache_key, |_, v| v.baseline.root.total_entries())
             .or_else(|| {
                 self.baseline_cache
-                    .read_sync(&self.config.baseline_tag, |_, v| v.0.root.total_entries())
+                    .read_sync(&self.config.baseline_tag, |_, v| {
+                        v.baseline.root.total_entries()
+                    })
             })
             .unwrap_or(0);
 
@@ -387,8 +400,8 @@ impl CacheIndex {
 
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
-            if let Some(sess) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
-                all_unique_hashes.extend(sess.delta.new_entries.keys().cloned());
+            if let Some(entry) = self.session_cache.read_sync(&tag, |_, v| v.clone()) {
+                all_unique_hashes.extend(entry.session.delta.new_entries.keys().cloned());
             }
         }
 
@@ -398,8 +411,8 @@ impl CacheIndex {
             } else {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
-            if let Some(branch) = self.session_cache.read_sync(&tag, |_, v| v.0.clone()) {
-                all_unique_hashes.extend(branch.delta.new_entries.keys().cloned());
+            if let Some(entry) = self.session_cache.read_sync(&tag, |_, v| v.clone()) {
+                all_unique_hashes.extend(entry.session.delta.new_entries.keys().cloned());
             }
         }
 
@@ -440,12 +453,10 @@ impl CacheIndex {
         let system = &self.config.target_system;
         let cache_key = format!("{}-{}", tag, system.as_str());
 
-        if let Some((cached, exp)) = self
-            .baseline_cache
-            .read_sync(&cache_key, |_, v| (v.0.clone(), v.1))
-            && exp > Instant::now()
+        if let Some(entry) = self.baseline_cache.read_sync(&cache_key, |_, v| v.clone())
+            && entry.expires_at > Instant::now()
         {
-            return cached;
+            return entry.baseline;
         }
 
         let tag_str = tag.clone();
@@ -490,13 +501,11 @@ impl CacheIndex {
                 };
 
                 // 增量失效发生变更的分片
-                if let Some((old_baseline, _)) = self
-                    .baseline_cache
-                    .read_sync(&cache_key, |_, v| (v.0.clone(), v.1))
-                    && old_baseline.root.merkle_root != root_data.merkle_root
+                if let Some(old_entry) = self.baseline_cache.read_sync(&cache_key, |_, v| v.clone())
+                    && old_entry.baseline.root.merkle_root != root_data.merkle_root
                 {
                     let changed =
-                        diff_shard_descriptors(&old_baseline.root.shards, &root_data.shards);
+                        diff_shard_descriptors(&old_entry.baseline.root.shards, &root_data.shards);
                     for sid in changed {
                         let _ = self.shard_cache.remove_sync(&sid);
                     }
@@ -508,6 +517,7 @@ impl CacheIndex {
                 if let Some(parent) = file_path.parent() {
                     let _ = fs::create_dir_all(parent).await;
                 }
+
                 if let Ok(bytes) =
                     IndexCodec::encode_zstd(&root_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
                 {
@@ -589,7 +599,10 @@ impl CacheIndex {
 
         let _ = self.baseline_cache.upsert_sync(
             cache_key,
-            (result.clone(), Instant::now() + self.config.baseline_ttl),
+            CachedBaselineEntry {
+                baseline: result.clone(),
+                expires_at: Instant::now() + self.config.baseline_ttl,
+            },
         );
         result
     }
@@ -646,10 +659,10 @@ impl CacheIndex {
     }
 
     async fn fetch_or_get_session(&self, tag: &str) -> Option<Arc<CachedSession>> {
-        if let Some((session, exp)) = self.session_cache.read_sync(tag, |_, v| (v.0.clone(), v.1))
-            && exp > Instant::now()
+        if let Some(entry) = self.session_cache.read_sync(tag, |_, v| v.clone())
+            && entry.expires_at > Instant::now()
         {
-            return Some(session);
+            return Some(entry.session);
         }
 
         let tag_str = tag.to_string();
@@ -672,7 +685,10 @@ impl CacheIndex {
                 let cached = Arc::new(CachedSession::new(delta));
                 let _ = self.session_cache.upsert_sync(
                     tag_str,
-                    (cached.clone(), Instant::now() + self.config.session_ttl),
+                    CachedSessionEntry {
+                        session: cached.clone(),
+                        expires_at: Instant::now() + self.config.session_ttl,
+                    },
                 );
                 Some(cached)
             }
@@ -730,11 +746,11 @@ impl CacheIndex {
             let nar_map = build_nar_lookup_map(&shard.entries);
             let _ = self.shard_cache.upsert_sync(
                 shard.shard_id,
-                (
-                    Arc::new(shard.clone()),
-                    Arc::new(nar_map),
-                    Instant::now() + Duration::from_secs(3600),
-                ),
+                ShardCacheEntry {
+                    payload: Arc::new(shard.clone()),
+                    nar_lookup: Arc::new(nar_map),
+                    expires_at: Instant::now() + Duration::from_secs(3600),
+                },
             );
         }
 
@@ -750,11 +766,17 @@ impl CacheIndex {
         let baseline = Arc::new(CachedBaseline::new(root, Arc::new(bloom_filter)));
         let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
-            (baseline.clone(), Instant::now() + Duration::from_secs(3600)),
+            CachedBaselineEntry {
+                baseline: baseline.clone(),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            },
         );
         let _ = self.baseline_cache.upsert_sync(
             cache_key,
-            (baseline, Instant::now() + Duration::from_secs(3600)),
+            CachedBaselineEntry {
+                baseline,
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            },
         );
         self.set_remote_status(true, None);
     }
@@ -763,10 +785,10 @@ impl CacheIndex {
     pub async fn update_session_in_memory(&self, tag: &str, delta: DeltaPatchData) {
         let _ = self.session_cache.upsert_sync(
             tag.to_string(),
-            (
-                Arc::new(CachedSession::new(delta)),
-                Instant::now() + Duration::from_secs(3600),
-            ),
+            CachedSessionEntry {
+                session: Arc::new(CachedSession::new(delta)),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+            },
         );
         self.set_remote_status(true, None);
     }

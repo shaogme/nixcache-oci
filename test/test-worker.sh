@@ -152,7 +152,9 @@ for attempt in 1 2 3; do
     if nix-store --realise "$TEST_STORE_PATH" \
       --option substituters "$TEST_WORKER_URL" \
       --option trusted-public-keys "$(cat test-worker-public.key)" \
-      --option require-sigs true -vvvvv; then
+      --option require-sigs true \
+      --option narinfo-cache-negative-ttl 0 \
+      --option narinfo-cache-positive-ttl 0 -vvvvv; then
         REALISE_SUCCESS=true
         break
     fi

@@ -1,6 +1,9 @@
 use crate::{
     error::WorkerStoreError,
-    state::{DEBOUNCE_THRESHOLD_MS, L1_MEM_TTL_MS, WorkerState},
+    state::{
+        CachedBaselineEntry, CachedSessionEntry, CachedShardEntry, DEBOUNCE_THRESHOLD_MS,
+        L1_MEM_TTL_MS, WorkerState,
+    },
     transport::WorkerFetchTransport,
 };
 use base64::Engine;
@@ -183,15 +186,46 @@ impl CacheStore {
         let should_check_ghcr =
             WorkerState::global().try_acquire_ghcr_check(now as u64, DEBOUNCE_THRESHOLD_MS as u64);
 
-        if should_check_ghcr
-            && self.force_refresh(env).await.is_ok()
-            && let Some(run_id) = self.config.run_id
-        {
-            let tag = format!("run-{}", run_id);
-            if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
-                && let Some(entry) = session.new_entries.get(&parsed_hash)
+        if should_check_ghcr && self.force_refresh(env).await.is_ok() {
+            // 5.1 Re-check Tier 1 (Workflow Run Session)
+            if let Some(run_id) = self.config.run_id {
+                let tag = format!("run-{}", run_id);
+                if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
+                    && let Some(entry) = session.new_entries.get(&parsed_hash)
+                {
+                    return Ok(Some(entry.to_narinfo_string()));
+                }
+            }
+
+            // 5.2 Re-check Tier 2 (Branch / PR Session)
+            if let Some(ref br) = self.config.branch_or_pr {
+                let tag = if br.starts_with("pr-") || br.starts_with("branch-") {
+                    br.to_string()
+                } else {
+                    format!("branch-{}", br.replace(['/', ':'], "-"))
+                };
+                if let Ok(Some((branch_sess, _))) = self.get_session_data(env, &tag).await
+                    && let Some(entry) = branch_sess.new_entries.get(&parsed_hash)
+                {
+                    return Ok(Some(entry.to_narinfo_string()));
+                }
+            }
+
+            // 5.3 Re-check Tier 3 (Production Baseline)
+            if let Ok((baseline, bloom_filter)) = self.get_baseline_data(env).await
+                && bloom_filter.contains(&parsed_hash)
             {
-                return Ok(Some(entry.to_narinfo_string()));
+                let shard_id = calculate_shard_id(&parsed_hash);
+                if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
+                    && !shard_desc.is_empty()
+                    && !shard_desc.blob_digest.is_empty()
+                    && let Ok(Some((shard_payload, _))) = self
+                        .get_shard_data(env, shard_id, &shard_desc.blob_digest)
+                        .await
+                    && let Some(entry) = shard_payload.entries.get(&parsed_hash)
+                {
+                    return Ok(Some(entry.to_narinfo_string()));
+                }
             }
         }
 
@@ -260,8 +294,8 @@ impl CacheStore {
 
         // 检查已加载在内存中的分片缓存
         let mut found_digest = None;
-        WorkerState::global().mem_shard_cache.iter_sync(|_, v| {
-            if let Some(digest) = v.1.get(normalized) {
+        WorkerState::global().mem_shard_cache.iter_sync(|_, entry| {
+            if let Some(digest) = entry.nar_lookup.get(normalized) {
                 found_digest = Some(digest.clone());
                 return false;
             }
@@ -277,15 +311,49 @@ impl CacheStore {
         let should_check_ghcr =
             WorkerState::global().try_acquire_ghcr_check(now as u64, DEBOUNCE_THRESHOLD_MS as u64);
 
-        if should_check_ghcr
-            && self.force_refresh(env).await.is_ok()
-            && let Some(run_id) = self.config.run_id
-        {
-            let tag = format!("run-{}", run_id);
-            if let Ok(Some((_, nar_lookup))) = self.get_session_data(env, &tag).await
-                && let Some(digest) = nar_lookup.get(normalized)
-            {
-                return Ok(Some(digest.clone()));
+        if should_check_ghcr && self.force_refresh(env).await.is_ok() {
+            // 5.1 Re-check Tier 1 (Workflow Run Session)
+            if let Some(run_id) = self.config.run_id {
+                let tag = format!("run-{}", run_id);
+                if let Ok(Some((_, nar_lookup))) = self.get_session_data(env, &tag).await
+                    && let Some(digest) = nar_lookup.get(normalized)
+                {
+                    return Ok(Some(digest.clone()));
+                }
+            }
+
+            // 5.2 Re-check Tier 2 (Branch / PR Session)
+            if let Some(ref br) = self.config.branch_or_pr {
+                let tag = if br.starts_with("pr-") || br.starts_with("branch-") {
+                    br.to_string()
+                } else {
+                    format!("branch-{}", br.replace(['/', ':'], "-"))
+                };
+                if let Ok(Some((_, nar_lookup))) = self.get_session_data(env, &tag).await
+                    && let Some(digest) = nar_lookup.get(normalized)
+                {
+                    return Ok(Some(digest.clone()));
+                }
+            }
+
+            // 5.3 Re-check Tier 3 (Production Baseline)
+            if let Some(store_hash) = extract_store_hash(nar_basename) {
+                let parsed_hash = StoreHash::parse(store_hash.as_str())?;
+                if let Ok((baseline, bloom_filter)) = self.get_baseline_data(env).await
+                    && bloom_filter.contains(&parsed_hash)
+                {
+                    let shard_id = calculate_shard_id(&parsed_hash);
+                    if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
+                        && !shard_desc.is_empty()
+                        && !shard_desc.blob_digest.is_empty()
+                        && let Ok(Some((_, nar_lookup))) = self
+                            .get_shard_data(env, shard_id, &shard_desc.blob_digest)
+                            .await
+                        && let Some(digest) = nar_lookup.get(normalized)
+                    {
+                        return Ok(Some(digest.clone()));
+                    }
+                }
             }
         }
 
@@ -326,9 +394,10 @@ impl CacheStore {
         if let Some(cached) = WorkerState::global()
             .mem_shard_cache
             .read_sync(&shard_id, |_, v| v.clone())
-            && now < cached.2
+            && cached.blob_digest == blob_digest
+            && now < cached.expires_at
         {
-            return Ok(Some((cached.0.clone(), cached.1.clone())));
+            return Ok(Some((cached.payload.clone(), cached.nar_lookup.clone())));
         }
 
         // 2. L2 Cloudflare KV
@@ -342,6 +411,7 @@ impl CacheStore {
                 .get(&kv_key)
                 .json::<KVCacheWrapper<ShardDataPayload>>()
                 .await
+            && wrapper.manifest_digest == blob_digest
             && now - wrapper.last_refresh < self.baseline_ttl_ms
         {
             let payload = wrapper.data;
@@ -349,7 +419,12 @@ impl CacheStore {
 
             let _ = WorkerState::global().mem_shard_cache.upsert_sync(
                 shard_id,
-                Arc::new((payload.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+                Arc::new(CachedShardEntry {
+                    payload: payload.clone(),
+                    nar_lookup: nar_lookup.clone(),
+                    blob_digest: blob_digest.to_string(),
+                    expires_at: now + L1_MEM_TTL_MS,
+                }),
             );
             return Ok(Some((payload, nar_lookup)));
         }
@@ -381,7 +456,12 @@ impl CacheStore {
 
                 let _ = WorkerState::global().mem_shard_cache.upsert_sync(
                     shard_id,
-                    Arc::new((payload.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+                    Arc::new(CachedShardEntry {
+                        payload: payload.clone(),
+                        nar_lookup: nar_lookup.clone(),
+                        blob_digest: blob_digest.to_string(),
+                        expires_at: now + L1_MEM_TTL_MS,
+                    }),
                 );
 
                 Ok(Some((payload, nar_lookup)))
@@ -392,6 +472,7 @@ impl CacheStore {
                         .get(&kv_key)
                         .json::<KVCacheWrapper<ShardDataPayload>>()
                         .await
+                    && wrapper.manifest_digest == blob_digest
                 {
                     let payload = wrapper.data;
                     let nar_lookup = build_nar_lookup_map(&payload.entries);
@@ -414,9 +495,9 @@ impl CacheStore {
         if let Some(cached) = WorkerState::global()
             .mem_session_cache
             .read_sync(tag, |_, v| v.clone())
-            && now < cached.2
+            && now < cached.expires_at
         {
-            return Ok(Some((cached.0.clone(), cached.1.clone())));
+            return Ok(Some((cached.delta.clone(), cached.nar_lookup.clone())));
         }
 
         // 2. L2 Cloudflare KV
@@ -433,7 +514,11 @@ impl CacheStore {
 
             let _ = WorkerState::global().mem_session_cache.upsert_sync(
                 tag.to_string(),
-                Arc::new((delta.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+                Arc::new(CachedSessionEntry {
+                    delta: delta.clone(),
+                    nar_lookup: nar_lookup.clone(),
+                    expires_at: now + L1_MEM_TTL_MS,
+                }),
             );
             return Ok(Some((delta, nar_lookup)));
         }
@@ -468,7 +553,11 @@ impl CacheStore {
 
                 let _ = WorkerState::global().mem_session_cache.upsert_sync(
                     tag.to_string(),
-                    Arc::new((delta.clone(), nar_lookup.clone(), now + L1_MEM_TTL_MS)),
+                    Arc::new(CachedSessionEntry {
+                        delta: delta.clone(),
+                        nar_lookup: nar_lookup.clone(),
+                        expires_at: now + L1_MEM_TTL_MS,
+                    }),
                 );
 
                 Ok(Some((delta, nar_lookup)))
@@ -499,9 +588,9 @@ impl CacheStore {
 
         // 1. L1 Memory Cache
         if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full()
-            && now < cached.2
+            && now < cached.expires_at
         {
-            return Ok((cached.0.clone(), cached.1.clone()));
+            return Ok((cached.root.clone(), cached.bloom_filter.clone()));
         }
 
         // 2. L2 Cloudflare KV
@@ -535,11 +624,11 @@ impl CacheStore {
 
             WorkerState::global()
                 .mem_baseline_cache
-                .store(Some(Arc::new((
-                    root_data.clone(),
-                    bloom_filter.clone(),
-                    now + L1_MEM_TTL_MS,
-                ))));
+                .store(Some(Arc::new(CachedBaselineEntry {
+                    root: root_data.clone(),
+                    bloom_filter: bloom_filter.clone(),
+                    expires_at: now + L1_MEM_TTL_MS,
+                })));
             return Ok((root_data, bloom_filter));
         }
 
@@ -642,11 +731,11 @@ impl CacheStore {
 
         WorkerState::global()
             .mem_baseline_cache
-            .store(Some(Arc::new((
-                root_data.clone(),
-                bloom_filter.clone(),
-                now + L1_MEM_TTL_MS,
-            ))));
+            .store(Some(Arc::new(CachedBaselineEntry {
+                root: root_data.clone(),
+                bloom_filter: bloom_filter.clone(),
+                expires_at: now + L1_MEM_TTL_MS,
+            })));
         WorkerState::global()
             .last_ghcr_check_ms
             .store(now as u64, Ordering::Release);

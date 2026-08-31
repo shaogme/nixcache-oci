@@ -15,9 +15,27 @@ use std::{
 pub const L1_MEM_TTL_MS: f64 = 10_000.0;
 pub const DEBOUNCE_THRESHOLD_MS: f64 = 500.0;
 
-pub type CachedSessionEntry = (DeltaPatchData, HashMap<String, NarDigest>, f64);
-pub type CachedBaselineEntry = (ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>, f64);
-pub type CachedShardEntry = (ShardDataPayload, HashMap<String, NarDigest>, f64);
+#[derive(Clone, Debug)]
+pub struct CachedSessionEntry {
+    pub delta: DeltaPatchData,
+    pub nar_lookup: HashMap<String, NarDigest>,
+    pub expires_at: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedBaselineEntry {
+    pub root: ShardedArchCacheIndexData,
+    pub bloom_filter: Arc<FastBlockedBloomFilter>,
+    pub expires_at: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedShardEntry {
+    pub payload: ShardDataPayload,
+    pub nar_lookup: HashMap<String, NarDigest>,
+    pub blob_digest: String,
+    pub expires_at: f64,
+}
 
 /// 收敛的 Worker 全局内存状态 (Schema v5 SMRI with Bloom Filter)
 pub struct WorkerState {
