@@ -212,6 +212,7 @@ impl CacheIndex {
 
         match self.oci_client.get_shard_data(blob_digest).await {
             Ok(payload) => {
+                self.set_remote_status(true, None);
                 let nar_map = build_nar_lookup_map(&payload.entries);
                 let arc_payload = Arc::new(payload);
                 let _ = self.shard_cache.upsert_sync(
@@ -229,6 +230,7 @@ impl CacheIndex {
                     "[nixcache-proxy] Failed to fetch shard data for shard {} (digest: {}): {}",
                     shard_id, blob_digest, e
                 );
+                self.set_remote_status(false, Some(format!("Failed to connect to remote: {}", e)));
                 None
             }
         }
@@ -613,8 +615,10 @@ impl CacheIndex {
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             let _ = self.session_cache.remove_sync(&tag);
-            if self.fetch_or_get_session(&tag).await.is_none() {
-                errs.push(format!("Session: failed to refresh tag {}", tag));
+            self.fetch_or_get_session(&tag).await;
+            let (_, remote_err) = self.remote_status();
+            if let Some(e) = remote_err {
+                errs.push(format!("Session (run-{}): {}", run_id, e));
             }
         }
         if let Some(ref br) = self.config.branch_or_pr {
@@ -624,8 +628,10 @@ impl CacheIndex {
                 format!("branch-{}", br.replace(['/', ':'], "-"))
             };
             let _ = self.session_cache.remove_sync(&tag);
-            if self.fetch_or_get_session(&tag).await.is_none() {
-                errs.push(format!("Branch: failed to refresh tag {}", tag));
+            self.fetch_or_get_session(&tag).await;
+            let (_, remote_err) = self.remote_status();
+            if let Some(e) = remote_err {
+                errs.push(format!("Branch ({}): {}", tag, e));
             }
         }
 
@@ -670,28 +676,13 @@ impl CacheIndex {
 
         let arch_tag = format!("{}-{}", tag_str, system_clone.as_str());
         let fetch_res = match self.oci_client.get_delta_patch_manifest(&arch_tag).await {
-            Ok(Some(res)) => Some(res),
-            Ok(None) => match self.oci_client.get_delta_patch_manifest(&tag_str).await {
-                Ok(res) => res,
-                Err(e) => {
-                    warn!(
-                        "[nixcache-proxy] Failed to fetch session delta {}: {}",
-                        tag_str, e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(
-                    "[nixcache-proxy] Failed to fetch session delta {}: {}",
-                    arch_tag, e
-                );
-                None
-            }
+            Ok(Some(res)) => Ok(Some(res)),
+            Ok(None) => self.oci_client.get_delta_patch_manifest(&tag_str).await,
+            Err(e) => Err(e),
         };
 
         match fetch_res {
-            Some((delta, _)) => {
+            Ok(Some((delta, _))) => {
                 self.set_remote_status(true, None);
                 let cached = Arc::new(CachedSession::new(delta));
                 let _ = self.session_cache.upsert_sync(
@@ -700,12 +691,20 @@ impl CacheIndex {
                 );
                 Some(cached)
             }
-            None => {
+            Ok(None) => {
                 info!(
                     "[nixcache-proxy] Session tag {} not found on remote for system {}.",
                     tag_str, system_clone
                 );
                 self.set_remote_status(true, None);
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "[nixcache-proxy] Failed to fetch session delta {}: {}",
+                    tag_str, e
+                );
+                self.set_remote_status(false, Some(format!("Failed to connect to remote: {}", e)));
                 None
             }
         }

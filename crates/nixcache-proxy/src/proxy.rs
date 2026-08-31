@@ -207,6 +207,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
     if let Some(digest) = state.index.find_nar_digest(&nar_name).await {
         match state.oci_client.stream_blob(digest.as_str()).await {
             Ok(resp) if resp.status.is_success() => {
+                state.index.set_remote_status(true, None);
                 let content_len = resp.content_length();
                 let mut headers = HeaderMap::new();
                 headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -229,8 +230,20 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
                     "[nixcache-proxy] Failed to stream blob {} from GHCR: {}",
                     digest, e
                 );
+                state.index.set_remote_status(
+                    false,
+                    Some(format!("Failed to stream blob {}: {}", digest, e)),
+                );
             }
-            _ => {}
+            Ok(resp) => {
+                state.index.set_remote_status(
+                    false,
+                    Some(format!(
+                        "Failed to stream blob {}: HTTP {}",
+                        digest, resp.status
+                    )),
+                );
+            }
         }
     }
 
