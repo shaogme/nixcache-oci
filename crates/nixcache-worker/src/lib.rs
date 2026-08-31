@@ -11,7 +11,10 @@ pub use error::WorkerStoreError;
 use nixcache_core::{IndexEntry, StoreHash, SystemArch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
+use worker::{
+    Env, Fetch, Headers, Method, Request, RequestInit, Response, Result, RouteContext, Router,
+    event,
+};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
@@ -127,6 +130,11 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             headers.set("Content-Type", "text/x-nix-cache-info")?;
             Ok(Response::ok(body)?.with_headers(headers))
         })
+        .head("/nix-cache-info", |_req, _ctx| {
+            let headers = Headers::new();
+            headers.set("Content-Type", "text/x-nix-cache-info")?;
+            Ok(Response::empty()?.with_headers(headers))
+        })
         .get_async("/public-key", |_req, ctx| async move {
             let store = get_store(&ctx.env)?;
             match store.get_public_key(&ctx.env).await {
@@ -217,106 +225,148 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             Response::from_json(&res)
         })
         .get_async("/nar/:nar_name", |_req, ctx| async move {
-            let nar_name = match ctx.param("nar_name") {
-                Some(name) => name,
-                None => return Response::error("Missing NAR name", 400),
-            };
-
-            let content_type_str = if nar_name.ends_with(".xz") {
-                "application/x-xz"
-            } else {
-                "application/x-nix-nar"
-            };
-
-            let store = get_store(&ctx.env)?;
-
-            // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-            match store.lookup_nar_digest_cascading(&ctx.env, nar_name).await {
-                Ok(Some(digest)) => {
-                    if let Ok(bytes) = store.oci_client().get_blob(digest.as_str()).await {
-                        let headers = Headers::new();
-                        headers.set("Content-Type", content_type_str)?;
-
-                        headers.set("Content-Length", &bytes.len().to_string())?;
-                        return Ok(Response::from_bytes(bytes.to_vec())?.with_headers(headers));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Response::error(format!("Failed to query NAR digest: {}", e), 500);
-                }
-            }
-
-            // 2. Fallback to upstream
-            for cache_url in &store.config().upstream_caches {
-                let upstream_url = format!("{}/nar/{}", cache_url, nar_name);
-                if let Ok(resp) = Fetch::Url(
-                    upstream_url
-                        .parse()
-                        .map_err(|e| worker::Error::from(format!("{:?}", e)))?,
-                )
-                .send()
-                .await
-                    && resp.status_code() == 200
-                {
-                    let headers = Headers::new();
-                    headers.set("Content-Type", content_type_str)?;
-                    if let Ok(Some(len)) = resp.headers().get("Content-Length") {
-                        headers.set("Content-Length", &len)?;
-                    }
-                    return Ok(resp.with_headers(headers));
-                }
-            }
-
-            Response::error("NAR not found", 404)
+            handle_nar(ctx, false).await
+        })
+        .head_async("/nar/:nar_name", |_req, ctx| async move {
+            handle_nar(ctx, true).await
         })
         .get_async("/:hash_ext", |_req, ctx| async move {
-            let hash_ext = match ctx.param("hash_ext") {
-                Some(h) => h,
-                None => return Response::error("Missing parameter", 400),
-            };
-
-            if !hash_ext.ends_with(".narinfo") {
-                return Response::error("Not found", 404);
-            }
-            let store_hash = hash_ext.trim_end_matches(".narinfo");
-
-            let store = get_store(&ctx.env)?;
-
-            // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-            match store.lookup_narinfo_cascading(&ctx.env, store_hash).await {
-                Ok(Some(narinfo)) => {
-                    let headers = Headers::new();
-                    headers.set("Content-Type", "text/x-nix-narinfo")?;
-                    return Ok(Response::ok(&narinfo)?.with_headers(headers));
-                }
-                Ok(None) => {}
-                Err(e) => return Response::error(format!("Failed to query narinfo: {}", e), 500),
-            }
-
-            // 2. Fallback to upstream
-            for cache_url in &store.config().upstream_caches {
-                let upstream_url = format!("{}/{}.narinfo", cache_url, store_hash);
-                if let Ok(mut resp) = Fetch::Url(
-                    upstream_url
-                        .parse()
-                        .map_err(|e| worker::Error::from(format!("{:?}", e)))?,
-                )
-                .send()
-                .await
-                    && resp.status_code() == 200
-                    && let Ok(body) = resp.text().await
-                {
-                    let headers = Headers::new();
-                    headers.set("Content-Type", "text/x-nix-narinfo")?;
-                    return Ok(Response::ok(body)?.with_headers(headers));
-                }
-            }
-
-            Response::error("narinfo not found", 404)
+            handle_narinfo(ctx, false).await
+        })
+        .head_async("/:hash_ext", |_req, ctx| async move {
+            handle_narinfo(ctx, true).await
         })
         .run(req, env)
         .await
+}
+
+async fn handle_nar(ctx: RouteContext<()>, is_head: bool) -> Result<Response> {
+    let nar_name = match ctx.param("nar_name") {
+        Some(name) => name,
+        None => return Response::error("Missing NAR name", 400),
+    };
+
+    let content_type_str = if nar_name.ends_with(".xz") {
+        "application/x-xz"
+    } else {
+        "application/x-nix-nar"
+    };
+
+    let store = get_store(&ctx.env)?;
+
+    // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
+    match store.lookup_nar_digest_cascading(&ctx.env, nar_name).await {
+        Ok(Some(digest)) => {
+            if is_head {
+                if let Ok(true) = store.oci_client().head_blob(digest.as_str()).await {
+                    let headers = Headers::new();
+                    headers.set("Content-Type", content_type_str)?;
+                    return Ok(Response::empty()?.with_headers(headers));
+                }
+            } else if let Ok(bytes) = store.oci_client().get_blob(digest.as_str()).await {
+                let headers = Headers::new();
+                headers.set("Content-Type", content_type_str)?;
+                headers.set("Content-Length", &bytes.len().to_string())?;
+                return Ok(Response::from_bytes(bytes.to_vec())?.with_headers(headers));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Response::error(format!("Failed to query NAR digest: {}", e), 500);
+        }
+    }
+
+    // 2. Fallback to upstream
+    for cache_url in &store.config().upstream_caches {
+        let upstream_url = format!("{}/nar/{}", cache_url, nar_name);
+        let fetch_req = if is_head {
+            let mut init = RequestInit::new();
+            init.with_method(Method::Head);
+            Request::new_with_init(&upstream_url, &init)
+                .map_err(|e| worker::Error::from(format!("{:?}", e)))?
+        } else {
+            Request::new(&upstream_url, Method::Get)
+                .map_err(|e| worker::Error::from(format!("{:?}", e)))?
+        };
+
+        if let Ok(resp) = Fetch::Request(fetch_req).send().await
+            && resp.status_code() == 200
+        {
+            let headers = Headers::new();
+            headers.set("Content-Type", content_type_str)?;
+            if let Ok(Some(len)) = resp.headers().get("Content-Length") {
+                headers.set("Content-Length", &len)?;
+            }
+            if is_head {
+                return Ok(Response::empty()?.with_headers(headers));
+            } else {
+                return Ok(resp.with_headers(headers));
+            }
+        }
+    }
+
+    Response::error("NAR not found", 404)
+}
+
+async fn handle_narinfo(ctx: RouteContext<()>, is_head: bool) -> Result<Response> {
+    let hash_ext = match ctx.param("hash_ext") {
+        Some(h) => h,
+        None => return Response::error("Missing parameter", 400),
+    };
+
+    if !hash_ext.ends_with(".narinfo") {
+        return Response::error("Not found", 404);
+    }
+    let store_hash = hash_ext.strip_suffix(".narinfo").unwrap_or(hash_ext);
+
+    let store = get_store(&ctx.env)?;
+
+    // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
+    match store.lookup_narinfo_cascading(&ctx.env, store_hash).await {
+        Ok(Some(narinfo)) => {
+            let headers = Headers::new();
+            headers.set("Content-Type", "text/x-nix-narinfo")?;
+            headers.set("Content-Length", &narinfo.len().to_string())?;
+            if is_head {
+                return Ok(Response::empty()?.with_headers(headers));
+            } else {
+                return Ok(Response::ok(&narinfo)?.with_headers(headers));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return Response::error(format!("Failed to query narinfo: {}", e), 500),
+    }
+
+    // 2. Fallback to upstream
+    for cache_url in &store.config().upstream_caches {
+        let upstream_url = format!("{}/{}.narinfo", cache_url, store_hash);
+        let fetch_req = if is_head {
+            let mut init = RequestInit::new();
+            init.with_method(Method::Head);
+            Request::new_with_init(&upstream_url, &init)
+                .map_err(|e| worker::Error::from(format!("{:?}", e)))?
+        } else {
+            Request::new(&upstream_url, Method::Get)
+                .map_err(|e| worker::Error::from(format!("{:?}", e)))?
+        };
+
+        if let Ok(mut resp) = Fetch::Request(fetch_req).send().await
+            && resp.status_code() == 200
+        {
+            let headers = Headers::new();
+            headers.set("Content-Type", "text/x-nix-narinfo")?;
+            if let Ok(Some(len)) = resp.headers().get("Content-Length") {
+                headers.set("Content-Length", &len)?;
+            }
+            if is_head {
+                return Ok(Response::empty()?.with_headers(headers));
+            } else if let Ok(body) = resp.text().await {
+                return Ok(Response::ok(body)?.with_headers(headers));
+            }
+        }
+    }
+
+    Response::error("narinfo not found", 404)
 }
 
 #[cfg(test)]

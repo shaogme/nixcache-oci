@@ -137,11 +137,14 @@ if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
     exit 1
 fi
 
-# 7. Perform substitution test from Worker
-# Wait for Cloudflare KV replication & edge cache convergence
-echo ">>> Waiting 30 seconds for global KV replication and edge convergence..."
-sleep 30
+# Pre-fetch / warm-up NAR URL
+NAR_REL_URL=$(echo "$NARINFO_CONTENT" | grep "^URL:" | awk '{print $2}')
+if [[ -n "$NAR_REL_URL" ]]; then
+    echo ">>> Pre-warming NAR endpoint: $TEST_WORKER_URL/$NAR_REL_URL"
+    curl -fs -r 0-0 "$TEST_WORKER_URL/$NAR_REL_URL" >/dev/null 2>&1 || true
+fi
 
+# 7. Perform substitution test from Worker
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 
@@ -149,6 +152,16 @@ echo ">>> Realising store path from Cloudflare Worker substituter..."
 REALISE_SUCCESS=false
 for attempt in 1 2 3; do
     echo ">>> Substitution attempt $attempt/3..."
+    # Clear local binary cache sqlite so negative cache from any failed attempt doesn't short-circuit retries
+    rm -rf "$HOME/.cache/nix/binary-cache"* /root/.cache/nix/binary-cache* /tmp/nix-binary-cache* 2>/dev/null || true
+
+    # Pre-check endpoint is still returning 200 before invoking nix-store
+    if ! curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" >/dev/null 2>&1; then
+        echo ">>> Worker narinfo not yet ready on this edge POP, refreshing index..."
+        curl -fs -X POST "$TEST_WORKER_URL/_refresh" >/dev/null 2>&1 || true
+        sleep 5
+    fi
+
     if nix-store --realise "$TEST_STORE_PATH" \
       --option substituters "$TEST_WORKER_URL" \
       --option trusted-public-keys "$(cat test-worker-public.key)" \
