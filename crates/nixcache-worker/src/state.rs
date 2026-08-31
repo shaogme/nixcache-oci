@@ -6,14 +6,10 @@ use nixcache_core::{
 use scc::HashMap as SccHashMap;
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, LazyLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, LazyLock},
 };
 
-pub const L1_MEM_TTL_MS: f64 = 10_000.0;
-pub const DEBOUNCE_THRESHOLD_MS: f64 = 500.0;
+pub const L1_MEM_TTL_MS: f64 = 30_000.0;
 
 #[derive(Clone, Debug)]
 pub struct CachedSessionEntry {
@@ -45,7 +41,6 @@ pub struct WorkerState {
     pub mem_session_cache: SccHashMap<String, Arc<CachedSessionEntry>>,
     pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
     pub mem_shard_cache: SccHashMap<u16, Arc<CachedShardEntry>>,
-    pub last_ghcr_check_ms: AtomicU64,
 }
 
 static GLOBAL_STATE: LazyLock<WorkerState> = LazyLock::new(|| WorkerState {
@@ -54,7 +49,6 @@ static GLOBAL_STATE: LazyLock<WorkerState> = LazyLock::new(|| WorkerState {
     mem_session_cache: SccHashMap::new(),
     mem_baseline_cache: ArcSwapOption::from(None),
     mem_shard_cache: SccHashMap::new(),
-    last_ghcr_check_ms: AtomicU64::new(0),
 });
 
 impl WorkerState {
@@ -81,17 +75,5 @@ impl WorkerState {
         self.mem_session_cache.clear_sync();
         self.mem_baseline_cache.store(None);
         self.mem_shard_cache.clear_sync();
-    }
-
-    /// 原子抢占 GHCR 刷新权限
-    pub fn try_acquire_ghcr_check(&self, now_ms: u64, debounce_ms: u64) -> bool {
-        let last = self.last_ghcr_check_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) > debounce_ms {
-            self.last_ghcr_check_ms
-                .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        } else {
-            false
-        }
     }
 }

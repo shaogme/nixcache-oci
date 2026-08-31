@@ -47,24 +47,62 @@ fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, Transport
     Ok(http_headers)
 }
 
+const MAX_REDIRECTS: usize = 5;
+
+fn is_redirect_status(code: u16) -> bool {
+    matches!(code, 301 | 302 | 303 | 307 | 308)
+}
+
+fn resolve_redirect_url(base_url: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_string()
+    } else if let Ok(base) = worker::Url::parse(base_url)
+        && let Ok(joined) = base.join(location)
+    {
+        joined.to_string()
+    } else {
+        location.to_string()
+    }
+}
+
 impl OciTransport for WorkerFetchTransport {
     type BodyStream = BoxBodyStream;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
-        let worker_headers = convert_to_worker_headers(&headers)?;
-        let mut req_init = RequestInit::new();
-        req_init.with_method(Method::Head);
-        req_init.with_headers(worker_headers);
+        let mut current_url = url.to_string();
+        let mut current_headers = headers;
+        let mut redirect_count = 0;
 
-        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
-        let resp = Fetch::Request(req)
-            .send()
-            .await
-            .map_err(|e| map_worker_error(url, e))?;
-        StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: Some(format!("Invalid status code {}", resp.status_code())),
-        })
+        loop {
+            let worker_headers = convert_to_worker_headers(&current_headers)?;
+            let mut req_init = RequestInit::new();
+            req_init.with_method(Method::Head);
+            req_init.with_headers(worker_headers);
+            req_init.with_redirect(worker::RequestRedirect::Manual);
+
+            let req = Request::new_with_init(&current_url, &req_init)
+                .map_err(|e| map_worker_error(&current_url, e))?;
+            let resp = Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| map_worker_error(&current_url, e))?;
+
+            let status_code = resp.status_code();
+            if is_redirect_status(status_code)
+                && redirect_count < MAX_REDIRECTS
+                && let Ok(Some(location)) = resp.headers().get("Location")
+            {
+                current_url = resolve_redirect_url(&current_url, &location);
+                current_headers.remove(http::header::AUTHORIZATION);
+                redirect_count += 1;
+                continue;
+            }
+
+            return StatusCode::from_u16(status_code).map_err(|_| TransportError::HttpStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Some(format!("Invalid status code {}", status_code)),
+            });
+        }
     }
 
     async fn get(
@@ -72,26 +110,49 @@ impl OciTransport for WorkerFetchTransport {
         url: &str,
         headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
-        let worker_headers = convert_to_worker_headers(&headers)?;
-        let mut req_init = RequestInit::new();
-        req_init.with_method(Method::Get);
-        req_init.with_headers(worker_headers);
+        let mut current_url = url.to_string();
+        let mut current_headers = headers;
+        let mut redirect_count = 0;
 
-        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
-        let mut resp = Fetch::Request(req)
-            .send()
-            .await
-            .map_err(|e| map_worker_error(url, e))?;
+        loop {
+            let worker_headers = convert_to_worker_headers(&current_headers)?;
+            let mut req_init = RequestInit::new();
+            req_init.with_method(Method::Get);
+            req_init.with_headers(worker_headers);
+            req_init.with_redirect(worker::RequestRedirect::Manual);
 
-        let status =
-            StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: Some(format!("Invalid status code {}", resp.status_code())),
-            })?;
-        let resp_headers = convert_from_worker_headers(resp.headers())?;
-        let bytes = Bytes::from(resp.bytes().await.map_err(|e| map_worker_error(url, e))?);
+            let req = Request::new_with_init(&current_url, &req_init)
+                .map_err(|e| map_worker_error(&current_url, e))?;
+            let mut resp = Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| map_worker_error(&current_url, e))?;
 
-        Ok((status, resp_headers, bytes))
+            let status_code = resp.status_code();
+            if is_redirect_status(status_code)
+                && redirect_count < MAX_REDIRECTS
+                && let Ok(Some(location)) = resp.headers().get("Location")
+            {
+                current_url = resolve_redirect_url(&current_url, &location);
+                current_headers.remove(http::header::AUTHORIZATION);
+                redirect_count += 1;
+                continue;
+            }
+
+            let status =
+                StatusCode::from_u16(status_code).map_err(|_| TransportError::HttpStatus {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: Some(format!("Invalid status code {}", status_code)),
+                })?;
+            let resp_headers = convert_from_worker_headers(resp.headers())?;
+            let bytes = Bytes::from(
+                resp.bytes()
+                    .await
+                    .map_err(|e| map_worker_error(&current_url, e))?,
+            );
+
+            return Ok((status, resp_headers, bytes));
+        }
     }
 
     async fn stream(

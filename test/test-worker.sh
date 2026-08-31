@@ -114,11 +114,11 @@ echo ">>> Triggering Worker cache index refresh..."
 REFRESH_RESP=$(curl -fs -X POST "$TEST_WORKER_URL/_refresh")
 echo "Worker refresh response: $REFRESH_RESP"
 
-# 6. Verify Narinfo resolves on Worker (with immediate consistency via Cache-Control: no-cache)
+# 6. Verify Narinfo resolves on Worker (deterministic resolution without custom bypass headers)
 echo ">>> Verifying .narinfo endpoint on Worker..."
 NARINFO_CONTENT=""
 for i in {1..5}; do
-    if NARINFO_CONTENT=$(curl -fs -H "Cache-Control: no-cache" "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
+    if NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
         echo ">>> Retrieved narinfo:"
         echo "$NARINFO_CONTENT"
         break

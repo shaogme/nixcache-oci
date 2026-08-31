@@ -116,25 +116,6 @@ fn get_store(env: &Env) -> Result<CacheStore> {
     Ok(CacheStore::new(oci_client, config))
 }
 
-fn should_bypass_cache(headers: &Headers) -> bool {
-    if let Ok(Some(cc)) = headers.get("Cache-Control")
-        && (cc.contains("no-cache") || cc.contains("max-age=0"))
-    {
-        return true;
-    }
-    if let Ok(Some(pragma)) = headers.get("Pragma")
-        && pragma.contains("no-cache")
-    {
-        return true;
-    }
-    if let Ok(Some(refresh)) = headers.get("X-NixCache-Refresh")
-        && (refresh.eq_ignore_ascii_case("true") || refresh == "1")
-    {
-        return true;
-    }
-    false
-}
-
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     let router = Router::new();
@@ -190,11 +171,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         .post_async("/_refresh", |_req, ctx| async move {
             let store = get_store(&ctx.env)?;
             match store.force_refresh(&ctx.env).await {
-                Ok(count) => {
+                Ok(refresh_res) => {
                     let status = store.get_status(&ctx.env).await;
                     let res = serde_json::json!({
                         "refreshed": true,
-                        "entries": count,
+                        "entries": refresh_res.total_entries,
+                        "warmed_shards": refresh_res.warmed_shards,
                         "manifest_digest": status.manifest_digest,
                     });
                     Response::from_json(&res)
@@ -202,7 +184,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 Err(e) => {
                     let res = serde_json::json!({
                         "refreshed": false,
-                        "error": e,
+                        "error": e.to_string(),
                     });
                     Response::from_json(&res)
                 }
@@ -237,7 +219,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             });
             Response::from_json(&res)
         })
-        .get_async("/nar/:nar_name", |req, ctx| async move {
+        .get_async("/nar/:nar_name", |_req, ctx| async move {
             let nar_name = match ctx.param("nar_name") {
                 Some(name) => name,
                 None => return Response::error("Missing NAR name", 400),
@@ -249,19 +231,14 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 "application/x-nix-nar"
             };
 
-            let bypass_debounce = should_bypass_cache(req.headers());
             let store = get_store(&ctx.env)?;
 
             // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-            match store
-                .lookup_nar_digest_cascading(&ctx.env, nar_name, bypass_debounce)
-                .await
-            {
+            match store.lookup_nar_digest(&ctx.env, nar_name).await {
                 Ok(Some(digest)) => {
                     if let Ok(bytes) = store.oci_client().get_blob(digest.as_str()).await {
                         let headers = Headers::new();
                         headers.set("Content-Type", content_type_str)?;
-
                         headers.set("Content-Length", &bytes.len().to_string())?;
                         return Ok(Response::from_bytes(bytes.to_vec())?.with_headers(headers));
                     }
@@ -295,7 +272,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             Response::error("NAR not found", 404)
         })
-        .get_async("/:hash_ext", |req, ctx| async move {
+        .get_async("/:hash_ext", |_req, ctx| async move {
             let hash_ext = match ctx.param("hash_ext") {
                 Some(h) => h,
                 None => return Response::error("Missing parameter", 400),
@@ -306,14 +283,10 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             }
             let store_hash = hash_ext.trim_end_matches(".narinfo");
 
-            let bypass_debounce = should_bypass_cache(req.headers());
             let store = get_store(&ctx.env)?;
 
             // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-            match store
-                .lookup_narinfo_cascading(&ctx.env, store_hash, bypass_debounce)
-                .await
-            {
+            match store.lookup_narinfo(&ctx.env, store_hash).await {
                 Ok(Some(narinfo)) => {
                     let headers = Headers::new();
                     headers.set("Content-Type", "text/x-nix-narinfo")?;
