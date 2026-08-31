@@ -374,8 +374,13 @@ impl FastBlockedBloomFilter {
         num_entries: usize,
         num_hashes: u8,
     ) -> Result<Self, BloomError> {
+        if num_hashes == 0 {
+            return Err(BloomError::ZeroHashCount(0));
+        }
         if bytes.is_empty() || !bytes.len().is_multiple_of(64) {
-            return Err(BloomError::InvalidByteLength(bytes.len()));
+            return Err(BloomError::InvalidByteLength {
+                actual: bytes.len(),
+            });
         }
 
         let num_blocks = bytes.len() / 64;

@@ -1,5 +1,5 @@
 use crate::{
-    error::BuilderError,
+    error::{BuilderError, NixExecError},
     nix::driver::{BuildConfig, BuildMode, BuildTarget, NixCli},
 };
 use serde::Deserialize;
@@ -34,11 +34,7 @@ pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, 
             let flake_ref = format!(
                 "path:{}",
                 fs::canonicalize(&config.flake_path)
-                    .await
-                    .map_err(|e| BuilderError::Config(format!(
-                        "Invalid path {}: {}",
-                        config.flake_path, e
-                    )))?
+                    .await?
                     .to_string_lossy()
             );
 
@@ -50,7 +46,12 @@ pub async fn discover_outputs(config: &BuildConfig) -> Result<Vec<BuildTarget>, 
                     .status()
                     .await?;
                 if !status.success() {
-                    return Err(BuilderError::NixCli("nix flake update failed".to_string()));
+                    return Err(NixExecError::ExitFailure {
+                        command: format!("nix flake update --flake {}", flake_ref),
+                        status,
+                        stderr: String::new(),
+                    }
+                    .into());
                 }
             }
 
@@ -79,10 +80,12 @@ in {{ inherit pkgs devShells nixos; }}"#,
 
             if !output.status.success() {
                 let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                return Err(BuilderError::NixCli(format!(
-                    "nix eval for flake discovery failed: {}",
-                    err_msg
-                )));
+                return Err(NixExecError::ExitFailure {
+                    command: "nix eval --json --impure --expr".to_string(),
+                    status: output.status,
+                    stderr: err_msg,
+                }
+                .into());
             }
 
             let json_str = String::from_utf8_lossy(&output.stdout);
@@ -122,10 +125,11 @@ in {{ inherit pkgs devShells nixos; }}"#,
             }
 
             if targets.is_empty() {
-                return Err(BuilderError::NixCli(format!(
+                return Err(NixExecError::Execution(format!(
                     "No buildable outputs found for {} in {}",
                     system, config.flake_path
-                )));
+                ))
+                .into());
             }
 
             Ok(targets)

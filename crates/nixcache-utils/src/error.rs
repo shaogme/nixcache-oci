@@ -1,28 +1,20 @@
 use std::io;
 use thiserror::Error;
 
-/// 跨平台统一压缩错误枚举
 #[derive(Error, Debug)]
 pub enum CompressionError {
-    #[error("Zstd internal error: {0}")]
-    ZstdError(String),
+    #[error("Zstd compression failed (code: {code})")]
+    ZstdCompress { code: usize },
 
-    #[error("Invalid Zstd magic number header")]
-    InvalidMagic,
+    #[error("Zstd decompression failed (code: {code})")]
+    ZstdDecompress { code: usize },
 
-    #[error("Zstd operation is not supported on target platform: {0}")]
-    Unsupported(String),
+    #[error("Invalid Zstd magic number header (found 0x{found:08X}, expected 0x28B52FFD)")]
+    InvalidMagic { found: u32 },
 
-    #[error("I/O error during compression/decompression: {0}")]
+    #[error("Empty buffer supplied for decompression")]
+    EmptyBuffer,
+
+    #[error("I/O error during compression streaming: {0}")]
     Io(#[from] io::Error),
-}
-
-/// 平台差异工具库通用错误枚举
-#[derive(Error, Debug)]
-pub enum UtilError {
-    #[error("Compression error: {0}")]
-    Compression(#[from] CompressionError),
-
-    #[error("System runtime error: {0}")]
-    Sys(String),
 }

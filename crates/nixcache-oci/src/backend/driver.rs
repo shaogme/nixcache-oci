@@ -1,7 +1,7 @@
 use crate::backend::kind::{
     BlobUploadStrategy, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind,
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 /// OCI 后端抽象驱动 (Rust 2024 原生 Trait)
 pub trait OciBackendDriver: Send + Sync + Debug + 'static {
@@ -629,9 +629,9 @@ impl<T: Into<OciDriver> + Copy> From<&T> for OciDriver {
     }
 }
 
-impl<T: Into<OciDriver> + Copy> From<std::sync::Arc<T>> for OciDriver {
+impl<T: Into<OciDriver> + Copy> From<Arc<T>> for OciDriver {
     #[inline(always)]
-    fn from(d: std::sync::Arc<T>) -> Self {
+    fn from(d: Arc<T>) -> Self {
         (*d).into()
     }
 }

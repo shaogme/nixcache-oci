@@ -9,7 +9,11 @@ use nixcache_oci::{
     TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
 };
 use reqwest::Client;
-use std::{io::SeekFrom, path::Path, time::Duration};
+use std::{
+    io::{Error as IoError, SeekFrom},
+    path::Path,
+    time::Duration,
+};
 use tokio::{
     fs::{File, metadata, read},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -18,12 +22,29 @@ use tokio::{
 use tracing::{info, warn};
 
 fn map_reqwest_error(err: reqwest::Error) -> TransportError {
-    if err.is_builder() || err.is_redirect() {
-        TransportError::InvalidUrl(err.to_string())
-    } else if err.is_status() {
-        TransportError::Http(err.to_string())
+    if err.is_timeout() {
+        TransportError::Timeout {
+            duration: Duration::from_secs(0),
+        }
+    } else if let Some(status) = err.status() {
+        TransportError::HttpStatus {
+            status,
+            message: Some(err.to_string()),
+        }
+    } else if err.is_builder() || err.is_redirect() {
+        TransportError::InvalidUri {
+            url: err.url().map(|u| u.to_string()).unwrap_or_default(),
+            reason: "Reqwest builder or redirect error",
+        }
     } else {
-        TransportError::Network(err.to_string())
+        let endpoint = err
+            .url()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        TransportError::ConnectionFailed {
+            endpoint,
+            source: IoError::other(err.to_string()),
+        }
     }
 }
 
@@ -464,7 +485,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
         let location = resp_headers
             .get("Location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
+            .ok_or(OciError::UploadLocationMissing)?;
 
         let mut session_url = if location.starts_with('/') {
             format!("{}://{}{}", self.url_scheme(), self.registry(), location)
@@ -482,7 +503,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
 
             let mut attempts = 0;
             let mut chunk_succeeded = false;
-            let mut last_err = String::new();
+            let mut last_err: Option<OciError> = None;
 
             while attempts < config.max_retry_attempts {
                 attempts += 1;
@@ -498,7 +519,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                 let headers = match self.get_auth_headers().await {
                     Ok(h) => h,
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = Some(e);
                         continue;
                     }
                 };
@@ -530,15 +551,15 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                         break;
                     }
                     Ok(resp) => {
-                        last_err = format!("Server returned unexpected status {}", resp.status);
+                        last_err = Some(OciError::BlobUploadFailed(resp.status));
                     }
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = Some(OciError::Transport(e));
                     }
                 }
 
                 warn!(
-                    "Chunk upload [{}-{}] failed on attempt {}/{}: {}. Probing range...",
+                    "Chunk upload [{}-{}] failed on attempt {}/{}: {:?}. Probing range...",
                     current_offset, end_offset, attempts, config.max_retry_attempts, last_err
                 );
 
@@ -570,7 +591,9 @@ impl OciClientExt for OciClient<ReqwestTransport> {
             if !chunk_succeeded {
                 return Err(OciError::ResumableUploadFailed {
                     attempts: config.max_retry_attempts,
-                    last_error: last_err,
+                    source: Box::new(last_err.unwrap_or(OciError::BlobUploadFailed(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    ))),
                 });
             }
         }

@@ -1,37 +1,27 @@
 use clap::Parser;
 use mimalloc::MiMalloc;
+use nixcache_builder::{
+    cli::{Cli, Commands, SessionCommands},
+    error::BuilderError,
+    gc::run_gc,
+    list::run_list,
+    nix::BuildConfig,
+    promote::run_promote,
+    purge::run_purge,
+    session::{
+        SessionCaptureOptions, SessionInitOptions, run_session_capture, run_session_clean,
+        run_session_init,
+    },
+    worker::{BuildWorkerOptions, run_build_worker},
+};
 use nixcache_cli::{DEFAULT_NIXCACHE_REPO, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT};
-use std::{error::Error, path::Path, process};
+use std::{path::Path, process};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-mod cli;
-mod env_injector;
-mod error;
-mod gc;
-mod list;
-mod nix;
-mod promote;
-mod purge;
-mod session;
-mod summary;
-mod worker;
-
-use cli::{Cli, Commands, SessionCommands};
-use gc::run_gc;
-use list::run_list;
-use nix::BuildConfig;
-use promote::run_promote;
-use purge::run_purge;
-use session::{
-    SessionCaptureOptions, SessionInitOptions, run_session_capture, run_session_clean,
-    run_session_init,
-};
-use worker::{BuildWorkerOptions, run_build_worker};
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), BuilderError> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();

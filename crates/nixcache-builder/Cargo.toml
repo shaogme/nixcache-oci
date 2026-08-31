@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # CLI & Utilities
+base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 mimalloc = { workspace = true }

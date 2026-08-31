@@ -1,6 +1,10 @@
 use crate::{error::BuilderError, nix::driver::NixCli};
 use nixcache_core::matches_pattern;
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    io::{self, ErrorKind},
+    path::Path,
+};
 use tokio::fs;
 use tracing::warn;
 
@@ -120,10 +124,14 @@ impl TargetResolver {
                                 "Symlink {:?} target {:?} could not be canonicalized: {}",
                                 entry_path, resolved_target, e
                             );
-                            return Err(BuilderError::Other(format!(
-                                "Dangling or broken symlink {:?} pointing to non-existent {:?}",
-                                entry_path, resolved_target
-                            )));
+                            return Err(io::Error::new(
+                                ErrorKind::NotFound,
+                                format!(
+                                    "Dangling or broken symlink {:?} pointing to non-existent {:?}",
+                                    entry_path, resolved_target
+                                ),
+                            )
+                            .into());
                         }
                     }
                 } else if let Ok(canon) = fs::canonicalize(&entry_path).await {

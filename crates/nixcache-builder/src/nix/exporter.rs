@@ -1,5 +1,5 @@
 use crate::{
-    error::BuilderError,
+    error::{BuilderError, CompressionError, NarInfoParseError, NixExecError, SigningError},
     nix::{
         driver::{NixCli, parse_path_info_items_typed},
         filter::NixPathInfoItem,
@@ -243,10 +243,12 @@ impl ParallelExporter {
             let output = cmd.output().await?;
             if !output.status.success() {
                 let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                return Err(BuilderError::NixCli(format!(
-                    "nix path-info failed: {}",
-                    err_msg
-                )));
+                return Err(NixExecError::ExitFailure {
+                    command: "nix path-info".to_string(),
+                    status: output.status,
+                    stderr: err_msg,
+                }
+                .into());
             }
 
             let json_str = String::from_utf8_lossy(&output.stdout);
@@ -269,13 +271,14 @@ impl ParallelExporter {
         let file_name = Path::new(store_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| BuilderError::Other(format!("Invalid store path: {}", store_path)))?;
+            .ok_or_else(|| NarInfoParseError::InvalidStorePath(store_path.clone()))?;
 
         if file_name.len() < 32 {
-            return Err(BuilderError::Other(format!(
+            return Err(NarInfoParseError::InvalidStorePath(format!(
                 "Path name too short: {}",
                 file_name
-            )));
+            ))
+            .into());
         }
         let hash = &file_name[..32];
 
@@ -283,12 +286,11 @@ impl ParallelExporter {
             .args(["--dump", store_path])
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| BuilderError::Other(format!("Failed to spawn nix-store --dump: {}", e)))?;
+            .map_err(NixExecError::Process)?;
 
-        let dump_stdout = dump_proc
-            .stdout
-            .take()
-            .ok_or_else(|| BuilderError::Other("Failed to capture nix-store stdout".to_string()))?;
+        let dump_stdout = dump_proc.stdout.take().ok_or_else(|| {
+            NixExecError::Execution("Failed to capture nix-store stdout".to_string())
+        })?;
 
         let (reader, writer) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
 
@@ -299,10 +301,10 @@ impl ParallelExporter {
             let res = copy_nar_stream(&mut reader, &mut encoder).await;
             let shutdown_res = encoder.shutdown().await;
             if let Err(e) = res {
-                return Err(format!("Compression copy failed: {}", e));
+                return Err(CompressionError::Zstd(e));
             }
             if let Err(e) = shutdown_res {
-                return Err(format!("Encoder shutdown failed: {}", e));
+                return Err(CompressionError::Zstd(e));
             }
             Ok(())
         });
@@ -312,30 +314,23 @@ impl ParallelExporter {
 
         let (nar_digest, nar_size) = oci_client
             .push_blob_streaming_resumable(oci_stream, upload_config)
-            .await
-            .map_err(|e| BuilderError::Other(format!("Streaming upload failed: {}", e)))?;
+            .await?;
 
         match compress_handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(BuilderError::Other(e)),
-            Err(e) => {
-                return Err(BuilderError::Other(format!(
-                    "Compression task join error: {}",
-                    e
-                )));
-            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(e) => return Err(BuilderError::Join(e)),
         }
 
-        let dump_status = dump_proc
-            .wait()
-            .await
-            .map_err(|e| BuilderError::Other(format!("nix-store dump wait failed: {}", e)))?;
+        let dump_status = dump_proc.wait().await.map_err(NixExecError::Process)?;
 
         if !dump_status.success() {
-            return Err(BuilderError::Other(format!(
-                "nix-store dump failed for {}",
-                store_path
-            )));
+            return Err(NixExecError::ExitFailure {
+                command: format!("nix-store --dump {}", store_path),
+                status: dump_status,
+                stderr: String::new(),
+            }
+            .into());
         }
 
         // 构造 NarInfo 与 IndexEntry
@@ -404,12 +399,7 @@ impl ParallelExporter {
         // 2. 读取私钥文件校验其存在性
         let _key_content = tokio::fs::read_to_string(signing_key_file)
             .await
-            .map_err(|e| {
-                BuilderError::Other(format!(
-                    "Failed to read signing key {}: {}",
-                    signing_key_file, e
-                ))
-            })?;
+            .map_err(SigningError::Io)?;
 
         // 3. 一次性获取签名后的最新 sigs 并直接在内存结构中更新
         let updated_infos = NixCli.get_path_infos_typed(&paths).await?;

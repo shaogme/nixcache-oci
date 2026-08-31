@@ -1,5 +1,5 @@
 use crate::{
-    error::BuilderError,
+    error::{BuilderError, NixExecError},
     nix::{driver::NixCli, filter::NixPathInfoItem},
     session::init::FastStoreScanner,
 };
@@ -104,11 +104,12 @@ impl ClosureEngine {
     ) -> Result<ClosureCandidateResult, BuilderError> {
         if target_roots.is_empty() {
             if strict_closure && mode != CaptureMode::DiffAll {
-                return Err(BuilderError::NixCli(
+                return Err(NixExecError::Execution(
                     "No valid target outputs or result symlinks found to capture. \
                      Please ensure 'nix build' generated a result symlink, or explicitly specify 'targets' or 'out-link' in action inputs."
                         .to_string(),
-                ));
+                )
+                .into());
             }
 
             warn!("No target roots identified; falling back to unconstrained diff-all mode.");
@@ -181,6 +182,7 @@ impl ClosureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_capture_mode_parsing_and_display() {
@@ -295,7 +297,7 @@ mod tests {
             });
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let filtered = ClosureEngine::filter_snapshot_diff(items, &snapshot_set);
         let elapsed = start.elapsed();
 

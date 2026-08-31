@@ -5,8 +5,8 @@ use nixcache_core::{
 use nixcache_oci::{
     CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciError, OciImageManifest, OciPlatform,
-    SessionMutationRequest, build_delta_patch_manifest, build_image_index,
-    build_sharded_arch_index_manifest,
+    SessionMutationRequest, ShardedArchIndexManifestParams, build_delta_patch_manifest,
+    build_image_index, build_sharded_arch_index_manifest,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
@@ -106,16 +106,16 @@ fn sample_delta_patch_data(run_id: u64, system: SystemArch) -> DeltaPatchData {
 #[test]
 fn test_manifest_builder_generates_v5_zstd_descriptors() {
     let system = SystemArch::X86_64Linux;
-    let index_manifest = build_sharded_arch_index_manifest(
-        "sha256:rootblob123",
-        500,
-        "sha256:bloomblob456",
-        120,
-        "sha256:config123",
-        2,
-        &system,
-        "sha256:merkle123",
-    );
+    let index_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: "sha256:rootblob123",
+        root_blob_size: 500,
+        bloom_blob_digest: "sha256:bloomblob456",
+        bloom_blob_size: 120,
+        config_digest: "sha256:config123",
+        config_size: 2,
+        system: &system,
+        merkle_root: "sha256:merkle123",
+    });
 
     assert_eq!(index_manifest.schema_version, 2);
     assert_eq!(index_manifest.media_type, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
@@ -238,16 +238,16 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     let blob_digest = compute_sha256(&compressed_bytes);
     let blob_size = compressed_bytes.len() as u64;
 
-    let sub_manifest = build_sharded_arch_index_manifest(
-        &blob_digest,
-        blob_size,
-        &bloom_digest,
-        bloom_bytes.len() as u64,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        &SystemArch::X86_64Linux,
-        &arch_data.merkle_root,
-    );
+    let sub_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: &blob_digest,
+        root_blob_size: blob_size,
+        bloom_blob_digest: &bloom_digest,
+        bloom_blob_size: bloom_bytes.len() as u64,
+        config_digest: EMPTY_CONFIG_DIGEST,
+        config_size: EMPTY_CONFIG_SIZE,
+        system: &SystemArch::X86_64Linux,
+        merkle_root: &arch_data.merkle_root,
+    });
     let manifest_json = sub_manifest.to_json_string().unwrap();
 
     // 1. HEAD blob (not exist)
@@ -449,29 +449,29 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let bytes_arm = IndexCodec::encode_zstd(&data_arm, 3).unwrap();
     let digest_arm = compute_sha256(&bytes_arm);
 
-    let manifest_x86 = build_sharded_arch_index_manifest(
-        &digest_x86,
-        bytes_x86.len() as u64,
-        &bloom_digest_x86,
-        bloom_bytes_x86.len() as u64,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        &SystemArch::X86_64Linux,
-        &data_x86.merkle_root,
-    );
+    let manifest_x86 = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: &digest_x86,
+        root_blob_size: bytes_x86.len() as u64,
+        bloom_blob_digest: &bloom_digest_x86,
+        bloom_blob_size: bloom_bytes_x86.len() as u64,
+        config_digest: EMPTY_CONFIG_DIGEST,
+        config_size: EMPTY_CONFIG_SIZE,
+        system: &SystemArch::X86_64Linux,
+        merkle_root: &data_x86.merkle_root,
+    });
     let json_x86 = manifest_x86.to_json_string().unwrap();
     let sub_digest_x86 = compute_sha256(json_x86.as_bytes());
 
-    let manifest_arm = build_sharded_arch_index_manifest(
-        &digest_arm,
-        bytes_arm.len() as u64,
-        &bloom_digest_arm,
-        bloom_bytes_arm.len() as u64,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        &SystemArch::Aarch64Linux,
-        &data_arm.merkle_root,
-    );
+    let manifest_arm = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: &digest_arm,
+        root_blob_size: bytes_arm.len() as u64,
+        bloom_blob_digest: &bloom_digest_arm,
+        bloom_blob_size: bloom_bytes_arm.len() as u64,
+        config_digest: EMPTY_CONFIG_DIGEST,
+        config_size: EMPTY_CONFIG_SIZE,
+        system: &SystemArch::Aarch64Linux,
+        merkle_root: &data_arm.merkle_root,
+    });
     let json_arm = manifest_arm.to_json_string().unwrap();
     let sub_digest_arm = compute_sha256(json_arm.as_bytes());
 
@@ -641,16 +641,16 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
-    let sub_manifest = build_sharded_arch_index_manifest(
-        "sha256:corruptblob",
-        100,
-        "sha256:bloomblob",
-        100,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        &SystemArch::X86_64Linux,
-        "sha256:merkle123",
-    );
+    let sub_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: "sha256:corruptblob",
+        root_blob_size: 100,
+        bloom_blob_digest: "sha256:bloomblob",
+        bloom_blob_size: 100,
+        config_digest: EMPTY_CONFIG_DIGEST,
+        config_size: EMPTY_CONFIG_SIZE,
+        system: &SystemArch::X86_64Linux,
+        merkle_root: "sha256:merkle123",
+    });
     let manifest_json = sub_manifest.to_json_string().unwrap();
 
     Mock::given(method("GET"))
@@ -673,7 +673,7 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
         .await
         .expect_err("Should reject invalid zstd magic blob");
 
-    assert!(matches!(err, OciError::CompressionError(_)));
+    assert!(matches!(err, OciError::Compression(_)));
 }
 
 #[tokio::test]

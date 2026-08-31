@@ -6,7 +6,7 @@ use nixcache_cli::{
 };
 use nixcache_core::SystemArch;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{error::Error, net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -17,9 +17,11 @@ use std::future;
 static GLOBAL: MiMalloc = MiMalloc;
 
 // Module declarations
+mod error;
 mod index;
 mod proxy;
 
+use error::ProxyError;
 use index::{CacheIndex, CascadingProxyConfig, detect_current_system};
 use proxy::{AppState, create_router};
 
@@ -73,7 +75,7 @@ async fn shutdown_signal() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), ProxyError> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -137,12 +139,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let app = create_router(state);
 
     let addr: SocketAddr = format!("{}:{}", listen, port).parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await.map_err(ProxyError::Bind)?;
     info!("Listening on http://{}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await
+        .map_err(ProxyError::Server)?;
 
     Ok(())
 }

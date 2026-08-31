@@ -7,11 +7,18 @@ use http::{
 use nixcache_oci::{
     BoxBodyStream, OciTransport, TransportError, UploadChunkResponse, parse_range_header,
 };
-use std::time::Duration;
+use std::{fmt::Display, io::Error as IoError, time::Duration};
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 #[derive(Clone, Default)]
 pub struct WorkerFetchTransport;
+
+fn map_worker_error(url: &str, err: impl Display) -> TransportError {
+    TransportError::ConnectionFailed {
+        endpoint: url.to_string(),
+        source: IoError::other(err.to_string()),
+    }
+}
 
 fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportError> {
     let worker_headers = Headers::new();
@@ -19,7 +26,9 @@ fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportEr
         if let Ok(val_str) = val.to_str() {
             worker_headers
                 .set(key.as_str(), val_str)
-                .map_err(|e| TransportError::Other(e.to_string()))?;
+                .map_err(|_| TransportError::HeaderParse {
+                    header: "worker_header_set",
+                })?;
         }
     }
     Ok(worker_headers)
@@ -47,13 +56,15 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_method(Method::Head);
         req_init.with_headers(worker_headers);
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
-        StatusCode::from_u16(resp.status_code()).map_err(|e| TransportError::Other(e.to_string()))
+            .map_err(|e| map_worker_error(url, e))?;
+        StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: Some(format!("Invalid status code {}", resp.status_code())),
+        })
     }
 
     async fn get(
@@ -66,21 +77,19 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_method(Method::Get);
         req_init.with_headers(worker_headers);
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let mut resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| map_worker_error(url, e))?;
 
-        let status = StatusCode::from_u16(resp.status_code())
-            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let status =
+            StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Some(format!("Invalid status code {}", resp.status_code())),
+            })?;
         let resp_headers = convert_from_worker_headers(resp.headers())?;
-        let bytes = Bytes::from(
-            resp.bytes()
-                .await
-                .map_err(|e| TransportError::Network(e.to_string()))?,
-        );
+        let bytes = Bytes::from(resp.bytes().await.map_err(|e| map_worker_error(url, e))?);
 
         Ok((status, resp_headers, bytes))
     }
@@ -106,15 +115,17 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_method(Method::Post);
         req_init.with_headers(worker_headers);
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| map_worker_error(url, e))?;
 
-        let status = StatusCode::from_u16(resp.status_code())
-            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let status =
+            StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Some(format!("Invalid status code {}", resp.status_code())),
+            })?;
         let resp_headers = convert_from_worker_headers(resp.headers())?;
         Ok((status, resp_headers))
     }
@@ -131,15 +142,17 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_headers(worker_headers);
         req_init.with_body(Some(JsValue::from(body.to_vec())));
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| map_worker_error(url, e))?;
 
-        let status = StatusCode::from_u16(resp.status_code())
-            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let status =
+            StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Some(format!("Invalid status code {}", resp.status_code())),
+            })?;
         let resp_headers = convert_from_worker_headers(resp.headers())?;
         Ok((status, resp_headers))
     }
@@ -177,15 +190,17 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_headers(worker_headers);
         req_init.with_body(Some(JsValue::from(chunk.to_vec())));
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+            .map_err(|e| map_worker_error(url, e))?;
 
-        let status = StatusCode::from_u16(resp.status_code())
-            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let status =
+            StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Some(format!("Invalid status code {}", resp.status_code())),
+            })?;
         let resp_headers = convert_from_worker_headers(resp.headers())?;
         let location = resp_headers
             .get("Location")
@@ -265,13 +280,15 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_headers(worker_headers);
         req_init.with_body(Some(JsValue::from(body.to_vec())));
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
-        StatusCode::from_u16(resp.status_code()).map_err(|e| TransportError::Other(e.to_string()))
+            .map_err(|e| map_worker_error(url, e))?;
+        StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: Some(format!("Invalid status code {}", resp.status_code())),
+        })
     }
 
     async fn put_stream(
@@ -296,13 +313,15 @@ impl OciTransport for WorkerFetchTransport {
         req_init.with_method(Method::Delete);
         req_init.with_headers(worker_headers);
 
-        let req = Request::new_with_init(url, &req_init)
-            .map_err(|e| TransportError::Network(e.to_string()))?;
+        let req = Request::new_with_init(url, &req_init).map_err(|e| map_worker_error(url, e))?;
         let resp = Fetch::Request(req)
             .send()
             .await
-            .map_err(|e| TransportError::Network(e.to_string()))?;
-        StatusCode::from_u16(resp.status_code()).map_err(|e| TransportError::Other(e.to_string()))
+            .map_err(|e| map_worker_error(url, e))?;
+        StatusCode::from_u16(resp.status_code()).map_err(|_| TransportError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: Some(format!("Invalid status code {}", resp.status_code())),
+        })
     }
 
     async fn sleep(&self, duration: Duration) {

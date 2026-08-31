@@ -1,3 +1,4 @@
+use crate::error::ProxyIndexError;
 use arc_swap::ArcSwap;
 use nixcache_core::{
     DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
@@ -85,24 +86,14 @@ impl CachedSession {
 
 /// 带有布隆过滤器与分片元数据的生产基线缓存模型
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct CachedBaseline {
     pub root: ShardedArchCacheIndexData,
     pub bloom_filter: Arc<FastBlockedBloomFilter>,
-    pub manifest_digest: String,
 }
 
 impl CachedBaseline {
-    pub fn new(
-        root: ShardedArchCacheIndexData,
-        bloom_filter: Arc<FastBlockedBloomFilter>,
-        manifest_digest: String,
-    ) -> Self {
-        Self {
-            root,
-            bloom_filter,
-            manifest_digest,
-        }
+    pub fn new(root: ShardedArchCacheIndexData, bloom_filter: Arc<FastBlockedBloomFilter>) -> Self {
+        Self { root, bloom_filter }
     }
 }
 
@@ -470,7 +461,7 @@ impl CacheIndex {
             .get_sharded_root_index(&tag_str, &system_clone)
             .await
         {
-            Ok(Some((root_data, manifest_digest))) => {
+            Ok(Some((root_data, _manifest_digest))) => {
                 self.set_remote_status(true, None);
 
                 let bloom_filter = if !root_data.bloom_filter.blob_digest.is_empty() {
@@ -530,11 +521,7 @@ impl CacheIndex {
                     }
                 }
 
-                fetched_baseline = Some(CachedBaseline::new(
-                    root_data,
-                    bloom_filter,
-                    manifest_digest,
-                ));
+                fetched_baseline = Some(CachedBaseline::new(root_data, bloom_filter));
             }
             Ok(None) => {
                 info!(
@@ -572,7 +559,6 @@ impl CacheIndex {
                             fetched_baseline = Some(CachedBaseline::new(
                                 root_data,
                                 Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
-                                String::new(),
                             ));
                         }
                     }
@@ -598,7 +584,6 @@ impl CacheIndex {
                     &self.config.registry,
                 ),
                 Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
-                String::new(),
             ))
         };
 
@@ -610,7 +595,7 @@ impl CacheIndex {
     }
 
     /// 强制刷新所有层级的索引
-    pub async fn force_refresh(&self) -> Result<usize, String> {
+    pub async fn force_refresh(&self) -> Result<usize, ProxyIndexError> {
         let mut errs = Vec::new();
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
@@ -656,7 +641,7 @@ impl CacheIndex {
         if errs.is_empty() || counts.total_unique_entries > 0 {
             Ok(counts.total_unique_entries)
         } else {
-            Err(errs.join("; "))
+            Err(ProxyIndexError::AggregatedRefreshFailure { failures: errs })
         }
     }
 
@@ -762,11 +747,7 @@ impl CacheIndex {
         );
         root.recalculate_merkle_root();
 
-        let baseline = Arc::new(CachedBaseline::new(
-            root,
-            Arc::new(bloom_filter),
-            "sha256:mock_manifest".to_string(),
-        ));
+        let baseline = Arc::new(CachedBaseline::new(root, Arc::new(bloom_filter)));
         let _ = self.baseline_cache.upsert_sync(
             self.config.baseline_tag.clone(),
             (baseline.clone(), Instant::now() + Duration::from_secs(3600)),

@@ -1,8 +1,8 @@
 //! TokenManager 并发与同步原语抽象层
 
-#[cfg(not(any(loom, feature = "loom")))]
+#[cfg(not(loom))]
 mod imp {
-    use crate::error::OciError;
+    use crate::error::{OciError, TokenError};
     use arc_swap::ArcSwapOption;
     use std::{
         fmt,
@@ -140,16 +140,19 @@ mod imp {
                 return Ok(Arc::clone(token));
             }
             if rx.changed().await.is_err() {
-                return Err(OciError::AuthFailed);
+                return Err(OciError::Token(TokenError::TokenMissingInBody));
             }
-            rx.borrow().as_ref().cloned().ok_or(OciError::AuthFailed)
+            rx.borrow()
+                .as_ref()
+                .cloned()
+                .ok_or(OciError::Token(TokenError::TokenMissingInBody))
         }
     }
 }
 
-#[cfg(any(loom, feature = "loom"))]
+#[cfg(loom)]
 mod imp {
-    use crate::error::OciError;
+    use crate::error::{OciError, TokenError};
     use loom::sync::{
         Arc as LoomArc, Condvar, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -224,11 +227,13 @@ mod imp {
         }
 
         pub fn load(&self) -> Option<Arc<str>> {
-            self.inner.lock().unwrap().clone()
+            let guard = self.inner.lock().unwrap();
+            guard.clone()
         }
 
         pub fn store(&self, token: impl Into<Arc<str>>) {
-            *self.inner.lock().unwrap() = Some(token.into());
+            let mut guard = self.inner.lock().unwrap();
+            *guard = Some(token.into());
         }
     }
 
@@ -270,7 +275,9 @@ mod imp {
                 return Ok(Arc::clone(val));
             }
             broadcast = cvar.wait(broadcast).unwrap();
-            broadcast.clone().ok_or(OciError::AuthFailed)
+            broadcast
+                .clone()
+                .ok_or(OciError::Token(TokenError::TokenMissingInBody))
         }
     }
 }

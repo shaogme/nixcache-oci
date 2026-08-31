@@ -17,12 +17,13 @@ pub use backend::{
 };
 pub use client::{DeletionSummary, FetchedOciArtifact, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
-pub use error::{OciError, TransportError};
+pub use error::{OciError, TokenError, TransportError};
 pub use manifest::{
     CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
     OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
-    build_delta_patch_manifest, build_image_index, build_sharded_arch_index_manifest,
+    ShardedArchIndexManifestParams, build_delta_patch_manifest, build_image_index,
+    build_sharded_arch_index_manifest,
 };
 pub use mock::{MockResponse, MockRouterTransport};
 pub use mutation::SessionMutationRequest;
@@ -196,7 +197,7 @@ mod tests {
         assert_eq!(&bytes[..], b"hello blob content");
 
         let err = client.get_blob("sha256:notfound").await.unwrap_err();
-        assert!(matches!(err, OciError::BlobNotFound(_)));
+        assert!(matches!(err, OciError::BlobNotFound { .. }));
     }
 
     #[tokio::test]
@@ -286,31 +287,31 @@ mod tests {
 
     #[test]
     fn test_oci_error_display() {
-        let err = OciError::AuthFailed;
-        assert_eq!(format!("{}", err), "Registry authentication failed");
-
         let upload_err = OciError::BlobUploadFailed(StatusCode::BAD_REQUEST);
         assert!(format!("{}", upload_err).contains("400"));
 
         let download_err = OciError::BlobDownloadFailed(StatusCode::INTERNAL_SERVER_ERROR);
         assert!(format!("{}", download_err).contains("500"));
 
-        let not_found_err = OciError::BlobNotFound("sha256:123".to_string());
-        assert_eq!(format!("{}", not_found_err), "Blob not found: sha256:123");
+        let not_found_err = OciError::BlobNotFound {
+            digest: "sha256:123".to_string(),
+        };
+        assert_eq!(
+            format!("{}", not_found_err),
+            "Target blob 'sha256:123' not found on registry"
+        );
 
         let manifest_err = OciError::ManifestPushFailed(StatusCode::INTERNAL_SERVER_ERROR);
         assert!(format!("{}", manifest_err).contains("500"));
 
-        let custom_err = OciError::Other("custom failure".to_string());
-        assert_eq!(format!("{}", custom_err), "Other error: custom failure");
-
-        let url_err = OciError::InvalidUrl("invalid".to_string());
-        assert_eq!(format!("{}", url_err), "Invalid URL: invalid");
-
-        let cas_err = OciError::CasConflict("run-123".to_string());
-        assert_eq!(
-            format!("{}", cas_err),
-            "CAS optimistic concurrency conflict on tag run-123"
+        let cas_err = OciError::CasPreconditionFailed {
+            tag: "run-123".to_string(),
+            expected: Some("sha256:old".to_string()),
+            actual: None,
+        };
+        assert!(
+            format!("{}", cas_err)
+                .contains("CAS optimistic concurrency precondition failed on tag 'run-123'")
         );
     }
 
@@ -341,7 +342,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, OciError::CasConflict(t) if t == "run-123"));
+        assert!(matches!(err, OciError::CasPreconditionFailed { tag, .. } if tag == "run-123"));
     }
 
     #[tokio::test]
@@ -822,7 +823,7 @@ mod tests {
             .get_manifest_with_digest("invalid-utf8")
             .await
             .unwrap_err();
-        assert!(format!("{}", invalid_err).contains("Invalid UTF-8 manifest"));
+        assert!(matches!(invalid_err, OciError::InvalidUtf8Manifest(_)));
     }
 
     #[tokio::test]

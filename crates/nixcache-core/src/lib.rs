@@ -9,7 +9,7 @@ pub mod sharding;
 pub mod types;
 
 pub use bloom::{BloomFilter, FastBlockedBloomFilter, murmur3_x64_128};
-pub use error::{BloomError, CoreError, GcError, NarInfoParseError, ShardingError, TypeError};
+pub use error::{BloomError, CoreError, NarInfoParseError, TypeError};
 pub use filter::{
     CacheQueryResult, CacheSelector, CascadeMode, SizeFilter, SortBy, SortOrder, TimeFilter,
     evaluate_arch_cache_query, evaluate_cache_query, matches_pattern,
@@ -38,17 +38,18 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use super::{
-        BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-        CacheQueryResult, CacheSelector, CascadeMode, DeltaPatchData, EMPTY_SHARD_MERKLE_HASH,
-        FastBlockedBloomFilter, IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS,
-        NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, SCHEMA_VERSION_V5, ShardDataPayload,
-        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
-        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
-        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
-        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
-        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
-        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
-        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
+        BloomError, BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats,
+        CACHE_INDEX_VERSION, CacheQueryResult, CacheSelector, CascadeMode, CoreError,
+        DeltaPatchData, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, IndexEntry,
+        JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta,
+        NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V5, ShardDataPayload, ShardDescriptor,
+        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
+        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
+        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
+        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
+        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
+        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
+        shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -64,11 +65,14 @@ mod tests {
         // Invalid StoreHash (invalid char 'e' or wrong length)
         assert!(matches!(
             StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vse"),
-            Err(TypeError::InvalidStoreHash(_))
+            Err(TypeError::StoreHashInvalidChar {
+                char: 'e',
+                index: 31
+            })
         ));
         assert!(matches!(
             StoreHash::parse("short"),
-            Err(TypeError::InvalidStoreHash(_))
+            Err(TypeError::StoreHashInvalidLength { actual: 5 })
         ));
 
         // Valid NarDigest
@@ -1310,6 +1314,29 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(
             result.updated_gc_roots.get(&SystemArch::X86_64Linux),
             Some(&vec![root_app])
+        );
+    }
+
+    #[test]
+    fn test_core_error_conversions() {
+        let type_err = TypeError::UnknownSystemArch {
+            raw: "invalid".to_string(),
+        };
+        let core_type: CoreError = type_err.into();
+        assert!(matches!(core_type, CoreError::Type(_)));
+
+        let bloom_err = BloomError::ZeroHashCount(0);
+        let core_bloom: CoreError = bloom_err.into();
+        assert!(matches!(core_bloom, CoreError::Bloom(_)));
+
+        let parse_err = NarInfoParseError::EmptyContent;
+        let core_parse: CoreError = parse_err.into();
+        assert!(matches!(core_parse, CoreError::NarInfoParse(_)));
+
+        let json_err = CoreError::Json("test error".to_string());
+        assert_eq!(
+            format!("{}", json_err),
+            "Serialization / Deserialization error: test error"
         );
     }
 }

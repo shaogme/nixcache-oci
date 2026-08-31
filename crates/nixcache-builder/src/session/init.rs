@@ -1,5 +1,7 @@
 use crate::{
-    env_injector::NixEnvInjector, error::BuilderError, nix::driver::get_own_public_key,
+    env_injector::NixEnvInjector,
+    error::{BuilderError, ProxyDaemonError},
+    nix::driver::get_own_public_key,
     summary::write_session_init_summary,
 };
 use nixcache_utils::env::Env;
@@ -62,11 +64,11 @@ impl FastStoreScanner {
             Ok(set)
         })
         .await
-        .map_err(|e| BuilderError::Other(format!("Store scan thread joined error: {}", e)))?
+        .map_err(BuilderError::Join)?
     }
 
     /// 计算差集候选路径全量列表 (旧模式兼容)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn compute_diff_paths(
         store_path: &Path,
         snapshot_file: &Path,
@@ -204,7 +206,7 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         proxy_cmd.env("NIXCACHE_BRANCH", br);
     }
 
-    let _child = proxy_cmd.spawn()?;
+    let mut child = proxy_cmd.spawn()?;
 
     let client = reqwest::Client::new();
     let probe_url = format!("http://{}:{}/nix-cache-info", opts.listen, opts.port);
@@ -215,6 +217,9 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
     let start_time = Instant::now();
 
     while start_time.elapsed() < max_wait {
+        if let Some(status) = child.try_wait()? {
+            return Err(ProxyDaemonError::Exited(format!("exited with code: {:?}", status)).into());
+        }
         if let Ok(res) = client.get(&probe_url).send().await
             && res.status().is_success()
         {
@@ -226,10 +231,11 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
     }
 
     if !ready {
-        return Err(BuilderError::Proxy(format!(
+        return Err(ProxyDaemonError::HealthCheck(format!(
             "Proxy failed to become ready on http://{}:{}",
             opts.listen, opts.port
-        )));
+        ))
+        .into());
     }
     info!(
         "Proxy is running and ready on http://{}:{}",

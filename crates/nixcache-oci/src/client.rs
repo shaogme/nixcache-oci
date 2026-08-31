@@ -8,8 +8,8 @@ use crate::{
     manifest::{
         CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
         OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
-        OciImageIndex, OciImageManifest, build_delta_patch_manifest,
-        build_sharded_arch_index_manifest,
+        OciImageIndex, OciImageManifest, ShardedArchIndexManifestParams,
+        build_delta_patch_manifest, build_sharded_arch_index_manifest,
     },
     mutation::SessionMutationRequest,
     token::TokenManager,
@@ -226,7 +226,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let location = resp_headers
             .get("Location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
+            .ok_or(OciError::UploadLocationMissing)?;
 
         let mut put_url = if location.starts_with('/') {
             format!("{}://{}{}", self.url_scheme(), self.registry, location)
@@ -365,7 +365,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let location = resp_headers
             .get("Location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
+            .ok_or(OciError::UploadLocationMissing)?;
 
         let mut put_url = if location.starts_with('/') {
             format!("{}://{}{}", self.url_scheme(), self.registry, location)
@@ -480,7 +480,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let location = resp_headers
             .get("Location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| OciError::Other("Location header missing".to_string()))?;
+            .ok_or(OciError::UploadLocationMissing)?;
 
         let mut session_url = if location.starts_with('/') {
             format!("{}://{}{}", self.url_scheme(), self.registry, location)
@@ -612,8 +612,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            let body = from_utf8(&bytes)
-                .map_err(|e| OciError::Other(format!("Invalid UTF-8 manifest: {}", e)))?;
+            let body = from_utf8(&bytes)?;
 
             let digest = digest_header.unwrap_or_else(|| compute_sha256_digest(&bytes));
 
@@ -715,8 +714,8 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 let (sub_manifest_json, _) = self
                     .get_manifest_with_digest(&descriptor.digest)
                     .await?
-                    .ok_or_else(|| {
-                        OciError::Other(format!("Sub-manifest {} missing", descriptor.digest))
+                    .ok_or_else(|| OciError::SubManifestMissing {
+                        digest: descriptor.digest.clone(),
                     })?;
 
                 let sub_manifest: OciImageManifest = serde_json::from_str(&sub_manifest_json)?;
@@ -729,9 +728,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                                 .is_some_and(|m| m.is_root_index())
                     })
                     .or_else(|| sub_manifest.layers.first())
-                    .ok_or_else(|| {
-                        OciError::Other("Sub-manifest missing layer descriptor".to_string())
-                    })?;
+                    .ok_or(OciError::LayerDescriptorMissing)?;
 
                 let blob_bytes = self.get_blob(&layer.digest).await?;
                 let root_data: ShardedArchCacheIndexData =
@@ -771,16 +768,16 @@ impl<T: OciTransport + Clone> OciClient<T> {
     ) -> Result<String, OciError> {
         let (root_blob_digest, root_compressed_size, _) = self.push_zstd_blob(root_data).await?;
 
-        let manifest = build_sharded_arch_index_manifest(
-            &root_blob_digest,
-            root_compressed_size,
+        let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+            root_blob_digest: &root_blob_digest,
+            root_blob_size: root_compressed_size,
             bloom_blob_digest,
             bloom_blob_size,
-            EMPTY_CONFIG_DIGEST,
-            EMPTY_CONFIG_SIZE,
-            &root_data.system,
-            &root_data.merkle_root,
-        );
+            config_digest: EMPTY_CONFIG_DIGEST,
+            config_size: EMPTY_CONFIG_SIZE,
+            system: &root_data.system,
+            merkle_root: &root_data.merkle_root,
+        });
 
         let manifest_str = manifest.to_json_string()?;
         self.put_manifest_conditional(tag, &manifest_str, previous_digest)
@@ -933,7 +930,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let status = self.transport.put_bytes(&url, headers, bytes).await?;
 
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
-            return Err(OciError::CasConflict(tag.to_string()));
+            return Err(OciError::CasPreconditionFailed {
+                tag: tag.to_string(),
+                expected: previous_digest.map(|s| s.to_string()),
+                actual: None,
+            });
         }
 
         if status == StatusCode::OK
@@ -979,7 +980,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let status = self.transport.put_bytes(&url, headers, bytes).await?;
 
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
-            return Err(OciError::CasConflict(tag.to_string()));
+            return Err(OciError::CasPreconditionFailed {
+                tag: tag.to_string(),
+                expected: previous_digest.map(|s| s.to_string()),
+                actual: None,
+            });
         }
 
         if status == StatusCode::OK
@@ -1074,6 +1079,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 Ok(())
             }
             RegistryDeletionStrategy::Unsupported => Err(OciError::OperationNotSupported {
+                operation: "delete_tag",
                 backend: self.kind(),
                 reason: format!(
                     "Registry backend '{}' does not support tag deletion",
@@ -1113,6 +1119,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             })
         } else if status == StatusCode::METHOD_NOT_ALLOWED {
             Err(OciError::OperationNotSupported {
+                operation: "delete_manifest",
                 backend: self.kind(),
                 reason: format!(
                     "Registry returned 405 Method Not Allowed for manifest deletion on {}. Backend deletion strategy: {:?}",
@@ -1134,6 +1141,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     pub async fn delete_blob_strict(&self, digest: &str) -> Result<(), OciError> {
         if !self.capabilities().supports_blob_physical_deletion {
             return Err(OciError::OperationNotSupported {
+                operation: "delete_blob",
                 backend: self.kind(),
                 reason: format!(
                     "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
@@ -1170,6 +1178,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             })
         } else if status == StatusCode::METHOD_NOT_ALLOWED {
             Err(OciError::OperationNotSupported {
+                operation: "delete_blob",
                 backend: self.kind(),
                 reason: format!(
                     "Registry returned 405 Method Not Allowed for blob deletion {}",
@@ -1201,6 +1210,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if !self.capabilities().supports_blob_physical_deletion {
             if strict_mode {
                 return Err(OciError::OperationNotSupported {
+                    operation: "batch_delete_blobs",
                     backend: self.kind(),
                     reason: format!(
                         "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
@@ -1269,6 +1279,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 Ok(())
             }
             RegistryDeletionStrategy::Unsupported => Err(OciError::OperationNotSupported {
+                operation: "delete_package",
                 backend: self.kind(),
                 reason: format!(
                     "Package deletion is not supported on backend '{}'",
@@ -1325,7 +1336,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
+                Err(OciError::CasPreconditionFailed { .. }) if attempt <= max_retries => {
                     let pid = get_process_id();
                     let backoff_ms =
                         (500 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 150);
@@ -1383,7 +1394,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 .await
             {
                 Ok(digest) => return Ok(digest),
-                Err(OciError::CasConflict(_)) if attempt <= max_retries => {
+                Err(OciError::CasPreconditionFailed { .. }) if attempt <= max_retries => {
                     let pid = get_process_id();
                     let backoff_ms =
                         (100 * (1 << attempt.min(5))) + ((pid * 37 + attempt as u64 * 53) % 100);
@@ -1433,7 +1444,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     );
                     return Ok(());
                 }
-                Err(OciError::CasConflict(_)) if attempt <= request.max_retries => {
+                Err(OciError::CasPreconditionFailed { .. }) if attempt <= request.max_retries => {
                     let pid = get_process_id();
                     let backoff_ms =
                         (50 * (1 << attempt.min(4))) + ((pid * 37 + attempt as u64 * 53) % 50);
@@ -1487,7 +1498,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if status.is_success() {
             Ok(bytes)
         } else if status == StatusCode::NOT_FOUND {
-            Err(OciError::BlobNotFound(digest.to_string()))
+            Err(OciError::BlobNotFound {
+                digest: digest.to_string(),
+            })
         } else {
             Err(OciError::BlobDownloadFailed(status))
         }
@@ -1511,7 +1524,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if status.is_success() {
             Ok(OciBlobStream::new(status, resp_headers, stream))
         } else if status == StatusCode::NOT_FOUND {
-            Err(OciError::BlobNotFound(digest.to_string()))
+            Err(OciError::BlobNotFound {
+                digest: digest.to_string(),
+            })
         } else {
             Err(OciError::BlobDownloadFailed(status))
         }

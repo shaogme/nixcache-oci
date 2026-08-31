@@ -1,3 +1,4 @@
+pub mod error;
 mod state;
 mod store;
 mod transport;
@@ -6,6 +7,7 @@ use crate::{
     store::{CacheStore, WorkerOciClient, WorkerProxyConfig},
     transport::WorkerFetchTransport,
 };
+pub use error::WorkerStoreError;
 use nixcache_core::{IndexEntry, StoreHash, SystemArch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

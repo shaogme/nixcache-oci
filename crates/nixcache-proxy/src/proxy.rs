@@ -130,7 +130,7 @@ async fn handle_refresh(State(state): State<AppState>) -> impl IntoResponse {
         Err(e) => {
             let res = json!({
                 "refreshed": false,
-                "error": e
+                "error": e.to_string()
             });
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(res))
         }

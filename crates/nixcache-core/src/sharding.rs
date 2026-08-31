@@ -21,7 +21,10 @@ pub fn nix_base32_val(byte: u8) -> Result<u8, TypeError> {
         b'f'..=b'n' => Ok(byte - b'f' + 14),
         b'p'..=b's' => Ok(byte - b'p' + 23),
         b'v'..=b'z' => Ok(byte - b'v' + 27),
-        _ => Err(TypeError::InvalidBase32Char(byte as char)),
+        _ => Err(TypeError::StoreHashInvalidChar {
+            char: byte as char,
+            index: 0,
+        }),
     }
 }
 
@@ -31,10 +34,10 @@ pub fn nix_base32_char(val: u8) -> Result<u8, TypeError> {
     if (val as usize) < NIX_BASE32_ALPHABET.len() {
         Ok(NIX_BASE32_ALPHABET[val as usize])
     } else {
-        Err(TypeError::InvalidStoreHash(format!(
-            "Base32 value out of range: {}",
-            val
-        )))
+        Err(TypeError::StoreHashInvalidChar {
+            char: val as char,
+            index: 0,
+        })
     }
 }
 
@@ -52,10 +55,9 @@ pub fn calculate_shard_id_from_str(s: &str) -> Result<u16, TypeError> {
     let trimmed = s.trim();
     let bytes = trimmed.as_bytes();
     if bytes.len() < 2 {
-        return Err(TypeError::InvalidStoreHash(format!(
-            "Hash string too short: '{}'",
-            s
-        )));
+        return Err(TypeError::StoreHashInvalidLength {
+            actual: bytes.len(),
+        });
     }
     let c0 = nix_base32_val(bytes[0])? as u16;
     let c1 = nix_base32_val(bytes[1])? as u16;

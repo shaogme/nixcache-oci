@@ -1,3 +1,4 @@
+use crate::list::{CacheListSummaryReport, ListItemDto, format_bytes};
 use std::env;
 use tokio::fs;
 
@@ -163,21 +164,19 @@ pub async fn write_purge_step_summary_to(
 
 /// 为 List 步骤生成并写入 GitHub Actions Step Summary
 pub async fn write_list_step_summary(
-    report: &crate::list::CacheListSummaryReport,
+    report: &CacheListSummaryReport,
     selector_desc: &str,
-    displayed_items: &[crate::list::ListItemDto],
+    displayed_items: &[ListItemDto],
 ) {
     write_list_step_summary_to(report, selector_desc, displayed_items, None).await;
 }
 
 pub async fn write_list_step_summary_to(
-    report: &crate::list::CacheListSummaryReport,
+    report: &CacheListSummaryReport,
     selector_desc: &str,
-    displayed_items: &[crate::list::ListItemDto],
+    displayed_items: &[ListItemDto],
     file_opt: Option<&str>,
 ) {
-    use crate::list::format_bytes;
-
     let mut md = String::new();
     md.push_str("### 📋 NixCache Build Cache Inspection Report\n\n");
     md.push_str(&format!(

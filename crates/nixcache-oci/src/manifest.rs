@@ -267,23 +267,31 @@ impl OciArtifactManifest {
     }
 }
 
+/// 单架构 Schema v5 Baseline Root Index Image Manifest 构建参数
+#[derive(Debug, Clone)]
+pub struct ShardedArchIndexManifestParams<'a> {
+    pub root_blob_digest: &'a str,
+    pub root_blob_size: u64,
+    pub bloom_blob_digest: &'a str,
+    pub bloom_blob_size: u64,
+    pub config_digest: &'a str,
+    pub config_size: u64,
+    pub system: &'a SystemArch,
+    pub merkle_root: &'a str,
+}
+
 /// 构造强类型的单架构 Schema v5 Baseline Root Index Image Manifest (Root Directory + Bloom Filter)
-#[allow(clippy::too_many_arguments)]
 pub fn build_sharded_arch_index_manifest(
-    root_blob_digest: &str,
-    root_blob_size: u64,
-    bloom_blob_digest: &str,
-    bloom_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-    system: &SystemArch,
-    merkle_root: &str,
+    params: ShardedArchIndexManifestParams<'_>,
 ) -> OciImageManifest {
     let mut root_layer_annotations = HashMap::new();
-    root_layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    root_layer_annotations.insert(
+        "org.nixos.nixcache.system".to_string(),
+        params.system.to_string(),
+    );
     root_layer_annotations.insert(
         "org.nixos.nixcache.merkle_root".to_string(),
-        merkle_root.to_string(),
+        params.merkle_root.to_string(),
     );
     root_layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
@@ -301,28 +309,34 @@ pub fn build_sharded_arch_index_manifest(
     );
     manifest_annotations.insert(
         "org.opencontainers.image.description".to_string(),
-        format!("NixCache Sharded Merkle Baseline ({})", system.as_str()),
+        format!(
+            "NixCache Sharded Merkle Baseline ({})",
+            params.system.as_str()
+        ),
     );
-    manifest_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
+    manifest_annotations.insert(
+        "org.nixos.nixcache.system".to_string(),
+        params.system.to_string(),
+    );
     manifest_annotations.insert(
         "org.nixos.nixcache.merkle_root".to_string(),
-        merkle_root.to_string(),
+        params.merkle_root.to_string(),
     );
     manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "5".to_string());
 
     let layers = vec![
         OciDescriptor {
             media_type: CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD.to_string(),
-            digest: root_blob_digest.to_string(),
-            size: root_blob_size,
-            platform: Some(OciPlatform::from_system(system)),
+            digest: params.root_blob_digest.to_string(),
+            size: params.root_blob_size,
+            platform: Some(OciPlatform::from_system(params.system)),
             annotations: Some(root_layer_annotations),
         },
         OciDescriptor {
             media_type: CacheLayerMediaTypeV5::BLOOM_FILTER_V5_ZSTD.to_string(),
-            digest: bloom_blob_digest.to_string(),
-            size: bloom_blob_size,
-            platform: Some(OciPlatform::from_system(system)),
+            digest: params.bloom_blob_digest.to_string(),
+            size: params.bloom_blob_size,
+            platform: Some(OciPlatform::from_system(params.system)),
             annotations: Some(bloom_layer_annotations),
         },
     ];
@@ -332,8 +346,8 @@ pub fn build_sharded_arch_index_manifest(
         media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
         config: OciDescriptor {
             media_type: OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            digest: config_digest.to_string(),
-            size: config_size,
+            digest: params.config_digest.to_string(),
+            size: params.config_size,
             platform: None,
             annotations: None,
         },

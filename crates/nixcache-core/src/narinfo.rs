@@ -71,24 +71,22 @@ impl NarInfo {
                     }
                     "FileHash" => file_hash = Some(value.to_string()),
                     "FileSize" => {
-                        let parsed =
-                            value
-                                .parse::<u64>()
-                                .map_err(|_| NarInfoParseError::InvalidNumber {
-                                    field: "FileSize",
-                                    value: value.to_string(),
-                                })?;
+                        let parsed = value.parse::<u64>().map_err(|source| {
+                            NarInfoParseError::InvalidNumber {
+                                field: "FileSize",
+                                source,
+                            }
+                        })?;
                         file_size = Some(parsed);
                     }
                     "NarHash" => nar_hash = Some(value.to_string()),
                     "NarSize" => {
-                        let parsed =
-                            value
-                                .parse::<u64>()
-                                .map_err(|_| NarInfoParseError::InvalidNumber {
-                                    field: "NarSize",
-                                    value: value.to_string(),
-                                })?;
+                        let parsed = value.parse::<u64>().map_err(|source| {
+                            NarInfoParseError::InvalidNumber {
+                                field: "NarSize",
+                                source,
+                            }
+                        })?;
                         nar_size = Some(parsed);
                     }
                     "References" => {

@@ -7,7 +7,7 @@
 //! 4. 故障回退与广播同步（Fault Tolerance & Broadcast Sync）：网络失败时 Fallback 状态机正确传播并复位
 //! 5. 同步原语级验证（Primitive Correctness）：针对 InFlightState、TokenStorage、TokenBroadcaster 单独进行模型检验
 
-#![cfg(any(loom, feature = "loom"))]
+#![cfg(loom)]
 
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};

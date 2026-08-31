@@ -32,7 +32,7 @@ impl ZstdCodec {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut encoder = zstd::stream::Encoder::new(Vec::with_capacity(data.len() / 4), level)
-                .map_err(|e| CompressionError::ZstdError(e.to_string()))?;
+                .map_err(CompressionError::Io)?;
             encoder.write_all(data).map_err(CompressionError::Io)?;
             let compressed = encoder.finish().map_err(CompressionError::Io)?;
             Ok(Bytes::from(compressed))
@@ -41,9 +41,7 @@ impl ZstdCodec {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (data, level);
-            Err(CompressionError::Unsupported(
-                "Zstd encoding/compression is not supported on wasm32 target".to_string(),
-            ))
+            Err(CompressionError::ZstdCompress { code: 0 })
         }
     }
 
@@ -51,14 +49,24 @@ impl ZstdCodec {
     ///
     /// 在 Native 平台使用 libzstd 解码器，在 wasm32 目标下使用纯 Rust ruzstd 流式解码器。
     pub fn decompress(raw_bytes: &[u8]) -> Result<Vec<u8>, CompressionError> {
+        if raw_bytes.is_empty() {
+            return Err(CompressionError::EmptyBuffer);
+        }
         if !Self::is_valid_magic(raw_bytes) {
-            return Err(CompressionError::InvalidMagic);
+            let found = if raw_bytes.len() >= 4 {
+                u32::from_le_bytes(raw_bytes[0..4].try_into().unwrap())
+            } else {
+                let mut buf = [0u8; 4];
+                buf[..raw_bytes.len()].copy_from_slice(raw_bytes);
+                u32::from_le_bytes(buf)
+            };
+            return Err(CompressionError::InvalidMagic { found });
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut decoder = zstd::stream::Decoder::new(raw_bytes)
-                .map_err(|e| CompressionError::ZstdError(e.to_string()))?;
+            let mut decoder =
+                zstd::stream::Decoder::new(raw_bytes).map_err(CompressionError::Io)?;
             let mut uncompressed = Vec::new();
             decoder
                 .read_to_end(&mut uncompressed)
@@ -69,7 +77,7 @@ impl ZstdCodec {
         #[cfg(target_arch = "wasm32")]
         {
             let mut decoder = StreamingDecoder::new(raw_bytes)
-                .map_err(|e| CompressionError::ZstdError(e.to_string()))?;
+                .map_err(|_| CompressionError::ZstdDecompress { code: 1 })?;
             let mut uncompressed = Vec::new();
             decoder
                 .read_to_end(&mut uncompressed)
@@ -113,7 +121,7 @@ mod tests {
         let invalid = b"plain text without zstd header";
         let err = ZstdCodec::decompress(invalid).expect_err("Should reject invalid magic");
         match err {
-            CompressionError::InvalidMagic => {}
+            CompressionError::InvalidMagic { .. } => {}
             _ => panic!("Expected InvalidMagic, got: {:?}", err),
         }
     }
@@ -123,8 +131,8 @@ mod tests {
         let empty = b"";
         let err = ZstdCodec::decompress(empty).expect_err("Should reject empty bytes");
         match err {
-            CompressionError::InvalidMagic => {}
-            _ => panic!("Expected InvalidMagic, got: {:?}", err),
+            CompressionError::EmptyBuffer => {}
+            _ => panic!("Expected EmptyBuffer, got: {:?}", err),
         }
     }
 
@@ -135,7 +143,7 @@ mod tests {
         let err = ZstdCodec::decompress(&corrupted).expect_err("Should reject corrupted data");
         assert!(matches!(
             err,
-            CompressionError::ZstdError(_) | CompressionError::Io(_)
+            CompressionError::ZstdDecompress { .. } | CompressionError::Io(_)
         ));
     }
 }

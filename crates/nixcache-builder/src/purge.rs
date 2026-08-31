@@ -310,6 +310,7 @@ pub async fn run_purge(
             if strict_mode {
                 return Err(BuilderError::Oci(
                     nixcache_oci::OciError::OperationNotSupported {
+                        operation: "delete_blob",
                         backend: oci.kind(),
                         reason: format!(
                             "Backend '{}' does not support standalone OCI blob deletion. Blobs are managed via package versions. To delete unused data on GHCR, use tag deletion or 'purge --all'.",

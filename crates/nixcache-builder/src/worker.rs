@@ -1,6 +1,6 @@
 use crate::{
     env_injector::NixEnvInjector,
-    error::BuilderError,
+    error::{BuilderError, ProxyDaemonError},
     nix::{self, BuildConfig, driver::get_own_public_key},
     session::init::find_proxy_binary,
     summary::write_worker_step_summary,
@@ -61,10 +61,24 @@ pub async fn setup_self_substituter(
         .stderr(Stdio::null());
 
     let (proxy_child, ready) = match proxy_cmd.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
             let mut ready = false;
             let client = reqwest::Client::new();
             for _ in 1..=15 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    if strict {
+                        return Err(ProxyDaemonError::Exited(format!(
+                            "exited with code: {:?}",
+                            status
+                        ))
+                        .into());
+                    }
+                    warn!(
+                        "Self-substituter proxy exited prematurely with code: {:?}",
+                        status
+                    );
+                    break;
+                }
                 if let Ok(res) = client
                     .get("http://127.0.0.1:37515/nix-cache-info")
                     .send()
@@ -80,10 +94,11 @@ pub async fn setup_self_substituter(
         }
         Err(e) => {
             if strict {
-                return Err(BuilderError::Proxy(format!(
+                return Err(ProxyDaemonError::Startup(format!(
                     "Failed to spawn nixcache-proxy: {}",
                     e
-                )));
+                ))
+                .into());
             }
             warn!(
                 "Could not spawn nixcache-proxy ({}). Proceeding without self-substituter.",
@@ -108,9 +123,10 @@ pub async fn setup_self_substituter(
             if let Some(mut child) = proxy_child {
                 let _ = child.kill().await;
             }
-            return Err(BuilderError::Proxy(
+            return Err(ProxyDaemonError::HealthCheck(
                 "Self-substituter proxy failed to become ready (timed out after 15s)".to_string(),
-            ));
+            )
+            .into());
         }
         info!("Self-substituter failed to respond, proceeding without it");
     }
@@ -145,7 +161,7 @@ pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
     own_hashes
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn fetch_remote_cache_hashes<T: OciTransport + Clone>(
     oci: &OciClient<T>,
 ) -> HashSet<StoreHash> {
@@ -250,10 +266,9 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
                 error!("Failed to export & upload {}: {}", path, err);
             }
             if opts.strict {
-                return Err(BuilderError::Other(format!(
-                    "Parallel export failed for {} path(s)",
-                    report.failed.len()
-                )));
+                return Err(BuilderError::ParallelExportFailed {
+                    failed_count: report.failed.len(),
+                });
             }
         }
     } else {

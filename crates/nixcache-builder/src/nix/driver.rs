@@ -1,6 +1,6 @@
 use crate::{
     env_injector::NixEnvInjector,
-    error::BuilderError,
+    error::{BuilderError, NixExecError},
     nix::filter::{NixArtifactFilter, NixArtifactFilterContext, NixPathInfoItem},
 };
 use clap::ValueEnum;
@@ -25,6 +25,15 @@ pub enum BuildMode {
     NonFlake,
 }
 
+impl fmt::Display for BuildMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildMode::Flake => write!(f, "flake"),
+            BuildMode::NonFlake => write!(f, "non-flake"),
+        }
+    }
+}
+
 impl FromStr for BuildMode {
     type Err = String;
 
@@ -32,7 +41,7 @@ impl FromStr for BuildMode {
         match s.trim().to_lowercase().as_str() {
             "flake" => Ok(BuildMode::Flake),
             "non-flake" | "nonflake" => Ok(BuildMode::NonFlake),
-            other => Err(format!("Invalid build mode: {}", other)),
+            _ => Err(format!("Unknown build mode: {}", s)),
         }
     }
 }
@@ -96,9 +105,12 @@ impl NixCli {
             .await?;
 
         if !output.status.success() {
-            return Err(BuilderError::NixCli(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            return Err(NixExecError::ExitFailure {
+                command: "nix eval --raw --impure --expr builtins.currentSystem".to_string(),
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -172,9 +184,12 @@ impl NixCli {
                         }
                     }
                 } else {
-                    return Err(BuilderError::NixCli(
-                        "Failed to build flake targets and fallback path-info failed".to_string(),
-                    ));
+                    return Err(NixExecError::ExitFailure {
+                        command: "nix path-info fallback for flake targets".to_string(),
+                        status: path_info_out.status,
+                        stderr: String::from_utf8_lossy(&path_info_out.stderr).to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -229,10 +244,12 @@ impl NixCli {
                         }
                     }
                 } else {
-                    return Err(BuilderError::NixCli(format!(
-                        "Failed to build non-flake targets for {}",
-                        file
-                    )));
+                    return Err(NixExecError::ExitFailure {
+                        command: format!("nix build --file {}", file),
+                        status: output.status,
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -279,9 +296,12 @@ impl NixCli {
         let output = cmd.output().await?;
 
         if !output.status.success() {
-            return Err(BuilderError::NixCli(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            return Err(NixExecError::ExitFailure {
+                command: "nix path-info --json --recursive".to_string(),
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
@@ -357,10 +377,12 @@ impl NixCli {
             let output = cmd.output().await?;
             if !output.status.success() {
                 let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                return Err(BuilderError::NixCli(format!(
-                    "nix path-info failed: {}",
-                    err_msg
-                )));
+                return Err(NixExecError::ExitFailure {
+                    command: "nix path-info --json".to_string(),
+                    status: output.status,
+                    stderr: err_msg,
+                }
+                .into());
             }
 
             let json_str = String::from_utf8_lossy(&output.stdout);
@@ -394,10 +416,12 @@ impl NixCli {
             let output = cmd.output().await?;
             if !output.status.success() {
                 let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                return Err(BuilderError::NixCli(format!(
-                    "nix path-info --recursive failed: {}",
-                    err_msg
-                )));
+                return Err(NixExecError::ExitFailure {
+                    command: "nix path-info --recursive --json".to_string(),
+                    status: output.status,
+                    stderr: err_msg,
+                }
+                .into());
             }
 
             let json_str = String::from_utf8_lossy(&output.stdout);
@@ -437,7 +461,7 @@ impl NixCli {
                 return Ok(paths);
             }
         }
-        Err(BuilderError::NixCli("Batch path-info failed".to_string()))
+        Err(NixExecError::Execution("Batch path-info failed".to_string()).into())
     }
 
     /// 解析单个目标（用于并发回退解析）
@@ -485,10 +509,10 @@ impl NixCli {
             }
         }
 
-        Err(BuilderError::NixCli(format!(
-            "Failed to resolve target expression: {}",
-            target
-        )))
+        Err(
+            NixExecError::Execution(format!("Failed to resolve target expression: {}", target))
+                .into(),
+        )
     }
 
     /// 解析 Flake 表达式或属性目标为确定的 Store 路径
@@ -540,7 +564,7 @@ impl NixCli {
             match res {
                 Ok(Ok(paths)) => resolved.extend(paths),
                 Ok(Err(e)) => return Err(e),
-                Err(join_err) => return Err(BuilderError::Other(join_err.to_string())),
+                Err(join_err) => return Err(BuilderError::Join(join_err)),
             }
         }
 
@@ -648,9 +672,7 @@ pub fn parse_path_info_value_typed(parsed: &Value) -> Result<Vec<NixPathInfoItem
         }
         Ok(list)
     } else {
-        Err(BuilderError::NixCli(
-            "Unexpected path-info JSON format".to_string(),
-        ))
+        Err(NixExecError::Execution("Unexpected path-info JSON format".to_string()).into())
     }
 }
 

@@ -1,7 +1,7 @@
 use nixcache_core::{
     IndexEntry, NIX_BASE32_ALPHABET, NarDigest, NarInfoMeta, StoreHash, SystemArch,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, str};
 
 /// 高性能轻量级伪随机数生成器 (XorShift64，零外部依赖，极高吞吐)
 #[derive(Clone, Debug)]
@@ -56,7 +56,7 @@ pub fn generate_store_hashes(count: usize, seed: u64) -> Vec<StoreHash> {
             let idx = (rng.next_u32() & 0x1F) as usize;
             *b = NIX_BASE32_ALPHABET[idx];
         }
-        let s = unsafe { std::str::from_utf8_unchecked(&buf) };
+        let s = unsafe { str::from_utf8_unchecked(&buf) };
         hashes.push(StoreHash::new_unchecked(s));
     }
 
@@ -123,7 +123,7 @@ pub fn generate_non_existent_hashes(count: usize, seed: u64) -> Vec<StoreHash> {
             let idx = (rng.next_u32() & 0x1F) as usize;
             *b = NIX_BASE32_ALPHABET[idx];
         }
-        let s = unsafe { std::str::from_utf8_unchecked(&buf) };
+        let s = unsafe { str::from_utf8_unchecked(&buf) };
         hashes.push(StoreHash::new_unchecked(s));
     }
 

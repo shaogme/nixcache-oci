@@ -1,4 +1,5 @@
 use crate::{
+    error::WorkerStoreError,
     state::{DEBOUNCE_THRESHOLD_MS, L1_MEM_TTL_MS, WorkerState},
     transport::WorkerFetchTransport,
 };
@@ -122,7 +123,7 @@ impl CacheStore {
         &self,
         env: &Env,
         store_hash: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, WorkerStoreError> {
         let parsed_hash = match StoreHash::parse(store_hash) {
             Ok(h) => h,
             Err(_) => return Ok(None),
@@ -146,7 +147,7 @@ impl CacheStore {
             }
         }
 
-        // 3. Tier 2: Branch / PR Session
+        // 3. Tier 2: Branch / PR Session (branch-<name> / pr-<num>)
         if let Some(ref br) = self.config.branch_or_pr {
             let tag = if br.starts_with("pr-") || br.starts_with("branch-") {
                 br.to_string()
@@ -160,13 +161,10 @@ impl CacheStore {
             }
         }
 
-        // 4. Tier 3: Baseline Sharded Index with Bloom Filter
-        if let Ok((baseline, bloom_filter)) = self.get_baseline_data(env).await {
-            // Bloom Filter 前置守卫 (False 判定则 100% 不存在，0ms 快速直通回退)
-            if !bloom_filter.contains(&parsed_hash) {
-                return Ok(None);
-            }
-
+        // 4. Tier 3: Production Baseline (cache-index)
+        if let Ok((baseline, bloom_filter)) = self.get_baseline_data(env).await
+            && bloom_filter.contains(&parsed_hash)
+        {
             let shard_id = calculate_shard_id(&parsed_hash);
             if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
                 && !shard_desc.is_empty()
@@ -180,32 +178,20 @@ impl CacheStore {
             }
         }
 
-        // 5. Miss: Debounced Read-Through to GHCR
+        // 5. Miss: Debounced Read-Through to GHCR (智能防抖穿透)
         let now = Date::now();
         let should_check_ghcr =
             WorkerState::global().try_acquire_ghcr_check(now as u64, DEBOUNCE_THRESHOLD_MS as u64);
 
-        if should_check_ghcr && self.force_refresh(env).await.is_ok() {
-            if let Some(run_id) = self.config.run_id {
-                let tag = format!("run-{}", run_id);
-                if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
-                    && let Some(entry) = session.new_entries.get(&parsed_hash)
-                {
-                    return Ok(Some(entry.to_narinfo_string()));
-                }
-            }
-            if let Ok((baseline, _)) = self.get_baseline_data(env).await {
-                let shard_id = calculate_shard_id(&parsed_hash);
-                if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
-                    && !shard_desc.is_empty()
-                    && !shard_desc.blob_digest.is_empty()
-                    && let Ok(Some((shard_payload, _))) = self
-                        .get_shard_data(env, shard_id, &shard_desc.blob_digest)
-                        .await
-                    && let Some(entry) = shard_payload.entries.get(&parsed_hash)
-                {
-                    return Ok(Some(entry.to_narinfo_string()));
-                }
+        if should_check_ghcr
+            && self.force_refresh(env).await.is_ok()
+            && let Some(run_id) = self.config.run_id
+        {
+            let tag = format!("run-{}", run_id);
+            if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
+                && let Some(entry) = session.new_entries.get(&parsed_hash)
+            {
+                return Ok(Some(entry.to_narinfo_string()));
             }
         }
 
@@ -217,7 +203,7 @@ impl CacheStore {
         &self,
         env: &Env,
         nar_basename: &str,
-    ) -> Result<Option<NarDigest>, String> {
+    ) -> Result<Option<NarDigest>, WorkerStoreError> {
         let normalized = extract_nar_basename(nar_basename);
 
         // 1. Tier 0: In-Memory Hot Registry
@@ -254,7 +240,7 @@ impl CacheStore {
 
         // 4. Tier 3: 若文件名包含 StoreHash 前缀，通过定位 Shard 实现 O(1) 查找
         if let Some(store_hash) = extract_store_hash(nar_basename) {
-            let parsed_hash = StoreHash::parse(store_hash.as_str()).map_err(|e| e.to_string())?;
+            let parsed_hash = StoreHash::parse(store_hash.as_str())?;
             if let Ok((baseline, bloom_filter)) = self.get_baseline_data(env).await
                 && bloom_filter.contains(&parsed_hash)
             {
@@ -307,7 +293,7 @@ impl CacheStore {
     }
 
     /// 获取有效的签名公钥 (按 会话 -> 分支 -> 基线 优先级查找)
-    pub async fn get_public_key(&self, env: &Env) -> Result<Option<String>, String> {
+    pub async fn get_public_key(&self, env: &Env) -> Result<Option<String>, WorkerStoreError> {
         // Tier 1
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
@@ -333,7 +319,7 @@ impl CacheStore {
         env: &Env,
         shard_id: u16,
         blob_digest: &str,
-    ) -> Result<Option<(ShardDataPayload, HashMap<String, NarDigest>)>, String> {
+    ) -> Result<Option<(ShardDataPayload, HashMap<String, NarDigest>)>, WorkerStoreError> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
@@ -385,7 +371,10 @@ impl CacheStore {
                     };
                     let _ = kv
                         .put(&kv_key, &wrapper)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|e| WorkerStoreError::KvPutFailed {
+                            key: kv_key.clone(),
+                            message: e.to_string(),
+                        })?
                         .execute()
                         .await;
                 }
@@ -408,7 +397,7 @@ impl CacheStore {
                     let nar_lookup = build_nar_lookup_map(&payload.entries);
                     return Ok(Some((payload, nar_lookup)));
                 }
-                Err(e.to_string())
+                Err(e.into())
             }
         }
     }
@@ -418,7 +407,7 @@ impl CacheStore {
         &self,
         env: &Env,
         tag: &str,
-    ) -> Result<Option<(DeltaPatchData, HashMap<String, NarDigest>)>, String> {
+    ) -> Result<Option<(DeltaPatchData, HashMap<String, NarDigest>)>, WorkerStoreError> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
@@ -469,7 +458,10 @@ impl CacheStore {
                     };
                     let _ = kv
                         .put(&kv_key, &wrapper)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|e| WorkerStoreError::KvPutFailed {
+                            key: kv_key.clone(),
+                            message: e.to_string(),
+                        })?
                         .execute()
                         .await;
                 }
@@ -493,7 +485,7 @@ impl CacheStore {
                     let nar_lookup = build_nar_lookup_map(&delta.new_entries);
                     return Ok(Some((delta, nar_lookup)));
                 }
-                Err(e.to_string())
+                Err(e.into())
             }
         }
     }
@@ -502,7 +494,7 @@ impl CacheStore {
     pub async fn get_baseline_data(
         &self,
         env: &Env,
-    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), String> {
+    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), WorkerStoreError> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
@@ -513,7 +505,12 @@ impl CacheStore {
         }
 
         // 2. L2 Cloudflare KV
-        let kv = env.kv("NIXCACHE_KV").map_err(|e| e.to_string())?;
+        let kv = env
+            .kv("NIXCACHE_KV")
+            .map_err(|e| WorkerStoreError::KvGetFailed {
+                key: "NIXCACHE_KV".to_string(),
+                message: e.to_string(),
+            })?;
         let root_key = format!("baseline_root_{}", self.config.target_system.as_str());
         let bloom_key = format!("baseline_bloom_{}", self.config.target_system.as_str());
 
@@ -525,9 +522,8 @@ impl CacheStore {
             && now - root_wrapper.last_refresh < self.baseline_ttl_ms
         {
             let root_data = root_wrapper.data;
-            let bloom_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&bloom_wrapper.bytes_base64)
-                .map_err(|e| e.to_string())?;
+            let bloom_bytes =
+                base64::engine::general_purpose::STANDARD.decode(&bloom_wrapper.bytes_base64)?;
             let bloom_filter = Arc::new(
                 FastBlockedBloomFilter::from_bytes(
                     &bloom_bytes,
@@ -568,13 +564,12 @@ impl CacheStore {
     async fn refresh_baseline_from_ghcr(
         &self,
         env: &Env,
-    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), String> {
+    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), WorkerStoreError> {
         let now = Date::now();
         let (root_data, manifest_digest) = match self
             .oci_client
             .get_sharded_root_index(&self.config.baseline_tag, &self.config.target_system)
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
         {
             Some((data, digest)) => (data, digest),
             None => (
@@ -606,7 +601,12 @@ impl CacheStore {
             Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
         };
 
-        let kv = env.kv("NIXCACHE_KV").map_err(|e| e.to_string())?;
+        let kv = env
+            .kv("NIXCACHE_KV")
+            .map_err(|e| WorkerStoreError::KvGetFailed {
+                key: "NIXCACHE_KV".to_string(),
+                message: e.to_string(),
+            })?;
         let root_key = format!("baseline_root_{}", self.config.target_system.as_str());
         let bloom_key = format!("baseline_bloom_{}", self.config.target_system.as_str());
 
@@ -617,7 +617,10 @@ impl CacheStore {
         };
         let _ = kv
             .put(&root_key, &root_wrapper)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| WorkerStoreError::KvPutFailed {
+                key: root_key.clone(),
+                message: e.to_string(),
+            })?
             .execute()
             .await;
 
@@ -630,7 +633,10 @@ impl CacheStore {
         };
         let _ = kv
             .put(&bloom_key, &bloom_wrapper)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| WorkerStoreError::KvPutFailed {
+                key: bloom_key.clone(),
+                message: e.to_string(),
+            })?
             .execute()
             .await;
 
@@ -649,7 +655,7 @@ impl CacheStore {
     }
 
     /// 强制刷新所有层级的索引 (Tier 1 -> Tier 2 -> Tier 3)
-    pub async fn force_refresh(&self, env: &Env) -> Result<usize, String> {
+    pub async fn force_refresh(&self, env: &Env) -> Result<usize, WorkerStoreError> {
         let mut errors = Vec::new();
 
         WorkerState::global().clear_l1_caches();
@@ -691,7 +697,7 @@ impl CacheStore {
         if errors.is_empty() || status.total_unique_entries > 0 || baseline.total_entries() > 0 {
             Ok(status.total_unique_entries)
         } else {
-            Err(errors.join("; "))
+            Err(WorkerStoreError::AggregatedRefreshFailed { errors })
         }
     }
 
@@ -752,7 +758,7 @@ impl CacheStore {
                         Some(w) => (w.data.total_entries(), w.manifest_digest, w.data.generated),
                         None => (0, String::new(), String::new()),
                     };
-                    (false, Some(e.clone()), count, digest, gen_str)
+                    (false, Some(e.to_string()), count, digest, gen_str)
                 }
             };
 

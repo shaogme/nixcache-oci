@@ -26,15 +26,17 @@ pub struct StoreHash(String);
 impl StoreHash {
     pub fn parse(s: &str) -> Result<Self, TypeError> {
         let trimmed = s.trim();
-        if trimmed.len() == 32
-            && trimmed
-                .chars()
-                .all(|c| matches!(c, '0'..='9' | 'a'..='d' | 'f'..='n' | 'p'..='s' | 'v'..='z'))
-        {
-            Ok(Self(trimmed.to_string()))
-        } else {
-            Err(TypeError::InvalidStoreHash(s.to_string()))
+        if trimmed.len() != 32 {
+            return Err(TypeError::StoreHashInvalidLength {
+                actual: trimmed.len(),
+            });
         }
+        for (index, c) in trimmed.chars().enumerate() {
+            if !matches!(c, '0'..='9' | 'a'..='d' | 'f'..='n' | 'p'..='s' | 'v'..='z') {
+                return Err(TypeError::StoreHashInvalidChar { char: c, index });
+            }
+        }
+        Ok(Self(trimmed.to_string()))
     }
 
     /// 不做合法性校验直接构造 StoreHash (仅限受信任的内部或测试场景)
@@ -143,28 +145,34 @@ impl Default for NarDigest {
 impl NarDigest {
     pub fn parse(s: &str) -> Result<Self, TypeError> {
         let trimmed = s.trim();
-        if let Some(hex) = trimmed.strip_prefix("sha256:") {
-            if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Ok(Self(trimmed.to_string()));
-            }
-        } else if let Some((algo, hex)) = trimmed.split_once(':')
-            && !algo.is_empty()
-            && !hex.is_empty()
-            && algo.chars().all(|c| c.is_ascii_alphanumeric())
-            && hex.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return Ok(Self(trimmed.to_string()));
+        let Some((algo, hex)) = trimmed.split_once(':') else {
+            return Err(TypeError::NarDigestMissingPrefix { raw: s.to_string() });
+        };
+        if hex.len() != 64 {
+            return Err(TypeError::NarDigestInvalidHexLength { actual: hex.len() });
         }
-        Err(TypeError::InvalidNarDigest(s.to_string()))
+        for (index, c) in hex.chars().enumerate() {
+            if !c.is_ascii_hexdigit() {
+                return Err(TypeError::NarDigestInvalidHexChar { char: c, index });
+            }
+        }
+        let _ = algo;
+        Ok(Self(trimmed.to_string()))
     }
 
     pub fn new_sha256(hex: &str) -> Result<Self, TypeError> {
         let trimmed = hex.trim();
-        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-            Ok(Self(format!("sha256:{}", trimmed)))
-        } else {
-            Err(TypeError::InvalidNarDigest(hex.to_string()))
+        if trimmed.len() != 64 {
+            return Err(TypeError::NarDigestInvalidHexLength {
+                actual: trimmed.len(),
+            });
         }
+        for (index, c) in trimmed.chars().enumerate() {
+            if !c.is_ascii_hexdigit() {
+                return Err(TypeError::NarDigestInvalidHexChar { char: c, index });
+            }
+        }
+        Ok(Self(format!("sha256:{}", trimmed)))
     }
 
     /// 不做合法性校验直接构造 NarDigest (仅限受信任的内部或测试场景)
@@ -377,6 +385,16 @@ impl SystemArch {
             detected
         } else {
             Self::Unknown
+        }
+    }
+
+    /// 严格解析系统架构字符串，若未知则返回 TypeError::UnknownSystemArch
+    pub fn parse_strict(s: &str) -> Result<Self, TypeError> {
+        let arch = Self::from(s);
+        if arch.is_known() {
+            Ok(arch)
+        } else {
+            Err(TypeError::UnknownSystemArch { raw: s.to_string() })
         }
     }
 }
