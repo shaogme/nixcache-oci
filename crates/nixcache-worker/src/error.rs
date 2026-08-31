@@ -11,8 +11,11 @@ pub enum WorkerStoreError {
     #[error("Cloudflare KV put operation failed on key '{key}': {message}")]
     KvPutFailed { key: String, message: String },
 
-    #[error("Base64 decoding failed for Bloom filter: {0}")]
-    BloomBase64(String),
+    #[error("Worker Fetch/Network error: {0}")]
+    Fetch(String),
+
+    #[error("Worker HTTP Header parse/set error: {0}")]
+    Header(String),
 
     #[error("Bloom filter decode failure: {0}")]
     Bloom(String),
@@ -29,7 +32,7 @@ pub enum WorkerStoreError {
 
 impl From<base64::DecodeError> for WorkerStoreError {
     fn from(err: base64::DecodeError) -> Self {
-        Self::BloomBase64(err.to_string())
+        Self::Bloom(err.to_string())
     }
 }
 
@@ -59,9 +62,16 @@ impl From<OciError> for WorkerStoreError {
 
 impl From<worker::Error> for WorkerStoreError {
     fn from(err: worker::Error) -> Self {
-        Self::KvGetFailed {
-            key: "unknown".to_string(),
-            message: err.to_string(),
+        let msg = err.to_string();
+        if msg.contains("Header") {
+            Self::Header(msg)
+        } else if msg.contains("Fetch") || msg.contains("network") {
+            Self::Fetch(msg)
+        } else {
+            Self::KvGetFailed {
+                key: "kv_operation".to_string(),
+                message: msg,
+            }
         }
     }
 }

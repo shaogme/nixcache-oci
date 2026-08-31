@@ -10,6 +10,9 @@ use nixcache_oci::{
 use std::{fmt::Display, io::Error as IoError, time::Duration};
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
+#[cfg(target_arch = "wasm32")]
+use futures_util::StreamExt;
+
 #[derive(Clone, Default)]
 pub struct WorkerFetchTransport;
 
@@ -155,6 +158,62 @@ impl OciTransport for WorkerFetchTransport {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
+        let mut current_url = url.to_string();
+        let mut current_headers = headers;
+        let mut redirect_count = 0;
+
+        loop {
+            let worker_headers = convert_to_worker_headers(&current_headers)?;
+            let mut req_init = RequestInit::new();
+            req_init.with_method(Method::Get);
+            req_init.with_headers(worker_headers);
+            req_init.with_redirect(worker::RequestRedirect::Manual);
+
+            let req = Request::new_with_init(&current_url, &req_init)
+                .map_err(|e| map_worker_error(&current_url, e))?;
+            let mut resp = Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| map_worker_error(&current_url, e))?;
+
+            let status_code = resp.status_code();
+            if is_redirect_status(status_code)
+                && redirect_count < MAX_REDIRECTS
+                && let Ok(Some(location)) = resp.headers().get("Location")
+            {
+                current_url = resolve_redirect_url(&current_url, &location);
+                current_headers.remove(http::header::AUTHORIZATION);
+                redirect_count += 1;
+                continue;
+            }
+
+            let status =
+                StatusCode::from_u16(status_code).map_err(|_| TransportError::HttpStatus {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: Some(format!("Invalid status code {}", status_code)),
+                })?;
+            let resp_headers = convert_from_worker_headers(resp.headers())?;
+            let err_url = current_url.clone();
+            let byte_stream = resp
+                .stream()
+                .map_err(|e| map_worker_error(&current_url, e))?;
+            let mapped = byte_stream.map(move |res| {
+                res.map(Bytes::from)
+                    .map_err(|e| map_worker_error(&err_url, e))
+            });
+            let stream: Self::BodyStream = Box::pin(mapped);
+
+            return Ok((status, resp_headers, stream));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn stream(
         &self,
         url: &str,

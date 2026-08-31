@@ -5,7 +5,7 @@ use crate::{
     },
     transport::WorkerFetchTransport,
 };
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use nixcache_core::{
     DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
     ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
@@ -15,15 +15,22 @@ use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 use worker::{Env, js_sys::Date};
 
 pub type WorkerOciClient = OciClient<WorkerFetchTransport>;
 
 pub fn format_branch_tag(br: &str) -> String {
-    if br.starts_with("pr-") || br.starts_with("branch-") {
+    if br.chars().all(|c| c.is_ascii_digit()) {
+        format!("pr-{}", br)
+    } else if br.starts_with("pr-") || br.starts_with("branch-") {
         br.to_string()
+    } else if let Some(stripped) = br.strip_prefix("refs/heads/") {
+        format!("branch-{}", stripped.replace(['/', ':'], "-"))
+    } else if let Some(stripped) = br.strip_prefix("refs/pull/") {
+        let pr_id = stripped.split('/').next().unwrap_or(stripped);
+        format!("pr-{}", pr_id)
     } else {
         format!("branch-{}", br.replace(['/', ':'], "-"))
     }
@@ -129,12 +136,17 @@ impl CacheStore {
         &self.oci_client
     }
 
+    /// 设置全局远端 GHCR 连通状态
+    pub fn set_remote_status(&self, connected: bool, error: Option<String>) {
+        WorkerState::global().set_remote_status(connected, error);
+    }
+
     /// 动态注册新编译完成的条目到 Tier 0 内存热表中 (0ms 延迟可用)
     pub fn register_hot_entries(entries: HashMap<StoreHash, IndexEntry>) {
         WorkerState::global().register_hot(entries);
     }
 
-    /// 级联查询 Store Hash 对应的 narinfo (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3 确定性分片透传)
+    /// 级联查询 Store Hash 对应的 narinfo (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3 布隆过滤器拦截与分片精准查找)
     pub async fn lookup_narinfo(
         &self,
         env: &Env,
@@ -173,15 +185,19 @@ impl CacheStore {
             }
         }
 
-        // 4. Tier 3: Production Baseline (Deterministic O(1) Shard Resolution)
-        let (baseline, _) = self.get_baseline_data(env).await?;
-        let shard_id = calculate_shard_id(&parsed_hash);
+        // 4. Tier 3: Production Baseline (SMRI with Bloom Guard)
+        let (baseline, bloom_filter) = self.get_baseline_data(env).await?;
 
+        // 前置布隆过滤器 O(1) 负向拒绝拦截
+        if !bloom_filter.is_empty() && !bloom_filter.contains(&parsed_hash) {
+            return Ok(None);
+        }
+
+        let shard_id = calculate_shard_id(&parsed_hash);
         if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
             && !shard_desc.is_empty()
             && !shard_desc.blob_digest.is_empty()
         {
-            // 分片确定存在且非空，强制执行 Read-Through
             let (shard_payload, _) = self
                 .get_shard_data(env, shard_id, &shard_desc.blob_digest)
                 .await?;
@@ -229,11 +245,13 @@ impl CacheStore {
             }
         }
 
-        // 4. Tier 3: 若文件名包含 StoreHash 前缀，通过定位 Shard 实现 O(1) 确定性查找
+        // 4. Tier 3: Production Baseline (StoreHash Shard Routing with Bloom Guard)
+        let (baseline, bloom_filter) = self.get_baseline_data(env).await?;
+
         if let Some(store_hash) = extract_store_hash(nar_basename)
             && let Ok(parsed_hash) = StoreHash::parse(store_hash.as_str())
+            && (bloom_filter.is_empty() || bloom_filter.contains(&parsed_hash))
         {
-            let (baseline, _) = self.get_baseline_data(env).await?;
             let shard_id = calculate_shard_id(&parsed_hash);
             if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
                 && !shard_desc.is_empty()
@@ -248,15 +266,20 @@ impl CacheStore {
             }
         }
 
-        // 检查已加载在内存中的分片缓存
+        // 遍历已加载且属于当前 Baseline 的内存分片缓存 (防止过期分片污染)
         let mut found_digest = None;
-        WorkerState::global().mem_shard_cache.iter_sync(|_, entry| {
-            if let Some(digest) = entry.nar_lookup.get(normalized) {
-                found_digest = Some(digest.clone());
-                return false;
-            }
-            true
-        });
+        WorkerState::global()
+            .mem_shard_cache
+            .iter_sync(|shard_id, entry| {
+                if let Some(shard_desc) = baseline.find_shard_by_id(*shard_id)
+                    && shard_desc.blob_digest == entry.blob_digest
+                    && let Some(digest) = entry.nar_lookup.get(normalized)
+                {
+                    found_digest = Some(digest.clone());
+                    return false;
+                }
+                true
+            });
 
         if let Some(digest) = found_digest {
             return Ok(Some(digest));
@@ -313,50 +336,32 @@ impl CacheStore {
 
         // 2. L2 Cloudflare KV (Content-Addressable: shard_v5_{blob_digest})
         let kv_key = format!("shard_v5_{}", blob_digest);
-        let legacy_kv_key = format!(
-            "shard_wrapper_{}_{}",
-            self.config.target_system.as_str(),
-            shard_id
-        );
 
-        if let Ok(kv) = env.kv("NIXCACHE_KV") {
-            let kv_res = if let Ok(Some(wrapper)) = kv
+        if let Ok(kv) = env.kv("NIXCACHE_KV")
+            && let Ok(Some(wrapper)) = kv
                 .get(&kv_key)
                 .json::<KVCacheWrapper<ShardDataPayload>>()
                 .await
-            {
-                Some(wrapper)
-            } else if let Ok(Some(legacy_wrapper)) = kv
-                .get(&legacy_kv_key)
-                .json::<KVCacheWrapper<ShardDataPayload>>()
-                .await
-                && legacy_wrapper.manifest_digest == blob_digest
-            {
-                Some(legacy_wrapper)
-            } else {
-                None
-            };
+        {
+            let payload = wrapper.data;
+            let nar_lookup = build_nar_lookup_map(&payload.entries);
 
-            if let Some(wrapper) = kv_res {
-                let payload = wrapper.data;
-                let nar_lookup = build_nar_lookup_map(&payload.entries);
-
-                let _ = WorkerState::global().mem_shard_cache.upsert_sync(
-                    shard_id,
-                    Arc::new(CachedShardEntry {
-                        payload: payload.clone(),
-                        nar_lookup: nar_lookup.clone(),
-                        blob_digest: blob_digest.to_string(),
-                        expires_at: now + L1_MEM_TTL_MS,
-                    }),
-                );
-                return Ok((payload, nar_lookup));
-            }
+            let _ = WorkerState::global().mem_shard_cache.upsert_sync(
+                shard_id,
+                Arc::new(CachedShardEntry {
+                    payload: payload.clone(),
+                    nar_lookup: nar_lookup.clone(),
+                    blob_digest: blob_digest.to_string(),
+                    expires_at: now + L1_MEM_TTL_MS,
+                }),
+            );
+            return Ok((payload, nar_lookup));
         }
 
         // 3. L3 OCI GHCR
         match self.oci_client.get_shard_data(blob_digest).await {
             Ok(payload) => {
+                self.set_remote_status(true, None);
                 let nar_lookup = build_nar_lookup_map(&payload.entries);
 
                 if let Ok(kv) = env.kv("NIXCACHE_KV") {
@@ -388,6 +393,7 @@ impl CacheStore {
                 Ok((payload, nar_lookup))
             }
             Err(e) => {
+                self.set_remote_status(false, Some(format!("GHCR shard {}: {}", blob_digest, e)));
                 if let Ok(kv) = env.kv("NIXCACHE_KV")
                     && let Ok(Some(wrapper)) = kv
                         .get(&kv_key)
@@ -417,12 +423,14 @@ impl CacheStore {
             Err(e) => Err(e),
         };
 
+        let kv_key = format!("session_v5_{}_{}", self.config.target_system.as_str(), tag);
+
         match fetch_res {
             Ok(Some((delta, manifest_digest))) => {
+                self.set_remote_status(true, None);
                 let nar_lookup = build_nar_lookup_map(&delta.new_entries);
 
                 if let Ok(kv) = env.kv("NIXCACHE_KV") {
-                    let kv_key = format!("session_wrapper_{}", tag);
                     let wrapper = KVCacheWrapper {
                         data: delta.clone(),
                         last_refresh: now,
@@ -449,9 +457,12 @@ impl CacheStore {
 
                 Ok(Some((delta, nar_lookup)))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                self.set_remote_status(true, None);
+                Ok(None)
+            }
             Err(e) => {
-                let kv_key = format!("session_wrapper_{}", tag);
+                self.set_remote_status(false, Some(format!("GHCR session {}: {}", tag, e)));
                 if let Ok(kv) = env.kv("NIXCACHE_KV")
                     && let Ok(Some(wrapper)) = kv
                         .get(&kv_key)
@@ -484,8 +495,8 @@ impl CacheStore {
             return Ok(Some((cached.delta.clone(), cached.nar_lookup.clone())));
         }
 
-        // 2. L2 Cloudflare KV
-        let kv_key = format!("session_wrapper_{}", tag);
+        // 2. L2 Cloudflare KV (带多架构命名空间隔离)
+        let kv_key = format!("session_v5_{}_{}", self.config.target_system.as_str(), tag);
         if let Ok(kv) = env.kv("NIXCACHE_KV")
             && let Ok(Some(wrapper)) = kv
                 .get(&kv_key)
@@ -525,32 +536,20 @@ impl CacheStore {
             return Ok((cached.root.clone(), cached.bloom_filter.clone()));
         }
 
-        // 2. L2 Cloudflare KV
+        // 2. L2 Cloudflare KV (单次写入与读取，无 Legacy 双重冗余)
         let kv = env
             .kv("NIXCACHE_KV")
             .map_err(|e| WorkerStoreError::KvGetFailed {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let ptr_root_key = format!("ptr_root_{}", self.config.target_system.as_str());
-        let legacy_root_key = format!("baseline_root_{}", self.config.target_system.as_str());
-        let bloom_key = format!("baseline_bloom_{}", self.config.target_system.as_str());
+        let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
+        let bloom_key = format!("baseline_bloom_v5_{}", self.config.target_system.as_str());
 
-        let kv_root = if let Ok(Some(wrapper)) = kv
-            .get(&ptr_root_key)
+        if let Ok(Some(root_wrapper)) = kv
+            .get(&root_key)
             .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
             .await
-        {
-            Some(wrapper)
-        } else {
-            kv.get(&legacy_root_key)
-                .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
-                .await
-                .ok()
-                .flatten()
-        };
-
-        if let Some(root_wrapper) = kv_root
             && now - root_wrapper.last_refresh < self.baseline_ttl_ms
         {
             let root_data = root_wrapper.data;
@@ -558,8 +557,7 @@ impl CacheStore {
             let bloom_filter = if let Ok(Some(bloom_wrapper)) =
                 kv.get(&bloom_key).json::<BloomFilterKvWrapper>().await
             {
-                let bloom_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&bloom_wrapper.bytes_base64)?;
+                let bloom_bytes = STANDARD.decode(&bloom_wrapper.bytes_base64)?;
                 Arc::new(
                     FastBlockedBloomFilter::from_bytes(
                         &bloom_bytes,
@@ -587,12 +585,10 @@ impl CacheStore {
         match self.refresh_baseline_from_ghcr(env).await {
             Ok(res) => Ok(res),
             Err(e) => {
-                let ptr_root_key = format!("ptr_root_{}", self.config.target_system.as_str());
-                if let Ok(kv) = env.kv("NIXCACHE_KV")
-                    && let Ok(Some(root_wrapper)) = kv
-                        .get(&ptr_root_key)
-                        .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
-                        .await
+                if let Ok(Some(root_wrapper)) = kv
+                    .get(&root_key)
+                    .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
+                    .await
                 {
                     let root_data = root_wrapper.data;
                     let bloom_filter = Arc::new(FastBlockedBloomFilter::new_with_defaults(0));
@@ -608,20 +604,33 @@ impl CacheStore {
         env: &Env,
     ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), WorkerStoreError> {
         let now = Date::now();
-        let (root_data, manifest_digest) = match self
+        let old_cached = WorkerState::global().mem_baseline_cache.load_full();
+
+        let fetch_root = self
             .oci_client
             .get_sharded_root_index(&self.config.baseline_tag, &self.config.target_system)
-            .await?
-        {
-            Some((data, digest)) => (data, digest),
-            None => (
-                ShardedArchCacheIndexData::new(
-                    self.config.target_system,
-                    &self.config.repo,
-                    &self.config.registry,
-                ),
-                String::new(),
-            ),
+            .await;
+
+        let (root_data, manifest_digest) = match fetch_root {
+            Ok(Some((data, digest))) => {
+                self.set_remote_status(true, None);
+                (data, digest)
+            }
+            Ok(None) => {
+                self.set_remote_status(true, None);
+                (
+                    ShardedArchCacheIndexData::new(
+                        self.config.target_system,
+                        &self.config.repo,
+                        &self.config.registry,
+                    ),
+                    String::new(),
+                )
+            }
+            Err(e) => {
+                self.set_remote_status(false, Some(format!("GHCR baseline root: {}", e)));
+                return Err(e.into());
+            }
         };
 
         let bloom_filter = if !root_data.bloom_filter.blob_digest.is_empty() {
@@ -634,14 +643,36 @@ impl CacheStore {
                 )
                 .await
             {
-                Ok(f) => Arc::new(f),
-                Err(_) => Arc::new(FastBlockedBloomFilter::new_with_defaults(
-                    root_data.bloom_filter.num_entries,
-                )),
+                Ok(f) => {
+                    self.set_remote_status(true, None);
+                    Arc::new(f)
+                }
+                Err(e) => {
+                    self.set_remote_status(
+                        false,
+                        Some(format!(
+                            "GHCR bloom filter {}: {}",
+                            root_data.bloom_filter.blob_digest, e
+                        )),
+                    );
+                    Arc::new(FastBlockedBloomFilter::new_with_defaults(
+                        root_data.bloom_filter.num_entries,
+                    ))
+                }
             }
         } else {
             Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
         };
+
+        // 比对新旧基线 Merkle Root 与 Shards 描述符，淘汰已失效分片
+        if let Some(old_b) = old_cached
+            && old_b.root.merkle_root != root_data.merkle_root
+        {
+            let invalidated_shards = diff_shard_descriptors(&old_b.root.shards, &root_data.shards);
+            for shard_id in invalidated_shards {
+                WorkerState::global().mem_shard_cache.remove_sync(&shard_id);
+            }
+        }
 
         let kv = env
             .kv("NIXCACHE_KV")
@@ -649,9 +680,8 @@ impl CacheStore {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let ptr_root_key = format!("ptr_root_{}", self.config.target_system.as_str());
-        let legacy_root_key = format!("baseline_root_{}", self.config.target_system.as_str());
-        let bloom_key = format!("baseline_bloom_{}", self.config.target_system.as_str());
+        let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
+        let bloom_key = format!("baseline_bloom_v5_{}", self.config.target_system.as_str());
 
         let root_wrapper = KVCacheWrapper {
             data: root_data.clone(),
@@ -659,17 +689,9 @@ impl CacheStore {
             manifest_digest: manifest_digest.clone(),
         };
         let _ = kv
-            .put(&ptr_root_key, &root_wrapper)
+            .put(&root_key, &root_wrapper)
             .map_err(|e| WorkerStoreError::KvPutFailed {
-                key: ptr_root_key.clone(),
-                message: e.to_string(),
-            })?
-            .execute()
-            .await;
-        let _ = kv
-            .put(&legacy_root_key, &root_wrapper)
-            .map_err(|e| WorkerStoreError::KvPutFailed {
-                key: legacy_root_key.clone(),
+                key: root_key.clone(),
                 message: e.to_string(),
             })?
             .execute()
@@ -678,7 +700,7 @@ impl CacheStore {
         let bloom_wrapper = BloomFilterKvWrapper {
             num_entries: bloom_filter.num_entries(),
             num_hashes: bloom_filter.num_hashes(),
-            bytes_base64: base64::engine::general_purpose::STANDARD.encode(bloom_filter.to_bytes()),
+            bytes_base64: STANDARD.encode(bloom_filter.to_bytes()),
             last_refresh: now,
             blob_digest: root_data.bloom_filter.blob_digest.clone(),
         };
@@ -712,9 +734,9 @@ impl CacheStore {
         {
             cached.root.shards.clone()
         } else if let Ok(kv) = env.kv("NIXCACHE_KV") {
-            let ptr_root_key = format!("ptr_root_{}", self.config.target_system.as_str());
+            let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
             if let Ok(Some(wrapper)) = kv
-                .get(&ptr_root_key)
+                .get(&root_key)
                 .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                 .await
             {
@@ -791,13 +813,9 @@ impl CacheStore {
         }
     }
 
-    /// 获取完整的状态元信息与各层级统计
+    /// 获取完整的状态元信息与各层级统计 (实时 RCU 远端连通度)
     pub async fn get_status(&self, env: &Env) -> RemoteStatus {
-        let mut hot_count = 0;
-        WorkerState::global().hot_entries.iter_sync(|_, _| {
-            hot_count += 1;
-            true
-        });
+        let hot_count = WorkerState::global().hot_count.load(Ordering::Relaxed);
 
         let mut tier1_count = 0;
         let mut session_opt = None;
@@ -820,45 +838,36 @@ impl CacheStore {
         }
 
         let baseline_res = self.get_baseline_data(env).await;
-        let (remote_connected, remote_error, tier3_count, manifest_digest, generated) =
-            match baseline_res {
-                Ok((ref b, _)) => {
-                    let digest = WorkerState::global()
-                        .mem_baseline_cache
-                        .load_full()
-                        .map(|c| c.manifest_digest.clone())
-                        .unwrap_or_default();
-                    (true, None, b.total_entries(), digest, b.generated.clone())
+        let (tier3_count, manifest_digest, generated) = match baseline_res {
+            Ok((ref b, _)) => {
+                let digest = WorkerState::global()
+                    .mem_baseline_cache
+                    .load_full()
+                    .map(|c| c.manifest_digest.clone())
+                    .unwrap_or_default();
+                (b.total_entries(), digest, b.generated.clone())
+            }
+            Err(_) => {
+                let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
+                let kv_data = match env.kv("NIXCACHE_KV") {
+                    Ok(kv) => kv
+                        .get(&root_key)
+                        .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
+                        .await
+                        .ok()
+                        .flatten(),
+                    Err(_) => None,
+                };
+                match kv_data {
+                    Some(w) => (w.data.total_entries(), w.manifest_digest, w.data.generated),
+                    None => (0, String::new(), String::new()),
                 }
-                Err(ref e) => {
-                    let ptr_root_key = format!("ptr_root_{}", self.config.target_system.as_str());
-                    let legacy_root_key =
-                        format!("baseline_root_{}", self.config.target_system.as_str());
-                    let kv_data = match env.kv("NIXCACHE_KV") {
-                        Ok(kv) => {
-                            if let Ok(Some(wrapper)) = kv
-                                .get(&ptr_root_key)
-                                .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
-                                .await
-                            {
-                                Some(wrapper)
-                            } else {
-                                kv.get(&legacy_root_key)
-                                    .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
-                                    .await
-                                    .ok()
-                                    .flatten()
-                            }
-                        }
-                        Err(_) => None,
-                    };
-                    let (count, digest, gen_str) = match kv_data {
-                        Some(w) => (w.data.total_entries(), w.manifest_digest, w.data.generated),
-                        None => (0, String::new(), String::new()),
-                    };
-                    (false, Some(e.to_string()), count, digest, gen_str)
-                }
-            };
+            }
+        };
+
+        let remote_state = WorkerState::global().remote_status.load();
+        let remote_connected = remote_state.connected;
+        let remote_error = remote_state.last_error.clone();
 
         let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
         WorkerState::global().hot_entries.iter_sync(|k, _| {
@@ -903,7 +912,7 @@ mod tests {
     use nixcache_core::{
         DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, NarInfoMeta,
         SCHEMA_VERSION_V5, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
-        build_nar_lookup_map,
+        build_nar_lookup_map, diff_shard_descriptors,
     };
     use std::collections::HashMap;
 
@@ -913,6 +922,9 @@ mod tests {
         assert_eq!(format_branch_tag("feat/test"), "branch-feat-test");
         assert_eq!(format_branch_tag("branch-xyz"), "branch-xyz");
         assert_eq!(format_branch_tag("pr-123"), "pr-123");
+        assert_eq!(format_branch_tag("42"), "pr-42");
+        assert_eq!(format_branch_tag("refs/heads/main"), "branch-main");
+        assert_eq!(format_branch_tag("refs/pull/123/head"), "pr-123");
     }
 
     #[test]
@@ -1047,5 +1059,17 @@ mod tests {
 
         assert!(bloom.contains(&hash1));
         assert!(!bloom.contains(&hash2));
+    }
+
+    #[test]
+    fn test_merkle_diff_invalidation() {
+        let root1 = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        let mut root2 = root1.clone();
+
+        root2.shards[0].blob_digest = "sha256:new_digest_0".to_string();
+        root2.shards[5].blob_digest = "sha256:new_digest_5".to_string();
+
+        let diff = diff_shard_descriptors(&root1.shards, &root2.shards);
+        assert_eq!(diff, vec![0, 5]);
     }
 }

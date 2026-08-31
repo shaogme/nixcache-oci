@@ -8,6 +8,7 @@ use crate::{
     transport::WorkerFetchTransport,
 };
 pub use error::WorkerStoreError;
+use futures_util::TryStreamExt;
 use nixcache_core::{IndexEntry, StoreHash, SystemArch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,11 +49,14 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
 
     let run_id = env
         .var("NIXCACHE_RUN_ID")
+        .or_else(|_| env.var("GITHUB_RUN_ID"))
         .ok()
         .and_then(|v| v.to_string().parse::<u64>().ok());
 
     let branch_or_pr = env
         .var("NIXCACHE_BRANCH")
+        .or_else(|_| env.var("GITHUB_REF_NAME"))
+        .or_else(|_| env.var("GITHUB_HEAD_REF"))
         .or_else(|_| env.var("NIXCACHE_PR"))
         .map(|v| v.to_string())
         .ok()
@@ -64,7 +68,8 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         .unwrap_or_else(|_| "cache-index".to_string());
 
     let upstream_str = env
-        .var("NIXCACHE_UPSTREAM")
+        .var("NIXCACHE_UPSTREAM_CACHES")
+        .or_else(|_| env.var("NIXCACHE_UPSTREAM"))
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "https://cache.nixos.org".to_string());
     let upstream_caches = parse_upstream_list(&upstream_str);
@@ -102,8 +107,10 @@ fn get_store(env: &Env) -> Result<CacheStore> {
     let config = get_worker_config(env)?;
     let github_token = env
         .secret("GITHUB_TOKEN")
+        .or_else(|_| env.secret("NIXCACHE_AUTH_TOKEN"))
+        .or_else(|_| env.var("GITHUB_TOKEN"))
+        .or_else(|_| env.var("NIXCACHE_AUTH_TOKEN"))
         .map(|v| v.to_string())
-        .or_else(|_| env.var("GITHUB_TOKEN").map(|v| v.to_string()))
         .unwrap_or_default();
 
     let oci_client = WorkerOciClient::with_transport(
@@ -233,23 +240,35 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             let store = get_store(&ctx.env)?;
 
-            // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
-            match store.lookup_nar_digest(&ctx.env, nar_name).await {
-                Ok(Some(digest)) => {
-                    if let Ok(bytes) = store.oci_client().get_blob(digest.as_str()).await {
+            // 1. 级联反向解析 NAR Digest (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
+            if let Ok(Some(digest)) = store.lookup_nar_digest(&ctx.env, nar_name).await {
+                match store.oci_client().stream_blob(digest.as_str()).await {
+                    Ok(blob_stream) if blob_stream.status.is_success() => {
+                        store.set_remote_status(true, None);
                         let headers = Headers::new();
                         headers.set("Content-Type", content_type_str)?;
-                        headers.set("Content-Length", &bytes.len().to_string())?;
-                        return Ok(Response::from_bytes(bytes.to_vec())?.with_headers(headers));
+                        headers.set("Accept-Ranges", "bytes")?;
+                        if let Some(len) = blob_stream.content_length() {
+                            headers.set("Content-Length", &len.to_string())?;
+                        }
+                        let stream = blob_stream
+                            .stream
+                            .map_err(|e| worker::Error::RustError(e.to_string()));
+                        return Ok(Response::from_stream(stream)?.with_headers(headers));
                     }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Response::error(format!("Failed to query NAR digest: {}", e), 500);
+                    Ok(blob_stream) => {
+                        store.set_remote_status(
+                            false,
+                            Some(format!("GHCR HTTP {}", blob_stream.status)),
+                        );
+                    }
+                    Err(e) => {
+                        store.set_remote_status(false, Some(format!("Stream failed: {}", e)));
+                    }
                 }
             }
 
-            // 2. Fallback to upstream
+            // 2. Fallback to upstream (保持原始 Headers，设置 Content-Type 与 Accept-Ranges)
             for cache_url in &store.config().upstream_caches {
                 let upstream_url = format!("{}/nar/{}", cache_url, nar_name);
                 if let Ok(resp) = Fetch::Url(
@@ -261,11 +280,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 .await
                     && resp.status_code() == 200
                 {
-                    let headers = Headers::new();
+                    let headers = resp.headers().clone();
                     headers.set("Content-Type", content_type_str)?;
-                    if let Ok(Some(len)) = resp.headers().get("Content-Length") {
-                        headers.set("Content-Length", &len)?;
-                    }
+                    headers.set("Accept-Ranges", "bytes")?;
                     return Ok(resp.with_headers(headers));
                 }
             }
@@ -309,7 +326,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                     && resp.status_code() == 200
                     && let Ok(body) = resp.text().await
                 {
-                    let headers = Headers::new();
+                    let headers = resp.headers().clone();
                     headers.set("Content-Type", "text/x-nix-narinfo")?;
                     return Ok(Response::ok(body)?.with_headers(headers));
                 }

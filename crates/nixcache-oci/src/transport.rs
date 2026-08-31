@@ -1,6 +1,6 @@
 use crate::error::TransportError;
 use bytes::Bytes;
-use futures_util::{Stream, ready, stream::BoxStream};
+use futures_util::{Stream, ready};
 use http::{HeaderMap, StatusCode};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +14,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::stream::BoxStream;
+
+#[cfg(target_arch = "wasm32")]
+use futures_util::stream::LocalBoxStream;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub type BoxBodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
+
+#[cfg(target_arch = "wasm32")]
+pub type BoxBodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
 pub struct OciBlobStream<S = BoxBodyStream> {
     pub status: StatusCode,
@@ -128,16 +138,13 @@ impl<S> HashingStream<S> {
 
 impl<S, E> Stream for HashingStream<S>
 where
-    S: Stream<Item = Result<Bytes, E>>,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
     type Item = Result<Bytes, E>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // SAFETY: Pin 结构拆分
-        let this = unsafe { self.get_unchecked_mut() };
-        let inner_pin = unsafe { Pin::new_unchecked(&mut this.inner) };
-
-        match ready!(inner_pin.poll_next(cx)) {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
             Some(Ok(bytes)) => {
                 // 100% 零锁操作！直接更新本地独占的 hasher
                 this.hasher.update(&bytes);
@@ -185,10 +192,105 @@ pub fn parse_range_header(header_val: &str) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-/// 纯协议层 OCI 传输抽象特征（零条件编译，Rust 2024 原生 Trait 异步方法）
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(async_fn_in_trait)]
 pub trait OciTransport: Send + Sync + 'static {
-    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Send + 'static;
+    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Send + Unpin + 'static;
+
+    async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
+
+    async fn get(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError>;
+
+    async fn stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError>;
+
+    async fn post(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError>;
+
+    /// 1-RTT Monolithic POST 上传 (Bytes)
+    async fn post_bytes(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<(StatusCode, HeaderMap), TransportError>;
+
+    /// 1-RTT Monolithic POST 上传 (Stream)
+    async fn post_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        content_len: u64,
+    ) -> Result<(StatusCode, HeaderMap), TransportError>;
+
+    /// 分块上传 PATCH (发送单个分块)
+    async fn patch_chunk(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        chunk: Bytes,
+        byte_range: (u64, u64),
+    ) -> Result<UploadChunkResponse, TransportError>;
+
+    /// 分块流式 PATCH (用于零拷贝大分块推流)
+    async fn patch_chunk_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        byte_range: (u64, u64),
+    ) -> Result<UploadChunkResponse, TransportError>;
+
+    /// 探测当前断点会话状态 (GET session url 获取已接收的 Range 终止偏移量)
+    async fn probe_upload_session(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<Option<u64>, TransportError>;
+
+    /// 完成分块上传 (PUT finish，可带尾部数据或为空 Body)
+    async fn put_chunk_finish(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        final_chunk: Option<(Bytes, (u64, u64))>,
+    ) -> Result<StatusCode, TransportError>;
+
+    async fn put_bytes(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<StatusCode, TransportError>;
+
+    async fn put_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        content_len: u64,
+    ) -> Result<StatusCode, TransportError>;
+
+    async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
+
+    async fn sleep(&self, duration: Duration);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(async_fn_in_trait)]
+pub trait OciTransport: 'static {
+    type BodyStream: Stream<Item = Result<Bytes, TransportError>> + Unpin + 'static;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
 
