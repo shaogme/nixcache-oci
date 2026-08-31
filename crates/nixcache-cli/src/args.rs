@@ -16,7 +16,7 @@ pub use cache::{
 pub use list::{ListArgs, OutputFormat};
 pub use oci::{DEFAULT_NIXCACHE_REGISTRY, DEFAULT_NIXCACHE_REPO, OciTargetArgs};
 pub use purge::PurgeArgs;
-pub use selector::CacheSelectorArgs;
+pub use selector::{CacheSelectorArgs, DefaultScopePolicy};
 pub use server::{DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT, ServerBindArgs};
 pub use session::SessionContextArgs;
 pub use signing::SigningKeyArgs;

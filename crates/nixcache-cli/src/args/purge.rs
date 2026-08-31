@@ -1,6 +1,6 @@
 use crate::args::{auth::AuthTokenArgs, oci::OciTargetArgs, selector::CacheSelectorArgs};
 use clap::Args;
-use nixcache_core::{CacheSelector, CascadeMode, StoreHash};
+use nixcache_core::{CacheSelector, StoreHash};
 use nixcache_utils::Env;
 
 /// 构建缓存主动清理与失效参数组
@@ -64,17 +64,16 @@ impl PurgeArgs {
         Env::get_bool("NIXCACHE_DRY_RUN").unwrap_or(false)
     }
 
-    /// 转换为 nixcache-core 的 CacheSelector 结构体 (Purge 默认采用 Dependents 级联)
+    /// 转换为 nixcache-core 的 CacheSelector 结构体 (Purge 默认采用 Dependents 级联及 RequireExplicit 策略)
     pub fn to_purge_filter(&self, extra_hashes: &[StoreHash]) -> CacheSelector {
-        self.selector
-            .to_selector(extra_hashes, CascadeMode::Dependents)
+        self.selector.to_purge_selector(extra_hashes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixcache_core::{SizeFilter, SystemArch};
+    use nixcache_core::{CascadeMode, SelectionScope, SizeFilter, SystemArch};
 
     #[test]
     fn test_purge_args_resolution_and_parsing() {
@@ -122,13 +121,17 @@ mod tests {
         assert!(args.resolve_dry_run());
 
         let selector = args.to_purge_filter(&[]);
-        assert_eq!(selector.store_hashes.len(), 2);
         assert_eq!(selector.cascade_mode, CascadeMode::Transitive);
         assert!(selector.protect_gc_roots);
-        assert_eq!(
-            selector.size_filter,
-            Some(SizeFilter::MinBytes(500 * 1024 * 1024))
-        );
+        if let SelectionScope::Filtered(predicates) = &selector.scope {
+            assert_eq!(predicates.store_hashes.len(), 2);
+            assert_eq!(
+                predicates.size_filter,
+                Some(SizeFilter::MinBytes(500 * 1024 * 1024))
+            );
+        } else {
+            panic!("Expected SelectionScope::Filtered");
+        }
     }
 
     #[test]

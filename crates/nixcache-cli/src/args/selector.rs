@@ -1,8 +1,20 @@
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
-use nixcache_core::{CacheSelector, CascadeMode, SizeFilter, StoreHash, SystemArch, TimeFilter};
+use nixcache_core::{
+    CacheSelector, CascadeMode, FilterPredicates, SelectionScope, SizeFilter, StoreHash,
+    SystemArch, TimeFilter,
+};
 use nixcache_utils::Env;
 use std::collections::HashSet;
+
+/// 未指定具体过滤条件时的默认回退策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultScopePolicy {
+    /// 默认全选（用于 list 只读查询，若用户未输入条件则展示全量内容）
+    SelectAll,
+    /// 需显式指定（用于 purge/delete 破坏性操作，未指定条件且未传 --all 时拒绝匹配）
+    RequireExplicit,
+}
 
 /// 统一构建缓存过滤与选择器参数组
 #[derive(Args, Debug, Clone, Default)]
@@ -363,26 +375,64 @@ impl CacheSelectorArgs {
         runs
     }
 
-    /// 转换为 nixcache-core 的 CacheSelector 实体
-    pub fn to_selector(
-        &self,
-        extra_hashes: &[StoreHash],
-        default_cascade: CascadeMode,
-    ) -> CacheSelector {
+    /// 提取解析后的纯过滤谓词集合
+    pub fn resolve_predicates(&self, extra_hashes: &[StoreHash]) -> FilterPredicates {
         let mut store_hashes: HashSet<StoreHash> = self.resolve_hashes().into_iter().collect();
         store_hashes.extend(extra_hashes.iter().cloned());
 
-        let systems: HashSet<SystemArch> = self.resolve_systems().into_iter().collect();
-
-        CacheSelector {
-            select_all: self.resolve_all(),
+        FilterPredicates {
             store_hashes,
             patterns: self.resolve_patterns(),
-            systems,
+            systems: self.resolve_systems().into_iter().collect(),
             time_filter: self.resolve_time_filter(),
             size_filter: self.resolve_size_filter(),
             origin_jobs: self.resolve_origin_jobs(),
             origin_runs: self.resolve_origin_runs(),
+        }
+    }
+
+    /// 转换为专用于 list 只读查询的选择器（默认策略：SelectAll）
+    pub fn to_list_selector(&self, extra_hashes: &[StoreHash]) -> CacheSelector {
+        self.to_selector_with_policy(
+            extra_hashes,
+            CascadeMode::Exact,
+            DefaultScopePolicy::SelectAll,
+        )
+    }
+
+    /// 转换为专用于 purge 清理操作的选择器（默认策略：RequireExplicit，默认级联：Dependents）
+    pub fn to_purge_selector(&self, extra_hashes: &[StoreHash]) -> CacheSelector {
+        self.to_selector_with_policy(
+            extra_hashes,
+            CascadeMode::Dependents,
+            DefaultScopePolicy::RequireExplicit,
+        )
+    }
+
+    /// 基于明确策略将 CLI 参数转换为领域模型 CacheSelector
+    pub fn to_selector_with_policy(
+        &self,
+        extra_hashes: &[StoreHash],
+        default_cascade: CascadeMode,
+        policy: DefaultScopePolicy,
+    ) -> CacheSelector {
+        let is_all = self.resolve_all();
+        let predicates = self.resolve_predicates(extra_hashes);
+        let systems = predicates.systems.clone();
+
+        let scope = if is_all {
+            SelectionScope::All { systems }
+        } else if predicates.is_empty() {
+            match policy {
+                DefaultScopePolicy::SelectAll => SelectionScope::All { systems },
+                DefaultScopePolicy::RequireExplicit => SelectionScope::None,
+            }
+        } else {
+            SelectionScope::Filtered(Box::new(predicates))
+        };
+
+        CacheSelector {
+            scope,
             cascade_mode: self.resolve_cascade(default_cascade),
             protect_gc_roots: self.resolve_protect_gc_roots(),
         }
@@ -430,9 +480,40 @@ mod tests {
         assert!(args.resolve_origin_runs().contains(&12345));
         assert!(args.resolve_protect_gc_roots());
 
-        let selector = args.to_selector(&[], CascadeMode::Exact);
-        assert_eq!(selector.store_hashes.len(), 2);
+        let selector = args.to_list_selector(&[]);
         assert_eq!(selector.cascade_mode, CascadeMode::Transitive);
         assert!(selector.protect_gc_roots);
+        if let SelectionScope::Filtered(predicates) = &selector.scope {
+            assert_eq!(predicates.store_hashes.len(), 2);
+            assert_eq!(
+                predicates.size_filter,
+                Some(SizeFilter::Range(500 * 1024 * 1024, 2 * 1024 * 1024 * 1024))
+            );
+        } else {
+            panic!("Expected SelectionScope::Filtered");
+        }
+    }
+
+    #[test]
+    fn test_selector_args_policies() {
+        let empty_args = CacheSelectorArgs::default();
+
+        // list selector defaults to All
+        let list_sel = empty_args.to_list_selector(&[]);
+        assert_eq!(list_sel.cascade_mode, CascadeMode::Exact);
+        assert!(matches!(list_sel.scope, SelectionScope::All { .. }));
+
+        // purge selector defaults to None (safe reject)
+        let purge_sel = empty_args.to_purge_selector(&[]);
+        assert_eq!(purge_sel.cascade_mode, CascadeMode::Dependents);
+        assert_eq!(purge_sel.scope, SelectionScope::None);
+
+        // explicit all
+        let all_args = CacheSelectorArgs {
+            all: true,
+            ..Default::default()
+        };
+        let purge_all_sel = all_args.to_purge_selector(&[]);
+        assert!(matches!(purge_all_sel.scope, SelectionScope::All { .. }));
     }
 }

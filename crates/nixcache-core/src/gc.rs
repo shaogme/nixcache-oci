@@ -1,5 +1,5 @@
 use crate::{
-    filter::{CacheSelector, CascadeMode, TimeFilter},
+    filter::{CacheSelector, CascadeMode, FilterPredicates, TimeFilter},
     purge::evaluate_cache_purge,
     types::{IndexEntry, StoreHash, SystemArch},
 };
@@ -34,12 +34,12 @@ pub fn evaluate_multi_arch_gc(
     gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     cutoff: &DateTime<Utc>,
 ) -> GcEvaluationResult {
-    let selector = CacheSelector {
+    let selector = CacheSelector::filtered(FilterPredicates {
         time_filter: Some(TimeFilter::Before(*cutoff)),
-        protect_gc_roots: true,
-        cascade_mode: CascadeMode::Exact,
         ..Default::default()
-    };
+    })
+    .with_protect_gc_roots(true)
+    .with_cascade(CascadeMode::Exact);
 
     let purge_res = evaluate_cache_purge(entries, gc_roots, &selector);
 

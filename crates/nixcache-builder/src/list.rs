@@ -4,8 +4,7 @@ use crate::{
 use futures_util::future::join_all;
 use nixcache_cli::{ListArgs, OutputFormat};
 use nixcache_core::{
-    CacheQueryResult, CascadeMode, IndexEntry, SortBy, SortOrder, StoreHash, SystemArch,
-    evaluate_cache_query,
+    CacheQueryResult, IndexEntry, SortBy, SortOrder, StoreHash, SystemArch, evaluate_cache_query,
 };
 use nixcache_oci::OciArtifactManifest;
 use nixcache_oci_backend::create_tokio_reqwest_client;
@@ -72,47 +71,6 @@ pub struct CacheListSummaryReport {
     pub matched_bytes: u64,
     pub arch_breakdown: HashMap<String, ArchStat>,
     pub items: Vec<ListItemDto>,
-}
-
-fn build_selector_description(args: &ListArgs) -> String {
-    let mut parts = Vec::new();
-    if args.selector.resolve_all() {
-        parts.push("all=true".to_string());
-    }
-    let hashes = args.selector.resolve_hashes();
-    if !hashes.is_empty() {
-        parts.push(format!("hashes=[{} items]", hashes.len()));
-    }
-    let pats = args.selector.resolve_patterns();
-    if !pats.is_empty() {
-        parts.push(format!("patterns=[{}]", pats.join(", ")));
-    }
-    let sys = args.selector.resolve_systems();
-    if !sys.is_empty() {
-        let sys_str: Vec<_> = sys.iter().map(|s| s.as_str()).collect();
-        parts.push(format!("systems=[{}]", sys_str.join(", ")));
-    }
-    if let Some(older) = args.selector.resolve_older_than() {
-        parts.push(format!("older_than={}", older.to_rfc3339()));
-    }
-    if let Some(newer) = args.selector.resolve_newer_than() {
-        parts.push(format!("newer_than={}", newer.to_rfc3339()));
-    }
-    if let Some(min) = args.selector.resolve_min_size() {
-        parts.push(format!("min_size={}", format_bytes(min)));
-    }
-    if let Some(max) = args.selector.resolve_max_size() {
-        parts.push(format!("max_size={}", format_bytes(max)));
-    }
-    if args.selector.resolve_protect_gc_roots() {
-        parts.push("protect_gc_roots=true".to_string());
-    }
-
-    if parts.is_empty() {
-        "Default Scope (Exact Match / All)".to_string()
-    } else {
-        parts.join(", ")
-    }
 }
 
 pub fn format_table(
@@ -362,7 +320,7 @@ pub async fn run_list(
         extra_hashes.extend(flake_hashes);
     }
 
-    let selector = args.selector.to_selector(&extra_hashes, CascadeMode::Exact);
+    let selector = args.selector.to_list_selector(&extra_hashes);
     let query_res: CacheQueryResult = evaluate_cache_query(&all_entries, &all_gc_roots, &selector);
 
     let total_entries = all_entries.len();
@@ -493,7 +451,7 @@ pub async fn run_list(
     }
 
     // 写入 GitHub Step Summary
-    let selector_desc = build_selector_description(args);
+    let selector_desc = selector.describe();
     write_list_step_summary(&report, &selector_desc, &displayed_items).await;
 
     Ok(())

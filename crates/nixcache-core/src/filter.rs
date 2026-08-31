@@ -46,11 +46,9 @@ pub enum SortOrder {
     Asc,
 }
 
-/// 统一的不可变声明式缓存选择器
-#[derive(Debug, Clone, Default)]
-pub struct CacheSelector {
-    /// 是否全选（若为 true 且无 root 保护，则全量匹配）
-    pub select_all: bool,
+/// 统一的纯过滤谓词集合容器
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterPredicates {
     /// 显式匹配的 StoreHash 集合
     pub store_hashes: HashSet<StoreHash>,
     /// 名称、StorePath 或 NarBasename 匹配模式 (Glob / Substring)
@@ -61,13 +59,293 @@ pub struct CacheSelector {
     pub time_filter: Option<TimeFilter>,
     /// 体积阈值条件
     pub size_filter: Option<SizeFilter>,
-    /// CI Job / Run ID 条件
+    /// CI Job 条件
     pub origin_jobs: HashSet<String>,
+    /// CI Run ID 条件
     pub origin_runs: HashSet<u64>,
+}
+
+impl FilterPredicates {
+    /// 判断是否完全没有任何过滤条件
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.store_hashes.is_empty()
+            && self.patterns.is_empty()
+            && self.systems.is_empty()
+            && self.time_filter.is_none()
+            && self.size_filter.is_none()
+            && self.origin_jobs.is_empty()
+            && self.origin_runs.is_empty()
+    }
+
+    /// 判断是否存在除架构过滤以外的具体条目过滤条件
+    #[inline]
+    pub fn has_item_filters(&self) -> bool {
+        !self.store_hashes.is_empty()
+            || !self.patterns.is_empty()
+            || self.time_filter.is_some()
+            || self.size_filter.is_some()
+            || !self.origin_jobs.is_empty()
+            || !self.origin_runs.is_empty()
+    }
+
+    /// 评估单个条目是否命中本谓词条件集合
+    /// 返回命中时的匹配原因列表（若未命中返回 None）
+    pub fn evaluate_entry(
+        &self,
+        hash: &StoreHash,
+        entry: &IndexEntry,
+    ) -> Option<Vec<&'static str>> {
+        // 1. 系统架构前置过滤
+        if !self.systems.is_empty() {
+            if let Some(sys) = &entry.system {
+                if !self.systems.contains(sys) {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        // 若仅指定了架构过滤，没有其他具体条件，则直接算作架构匹配成功
+        if !self.has_item_filters() {
+            return Some(vec!["System Architecture Match"]);
+        }
+
+        let mut reasons = Vec::new();
+
+        // 2. 精确 Hash 匹配
+        if self.store_hashes.contains(hash) {
+            reasons.push("Explicit Hash Match");
+        }
+
+        // 3. 名称 / 路径模式匹配 (Glob / Substring)
+        for pat in &self.patterns {
+            if matches_pattern(pat, &entry.name)
+                || matches_pattern(pat, &entry.narinfo_meta.store_path)
+                || matches_pattern(pat, &entry.narinfo_meta.nar_basename)
+            {
+                reasons.push("Pattern Match");
+                break;
+            }
+        }
+
+        // 4. 时间范围匹配
+        if let Some(ref tf) = self.time_filter
+            && let Ok(added_dt) = DateTime::parse_from_rfc3339(&entry.added)
+        {
+            let added_utc = added_dt.with_timezone(&Utc);
+            let time_matched = match tf {
+                TimeFilter::Before(dt) => added_utc < *dt,
+                TimeFilter::After(dt) => added_utc > *dt,
+                TimeFilter::Between(start, end) => added_utc >= *start && added_utc <= *end,
+            };
+            if time_matched {
+                reasons.push("Time Range Match");
+            }
+        }
+
+        // 5. 体积阈值匹配
+        if let Some(ref sf) = self.size_filter {
+            let size_matched = match sf {
+                SizeFilter::MinBytes(min) => entry.nar_size >= *min,
+                SizeFilter::MaxBytes(max) => entry.nar_size <= *max,
+                SizeFilter::Range(min, max) => entry.nar_size >= *min && entry.nar_size <= *max,
+            };
+            if size_matched {
+                reasons.push("Size Threshold Match");
+            }
+        }
+
+        // 6. CI Job / Run ID 匹配
+        if let Some(ref job) = entry.origin_job {
+            if !self.origin_jobs.is_empty() && self.origin_jobs.contains(job) {
+                reasons.push("Origin Job Match");
+            }
+            for run_id in &self.origin_runs {
+                let run_prefix = format!("run:{}", run_id);
+                let run_str = format!("{}", run_id);
+                if job.contains(&run_prefix) || job.contains(&run_str) {
+                    reasons.push("Origin Run Match");
+                    break;
+                }
+            }
+        }
+
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons)
+        }
+    }
+
+    /// 返回谓词列表的描述项
+    pub fn describe(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if !self.store_hashes.is_empty() {
+            parts.push(format!("hashes=[{} items]", self.store_hashes.len()));
+        }
+        if !self.patterns.is_empty() {
+            parts.push(format!("patterns=[{}]", self.patterns.join(", ")));
+        }
+        if !self.systems.is_empty() {
+            let mut sys_names: Vec<_> = self.systems.iter().map(|s| s.as_str()).collect();
+            sys_names.sort();
+            parts.push(format!("systems=[{}]", sys_names.join(", ")));
+        }
+        if let Some(ref tf) = self.time_filter {
+            match tf {
+                TimeFilter::Before(dt) => parts.push(format!("older_than={}", dt.to_rfc3339())),
+                TimeFilter::After(dt) => parts.push(format!("newer_than={}", dt.to_rfc3339())),
+                TimeFilter::Between(start, end) => parts.push(format!(
+                    "time_between=[{}, {}]",
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                )),
+            }
+        }
+        if let Some(ref sf) = self.size_filter {
+            match sf {
+                SizeFilter::MinBytes(min) => parts.push(format!("min_size={}B", min)),
+                SizeFilter::MaxBytes(max) => parts.push(format!("max_size={}B", max)),
+                SizeFilter::Range(min, max) => {
+                    parts.push(format!("size_range=[{}B, {}B]", min, max))
+                }
+            }
+        }
+        if !self.origin_jobs.is_empty() {
+            let mut jobs: Vec<_> = self.origin_jobs.iter().cloned().collect();
+            jobs.sort();
+            parts.push(format!("origin_jobs=[{}]", jobs.join(", ")));
+        }
+        if !self.origin_runs.is_empty() {
+            let mut runs: Vec<_> = self.origin_runs.iter().map(|r| r.to_string()).collect();
+            runs.sort();
+            parts.push(format!("origin_runs=[{}]", runs.join(", ")));
+        }
+        parts
+    }
+}
+
+/// 声明式缓存选择作用域
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SelectionScope {
+    /// 全选模式：匹配所有条目（可限制在特定系统架构集合内）
+    All { systems: HashSet<SystemArch> },
+    /// 条件过滤模式：基于多维谓词集合进行筛选
+    Filtered(Box<FilterPredicates>),
+    /// 空选择模式：不匹配任何条目（用于未指定条件的默认保护状态）
+    #[default]
+    None,
+}
+
+/// 统一的不可变声明式缓存选择器
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CacheSelector {
+    /// 目标匹配作用域
+    pub scope: SelectionScope,
     /// 级联展开模式
     pub cascade_mode: CascadeMode,
     /// 是否保护 GC Roots 可达闭包不被选中
     pub protect_gc_roots: bool,
+}
+
+impl CacheSelector {
+    /// 构造全选选择器（可选传入架构约束）
+    pub fn all(systems: HashSet<SystemArch>) -> Self {
+        Self {
+            scope: SelectionScope::All { systems },
+            cascade_mode: CascadeMode::Exact,
+            protect_gc_roots: false,
+        }
+    }
+
+    /// 构造基于谓词过滤的选择器
+    pub fn filtered(predicates: FilterPredicates) -> Self {
+        Self {
+            scope: SelectionScope::Filtered(Box::new(predicates)),
+            cascade_mode: CascadeMode::Exact,
+            protect_gc_roots: false,
+        }
+    }
+
+    /// 构造空选择器
+    pub fn none() -> Self {
+        Self {
+            scope: SelectionScope::None,
+            cascade_mode: CascadeMode::Exact,
+            protect_gc_roots: false,
+        }
+    }
+
+    /// 链式设置级联展开模式
+    pub fn with_cascade(mut self, cascade_mode: CascadeMode) -> Self {
+        self.cascade_mode = cascade_mode;
+        self
+    }
+
+    /// 链式设置 GC Root 保护
+    pub fn with_protect_gc_roots(mut self, protect: bool) -> Self {
+        self.protect_gc_roots = protect;
+        self
+    }
+
+    /// 提取该选择器所约束的系统架构集合（若有）
+    pub fn target_systems(&self) -> Option<&HashSet<SystemArch>> {
+        match &self.scope {
+            SelectionScope::All { systems } => {
+                if systems.is_empty() {
+                    None
+                } else {
+                    Some(systems)
+                }
+            }
+            SelectionScope::Filtered(predicates) => {
+                if predicates.systems.is_empty() {
+                    None
+                } else {
+                    Some(&predicates.systems)
+                }
+            }
+            SelectionScope::None => None,
+        }
+    }
+
+    /// 生成选择器的可读描述信息
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+
+        match &self.scope {
+            SelectionScope::All { systems } => {
+                parts.push("all=true".to_string());
+                if !systems.is_empty() {
+                    let mut sys_names: Vec<_> = systems.iter().map(|s| s.as_str()).collect();
+                    sys_names.sort();
+                    parts.push(format!("systems=[{}]", sys_names.join(", ")));
+                }
+            }
+            SelectionScope::Filtered(predicates) => {
+                parts.extend(predicates.describe());
+            }
+            SelectionScope::None => {
+                parts.push("none=true".to_string());
+            }
+        }
+
+        if self.protect_gc_roots {
+            parts.push("protect_gc_roots=true".to_string());
+        }
+
+        if self.cascade_mode != CascadeMode::Exact {
+            parts.push(format!("cascade={:?}", self.cascade_mode).to_lowercase());
+        }
+
+        if parts.is_empty() {
+            "Default Scope (Exact Match / All)".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 /// 统一的查询评估结果
@@ -171,8 +449,9 @@ pub fn evaluate_cache_query(
     let mut active_gc_roots: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
     let mut protected_reachable: HashSet<StoreHash> = HashSet::new();
 
+    let target_systems = selector.target_systems();
     for (sys, roots) in gc_roots {
-        if selector.systems.is_empty() || selector.systems.contains(sys) {
+        if target_systems.is_none_or(|systems| systems.contains(sys)) {
             active_gc_roots.insert(*sys, roots.clone());
         }
     }
@@ -197,19 +476,10 @@ pub fn evaluate_cache_query(
         }
     }
 
-    // 3. 第 1 轮初筛：匹配初始命中目标 (Initial Matches)
+    // 3. 第 1 轮初筛：根据 SelectionScope 匹配初始命中目标 (Initial Matches)
     let mut initial_matched: HashSet<StoreHash> = HashSet::new();
     let mut initial_matched_hashes: Vec<StoreHash> = Vec::new();
     let mut reason_map: HashMap<StoreHash, String> = HashMap::new();
-
-    let only_system_filter = !selector.systems.is_empty()
-        && !selector.select_all
-        && selector.store_hashes.is_empty()
-        && selector.patterns.is_empty()
-        && selector.time_filter.is_none()
-        && selector.size_filter.is_none()
-        && selector.origin_jobs.is_empty()
-        && selector.origin_runs.is_empty();
 
     for (hash, entry) in entries {
         // 3.0 若受 GC Roots 保护且处于可达闭包中，绝对不作为初始命中目标
@@ -217,109 +487,36 @@ pub fn evaluate_cache_query(
             continue;
         }
 
-        // 3.1 系统架构前置过滤
-        if !selector.systems.is_empty() {
-            if let Some(sys) = &entry.system {
-                if !selector.systems.contains(sys) {
-                    continue;
+        match &selector.scope {
+            SelectionScope::All { systems } => {
+                if !systems.is_empty() {
+                    if let Some(sys) = &entry.system {
+                        if !systems.contains(sys) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
-            } else {
-                continue;
+                initial_matched.insert(hash.clone());
+                initial_matched_hashes.push(hash.clone());
+                let reason = if selector.protect_gc_roots {
+                    "Select All (Unreachable Roots)".to_string()
+                } else {
+                    "Select All".to_string()
+                };
+                reason_map.insert(hash.clone(), reason);
             }
-        }
-
-        // 3.2 全选模式 (在 GC Roots 保护模式下匹配所有非根可达项)
-        if selector.select_all {
-            initial_matched.insert(hash.clone());
-            initial_matched_hashes.push(hash.clone());
-            let reason = if selector.protect_gc_roots {
-                "Select All (Unreachable Roots)".to_string()
-            } else {
-                "Select All".to_string()
-            };
-            reason_map.insert(hash.clone(), reason);
-            continue;
-        }
-
-        // 3.3 仅架构重置/匹配模式
-        if only_system_filter {
-            initial_matched.insert(hash.clone());
-            initial_matched_hashes.push(hash.clone());
-            reason_map.insert(hash.clone(), "System Architecture Match".to_string());
-            continue;
-        }
-
-        let mut matched = false;
-        let mut reasons = Vec::new();
-
-        // 3.4 精确 Hash 匹配
-        if selector.store_hashes.contains(hash) {
-            matched = true;
-            reasons.push("Explicit Hash Match");
-        }
-
-        // 3.5 名称 / 路径模式匹配 (Glob / Substring)
-        for pat in &selector.patterns {
-            if matches_pattern(pat, &entry.name)
-                || matches_pattern(pat, &entry.narinfo_meta.store_path)
-                || matches_pattern(pat, &entry.narinfo_meta.nar_basename)
-            {
-                matched = true;
-                reasons.push("Pattern Match");
-                break;
-            }
-        }
-
-        // 3.6 时间范围匹配
-        if let Some(ref tf) = selector.time_filter
-            && let Ok(added_dt) = DateTime::parse_from_rfc3339(&entry.added)
-        {
-            let added_utc = added_dt.with_timezone(&Utc);
-            let time_matched = match tf {
-                TimeFilter::Before(dt) => added_utc < *dt,
-                TimeFilter::After(dt) => added_utc > *dt,
-                TimeFilter::Between(start, end) => added_utc >= *start && added_utc <= *end,
-            };
-            if time_matched {
-                matched = true;
-                reasons.push("Time Range Match");
-            }
-        }
-
-        // 3.7 体积阈值匹配
-        if let Some(ref sf) = selector.size_filter {
-            let size_matched = match sf {
-                SizeFilter::MinBytes(min) => entry.nar_size >= *min,
-                SizeFilter::MaxBytes(max) => entry.nar_size <= *max,
-                SizeFilter::Range(min, max) => entry.nar_size >= *min && entry.nar_size <= *max,
-            };
-            if size_matched {
-                matched = true;
-                reasons.push("Size Threshold Match");
-            }
-        }
-
-        // 3.8 CI Job / Run ID 匹配
-        if let Some(ref job) = entry.origin_job {
-            if !selector.origin_jobs.is_empty() && selector.origin_jobs.contains(job) {
-                matched = true;
-                reasons.push("Origin Job Match");
-            }
-            for run_id in &selector.origin_runs {
-                let run_prefix = format!("run:{}", run_id);
-                let run_str = format!("{}", run_id);
-                if job.contains(&run_prefix) || job.contains(&run_str) {
-                    matched = true;
-                    reasons.push("Origin Run Match");
-                    break;
+            SelectionScope::Filtered(predicates) => {
+                if let Some(reasons) = predicates.evaluate_entry(hash, entry) {
+                    initial_matched.insert(hash.clone());
+                    initial_matched_hashes.push(hash.clone());
+                    reason_map.insert(hash.clone(), reasons.join(", "));
                 }
             }
-        }
-
-        if matched {
-            initial_matched.insert(hash.clone());
-            initial_matched_hashes.push(hash.clone());
-            reason_map.insert(hash.clone(), reasons.join(", "));
+            SelectionScope::None => {
+                // 空选择，不命中任何条目
+            }
         }
     }
 

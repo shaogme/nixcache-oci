@@ -11,8 +11,9 @@ pub mod types;
 pub use bloom::{BloomFilter, FastBlockedBloomFilter, murmur3_x64_128};
 pub use error::{BloomError, CoreError, NarInfoParseError, TypeError};
 pub use filter::{
-    CacheQueryResult, CacheSelector, CascadeMode, SizeFilter, SortBy, SortOrder, TimeFilter,
-    evaluate_arch_cache_query, evaluate_cache_query, matches_pattern,
+    CacheQueryResult, CacheSelector, CascadeMode, FilterPredicates, SelectionScope, SizeFilter,
+    SortBy, SortOrder, TimeFilter, evaluate_arch_cache_query, evaluate_cache_query,
+    matches_pattern,
 };
 pub use gc::{GcEvaluationResult, evaluate_gc, evaluate_multi_arch_gc};
 pub use lookup::{
@@ -40,16 +41,16 @@ mod tests {
     use super::{
         BloomError, BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats,
         CACHE_INDEX_VERSION, CacheQueryResult, CacheSelector, CascadeMode, CoreError,
-        DeltaPatchData, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, IndexEntry,
-        JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta,
-        NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V5, ShardDataPayload, ShardDescriptor,
-        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
-        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
-        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
-        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
-        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
-        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
-        shard_id_to_prefix,
+        DeltaPatchData, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, FilterPredicates,
+        IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo,
+        NarInfoMeta, NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V5, SelectionScope,
+        ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash,
+        SystemArch, TimeFilter, TypeError, build_nar_lookup_map, calculate_shard_id,
+        calculate_shard_id_from_str, compute_merkle_root, compute_shard_merkle_hash,
+        diff_shard_descriptors, evaluate_arch_cache_purge, evaluate_arch_cache_query,
+        evaluate_cache_purge, evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc,
+        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
+        nix_base32_char, nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -714,10 +715,10 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             },
         );
 
-        let selector = CacheSelector {
+        let selector = CacheSelector::filtered(FilterPredicates {
             patterns: vec!["*rust*".to_string()],
             ..Default::default()
-        };
+        });
         let query_res: CacheQueryResult =
             evaluate_cache_query(&entries, &HashMap::new(), &selector);
         assert_eq!(query_res.matched_entries.len(), 1);
@@ -774,10 +775,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         gc_roots.insert(SystemArch::X86_64Linux, vec![hash1.clone()]);
         gc_roots.insert(SystemArch::Aarch64Linux, vec![hash2.clone()]);
 
-        let selector = CacheSelector {
-            select_all: true,
-            ..Default::default()
-        };
+        let selector = CacheSelector::all(HashSet::new());
 
         let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert!(result.kept_entries.is_empty());
@@ -859,11 +857,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut hashes = HashSet::new();
         hashes.insert(lib_a.clone());
 
-        let selector = CacheSelector {
+        let selector = CacheSelector::filtered(FilterPredicates {
             store_hashes: hashes,
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
 
         let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_hashes, vec![lib_a.clone()]);
@@ -942,11 +940,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut hashes = HashSet::new();
         hashes.insert(lib_a.clone());
 
-        let selector = CacheSelector {
+        let selector = CacheSelector::filtered(FilterPredicates {
             store_hashes: hashes,
-            cascade_mode: CascadeMode::Dependents,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Dependents);
 
         let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_entries.len(), 2);
@@ -1020,11 +1018,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         hashes.insert(lib_a.clone());
 
         // Transitive: lib_a + core
-        let selector_transitive = CacheSelector {
+        let selector_transitive = CacheSelector::filtered(FilterPredicates {
             store_hashes: hashes.clone(),
-            cascade_mode: CascadeMode::Transitive,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Transitive);
         let res_transitive = evaluate_cache_purge(&entries, &HashMap::new(), &selector_transitive);
         assert_eq!(res_transitive.purged_entries.len(), 2);
         assert!(res_transitive.purged_entries.contains_key(&lib_a));
@@ -1032,11 +1030,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert!(res_transitive.kept_entries.contains_key(&app));
 
         // FullTree: app + lib_a + core
-        let selector_full = CacheSelector {
+        let selector_full = CacheSelector::filtered(FilterPredicates {
             store_hashes: hashes,
-            cascade_mode: CascadeMode::FullTree,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::FullTree);
         let res_full = evaluate_cache_purge(&entries, &HashMap::new(), &selector_full);
         assert_eq!(res_full.purged_entries.len(), 3);
         assert!(res_full.purged_entries.contains_key(&app));
@@ -1104,45 +1102,45 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
 
         // Pattern filter
-        let selector_pat = CacheSelector {
+        let selector_pat = CacheSelector::filtered(FilterPredicates {
             patterns: vec!["*chromium*".to_string()],
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
         let res_pat = evaluate_cache_purge(&entries, &HashMap::new(), &selector_pat);
         assert_eq!(res_pat.purged_hashes, vec![hash_chromium.clone()]);
 
         // Size filter: MinBytes(100MB)
-        let selector_size = CacheSelector {
+        let selector_size = CacheSelector::filtered(FilterPredicates {
             size_filter: Some(SizeFilter::MinBytes(100_000_000)),
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
         let res_size = evaluate_cache_purge(&entries, &HashMap::new(), &selector_size);
         assert_eq!(res_size.purged_hashes, vec![hash_chromium.clone()]);
 
         // Time filter: Before 2026-08-01
-        let selector_time = CacheSelector {
+        let selector_time = CacheSelector::filtered(FilterPredicates {
             time_filter: Some(TimeFilter::Before(
                 DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
             )),
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
         let res_time = evaluate_cache_purge(&entries, &HashMap::new(), &selector_time);
         assert_eq!(res_time.purged_hashes, vec![hash_old.clone()]);
 
         // System filter
         let mut sys_filter = HashSet::new();
         sys_filter.insert(SystemArch::Aarch64Linux);
-        let selector_sys = CacheSelector {
+        let selector_sys = CacheSelector::filtered(FilterPredicates {
             systems: sys_filter,
             patterns: vec!["*lib*".to_string()],
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
         let res_sys = evaluate_cache_purge(&entries, &HashMap::new(), &selector_sys);
         assert_eq!(res_sys.purged_hashes, vec![hash_old.clone()]);
     }
@@ -1215,11 +1213,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         // Purge dep_x86 with Exact mode
         let mut hashes = HashSet::new();
         hashes.insert(dep_x86.clone());
-        let selector = CacheSelector {
+        let selector = CacheSelector::filtered(FilterPredicates {
             store_hashes: hashes,
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_cascade(CascadeMode::Exact);
 
         let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         // root_x86 should be pruned because its dependency dep_x86 was purged!
@@ -1299,12 +1297,12 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
         // When protect_gc_roots is true, root_app and shared_dep must be protected even if older_than / patterns match
         let cutoff = Utc::now() - Duration::days(30);
-        let selector = CacheSelector {
+        let selector = CacheSelector::filtered(FilterPredicates {
             time_filter: Some(TimeFilter::Before(cutoff)),
-            protect_gc_roots: true,
-            cascade_mode: CascadeMode::Exact,
             ..Default::default()
-        };
+        })
+        .with_protect_gc_roots(true)
+        .with_cascade(CascadeMode::Exact);
 
         let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
         assert_eq!(result.purged_hashes, vec![orphan_old]);
@@ -1315,6 +1313,57 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             result.updated_gc_roots.get(&SystemArch::X86_64Linux),
             Some(&vec![root_app])
         );
+    }
+
+    #[test]
+    fn test_selector_predicates_and_describe() {
+        let mut hashes = HashSet::new();
+        let hash = StoreHash::new_unchecked("0000000000000000000000000000pkg1");
+        hashes.insert(hash);
+
+        let mut systems = HashSet::new();
+        systems.insert(SystemArch::X86_64Linux);
+
+        let predicates = FilterPredicates {
+            store_hashes: hashes,
+            patterns: vec!["*foo*".to_string()],
+            systems: systems.clone(),
+            time_filter: Some(TimeFilter::Before(
+                DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )),
+            size_filter: Some(SizeFilter::MinBytes(1024)),
+            origin_jobs: HashSet::from(["job-ci".to_string()]),
+            origin_runs: HashSet::from([9999]),
+        };
+
+        assert!(!predicates.is_empty());
+        assert!(predicates.has_item_filters());
+
+        let selector = CacheSelector::filtered(predicates)
+            .with_cascade(CascadeMode::Dependents)
+            .with_protect_gc_roots(true);
+
+        assert!(matches!(selector.scope, SelectionScope::Filtered(_)));
+
+        let desc = selector.describe();
+        assert!(desc.contains("hashes=[1 items]"));
+        assert!(desc.contains("patterns=[*foo*]"));
+        assert!(desc.contains("systems=[x86_64-linux]"));
+        assert!(desc.contains("min_size=1024B"));
+        assert!(desc.contains("protect_gc_roots=true"));
+        assert!(desc.contains("cascade=dependents"));
+
+        let all_sel = CacheSelector::all(systems);
+        assert!(matches!(all_sel.scope, SelectionScope::All { .. }));
+        let all_desc = all_sel.describe();
+        assert!(all_desc.contains("all=true"));
+        assert!(all_desc.contains("systems=[x86_64-linux]"));
+
+        let none_sel = CacheSelector::none();
+        assert_eq!(none_sel.scope, SelectionScope::None);
+        assert_eq!(none_sel.describe(), "none=true");
     }
 
     #[test]
