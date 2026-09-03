@@ -64,6 +64,7 @@ thiserror = "2.0"
 web-time = "1.1"
 
 # Testing
+wasm-bindgen-test = "0.3"
 wiremock = "0.6"
 
 [profile.test]

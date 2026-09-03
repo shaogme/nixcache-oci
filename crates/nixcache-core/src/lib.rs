@@ -504,7 +504,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(partitioned.get(&838).unwrap().len(), 1);
 
         // BloomFilterManifest
-        let bf_manifest = BloomFilterManifest::new(100, 1024, 7, "sha256:bloom_blob", 120);
+        let bf_manifest = BloomFilterManifest::new(100u64, 1024, 7, "sha256:bloom_blob", 120);
         let bf_json = serde_json::to_string(&bf_manifest).unwrap();
         let loaded_bf: BloomFilterManifest = serde_json::from_str(&bf_json).unwrap();
         assert_eq!(loaded_bf.num_entries, 100);

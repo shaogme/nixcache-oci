@@ -47,7 +47,7 @@ impl IndexCodec {
     /// 严格通过 Zstd 解压并反序列化布隆过滤器
     pub fn decode_bloom_filter(
         raw_bytes: &[u8],
-        num_entries: usize,
+        num_entries: u64,
         num_hashes: u8,
     ) -> Result<FastBlockedBloomFilter, OciError> {
         let uncompressed = ZstdCodec::decompress(raw_bytes)?;
@@ -129,7 +129,7 @@ mod tests {
             .expect("Bloom filter encode should succeed");
         assert!(IndexCodec::is_valid_zstd_magic(&encoded));
 
-        let decoded = IndexCodec::decode_bloom_filter(&encoded, 100, filter.num_hashes())
+        let decoded = IndexCodec::decode_bloom_filter(&encoded, 100u64, filter.num_hashes())
             .expect("Bloom filter decode should succeed");
         assert!(decoded.contains(&hash1));
         assert!(decoded.contains(&hash2));

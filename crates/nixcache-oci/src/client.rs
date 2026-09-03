@@ -790,7 +790,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     pub async fn get_bloom_filter(
         &self,
         bloom_blob_digest: &str,
-        num_entries: usize,
+        num_entries: u64,
         num_hashes: u8,
     ) -> Result<FastBlockedBloomFilter, OciError> {
         let raw_bytes = self.get_blob(bloom_blob_digest).await?;

@@ -646,7 +646,7 @@ impl ShardDescriptor {
 /// 全局紧凑布隆过滤器元数据容器
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BloomFilterManifest {
-    pub num_entries: usize,
+    pub num_entries: u64,
     pub num_bits: u64,
     pub num_hashes: u8,
     pub blob_digest: String,
@@ -665,7 +665,7 @@ impl BloomFilterManifest {
     }
 
     pub fn new(
-        num_entries: usize,
+        num_entries: u64,
         num_bits: u64,
         num_hashes: u8,
         blob_digest: impl Into<String>,

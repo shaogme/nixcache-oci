@@ -51,7 +51,7 @@ pub struct KVCacheWrapper<T> {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BloomFilterKvWrapper {
-    pub num_entries: usize,
+    pub num_entries: u64,
     pub num_hashes: u8,
     pub bytes_base64: String,
     pub last_refresh: f64,
@@ -656,7 +656,7 @@ impl CacheStore {
                         )),
                     );
                     Arc::new(FastBlockedBloomFilter::new_with_defaults(
-                        root_data.bloom_filter.num_entries,
+                        root_data.bloom_filter.num_entries as usize,
                     ))
                 }
             }
