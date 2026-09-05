@@ -39,10 +39,9 @@
 | **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 严禁 PATCH，无 416 风险；原生支持 Tag 与 Package 物理删除 |
 | **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **Hub 专有 REST API** (`DockerHubRestApi`) | 自动规范化域名为 `registry-1.docker.io` |
 | **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **AWS ECR API** (`AwsEcrApi`) | 原生适配 AWS ECR 端点与 BatchDeleteImage |
-| **GCP GAR** (`gcp_artifact_registry`)| `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
+| **GCP GAR** (`gcp_artifact_registry`) | `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
 | **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Azure 容器注册表 |
 | **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 严格遵循 OCI Distribution Spec，支持 Manifest 与 Blob 物理删除 |
-
 
 ## 快速开始
 
@@ -57,6 +56,7 @@
 支持任意多架构（如 `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` 等）并发编译，各节点无锁并发上传 NAR Blobs 并生成 Build Receipt，最后由 Coordinator 单节点原子合并全局索引发布：
 
 在你的仓库中创建 `.github/workflows/publish-cache.yml`：
+
 ```yaml
 name: Build & Publish Multi-Arch Cache
 
@@ -126,6 +126,7 @@ jobs:
 在单节点上直接完成编译、NAR 上传与索引发布：
 
 - **Flake 模式：**
+
   ```yaml
   name: Publish Cache
   on:
@@ -156,6 +157,7 @@ jobs:
   ```
 
 - **非 Flake 模式：**
+
   ```yaml
   name: Publish Cache
   on:
@@ -234,6 +236,7 @@ jobs:
 ##### 4. 自定义 OCI 注册表配置（支持 Docker Hub / AWS ECR / Harbor 等）
 
 所有 Action 均支持通过 `registry`、`repo` 以及 `registry-kind` 接入任意符合 OCI 规范的镜像仓库：
+
 ```yaml
       - name: Build & Push to Custom Harbor Registry
         uses: shaogme/nixcache-oci/build@main
@@ -267,7 +270,6 @@ jobs:
 - **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收。
 - **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
 
-
 你可以通过官方 `list` Action 或直接触发 `List & Inspect Build Cache` 交互式工作流，实时查询、过滤并审查远程 OCI 镜像仓库中的构建缓存状态：
 
 ```yaml
@@ -296,9 +298,10 @@ jobs:
           version: ''      # 可选，显式指定版本/commit/tag（留空则自动读取 .nixcache-version 或回退 action 版本）
 ```
 
-###### `install` Action 参数说明：
+###### `install` Action 参数说明
+
 | 参数名 | 类型 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `source` | string | `binary` | 安装方式：`binary`（推荐，免编译预编译包）或 `source`（从源码编译） |
 | `force` | string / boolean | `false` | 若为 `true`，即使环境中已存在 `nixcache-builder` 和 `nixcache-proxy` 也强制重新安装并覆盖 |
 | `version` | string | （自动探测） | 指定要安装的版本/Git Commit SHA/Tag（默认读取 `.nixcache-version` 或回退 Action 自身版本） |
@@ -306,7 +309,7 @@ jobs:
 ##### 8. 版本控制与配置
 
 - **版本控制（可选）**：如果你想锁定并使用特定版本的 `nixcache-oci` 工具，只需在你仓库根目录下创建一个 `.nixcache-version` 文件，在其中写入要锁定的 commit hash 或 tag（例如 `842ad0d1952768890c96edf77f7c8b9d104e5969`）。如果该文件不存在，Action 会默认回退使用 Action 自身的 Ref 或最新 `main` 实现。
-  * **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
+  - **自动升级**：如果你希望工具能够保持最新，同时又能显式锁定和审计版本，我们提供了一个自动更新 `.nixcache-version` 文件的 Action 示例。你可以将 [update-nixcache-version.yml](examples/update-nixcache-version.yml) 放入你的项目仓库工作流中，以实现每天自动检测最新 commit 并提交。
 
 - 参见下文的[签名配置](#签名配置)生成并配置 `NIX_SIGNING_KEY` 密钥。
 
@@ -322,6 +325,7 @@ jobs:
 > 设置 `require-sigs = false` 和 `requireSignatures = false` 会全局禁用**所有**替代器（substituters）的签名校验，而不仅仅是针对该缓存。这意味着来自 `cache.nixos.org` 和其他公共缓存的包也将不经验证就被接受。这在个人使用或测试环境中是可以接受的，但在多用户或生产系统中，请务必设置正确的签名。
 
 **NixOS 模块配置：**
+
 ```nix
 services.nixcache-proxy = {
   enable = true;
@@ -331,6 +335,7 @@ services.nixcache-proxy = {
 ```
 
 **手动修改 `nix.conf`：**
+
 ```ini
 extra-substituters = http://localhost:37515
 extra-trusted-substituters = http://localhost:37515
@@ -340,11 +345,13 @@ require-sigs = false
 #### 方案 B —— 有签名（推荐）
 
 **步骤 1 — 生成密钥对**（在一台安全的机器上运行一次即可）：
+
 ```bash
 nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
 ```
 
 运行后将生成两个文件：
+
 - `secret.key` — 私钥（请务必妥善保管，切勿泄露）
 - `public.key` — 公钥，内容格式类似于 `my-cache-1:BASE64...=`（提供给客户端）
 
@@ -353,13 +360,15 @@ nix-store --generate-binary-cache-key my-cache-1 secret.key public.key
 进入你的 GitHub 仓库的 **Settings > Secrets and variables > Actions**，新建一个名为 `NIX_SIGNING_KEY` 的 Secret，并将 `secret.key` 文件中的内容粘贴进去。
 
 **步骤 3 — 将公钥提供给客户端。** 打开 `public.key` 复制里面的字符串，类似于：
-```
+
+``` txt
 my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 ```
 
 客户端需要使用此公钥来校验包的完整性。有以下三种配置方式：
 
 **NixOS 模块配置：**
+
 ```nix
 services.nixcache-proxy = {
   enable = true;
@@ -369,6 +378,7 @@ services.nixcache-proxy = {
 ```
 
 **手动修改 `nix.conf`：**
+
 ```ini
 extra-substituters = http://localhost:37515
 extra-trusted-substituters = http://localhost:37515
@@ -381,13 +391,16 @@ extra-trusted-public-keys = my-cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 ### 客户端消费（使用缓存）
 
-#### 方法一 —— 手动运行本地代理：
+#### 方法一 —— 手动运行本地代理
+
 ```bash
 nix run github:shaogme/nixcache-oci#cache-proxy -- --repo my-org/my-cache &
 ```
+
 然后配置 Nix 客户端（详见上面的[签名配置](#签名配置)）。
 
-#### 方法二 —— NixOS 模块（常驻系统服务，推荐）：
+#### 方法二 —— NixOS 模块（常驻系统服务，推荐）
+
 ```nix
 {
   inputs.nixcache.url = "github:shaogme/nixcache-oci";
@@ -413,27 +426,29 @@ nix run github:shaogme/nixcache-oci#cache-proxy -- --repo my-org/my-cache &
 
 这会将本地代理以 `systemd` 服务形式启动，并自动配置 Nix 的替代器（substituters）和可信公钥。
 
-##### NixOS 模块可配置参数：
+##### NixOS 模块可配置参数
 
 | 参数项 | 类型 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `services.nixcache-proxy.enable` | boolean | `false` | 是否启用 nixcache-proxy 本地代理服务 |
 | `services.nixcache-proxy.package` | package | 源码构建的 `cache-proxy` 包 | 要使用的 nixcache-proxy 软件包 |
 | `services.nixcache-proxy.repo` | string | `"shaogme/nixcache-oci"` | 托管 OCI 二进制缓存的 GitHub 仓库名称 |
 | `services.nixcache-proxy.port` | port | `37515` | 本地代理服务监听的端口 |
-| `services.nixcache-proxy.listenAddress`| string | `"127.0.0.1"` | 本地代理服务绑定的 IP 地址（若为其他机器服务可设为 `"0.0.0.0"`） |
+| `services.nixcache-proxy.listenAddress` | string | `"127.0.0.1"` | 本地代理服务绑定的 IP 地址（若为其他机器服务可设为 `"0.0.0.0"`） |
 | `services.nixcache-proxy.publicKey` | string | `""` | 校验包签名所用的 Base64 公钥，留空代表不校验（此时需将 `requireSignatures` 设为 `false`） |
-| `services.nixcache-proxy.requireSignatures`| boolean | `true` | 是否强制校验缓存包的签名 |
+| `services.nixcache-proxy.requireSignatures` | boolean | `true` | 是否强制校验缓存包的签名 |
 
+#### 方法三 —— 非 Flake 方式（直接构建，推荐在传统 Nix 环境下使用）
 
-#### 方法三 —— 非 Flake 方式（直接构建，推荐在传统 Nix 环境下使用）：
 如果你没有启用 Flake，可以直接使用 `default.nix` 构建并运行本地代理：
+
 ```bash
 nix-build -A cache-proxy
 ./result/bin/nixcache-proxy --repo my-org/my-cache &
 ```
 
 此外，`default.nix` 已经对齐了 Flake 的输出结构，在非 Flake 环境下也可以直接导入并使用 NixOS 模块：
+
 ```nix
 # 在传统 Nix/NixOS 配置中导入
 let
@@ -447,13 +462,14 @@ in {
 }
 ```
 
-#### 方法四 —— Cloudflare Workers 无服务器代理（Serverless，极力推荐）：
+#### 方法四 —— Cloudflare Workers 无服务器代理（Serverless，极力推荐）
 
 如果您不想在每台客户端机器上都运行本地 `nixcache-proxy` 代理进程，您可以将代理以 WebAssembly 的形式一键部署在 Cloudflare Workers 上，使用 Cloudflare 全球边缘网络进行极速响应和流式分发。
 
 具体配置与部署流程详见子项目：[nixcache-worker README](crates/nixcache-worker/README.md)。
 
 部署完成后，您只需直接将 Worker 提供的 HTTPS 链接填入 Nix 的 `substituters` 列表中即可，无需本地运行任何常驻服务：
+
 ```nix
 nix.settings.substituters = [
   "https://nixcache-worker.<your-subdomain>.workers.dev"
@@ -466,12 +482,14 @@ nix.settings.substituters = [
 
 在不同场景下，只需在原包名后加上 `-bin` 后缀即可使用：
 
-* **命令行即时运行**：
+- **命令行即时运行**：
+
   ```bash
   nix run github:shaogme/nixcache-oci#cache-proxy-bin -- --repo my-org/my-cache &
   ```
 
-* **NixOS 模块引用**：
+- **NixOS 模块引用**：
+
   ```nix
   services.nixcache-proxy = {
     enable = true;
@@ -481,7 +499,8 @@ nix.settings.substituters = [
   };
   ```
 
-* **非 Flake 方式（直接构建）**：
+- **非 Flake 方式（直接构建）**：
+
   ```bash
   nix-build -A cache-proxy-bin
   ./result/bin/nixcache-proxy --repo my-org/my-cache &
@@ -490,16 +509,18 @@ nix.settings.substituters = [
 ### 开发与依赖更新
 
 本项目使用 `npins` 管理 Nix 依赖。如果你需要更新 `nixpkgs` 或其他依赖，请在项目根目录下运行：
+
 ```bash
 npins update
 ```
+
 该命令会自动更新 `npins/sources.json` 锁定文件。请在更新后提交该文件的修改。
 
 更多关于依赖管理、代码引用覆盖与测试规范的深度文档请查阅：
+
 - [npins CLI 命令行操作指南](docs/npins/cli.md)：添加、更新、锁定与通道切换规范。
 - [npins 产物使用与覆盖指南](docs/npins/usage.md)：在 Nix 代码中正确引用外部源及调试覆盖方法。
 - [项目测试与质量规范指南](docs/npins/testing.md)：静态检查、VM 虚拟机测试编写与验证规范。
-
 
 ## 配置参数说明
 
@@ -511,7 +532,7 @@ npins update
 ### 代理服务 (nixcache-proxy) 配置
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--repo <REPO>` | `NIXCACHE_REPO` | （无） | OCI 仓库名称 (例如: `shaogme/nixcache-oci`) |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
@@ -534,6 +555,7 @@ npins update
 `nixcache-builder` 采用清晰的职责拆分子命令设计，且预编译产物与 Nix 包中均内嵌了同版本的 `nixcache-proxy` 守护进程，使会话初始化与代理拉起开箱即用：
 
 #### 1. `session` (流水线会话全生命周期与级联协调)
+
 支持 GitHub Actions 工作流在不同 Job 阶段进行透明级联缓存与原子 CAS 上传：
 
 - **`session init`**：启动本地 `nixcache-proxy` 代理后台守护进程，配置 Nix 客户端 substituters（安全注入 `NIX_CONFIG`），并记录基线 Store 快照。
@@ -551,9 +573,10 @@ nixcache-builder session capture --run-id 123456 --job-id "build-x86"
 nixcache-builder session clean
 ```
 
-##### `session init` 参数：
+##### `session init` 参数
+
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
@@ -565,13 +588,14 @@ nixcache-builder session clean
 | `--session-ttl <TTL>` | `NIXCACHE_SESSION_TTL` | `10` | 会话索引刷新周期（秒） |
 | `--baseline-ttl <TTL>` | `NIXCACHE_BASELINE_TTL` | `300` | 基线索引刷新周期（秒） |
 | `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线 OCI Tag |
-| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--signing-key-file <FILE>` | `NIXCACHE_SIGNING_KEY_FILE` | （无） | 签名私钥文件路径 |
 | `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 记录构建前 Store 路径快照的文件路径 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-##### `session capture` 参数：
+##### `session capture` 参数
+
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
@@ -582,7 +606,7 @@ nixcache-builder session clean
 | `--targets <EXPR>` | `NIXCACHE_TARGETS` | （无） | 显式 Flake 目标表达式（如 `.#my-app` 或 `.#pkg1 .#pkg2`） |
 | `--capture-mode <MODE>` | `NIXCACHE_CAPTURE_MODE` | `runtime-closure` | 捕获模式：`runtime-closure`(默认)、`build-closure`、`roots-only`、`diff-all` |
 | `--strict-closure` / `--no-strict-closure` | `NIXCACHE_STRICT_CLOSURE` | `true` | 严格模式（默认开启，无产物时报错退出；关闭时回退为全量 diff 模式） |
-| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--signing-key-file <FILE>` | `NIXCACHE_SIGNING_KEY_FILE` | （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（可选） |
 | `--proxy-url <URL>` | `NIXCACHE_PROXY_URL` | `http://127.0.0.1:37515` | 本地 Proxy 代理地址（用于热注册新产物） |
 | `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 构建前 Store 路径快照文件路径（用于自动 diff） |
@@ -590,13 +614,16 @@ nixcache-builder session clean
 | `[PATHS...]` | - | （无） | 显式指定要捕获的 Store 路径（位置参数，可选） |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-##### `session clean` 参数：
+##### `session clean` 参数
+
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 要删除的 Store 路径快照文件路径 |
 
 #### 2. `build` (Matrix Worker 节点构建)
+
 构建指定平台的 Nix 产物、并发推送 NAR Blobs 到 GHCR，并生成本地轻量构建收据（Build Receipt）：
+
 ```bash
 nixcache-builder build \
   --system x86_64-linux \
@@ -609,7 +636,7 @@ nixcache-builder build \
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台架构（如 `x86_64-linux`, `aarch64-linux`） |
 | `--mode <MODE>` | `NIXCACHE_MODE` | `flake` | 构建模式，可选: `flake` 或 `non-flake` |
 | `--flake-path <PATH>` | `NIXCACHE_FLAKE_PATH` | `.` | 含有 `flake.nix` 的目录路径 |
@@ -619,14 +646,16 @@ nixcache-builder build \
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
-| `--signing-key-file <FILE>`| `NIXCACHE_SIGNING_KEY_FILE`| （无） | 签名私钥文件路径 |
+| `--signing-key-file <FILE>` | `NIXCACHE_SIGNING_KEY_FILE` | （无） | 签名私钥文件路径 |
 | `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | `receipt-<system>.json` | 生成的收据 JSON 文件路径 |
 | `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇到 Proxy 或构建/导出异常立即报错退出） |
 | `--export-concurrency <NUM>` | `NIXCACHE_EXPORT_CONCURRENCY` | 自适应 (`num_cpus.clamp(2, 8)`) | 并行导出与上传的最大并发 Worker 数 |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 3. `promote` (Coordinator 汇聚与晋升发布节点专用)
+
 收集所有 Matrix 节点的 Build Receipts 或工作流会话（`run-<run_id>`），原子晋升合并全局索引清单并发布到 GHCR：
+
 ```bash
 # 方式 A：通过 Receipts 目录合并发布
 nixcache-builder promote \
@@ -642,7 +671,7 @@ nixcache-builder promote \
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | 要晋升的 GitHub Actions Workflow Run ID |
 | `--receipts-dir <DIR>` | `NIXCACHE_RECEIPTS_DIR` | （无） | 存放 BuildReceipt JSON 文件的目录 |
 | `--receipt <FILE...>` | - | （无） | 单独指定的 BuildReceipt JSON 文件路径（可多次指定） |
@@ -655,7 +684,9 @@ nixcache-builder promote \
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 4. `gc` (跨平台垃圾回收阶段)
+
 聚合保留所有平台的活性根（GC Roots），底层统一复用 `purge` 引擎并启用 GC Roots 闭包保护，清理失效孤立包：
+
 ```bash
 nixcache-builder gc \
   --repo owner/repo \
@@ -665,8 +696,8 @@ nixcache-builder gc \
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
-| `--retention-days <DAYS>`| `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
+| --- | --- | --- | --- |
+| `--retention-days <DAYS>` | `NIXCACHE_RETENTION_DAYS` | `30` | 垃圾回收所保留的缓存包天数 |
 | `--delete-blobs` | `NIXCACHE_DELETE_BLOBS` | `false` | 请求物理删除 OCI Blobs（在支持的后端如 Generic OCI 执行；在 GHCR 上 Blob 随版本回收） |
 | `--strict` / `--no-strict` | `NIXCACHE_STRICT` | `true` | 严格错误模式（遇权限不足或远程异常立即报错退出） |
 | `--dry-run` | - | `false` | 垃圾回收试运行（仅输出，不执行实际删除） |
@@ -676,7 +707,9 @@ nixcache-builder gc \
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 5. `purge` (构建缓存主动清理与失效)
+
 多维精准定位或彻底清空生产基线索引，支持双向依赖级联失效、GC Roots 保护模式与同步重构：
+
 ```bash
 nixcache-builder purge \
   --patterns "*chromium*" \
@@ -686,7 +719,7 @@ nixcache-builder purge \
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--all` | `NIXCACHE_PURGE_ALL` | `false` | **彻底清空/重置**：GHCR 下通过 REST API 直接删除整个 Package；Generic OCI 下重置生产基线索引 |
 | `--hashes <HASHES>` | `NIXCACHE_PURGE_HASHES` | （无） | 指定要清理的 Store Hash（逗号或空格分隔） |
 | `--patterns <PATTERN...>` | `NIXCACHE_PURGE_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
@@ -708,7 +741,9 @@ nixcache-builder purge \
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 #### 6. `list` (构建缓存多维查询、列表与统计)
+
 多维查询、过滤并分析远程 OCI 镜像仓库中的构建缓存，支持终端 ASCII 表格、JSON、NDJSON、纯路径输出与 GitHub Step Summary 报表渲染：
+
 ```bash
 # 列出生产基线全部缓存并打印终端美化表格
 nixcache-builder list --all
@@ -727,7 +762,7 @@ nixcache-builder list \
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--all` | `NIXCACHE_FILTER_ALL` | `false` | 全量匹配所有缓存条目 |
 | `--hashes <HASHES>` | `NIXCACHE_FILTER_HASHES` | （无） | 指定要查询的 Store Hash（逗号或空格分隔） |
 | `--patterns <PATTERN...>` | `NIXCACHE_FILTER_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
@@ -773,15 +808,17 @@ nixcache-builder list \
 `nixcache-proxy` 与 `nixcache-worker` 完整实现了 Nix 标准二进制缓存协议，并提供了丰富的运维与热注册管理端点：
 
 #### 1. Nix 标准协议端点
+
 | 端点路径 | HTTP 方法 | Content-Type | 描述 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `/nix-cache-info` | GET | `text/x-nix-cache-info` | Nix 替代器握手端点（返回 StoreDir、WantMassQuery、Priority 等元数据） |
 | `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持 Tier 0~3 级联与上游透明回退） |
 | `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/zstd` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
 
 #### 2. 代理管理与运维端点
+
 | 端点路径 | HTTP 方法 | 描述 |
-|---|---|---|
+| --- | --- | --- |
 | `/_status` | GET | 查看远端连接状态 (`remote_connected`)、各 Tier 索引条目统计、配置和上游缓存状态 |
 | `/_refresh` | POST | 强制立即刷新索引（无需等待 TTL 过期） |
 | `/_session/register` | POST | 动态注册当前会话构建产物热条目（实现 CI 步骤间 0ms 极速热穿透） |
@@ -800,7 +837,7 @@ curl -X POST http://localhost:37515/_refresh
 `/_status` 是健康检查与运行状态探测的核心端点，在 `nixcache-proxy`（本地代理）与 `nixcache-worker`（Cloudflare Worker）上保持统一的 JSON 结构规范：
 
 | 字段名 | 类型 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `remote_connected` | `boolean` | **远程连接指示**：`true` 表示与远程 OCI Registry（如 GHCR）通信、认证及清单拉取成功；`false` 表示远程通信异常。 |
 | `remote_error` | `string \| null` | **错误诊断信息**：当 `remote_connected` 为 `false` 时提供具体的错误原因（如网络超时、503 服务不可用、401 鉴权失败等）；正常时省略。 |
 | `registry` | `string` | 当前代理所绑定的 OCI 注册表地址（如 `ghcr.io` 或 `127.0.0.1:5001`）。 |
@@ -820,6 +857,7 @@ curl -X POST http://localhost:37515/_refresh
 ##### 典型响应示例
 
 - **场景 1：正常运行与 4 级级联就绪**
+
   ```json
   {
     "remote_connected": true,
@@ -843,6 +881,7 @@ curl -X POST http://localhost:37515/_refresh
   ```
 
 - **场景 2：远程 Registry 故障/离线（安全降级使用本地快照或上游）**
+
   ```json
   {
     "remote_connected": false,
@@ -865,6 +904,7 @@ curl -X POST http://localhost:37515/_refresh
   ```
 
 - **场景 3：新仓库冷启动（尚未发布任何构建索引）**
+
   ```json
   {
     "remote_connected": true,
@@ -980,10 +1020,10 @@ flowchart TD
 - **CAS（Compare-And-Swap）原子更新与指数退避**：所有 OCI 清单的更新均通过 CAS 条件写入机制进行，在并发竞争时采用抖动指数退避自动重试，确保多节点无锁并发提交时绝对不会发生数据覆盖或丢失。
 - **Coordinator 汇聚与分片局部压实（Partial Compaction）**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session Delta Patches，基于 1024 分片梅克尔差集精准计算受影响的分片（未变动分片 0 传输 0 上传，直接复用原 digest 与 merkle_hash），局部压实并上传变动分片，生成新 Merkle Root 与全局布隆过滤器，原子发布全局分片根索引 `cache-index`（Schema v5），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
 
-
 ### 输出自动发现机制
 
 GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的下列输出：
+
 - `packages.<system>.<name>` -- 该运行器架构下的所有软件包。
 - `nixosConfigurations.<hostname>` -- 构建每个主机的 `config.system.build.toplevel`。
 - `devShells.<system>.<name>` -- 所有的开发环境 Shell。
@@ -1061,8 +1101,8 @@ flowchart TB
 
 开发者与贡献者可以在本地极速运行各层测试：
 
-
 #### Rust 单元测试与形式化并发检验
+
 ```bash
 # 运行工作区全部 100+ 单元与集成测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
 cargo test --workspace
@@ -1076,6 +1116,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 #### NixOS 模块评估与 VM 虚拟机集成测试
+
 ```bash
 # 1. 执行模块配置静态检查 (验证默认关闭、端口传递、trusted-keys 等)
 nix-build default.nix -A tests.static --no-out-link
@@ -1085,6 +1126,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 ```
 
 #### 异常注入与容错安全测试（Fault Injection & Resilience）
+
 ```bash
 # 1. 验证 OCI 多后端确定性（GHCR 两阶段 PUT 零 416、Docker Hub 命名空间转换与 1-RTT 直传、Generic OCI 分块断点续传）
 ./test/test-backends-determinism.sh
@@ -1129,6 +1171,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 ```
 
 #### 工作流与 Shell 脚本检查
+
 ```bash
 nix-shell -p shellcheck actionlint --run "shellcheck test/*.sh install/*.sh && actionlint"
 ```
