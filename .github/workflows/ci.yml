@@ -213,9 +213,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Wrangler
-        run: npm install -g wrangler
-
       - name: Install worker-build
         run: |
           if ! command -v worker-build &>/dev/null; then
@@ -224,35 +221,35 @@ jobs:
 
       - name: Configure wrangler.toml
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_KV_ID: ${{ secrets.CLOUDFLARE_KV_ID }}
           NIXCACHE_REPO: ${{ vars.NIXCACHE_REPO || github.repository }}
           NIXCACHE_REGISTRY: ${{ vars.NIXCACHE_REGISTRY || 'ghcr.io' }}
           NIXCACHE_UPSTREAM: ${{ vars.NIXCACHE_UPSTREAM || 'https://cache.nixos.org' }}
           NIXCACHE_INDEX_TTL: ${{ vars.NIXCACHE_INDEX_TTL || '300' }}
         run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Missing required secret: CLOUDFLARE_API_TOKEN is not set."
+            exit 1
+          fi
           if [ -z "$CLOUDFLARE_KV_ID" ]; then
-            echo "::warning::CLOUDFLARE_KV_ID secret is not set, using placeholder."
+            echo "::error::Missing required secret: CLOUDFLARE_KV_ID is not set."
+            exit 1
+          fi
+          if [ -z "$NIXCACHE_REPO" ]; then
+            echo "::error::Missing required variable: NIXCACHE_REPO is not set."
+            exit 1
           fi
           sed -e "s|YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME|${NIXCACHE_REPO}|g" \
               -e "s|nixcache_kv_placeholder|${CLOUDFLARE_KV_ID}|g" \
               crates/nixcache-worker/wrangler.toml.example > crates/nixcache-worker/wrangler.toml
 
       - name: Deploy Worker to Cloudflare
-        working-directory: crates/nixcache-worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_KV_ID: ${{ secrets.CLOUDFLARE_KV_ID }}
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "CLOUDFLARE_API_TOKEN secret is not set. Skipping Worker deployment."
-            exit 0
-          fi
-          if [ -z "$CLOUDFLARE_KV_ID" ]; then
-            echo "CLOUDFLARE_KV_ID secret is not set. Skipping Worker deployment."
-            exit 0
-          fi
-          wrangler deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: "crates/nixcache-worker"
 
   # =========================================================================
   # 阶段 2: 全套集成与端到端测试 (完全自闭环)

@@ -4,8 +4,8 @@
 set -euo pipefail
 
 if [[ -z "${TEST_WORKER_URL:-}" ]]; then
-    echo "TEST_WORKER_URL is not set. Skipping Cloudflare Worker E2E test."
-    exit 0
+    echo "::error::TEST_WORKER_URL environment variable must be set to run Cloudflare Worker E2E test."
+    exit 1
 fi
 
 # Strip trailing slash if present
