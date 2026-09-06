@@ -2,6 +2,7 @@ services:
   # Base configuration for the application
   app-base: &app-base
     image: ghcr.io/shaogme/coding-images/rust-wasm:latest
+    privileged: true
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
       - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
