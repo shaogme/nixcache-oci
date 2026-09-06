@@ -1,13 +1,6 @@
 name: CI Quality & Test Gate
 
 on:
-  push:
-    branches:
-      - '**'
-    paths-ignore:
-      - 'nix/binaries.json'
-      - '**.md'
-      - 'docs/**'
   pull_request:
     branches: [main]
     paths-ignore:
@@ -135,8 +128,9 @@ jobs:
           node-version: 22
 
       - name: Install wasm-bindgen-cli
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.127 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.127
 
       - name: Cargo Check (wasm32-unknown-unknown)
         run: cargo check --target wasm32-unknown-unknown -p nixcache-core -p nixcache-worker
