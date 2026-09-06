@@ -266,6 +266,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Run NixOS Module evalConfig Static Check
         run: nix-build default.nix -A tests.static --no-out-link
@@ -282,6 +283,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Run NixOS VM Test
         run: nix-build default.nix -A tests.vmtest --no-out-link
@@ -303,6 +305,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Pre-compiled Binaries
         uses: actions/download-artifact@main
@@ -335,6 +338,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Pre-compiled Binaries
         uses: actions/download-artifact@main
@@ -370,6 +374,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Pre-compiled Binaries
         uses: actions/download-artifact@main
@@ -412,12 +417,12 @@ jobs:
           chmod +x test/test-concurrency-merge.sh
           ./test/test-concurrency-merge.sh
 
-      - name: Run Schema v6 Session CAS & Cascading Pipeline Test
+      - name: Run Single-Writer Pipeline Receipt Test
         env:
           PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
         run: |
-          chmod +x test/test-pipeline-session-cas.sh
-          ./test/test-pipeline-session-cas.sh
+          chmod +x test/test-pipeline-receipt-single-writer.sh
+          ./test/test-pipeline-receipt-single-writer.sh
 
       - name: Run Cache Purge & Invalidation CAS Integration Test
         env:
@@ -454,6 +459,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Pre-compiled Binaries
         uses: actions/download-artifact@main

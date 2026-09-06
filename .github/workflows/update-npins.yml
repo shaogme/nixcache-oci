@@ -23,6 +23,11 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            trusted-users = root runner
+
 
       - name: Install npins CLI
         run: |

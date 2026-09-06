@@ -402,7 +402,13 @@ for m in manifests:
 ")
 
 echo ">>> Testing substitution for: $SAMPLE_STORE_PATH"
-nix-store --delete "$SAMPLE_STORE_PATH" --ignore-liveness 2>/dev/null || true
+NIX_STORE_BIN=$(command -v nix-store)
+"$NIX_STORE_BIN" --delete "$SAMPLE_STORE_PATH" --ignore-liveness 2>/dev/null || true
+if "$NIX_STORE_BIN" --query --hash "$SAMPLE_STORE_PATH" >/dev/null 2>&1; then
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        sudo "$NIX_STORE_BIN" --delete "$SAMPLE_STORE_PATH" --ignore-liveness 2>/dev/null || true
+    fi
+fi
 
 nix-store --realise "$SAMPLE_STORE_PATH" \
   --option substituters "http://127.0.0.1:37516" \

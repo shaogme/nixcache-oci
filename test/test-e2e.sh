@@ -199,7 +199,13 @@ fi
 
 # 7. Perform substitution test
 echo ">>> Deleting local store path from Nix store (if possible)..."
-nix-store --delete "$TEST_STORE_PATH" --ignore-liveness || true
+NIX_STORE_BIN=$(command -v nix-store)
+"$NIX_STORE_BIN" --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
+if "$NIX_STORE_BIN" --query --hash "$TEST_STORE_PATH" >/dev/null 2>&1; then
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        sudo "$NIX_STORE_BIN" --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
+    fi
+fi
 
 echo ">>> Realising store path from local proxy substituter..."
 nix-store --realise "$TEST_STORE_PATH" \

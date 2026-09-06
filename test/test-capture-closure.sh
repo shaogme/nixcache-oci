@@ -397,7 +397,13 @@ for _ in {1..20}; do
 done
 
 # 删除本地的 Rust 产物路径
-nix-store --delete "$RUST_APP_PATH" --ignore-liveness 2>/dev/null || true
+NIX_STORE_BIN=$(command -v nix-store)
+"$NIX_STORE_BIN" --delete "$RUST_APP_PATH" --ignore-liveness 2>/dev/null || true
+if "$NIX_STORE_BIN" --query --hash "$RUST_APP_PATH" >/dev/null 2>&1; then
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        sudo "$NIX_STORE_BIN" --delete "$RUST_APP_PATH" --ignore-liveness 2>/dev/null || true
+    fi
+fi
 
 # 从本地 nixcache-proxy 替代替换产物
 nix-store --realise "$RUST_APP_PATH" --option binary-caches "http://127.0.0.1:${PROXY_PORT}" --option require-sigs false

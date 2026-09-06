@@ -88,6 +88,39 @@ find_binaries() {
 
 find_binaries
 
+delete_store_path() {
+    local target_path="$1"
+    local nix_store_bin
+    nix_store_bin=$(command -v nix-store)
+
+    # 1. 尝试以当前用户权限删除
+    "$nix_store_bin" --delete "$target_path" --ignore-liveness 2>/dev/null || true
+
+    # 2. 如果仍存在且具备 sudo 权限，以 root 身份强制删除（应对 multi-user nix-daemon 环境）
+    if "$nix_store_bin" --query --hash "$target_path" >/dev/null 2>&1; then
+        if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+            sudo "$nix_store_bin" --delete "$target_path" --ignore-liveness 2>/dev/null || true
+        fi
+    fi
+
+    # 3. 如果依然有效，先执行 GC 回收（清理临时根）再强制删除
+    if "$nix_store_bin" --query --hash "$target_path" >/dev/null 2>&1; then
+        if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+            sudo nix-collect-garbage 2>/dev/null || true
+            sudo "$nix_store_bin" --delete "$target_path" --ignore-liveness 2>/dev/null || true
+        else
+            nix-collect-garbage 2>/dev/null || true
+            "$nix_store_bin" --delete "$target_path" --ignore-liveness 2>/dev/null || true
+        fi
+    fi
+
+    # 4. 严格断言：确保路径已被移出本地 store 数据库
+    if "$nix_store_bin" --query --hash "$target_path" >/dev/null 2>&1; then
+        echo "!!! CRITICAL: Failed to evict $target_path from local Nix store before test!"
+        exit 1
+    fi
+}
+
 # 4. Build a test package and publish to mock registry
 echo ">>> Building package with legitimate signature..."
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
@@ -129,7 +162,7 @@ done
 
 # 6. Test Security Scenario 1: Untrusted Public Key (Signature verification must fail)
 echo ">>> Security Test 1: Verifying that Nix rejects substitution when signed by untrusted key..."
-nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
+delete_store_path "$TEST_STORE_PATH"
 
 if nix-store --realise "$TEST_STORE_PATH" \
     --max-jobs 0 \
@@ -151,7 +184,7 @@ for blob_file in /tmp/nixcache-test-registry/docker/registry/v2/blobs/sha256/*/*
     fi
 done
 
-nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
+delete_store_path "$TEST_STORE_PATH"
 
 if nix-store --realise "$TEST_STORE_PATH" \
     --max-jobs 0 \
@@ -191,7 +224,7 @@ rm -f "$RECEIPT_FILE"
 PROXY_PID=$!
 sleep 1
 
-nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
+delete_store_path "$TEST_STORE_PATH"
 
 nix-store --realise "$TEST_STORE_PATH" \
     --max-jobs 0 \

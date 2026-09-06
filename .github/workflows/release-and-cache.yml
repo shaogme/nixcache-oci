@@ -253,6 +253,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Newly Built Binaries
         uses: actions/download-artifact@main
@@ -310,6 +311,7 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            trusted-users = root runner
 
       - name: Download Linux x86_64 Binaries
         uses: actions/download-artifact@main
