@@ -114,17 +114,33 @@ echo ">>> Triggering Worker cache index refresh..."
 REFRESH_RESP=$(curl -fs -X POST "$TEST_WORKER_URL/_refresh")
 echo "Worker refresh response: $REFRESH_RESP"
 
+EXPECTED_DIGEST=$(echo "$REFRESH_RESP" | python3 -c "import sys, json; print(json.load(sys.stdin).get('manifest_digest', ''))")
+echo ">>> Expected manifest digest: $EXPECTED_DIGEST"
+
+if [[ -n "$EXPECTED_DIGEST" ]]; then
+    echo ">>> Polling Worker /_status until manifest_digest matches expected digest..."
+    for i in {1..20}; do
+        CURRENT_DIGEST=$(curl -fsSL "$TEST_WORKER_URL/_status" 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('manifest_digest', ''))" 2>/dev/null || true)
+        if [[ "$CURRENT_DIGEST" == "$EXPECTED_DIGEST" ]]; then
+            echo ">>> Worker status converged to expected manifest digest ($CURRENT_DIGEST) at attempt $i."
+            break
+        fi
+        echo ">>> Stale manifest digest ($CURRENT_DIGEST), retrying in 3 seconds ($i/20)..."
+        sleep 3
+    done
+fi
+
 # 6. Verify Narinfo resolves on Worker (deterministic resolution without custom bypass headers)
 echo ">>> Verifying .narinfo endpoint on Worker..."
 NARINFO_CONTENT=""
-for i in {1..5}; do
+for i in {1..20}; do
     if NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
         echo ">>> Retrieved narinfo:"
         echo "$NARINFO_CONTENT"
         break
     fi
-    echo ">>> Stale or 404 response, retrying in 2 seconds ($i/5)..."
-    sleep 2
+    echo ">>> Stale or 404 response, retrying in 3 seconds ($i/20)..."
+    sleep 3
 done
 
 if [[ -z "${NARINFO_CONTENT:-}" ]]; then
