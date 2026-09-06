@@ -42,6 +42,7 @@ cleanup() {
     pkill -9 -f "nixcache-proxy" 2>/dev/null || true
     podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
     rm -rf /tmp/nixcache-test-registry "$TMP_DIR"
+    rm -f test-secret.key test-public.key
     echo ">>> 清理完成。"
 }
 trap cleanup EXIT
@@ -76,6 +77,16 @@ find_binaries() {
 find_binaries
 PROXY_DIR="$(cd "$(dirname "$PROXY_BIN")" && pwd)"
 export PATH="$PROXY_DIR:$PATH"
+
+# 生成签名公私钥对
+echo ">>> Generating signing key pair..."
+KEY_SECRET="$TMP_DIR/test-secret.key"
+KEY_PUBLIC="$TMP_DIR/test-public.key"
+rm -f "$KEY_SECRET" "$KEY_PUBLIC" test-secret.key test-public.key
+nix-store --generate-binary-cache-key test-key-1 "$KEY_SECRET" "$KEY_PUBLIC"
+cp "$KEY_SECRET" test-secret.key
+cp "$KEY_PUBLIC" test-public.key
+export NIXCACHE_SIGNING_KEY_FILE="$KEY_SECRET"
 
 export NIXCACHE_REPO="testorg/closure-app"
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
@@ -406,7 +417,10 @@ if "$NIX_STORE_BIN" --query --hash "$RUST_APP_PATH" >/dev/null 2>&1; then
 fi
 
 # 从本地 nixcache-proxy 替代替换产物
-nix-store --realise "$RUST_APP_PATH" --option binary-caches "http://127.0.0.1:${PROXY_PORT}" --option require-sigs false
+nix-store --realise "$RUST_APP_PATH" \
+    --option binary-caches "http://127.0.0.1:${PROXY_PORT}" \
+    --option trusted-public-keys "$(cat "$KEY_PUBLIC")" \
+    --option require-sigs true
 
 # 执行替换下载后的二进制程序
 RUST_OUTPUT=$("$RUST_APP_PATH/bin/demo-rust-app")
