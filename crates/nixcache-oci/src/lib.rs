@@ -487,6 +487,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_converge_run_session_manifest_concurrent_mock() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+
+        let hash_1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let mut entries_1 = HashMap::new();
+        entries_1.insert(hash_1.clone(), IndexEntry::default());
+        let req1 = SessionMutationRequest::new(999, "worker-1", SystemArch::X86_64Linux)
+            .with_entries(entries_1)
+            .with_roots(vec![hash_1.clone()]);
+
+        let hash_2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
+        let mut entries_2 = HashMap::new();
+        entries_2.insert(hash_2.clone(), IndexEntry::default());
+        let req2 = SessionMutationRequest::new(999, "worker-2", SystemArch::X86_64Linux)
+            .with_entries(entries_2)
+            .with_roots(vec![hash_2.clone()]);
+
+        // 并发收敛两个 Worker
+        let (res1, res2) = tokio::join!(
+            client.converge_run_session_manifest(&req1),
+            client.converge_run_session_manifest(&req2)
+        );
+        assert!(res1.is_ok());
+        assert!(res2.is_ok());
+
+        // 验证主标签收敛包含两个条目
+        let (main_delta, _) = client
+            .get_delta_patch_manifest("run-999-x86_64-linux")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(main_delta.new_entries.len(), 2);
+        assert!(main_delta.new_entries.contains_key(&hash_1));
+        assert!(main_delta.new_entries.contains_key(&hash_2));
+
+        // 验证仅生成唯一主会话标签
+        let tags = client.list_tags().await.unwrap();
+        assert!(tags.contains(&"run-999-x86_64-linux".to_string()));
+        assert!(!tags.iter().any(|t| t.contains("-chunk-")));
+    }
+
+    #[tokio::test]
     async fn test_sharded_root_index_and_shard_data_flow_mock() {
         let transport = MockRouterTransport::default();
         let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);

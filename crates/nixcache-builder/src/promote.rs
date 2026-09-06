@@ -319,7 +319,7 @@ pub async fn run_promote(
         target_tag
     );
 
-    // 5. 清理会话标签 (包括全局会话与各架构专属会话)
+    // 5. 清理会话标签 (删除全局会话与各架构专属主标签)
     if cleanup_session && let Some(rid) = run_id {
         let main_tag = format!("run-{}", rid);
         let mut delete_tags = vec![main_tag];

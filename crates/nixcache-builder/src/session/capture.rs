@@ -190,7 +190,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
     let head_sha = env::var("GITHUB_SHA").ok();
     let ref_name = env::var("GITHUB_REF_NAME").ok();
 
-    // 8. CAS 原子提交 Session Manifest (严格仅登记 closure_res.active_gc_roots)
+    // 8. 主标签单调并集收敛写入 (集合超集写后校验自愈收敛)
     if !new_entries.is_empty() || !closure_res.active_gc_roots.is_empty() {
         let request = SessionMutationRequest::new(opts.run_id, opts.job_id, system)
             .with_entries(new_entries.clone())
@@ -200,7 +200,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
             .with_upload_stats(uploaded_count, total_bytes_uploaded)
             .with_max_retries(5);
 
-        oci.update_arch_session_with_cas(request).await?;
+        oci.converge_run_session_manifest(&request).await?;
     }
 
     // 9. 代理热注册与 BuildReceipt 写入

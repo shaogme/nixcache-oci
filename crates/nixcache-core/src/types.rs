@@ -817,6 +817,26 @@ impl DeltaPatchData {
     pub fn is_empty(&self) -> bool {
         self.new_entries.is_empty() && self.active_gc_roots.is_empty()
     }
+
+    /// 检查当前 DeltaPatchData 是否完全包含了指定的条目集 (超集校验)
+    pub fn contains_all_entries(&self, entries: &HashMap<StoreHash, IndexEntry>) -> bool {
+        entries
+            .keys()
+            .all(|hash| self.new_entries.contains_key(hash))
+    }
+
+    /// 检查当前 DeltaPatchData 是否完全包含了指定的 GC Roots (超集校验)
+    pub fn contains_all_roots(&self, roots: &[StoreHash]) -> bool {
+        roots.iter().all(|root| self.active_gc_roots.contains(root))
+    }
+
+    /// 执行两份 DeltaPatchData 的无损并集合并
+    pub fn merge_union(&mut self, other: DeltaPatchData) {
+        self.new_entries.extend(other.new_entries);
+        self.active_gc_roots.extend(other.active_gc_roots);
+        self.active_gc_roots.sort_unstable();
+        self.active_gc_roots.dedup();
+    }
 }
 
 /// 单个构建节点的统计数据

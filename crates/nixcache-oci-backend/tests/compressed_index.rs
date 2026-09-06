@@ -680,22 +680,6 @@ async fn test_update_arch_session_with_cas_zstd_roundtrip() {
         .mount(&server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
-        ))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
-        ))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&server)
-        .await;
-
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let mut entries = HashMap::new();
     let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
@@ -730,6 +714,60 @@ async fn test_update_arch_session_with_cas_zstd_roundtrip() {
         )
         .with_public_key(Some("pubkey:123".to_string()))
         .with_upload_stats(1, 1024);
+
+    let delta = req.to_delta_patch();
+    let delta_bytes = IndexCodec::encode_zstd(&delta, 3).unwrap();
+    let delta_blob_digest = compute_sha256(&delta_bytes);
+    let delta_blob_size = delta_bytes.len() as u64;
+    let manifest = build_delta_patch_manifest(
+        &delta_blob_digest,
+        delta_blob_size,
+        EMPTY_CONFIG_DIGEST,
+        EMPTY_CONFIG_SIZE,
+        delta.run_id,
+        &delta.job_id,
+        &delta.system,
+    );
+    let manifest_json = manifest.to_json_string().unwrap();
+    let manifest_digest = compute_sha256(manifest_json.as_bytes());
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(&manifest_json)
+                .insert_header("Docker-Content-Digest", manifest_digest.as_str()),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v2/test/repo/nix-cache/blobs/{}",
+            delta_blob_digest
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(delta_bytes.to_vec()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(
+            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
 
     let res = client.update_arch_session_with_cas(req).await;
     assert!(res.is_ok());

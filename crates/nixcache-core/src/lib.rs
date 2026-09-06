@@ -502,6 +502,21 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(loaded_delta.new_entries.len(), 1);
         let partitioned = loaded_delta.partition_by_shard();
         assert_eq!(partitioned.get(&838).unwrap().len(), 1);
+        assert!(loaded_delta.contains_all_entries(&delta.new_entries));
+        assert!(loaded_delta.contains_all_roots(&delta.active_gc_roots));
+
+        let mut delta2 = DeltaPatchData::new(12345, "job-build-2", SystemArch::X86_64Linux);
+        let h2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
+        delta2.new_entries.insert(h2.clone(), IndexEntry::default());
+        delta2.active_gc_roots.push(h2.clone());
+        assert!(!loaded_delta.contains_all_entries(&delta2.new_entries));
+
+        let mut merged = loaded_delta.clone();
+        merged.merge_union(delta2.clone());
+        assert_eq!(merged.new_entries.len(), 2);
+        assert_eq!(merged.active_gc_roots.len(), 2);
+        assert!(merged.contains_all_entries(&delta.new_entries));
+        assert!(merged.contains_all_entries(&delta2.new_entries));
 
         // JobSummaryMetadata
         let job_summary = JobSummaryMetadata {

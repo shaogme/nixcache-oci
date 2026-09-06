@@ -467,7 +467,7 @@ impl OciBackendDriver for AzureAcrDriver {
 pub static GENERIC_OCI_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: true,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: true,
+    supports_manifest_cas_if_match: false,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
     custom_auth_endpoint: None,

@@ -4,7 +4,7 @@ use crate::{
         RegistryDeletionStrategy, RegistryKind, detect_driver, driver_for_kind,
     },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
-    error::OciError,
+    error::{OciError, TransportError},
     manifest::{
         CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
         OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
@@ -659,6 +659,104 @@ impl<T: OciTransport + Clone> OciClient<T> {
         } else {
             Err(OciError::ManifestFetchFailed(status))
         }
+    }
+
+    /// 列出仓库的所有 Tags (标准 OCI Distribution GET /v2/<name>/tags/list 路由)
+    pub async fn list_tags(&self) -> Result<Vec<String>, OciError> {
+        let mut all_tags = Vec::new();
+        let mut last_tag: Option<String> = None;
+
+        loop {
+            let mut url = format!(
+                "{}://{}/v2/{}/nix-cache/tags/list?n=100",
+                self.url_scheme(),
+                self.registry,
+                self.repo
+            );
+            if let Some(ref last) = last_tag {
+                url.push_str(&format!("&last={}", last));
+            }
+
+            let headers = self.get_auth_headers().await?;
+            let (status, _resp_headers, body) = match self.transport.get(&url, headers).await {
+                Ok(res) => res,
+                Err(e) => return Err(OciError::Transport(e)),
+            };
+
+            if status == StatusCode::NOT_FOUND {
+                // 若仓库尚无任何 tag，返回当前收集到的列表 (空)
+                return Ok(all_tags);
+            }
+
+            if !status.is_success() {
+                // 部分 Registry 可能不支持带 query params 的 tags/list，回退到无参 URL 尝试
+                if last_tag.is_none() {
+                    let plain_url = format!(
+                        "{}://{}/v2/{}/nix-cache/tags/list",
+                        self.url_scheme(),
+                        self.registry,
+                        self.repo
+                    );
+                    if let Ok(headers) = self.get_auth_headers().await
+                        && let Ok((plain_status, _, plain_body)) =
+                            self.transport.get(&plain_url, headers).await
+                        && plain_status.is_success()
+                        && let Ok(resp) = serde_json::from_slice::<OciTagsListResponse>(&plain_body)
+                    {
+                        return Ok(resp.tags);
+                    }
+                }
+                return Err(OciError::Transport(TransportError::HttpStatus {
+                    status,
+                    message: Some(format!("Failed to list tags from {}", url)),
+                }));
+            }
+
+            #[derive(serde::Deserialize)]
+            struct OciTagsListResponse {
+                #[serde(default)]
+                tags: Vec<String>,
+            }
+
+            let parsed: OciTagsListResponse = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to parse OCI tags list response: {}", e);
+                    break;
+                }
+            };
+
+            if parsed.tags.is_empty() {
+                break;
+            }
+
+            let count = parsed.tags.len();
+            let new_last = parsed.tags.last().cloned();
+            all_tags.extend(parsed.tags);
+
+            if count < 100 || new_last == last_tag {
+                break;
+            }
+            last_tag = new_last;
+        }
+
+        if all_tags.is_empty()
+            && self.capabilities().deletion_strategy
+                == RegistryDeletionStrategy::GitHubPackagesRestApi
+            && let Ok(versions) = self.ghcr_client().list_package_versions().await
+        {
+            for v in versions {
+                if let Some(meta) = v.metadata
+                    && let Some(container) = meta.container
+                {
+                    all_tags.extend(container.tags);
+                }
+            }
+            all_tags.sort();
+            all_tags.dedup();
+        }
+
+        Ok(all_tags)
     }
 
     /// 拉取并解析 OCI 产物（强类型枚举支持 OciImageIndex 与 OciImageManifest）
@@ -1389,76 +1487,174 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 单架构无锁 CAS 追加会话 Delta Patch (构建期极速提交，零全量开销)
-    pub async fn update_run_session_with_cas(
+    /// 会话清单单调并集自愈收敛
+    pub async fn converge_run_session_manifest(
         &self,
-        request: SessionMutationRequest,
+        request: &SessionMutationRequest,
     ) -> Result<(), OciError> {
-        let delta = request.to_delta_patch();
-        let arch_tag = format!("run-{}-{}", request.run_id, request.system.as_str());
+        let system_str = request.system.as_str();
+        let main_tag = format!("run-{}-{}", request.run_id, system_str);
 
         let mut attempt = 0;
+        let max_retries = request.max_retries.max(6);
+
         loop {
             attempt += 1;
-            let (mut current_delta, previous_digest) =
-                match self.get_delta_patch_manifest(&arch_tag).await? {
-                    Some((d, digest)) => (d, Some(digest)),
+
+            // 1. 拉取当前主标签已有数据
+            let (mut merged_delta, prev_digest) =
+                match self.get_delta_patch_manifest(&main_tag).await? {
+                    Some((remote_delta, digest)) => (remote_delta, Some(digest)),
                     None => (
                         DeltaPatchData::new(request.run_id, &request.job_id, request.system),
                         None,
                     ),
                 };
 
-            request.apply_to_delta(&mut current_delta);
+            // 2. 快速跳出: 若远端已是超集，无需任何写入
+            let entries_contained = request.new_entries.is_empty()
+                || merged_delta.contains_all_entries(&request.new_entries);
+            let roots_contained =
+                request.new_roots.is_empty() || merged_delta.contains_all_roots(&request.new_roots);
+            if entries_contained && roots_contained && attempt > 1 {
+                info!(
+                    "Main session tag {} already contains our entries. Converged early.",
+                    main_tag
+                );
+                return Ok(());
+            }
 
-            match self
-                .push_delta_patch_manifest(&arch_tag, &current_delta, previous_digest.as_deref())
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        "Successfully updated run session delta tag {} on attempt {}",
-                        arch_tag, attempt
-                    );
-                    return Ok(());
-                }
-                Err(OciError::CasPreconditionFailed { .. }) if attempt <= request.max_retries => {
+            // 3. 执行本地集合并集
+            request.apply_to_delta(&mut merged_delta);
+
+            // 4. 推送合并后的全量清单
+            let push_res = self
+                .push_delta_patch_manifest(&main_tag, &merged_delta, prev_digest.as_deref())
+                .await;
+
+            let pushed_digest = match push_res {
+                Ok(digest) => digest,
+                Err(OciError::CasPreconditionFailed { .. }) if attempt <= max_retries => {
                     let pid = get_process_id();
-                    let backoff_ms =
-                        (50 * (1 << attempt.min(4))) + ((pid * 37 + attempt as u64 * 53) % 50);
+                    let jitter = (pid * 37 + attempt as u64 * 53) % 100;
+                    let backoff_ms = (50 * (1 << attempt.min(5))) + jitter;
                     warn!(
-                        "CAS conflict on session delta tag {}, retrying in {}ms (attempt {}/{})",
-                        arch_tag, backoff_ms, attempt, request.max_retries
+                        "CAS precondition failed on {}, retrying convergence in {}ms (attempt {}/{})",
+                        main_tag, backoff_ms, attempt, max_retries
                     );
                     self.transport
                         .sleep(Duration::from_millis(backoff_ms))
                         .await;
+                    continue;
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to update session delta tag {} after {} attempts: {}",
-                        arch_tag, attempt, e
-                    );
-                    let fallback_tag = format!(
-                        "run-{}-{}-job-{}",
-                        request.run_id,
-                        request.system.as_str(),
-                        request.job_id.replace(['/', ':', ' '], "-")
-                    );
-                    warn!("Falling back to job-specific chunk tag: {}", fallback_tag);
-                    self.push_delta_patch_manifest(&fallback_tag, &delta, None)
-                        .await?;
-                    return Ok(());
+                Err(e) => return Err(e),
+            };
+
+            // 5. 写后超集校验 (Read-After-Write Superset Verification)
+            if let Some((manifest_json, latest_digest)) =
+                self.get_manifest_with_digest(&main_tag).await?
+            {
+                let is_exact = latest_digest == pushed_digest;
+                let is_superset = if is_exact {
+                    true
+                } else if let Ok(manifest) = serde_json::from_str::<OciImageManifest>(&manifest_json)
+                    && let Some(layer) = manifest.layers.first()
+                    && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                    && let Ok(latest_delta) =
+                        IndexCodec::decode_zstd::<DeltaPatchData>(&blob_bytes, &layer.media_type)
+                {
+                    let latest_entries_contained = request.new_entries.is_empty()
+                        || latest_delta.contains_all_entries(&request.new_entries);
+                    let latest_roots_contained = request.new_roots.is_empty()
+                        || latest_delta.contains_all_roots(&request.new_roots);
+                    latest_entries_contained && latest_roots_contained
+                } else {
+                    false
+                };
+
+                if is_superset {
+                    // 5.1 稳态静默校验窗口 (Settling Window):
+                    // 等待随机微小窗口并二次复核，防止并发 Worker 几乎同时盲目 PUT 造成数据被后发 Worker 冲掉
+                    let pid = get_process_id();
+                    let settle_ms = 80 + (pid * 37 + attempt as u64 * 31) % 100;
+                    self.transport
+                        .sleep(Duration::from_millis(settle_ms))
+                        .await;
+
+                    if let Some((settle_json, settle_digest)) =
+                        self.get_manifest_with_digest(&main_tag).await?
+                    {
+                        if settle_digest == pushed_digest || settle_digest == latest_digest {
+                            info!(
+                                "Main session tag {} verified stable on attempt {}",
+                                main_tag, attempt
+                            );
+                            return Ok(());
+                        }
+
+                        if let Ok(manifest) =
+                            serde_json::from_str::<OciImageManifest>(&settle_json)
+                            && let Some(layer) = manifest.layers.first()
+                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
+                            && let Ok(settle_delta) = IndexCodec::decode_zstd::<DeltaPatchData>(
+                                &blob_bytes,
+                                &layer.media_type,
+                            )
+                        {
+                            let settle_entries_contained = request.new_entries.is_empty()
+                                || settle_delta.contains_all_entries(&request.new_entries);
+                            let settle_roots_contained = request.new_roots.is_empty()
+                                || settle_delta.contains_all_roots(&request.new_roots);
+                            if settle_entries_contained && settle_roots_contained {
+                                info!(
+                                    "Main session tag {} verified by settling superset containment on attempt {}",
+                                    main_tag, attempt
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
+
+            // 6. 未通过超集校验 (发生写覆盖导致条目丢失)，退避重试
+            if attempt >= max_retries {
+                error!(
+                    "Main session tag {} did not converge after {} attempts",
+                    main_tag, attempt
+                );
+                return Err(OciError::CasPreconditionFailed {
+                    tag: main_tag,
+                    expected: Some("superset containment".to_string()),
+                    actual: None,
+                });
+            }
+
+            let pid = get_process_id();
+            let jitter = (pid * 37 + attempt as u64 * 53) % 100;
+            let backoff_ms = (50 * (1 << attempt.min(5))) + jitter;
+            warn!(
+                "Concurrent overwrite detected on {}, retrying convergence in {}ms (attempt {}/{})",
+                main_tag, backoff_ms, attempt, max_retries
+            );
+            self.transport
+                .sleep(Duration::from_millis(backoff_ms))
+                .await;
         }
+    }
+
+    pub async fn update_run_session_with_cas(
+        &self,
+        request: SessionMutationRequest,
+    ) -> Result<(), OciError> {
+        self.converge_run_session_manifest(&request).await
     }
 
     pub async fn update_arch_session_with_cas(
         &self,
         request: SessionMutationRequest,
     ) -> Result<(), OciError> {
-        self.update_run_session_with_cas(request).await
+        self.converge_run_session_manifest(&request).await
     }
 
     pub async fn get_blob(&self, digest: &str) -> Result<Bytes, OciError> {

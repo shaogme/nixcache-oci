@@ -164,6 +164,24 @@ impl OciTransport for MockRouterTransport {
             }
         }
 
+        if path.ends_with("/tags/list") {
+            let mut tags = Vec::new();
+            self.stored_manifests.iter_sync(|tag, _| {
+                if !tag.starts_with("sha256:") {
+                    tags.push(tag.clone());
+                }
+                true
+            });
+            tags.sort();
+            tags.dedup();
+            let json = serde_json::json!({
+                "name": "nix-cache",
+                "tags": tags,
+            });
+            let bytes = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
+            return Ok((StatusCode::OK, HeaderMap::new(), bytes));
+        }
+
         Ok((StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new()))
     }
 

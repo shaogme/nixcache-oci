@@ -152,7 +152,14 @@ session_data = json.loads(decompressed)
 assert session_data['version'] == 6, f'Expected version 6, got {session_data[\"version\"]}'
 assert session_data['run_id'] == $RUN_ID, f'Expected run_id $RUN_ID, got {session_data[\"run_id\"]}'
 assert len(session_data['new_entries']) == 4, f'Expected 4 entries from 4 workers, got {len(session_data[\"new_entries\"])}'
-print('>>> Session manifest verified: Schema v6, 4 entries merged via CAS.')
+print('>>> Session manifest verified: Schema v6, 4 entries merged via monotonic convergence.')
+
+import urllib.request
+with urllib.request.urlopen('http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/tags/list') as resp:
+    tags = json.loads(resp.read().decode())['tags']
+chunk_tags = [t for t in tags if '-chunk-' in t]
+assert len(chunk_tags) == 0, f'Expected 0 chunk tags in registry, found {chunk_tags}'
+print('>>> Confirmed: 0 ephemeral chunk tags generated (Pure Main-Tag Monotonic Convergence).')
 "
 
 # 6. Test Cascading Proxy Tier 0 (Hot Registry) & Tier 1 (run-<run_id>)
