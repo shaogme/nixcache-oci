@@ -33,20 +33,12 @@ inputs:
     description: 'OCI Registry backend kind (ghcr, docker_hub, aws_ecr, gcp_artifact_registry, azure_acr, generic_oci). Leave empty to autodetect from registry host.'
     required: false
     default: ''
-  run-id:
-    description: 'Workflow run ID for Tier 1 session'
-    required: false
-    default: ${{ github.run_id }}
-  job-id:
-    description: 'Job identifier'
-    required: false
-    default: ${{ github.job }}
   signing-key:
     description: 'Nix secret key used to sign store paths'
     required: false
     default: ''
   output-receipt:
-    description: 'Output path for the BuildReceipt JSON file (optional)'
+    description: 'Output path for the BuildReceipt JSON file'
     required: false
     default: ''
   proxy-url:
@@ -102,12 +94,18 @@ runs:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
-        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
-        NIXCACHE_JOB_ID: ${{ inputs.job-id }}
-        NIXCACHE_OUTPUT_RECEIPT: ${{ inputs.output-receipt }}
+        NIXCACHE_OUTPUT_RECEIPT: ${{ inputs.output-receipt != '' && inputs.output-receipt || format('{0}/receipt-{1}.json', runner.temp, inputs.system != '' && inputs.system || runner.os) }}
         NIXCACHE_PROXY_URL: ${{ inputs.proxy-url }}
         NIXCACHE_SNAPSHOT_PATH: ${{ inputs.snapshot-path }}
         NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         nixcache-builder session capture
+
+    - name: Upload Build Receipt Artifact
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ inputs.system != '' && format('nixcache-receipt-{0}', inputs.system) || format('nixcache-receipt-{0}', runner.os) }}
+        path: ${{ inputs.output-receipt != '' && inputs.output-receipt || format('{0}/receipt-{1}.json', runner.temp, inputs.system != '' && inputs.system || runner.os) }}
+        retention-days: 1
+        overwrite: true

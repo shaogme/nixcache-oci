@@ -155,7 +155,6 @@ print('>>> Generic OCI upload succeeded.')
 # 6. Test Section D: Promote & Multi-arch Index Integration across providers
 echo ">>> [TEST D] Testing Promote on multi-backend session..."
 "$BUILDER_BIN" promote \
-    --run-id 1001 \
     --registry "127.0.0.1:${REGISTRY_PORT}" \
     --repo "owner/repo" \
     --registry-kind "ghcr" \

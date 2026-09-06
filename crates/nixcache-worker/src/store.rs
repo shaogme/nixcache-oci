@@ -1,39 +1,19 @@
 use crate::{
     error::WorkerStoreError,
-    state::{
-        CachedBaselineEntry, CachedSessionEntry, CachedShardEntry, L1_MEM_TTL_MS, WorkerState,
-    },
+    state::{CachedBaselineEntry, CachedShardEntry, L1_MEM_TTL_MS, WorkerState},
     transport::WorkerFetchTransport,
 };
 use nixcache_core::{
-    DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
     build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors, extract_nar_basename,
     extract_store_hash,
 };
 use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use worker::{Env, js_sys::Date};
 
 pub type WorkerOciClient = OciClient<WorkerFetchTransport>;
-
-pub fn format_branch_tag(br: &str) -> String {
-    if br.chars().all(|c| c.is_ascii_digit()) {
-        format!("pr-{}", br)
-    } else if br.starts_with("pr-") || br.starts_with("branch-") {
-        br.to_string()
-    } else if let Some(stripped) = br.strip_prefix("refs/heads/") {
-        format!("branch-{}", stripped.replace(['/', ':'], "-"))
-    } else if let Some(stripped) = br.strip_prefix("refs/pull/") {
-        let pr_id = stripped.split('/').next().unwrap_or(stripped);
-        format!("pr-{}", pr_id)
-    } else {
-        format!("branch-{}", br.replace(['/', ':'], "-"))
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshResult {
@@ -60,11 +40,8 @@ pub struct NarInfoLookupResult {
 pub struct WorkerProxyConfig {
     pub registry: String,
     pub repo: String,
-    pub run_id: Option<u64>,
-    pub branch_or_pr: Option<String>,
     pub baseline_tag: String,
     pub upstream_caches: Vec<String>,
-    pub session_ttl_secs: u64,
     pub baseline_ttl_secs: u64,
     pub target_system: SystemArch,
 }
@@ -74,11 +51,8 @@ impl Default for WorkerProxyConfig {
         Self {
             registry: "ghcr.io".to_string(),
             repo: String::new(),
-            run_id: None,
-            branch_or_pr: None,
             baseline_tag: "cache-index".to_string(),
             upstream_caches: vec!["https://cache.nixos.org".to_string()],
-            session_ttl_secs: 10,
             baseline_ttl_secs: 300,
             target_system: SystemArch::X86_64Linux,
         }
@@ -91,16 +65,11 @@ pub struct RemoteStatus {
     pub remote_error: Option<String>,
     pub registry: String,
     pub repo: String,
-    pub run_id: Option<u64>,
-    pub branch_or_pr: Option<String>,
     pub tier0_hot_entries: usize,
-    pub tier1_session_entries: usize,
-    pub tier2_branch_entries: usize,
-    pub tier3_baseline_entries: usize,
+    pub baseline_entries: usize,
     pub total_unique_entries: usize,
     pub index_entries: usize,
     pub index_ttl: u64,
-    pub session_ttl: u64,
     pub baseline_ttl: u64,
     pub upstream: Vec<String>,
     pub manifest_digest: String,
@@ -110,18 +79,15 @@ pub struct RemoteStatus {
 pub struct CacheStore {
     oci_client: WorkerOciClient,
     config: WorkerProxyConfig,
-    session_ttl_ms: f64,
     baseline_ttl_ms: f64,
 }
 
 impl CacheStore {
     pub fn new(oci_client: WorkerOciClient, config: WorkerProxyConfig) -> Self {
-        let session_ttl_ms = (config.session_ttl_secs * 1000) as f64;
         let baseline_ttl_ms = (config.baseline_ttl_secs * 1000) as f64;
         Self {
             oci_client,
             config,
-            session_ttl_ms,
             baseline_ttl_ms,
         }
     }
@@ -150,37 +116,7 @@ impl CacheStore {
             Err(_) => return Ok(None),
         };
 
-        // 1. Tier 1: Workflow Run Session (run-<id>)
-        if let Some(run_id) = self.config.run_id {
-            let tag = format!("run-{}", run_id);
-            if let Some((session, _)) = self.get_session_data(env, &tag).await?
-                && let Some(entry) = session.new_entries.get(&parsed_hash)
-            {
-                return Ok(Some(NarInfoLookupResult {
-                    narinfo_content: entry.to_narinfo_string(),
-                    shard_id: None,
-                    manifest_digest: None,
-                    self_healed: false,
-                }));
-            }
-        }
-
-        // 2. Tier 2: Branch / PR Session
-        if let Some(ref br) = self.config.branch_or_pr {
-            let tag = format_branch_tag(br);
-            if let Some((branch_sess, _)) = self.get_session_data(env, &tag).await?
-                && let Some(entry) = branch_sess.new_entries.get(&parsed_hash)
-            {
-                return Ok(Some(NarInfoLookupResult {
-                    narinfo_content: entry.to_narinfo_string(),
-                    shard_id: None,
-                    manifest_digest: None,
-                    self_healed: false,
-                }));
-            }
-        }
-
-        // 3. Tier 3: Production Baseline (SMRI 1024 阶确定性分片)
+        // 1. Production Baseline (SMRI 1024 阶确定性分片)
         let (baseline, manifest_digest) = self.get_baseline_data(env).await?;
         let shard_id = calculate_shard_id(&parsed_hash);
 
@@ -201,7 +137,7 @@ impl CacheStore {
             }
         }
 
-        // 4. Cache Miss: Read-Through SWR 防抖自愈穿透探查
+        // 2. Cache Miss: Read-Through SWR 防抖自愈穿透探查
         if WorkerState::global().should_revalidate() {
             let arch_tag = format!(
                 "{}-{}",
@@ -256,27 +192,7 @@ impl CacheStore {
     ) -> Result<Option<NarDigest>, WorkerStoreError> {
         let normalized = extract_nar_basename(nar_basename);
 
-        // 1. Tier 1: Workflow Run Session (run-<run_id>)
-        if let Some(run_id) = self.config.run_id {
-            let tag = format!("run-{}", run_id);
-            if let Some((_, nar_lookup)) = self.get_session_data(env, &tag).await?
-                && let Some(digest) = nar_lookup.get(normalized)
-            {
-                return Ok(Some(digest.clone()));
-            }
-        }
-
-        // 2. Tier 2: Branch / PR Session
-        if let Some(ref br) = self.config.branch_or_pr {
-            let tag = format_branch_tag(br);
-            if let Some((_, nar_lookup)) = self.get_session_data(env, &tag).await?
-                && let Some(digest) = nar_lookup.get(normalized)
-            {
-                return Ok(Some(digest.clone()));
-            }
-        }
-
-        // 3. Tier 3: Production Baseline (StoreHash Shard Routing)
+        // Production Baseline (StoreHash Shard Routing)
         let (baseline, _) = self.get_baseline_data(env).await?;
 
         if let Some(store_hash) = extract_store_hash(nar_basename)
@@ -318,19 +234,8 @@ impl CacheStore {
         Ok(None)
     }
 
-    /// 获取有效的签名公钥 (按 会话 -> 分支 -> 基线 优先级查找)
+    /// 获取有效的签名公钥
     pub async fn get_public_key(&self, env: &Env) -> Result<Option<String>, WorkerStoreError> {
-        // Tier 1
-        if let Some(run_id) = self.config.run_id {
-            let tag = format!("run-{}", run_id);
-            if let Ok(Some((session, _))) = self.get_session_data(env, &tag).await
-                && !session.new_entries.is_empty()
-            {
-                // 可回退
-            }
-        }
-
-        // Tier 3
         let (baseline, _) = self.get_baseline_data(env).await?;
         if !baseline.public_key.is_empty() {
             Ok(Some(baseline.public_key))
@@ -437,119 +342,6 @@ impl CacheStore {
                 Err(e.into())
             }
         }
-    }
-
-    /// 从 OCI GHCR 强制刷新指定会话清单并写回 KV 和 L1
-    pub async fn refresh_session_from_ghcr(
-        &self,
-        env: &Env,
-        tag: &str,
-    ) -> Result<Option<(DeltaPatchData, HashMap<String, NarDigest>)>, WorkerStoreError> {
-        let now = Date::now();
-        let arch_tag = format!("{}-{}", tag, self.config.target_system.as_str());
-        let fetch_res = match self.oci_client.get_delta_patch_manifest(&arch_tag).await {
-            Ok(Some(res)) => Ok(Some(res)),
-            Ok(None) => self.oci_client.get_delta_patch_manifest(tag).await,
-            Err(e) => Err(e),
-        };
-
-        let kv_key = format!("session_v6_{}_{}", self.config.target_system.as_str(), tag);
-
-        match fetch_res {
-            Ok(Some((delta, manifest_digest))) => {
-                self.set_remote_status(true, None);
-                let nar_lookup = build_nar_lookup_map(&delta.new_entries);
-
-                if let Ok(kv) = env.kv("NIXCACHE_KV") {
-                    let wrapper = KVCacheWrapper {
-                        data: delta.clone(),
-                        last_refresh: now,
-                        manifest_digest,
-                    };
-                    let _ = kv
-                        .put(&kv_key, &wrapper)
-                        .map_err(|e| WorkerStoreError::KvPutFailed {
-                            key: kv_key.clone(),
-                            message: e.to_string(),
-                        })?
-                        .execute()
-                        .await;
-                }
-
-                let _ = WorkerState::global().mem_session_cache.upsert_sync(
-                    tag.to_string(),
-                    Arc::new(CachedSessionEntry {
-                        delta: delta.clone(),
-                        nar_lookup: nar_lookup.clone(),
-                        expires_at: now + L1_MEM_TTL_MS,
-                    }),
-                );
-
-                Ok(Some((delta, nar_lookup)))
-            }
-            Ok(None) => {
-                self.set_remote_status(true, None);
-                Ok(None)
-            }
-            Err(e) => {
-                self.set_remote_status(false, Some(format!("GHCR session {}: {}", tag, e)));
-                if let Ok(kv) = env.kv("NIXCACHE_KV")
-                    && let Ok(Some(wrapper)) = kv
-                        .get(&kv_key)
-                        .json::<KVCacheWrapper<DeltaPatchData>>()
-                        .await
-                {
-                    let delta = wrapper.data;
-                    let nar_lookup = build_nar_lookup_map(&delta.new_entries);
-                    return Ok(Some((delta, nar_lookup)));
-                }
-                Err(e.into())
-            }
-        }
-    }
-
-    /// 获取会话清单数据 (L1 Memory -> L2 KV -> L3 GHCR)
-    pub async fn get_session_data(
-        &self,
-        env: &Env,
-        tag: &str,
-    ) -> Result<Option<(DeltaPatchData, HashMap<String, NarDigest>)>, WorkerStoreError> {
-        let now = Date::now();
-
-        // 1. L1 Memory Cache
-        if let Some(cached) = WorkerState::global()
-            .mem_session_cache
-            .read_sync(tag, |_, v| v.clone())
-            && now < cached.expires_at
-        {
-            return Ok(Some((cached.delta.clone(), cached.nar_lookup.clone())));
-        }
-
-        // 2. L2 Cloudflare KV (带多架构命名空间隔离)
-        let kv_key = format!("session_v6_{}_{}", self.config.target_system.as_str(), tag);
-        if let Ok(kv) = env.kv("NIXCACHE_KV")
-            && let Ok(Some(wrapper)) = kv
-                .get(&kv_key)
-                .json::<KVCacheWrapper<DeltaPatchData>>()
-                .await
-            && now - wrapper.last_refresh < self.session_ttl_ms
-        {
-            let delta = wrapper.data;
-            let nar_lookup = build_nar_lookup_map(&delta.new_entries);
-
-            let _ = WorkerState::global().mem_session_cache.upsert_sync(
-                tag.to_string(),
-                Arc::new(CachedSessionEntry {
-                    delta: delta.clone(),
-                    nar_lookup: nar_lookup.clone(),
-                    expires_at: now + L1_MEM_TTL_MS,
-                }),
-            );
-            return Ok(Some((delta, nar_lookup)));
-        }
-
-        // 3. L3 OCI GHCR
-        self.refresh_session_from_ghcr(env, tag).await
     }
 
     /// 获取生产基线分片根索引 (L1 Memory -> L2 KV -> L3 GHCR，纯粹单原子 baseline_v6_{system})
@@ -687,7 +479,7 @@ impl CacheStore {
         Ok((root_data, manifest_digest))
     }
 
-    /// 强制刷新所有层级的索引并主动预热变更分片 (Tier 1 -> Tier 2 -> Tier 3)
+    /// 强制刷新所有层级的索引并主动预热变更分片
     pub async fn force_refresh(&self, env: &Env) -> Result<RefreshResult, WorkerStoreError> {
         let mut errors = Vec::new();
 
@@ -711,20 +503,6 @@ impl CacheStore {
         };
 
         WorkerState::global().clear_l1_caches();
-
-        if let Some(run_id) = self.config.run_id {
-            let tag = format!("run-{}", run_id);
-            if let Err(e) = self.refresh_session_from_ghcr(env, &tag).await {
-                errors.push(format!("Session (run-{}): {}", run_id, e));
-            }
-        }
-
-        if let Some(ref br) = self.config.branch_or_pr {
-            let tag = format_branch_tag(br);
-            if let Err(e) = self.refresh_session_from_ghcr(env, &tag).await {
-                errors.push(format!("Branch ({}): {}", tag, e));
-            }
-        }
 
         let (baseline, _) = match self.refresh_baseline_from_ghcr(env).await {
             Ok(b) => b,
@@ -777,28 +555,8 @@ impl CacheStore {
 
     /// 获取完整的状态元信息与各层级统计 (实时 RCU 远端连通度)
     pub async fn get_status(&self, env: &Env) -> RemoteStatus {
-        let mut tier1_count = 0;
-        let mut session_opt = None;
-        if let Some(run_id) = self.config.run_id {
-            let tag = format!("run-{}", run_id);
-            if let Ok(Some((sess, _))) = self.get_session_data(env, &tag).await {
-                tier1_count = sess.new_entries.len();
-                session_opt = Some(sess);
-            }
-        }
-
-        let mut tier2_count = 0;
-        let mut branch_opt = None;
-        if let Some(ref br) = self.config.branch_or_pr {
-            let tag = format_branch_tag(br);
-            if let Ok(Some((b_sess, _))) = self.get_session_data(env, &tag).await {
-                tier2_count = b_sess.new_entries.len();
-                branch_opt = Some(b_sess);
-            }
-        }
-
         let baseline_res = self.get_baseline_data(env).await;
-        let (tier3_count, manifest_digest, generated) = match baseline_res {
+        let (baseline_count, manifest_digest, generated) = match baseline_res {
             Ok((ref b, ref digest)) => (b.total_entries(), digest.clone(), b.generated.clone()),
             Err(_) => {
                 let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
@@ -822,31 +580,18 @@ impl CacheStore {
         let remote_connected = remote_state.connected;
         let remote_error = remote_state.last_error.clone();
 
-        let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
-        if let Some(s) = session_opt {
-            unique_hashes.extend(s.new_entries.keys().cloned());
-        }
-        if let Some(b) = branch_opt {
-            unique_hashes.extend(b.new_entries.keys().cloned());
-        }
-
-        let total_unique = unique_hashes.len() + tier3_count;
+        let total_unique = baseline_count;
 
         RemoteStatus {
             remote_connected,
             remote_error,
             registry: self.config.registry.clone(),
             repo: self.config.repo.clone(),
-            run_id: self.config.run_id,
-            branch_or_pr: self.config.branch_or_pr.clone(),
             tier0_hot_entries: 0,
-            tier1_session_entries: tier1_count,
-            tier2_branch_entries: tier2_count,
-            tier3_baseline_entries: tier3_count,
+            baseline_entries: baseline_count,
             total_unique_entries: total_unique,
             index_entries: total_unique,
             index_ttl: self.config.baseline_ttl_secs,
-            session_ttl: self.config.session_ttl_secs,
             baseline_ttl: self.config.baseline_ttl_secs,
             upstream: self.config.upstream_caches.clone(),
             manifest_digest,
@@ -857,24 +602,13 @@ impl CacheStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteStatus, WorkerProxyConfig, format_branch_tag};
+    use super::{RemoteStatus, WorkerProxyConfig};
     use nixcache_core::{
-        DeltaPatchData, IndexEntry, NarDigest, NarInfoMeta, SCHEMA_VERSION_V6, ShardDataPayload,
+        IndexEntry, NarDigest, NarInfoMeta, SCHEMA_VERSION_V6, ShardDataPayload,
         ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map,
         diff_shard_descriptors,
     };
     use std::collections::HashMap;
-
-    #[test]
-    fn test_format_branch_tag() {
-        assert_eq!(format_branch_tag("main"), "branch-main");
-        assert_eq!(format_branch_tag("feat/test"), "branch-feat-test");
-        assert_eq!(format_branch_tag("branch-xyz"), "branch-xyz");
-        assert_eq!(format_branch_tag("pr-123"), "pr-123");
-        assert_eq!(format_branch_tag("42"), "pr-42");
-        assert_eq!(format_branch_tag("refs/heads/main"), "branch-main");
-        assert_eq!(format_branch_tag("refs/pull/123/head"), "pr-123");
-    }
 
     #[test]
     fn test_build_nar_lookup_map() {
@@ -916,16 +650,11 @@ mod tests {
             remote_error: None,
             registry: "ghcr.io".to_string(),
             repo: "test/repo".to_string(),
-            run_id: Some(123456),
-            branch_or_pr: Some("main".to_string()),
             tier0_hot_entries: 0,
-            tier1_session_entries: 2,
-            tier2_branch_entries: 0,
-            tier3_baseline_entries: 3,
-            total_unique_entries: 5,
-            index_entries: 5,
+            baseline_entries: 3,
+            total_unique_entries: 3,
+            index_entries: 3,
             index_ttl: 300,
-            session_ttl: 10,
             baseline_ttl: 300,
             upstream: vec!["https://cache.nixos.org".to_string()],
             manifest_digest: "sha256:digest".to_string(),
@@ -942,21 +671,12 @@ mod tests {
         let config = WorkerProxyConfig::default();
         assert_eq!(config.registry, "ghcr.io");
         assert_eq!(config.baseline_tag, "cache-index");
-        assert_eq!(config.session_ttl_secs, 10);
         assert_eq!(config.baseline_ttl_secs, 300);
         assert_eq!(config.target_system, SystemArch::X86_64Linux);
     }
 
     #[test]
-    fn test_schema_v6_delta_and_sharding_serialization() {
-        let mut delta = DeltaPatchData::new(12345, "job1", SystemArch::X86_64Linux);
-        delta.active_gc_roots.push(StoreHash::default());
-
-        assert_eq!(delta.version, SCHEMA_VERSION_V6);
-        let delta_json = serde_json::to_string(&delta).unwrap();
-        let loaded: DeltaPatchData = serde_json::from_str(&delta_json).unwrap();
-        assert_eq!(loaded.run_id, 12345);
-
+    fn test_schema_v6_sharding_serialization() {
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         assert_eq!(root.version, SCHEMA_VERSION_V6);
         assert_eq!(root.shards.len(), 1024);

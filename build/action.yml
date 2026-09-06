@@ -49,10 +49,6 @@ inputs:
     description: 'GitHub token with package write permissions'
     required: false
     default: ${{ github.token }}
-  run-id:
-    description: 'Workflow run ID for Tier 1 session'
-    required: false
-    default: ${{ github.run_id }}
   receipt-name:
     description: 'Artifact name for the generated build receipt'
     required: false
@@ -98,7 +94,6 @@ runs:
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         NIXCACHE_STRICT: ${{ inputs.strict }}
         NIXCACHE_EXPORT_CONCURRENCY: ${{ inputs.export-concurrency }}
-        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt-${{ inputs.system != '' && inputs.system || runner.os }}.json
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |

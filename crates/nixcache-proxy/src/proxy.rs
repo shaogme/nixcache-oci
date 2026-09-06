@@ -32,16 +32,12 @@ struct StatusResponse {
     remote_error: Option<String>,
     registry: String,
     repo: String,
-    run_id: Option<u64>,
-    branch_or_pr: Option<String>,
+    system: String,
     tier0_hot_entries: usize,
-    tier1_session_entries: usize,
-    tier2_branch_entries: usize,
-    tier3_baseline_entries: usize,
+    baseline_entries: usize,
     total_unique_entries: usize,
     index_entries: usize,
     index_ttl: u64,
-    session_ttl: u64,
     baseline_ttl: u64,
     upstream: Vec<String>,
 }
@@ -102,16 +98,12 @@ async fn serve_status(State(state): State<AppState>) -> impl IntoResponse {
         remote_error,
         registry: state.index.registry().to_string(),
         repo: state.repo.clone(),
-        run_id: config.run_id,
-        branch_or_pr: config.branch_or_pr.clone(),
+        system: config.target_system.to_string(),
         tier0_hot_entries: counts.tier0_hot_entries,
-        tier1_session_entries: counts.tier1_session_entries,
-        tier2_branch_entries: counts.tier2_branch_entries,
-        tier3_baseline_entries: counts.tier3_baseline_entries,
+        baseline_entries: counts.baseline_entries,
         total_unique_entries: counts.total_unique_entries,
         index_entries: counts.total_unique_entries,
         index_ttl: config.baseline_ttl.as_secs(),
-        session_ttl: config.session_ttl.as_secs(),
         baseline_ttl: config.baseline_ttl.as_secs(),
         upstream: state.index.upstream_caches().to_vec(),
     };
@@ -471,6 +463,9 @@ mod tests {
         let status_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status_json["remote_connected"], true);
         assert_eq!(status_json["registry"], "ghcr.io");
+        assert_eq!(status_json["tier0_hot_entries"], 0);
+        assert_eq!(status_json["baseline_entries"], 1);
+        assert_eq!(status_json["total_unique_entries"], 1);
         assert_eq!(status_json["index_entries"], 1);
         assert_eq!(status_json["repo"], "test/repo");
         assert_eq!(status_json["index_ttl"], 300);

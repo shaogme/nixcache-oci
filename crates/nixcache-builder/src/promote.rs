@@ -12,6 +12,7 @@ use nixcache_oci::{
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
     collections::{HashMap, HashSet},
+    env,
     path::PathBuf,
 };
 use tokio::fs;
@@ -51,19 +52,17 @@ async fn collect_receipt_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Promote: 汇聚多架构会话清单与 Receipts，分架构局部压实 (Partial Shard Compaction)，并原子发布顶层 OCI Image Index
+/// Promote: 汇聚多架构 Receipts，分架构局部压实 (Partial Shard Compaction)，并单写原子发布顶层 OCI Image Index
 pub async fn run_promote(
-    run_id: Option<u64>,
     receipt_paths: &[PathBuf],
     repo: &str,
     registry: &str,
     target_tag: &str,
-    cleanup_session: bool,
     github_token: &str,
 ) -> Result<(), BuilderError> {
     info!(
-        "Promoting multi-arch cache to tag '{}' for repo: {}/{} (Run ID: {:?})",
-        target_tag, registry, repo, run_id
+        "Promoting multi-arch cache to tag '{}' for repo: {}/{}",
+        target_tag, registry, repo
     );
 
     let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
@@ -73,53 +72,8 @@ pub async fn run_promote(
         HashMap::new();
     let mut incoming_roots_by_sys: HashMap<SystemArch, Vec<StoreHash>> = HashMap::new();
     let mut base_pub_key = String::new();
-    let mut session_found = false;
 
-    // 1.1 远端 Session Delta Manifests 收集
-    if let Some(rid) = run_id {
-        for sys in SystemArch::all() {
-            let arch_tag = format!("run-{}-{}", rid, sys.as_str());
-            if let Ok(Some((delta, _))) = oci.get_delta_patch_manifest(&arch_tag).await {
-                info!(
-                    "Found remote DeltaPatchData for tag {} with {} new entries",
-                    arch_tag,
-                    delta.new_entries.len()
-                );
-                session_found = true;
-                incoming_entries_by_sys
-                    .entry(sys)
-                    .or_default()
-                    .extend(delta.new_entries);
-                incoming_roots_by_sys
-                    .entry(sys)
-                    .or_default()
-                    .extend(delta.active_gc_roots);
-            }
-        }
-
-        let main_tag = format!("run-{}", rid);
-        if let Ok(Some((main_delta, _))) = oci.get_delta_patch_manifest(&main_tag).await {
-            info!(
-                "Found remote DeltaPatchData for tag {} with {} entries",
-                main_tag,
-                main_delta.new_entries.len()
-            );
-            session_found = true;
-            for (hash, entry) in main_delta.new_entries {
-                let sys = entry.system.unwrap_or(main_delta.system);
-                incoming_entries_by_sys
-                    .entry(sys)
-                    .or_default()
-                    .insert(hash, entry);
-            }
-            incoming_roots_by_sys
-                .entry(main_delta.system)
-                .or_default()
-                .extend(main_delta.active_gc_roots);
-        }
-    }
-
-    // 1.2 本地 Receipt 文件/目录加载（支持单文件、目录及多级子目录递归扫描）
+    // 1.1 本地 Receipt 文件/目录加载（支持单文件、目录及多级子目录递归扫描）
     let receipt_files = collect_receipt_files(receipt_paths).await;
     for file_path in receipt_files {
         match fs::read_to_string(&file_path).await {
@@ -157,9 +111,10 @@ pub async fn run_promote(
     }
 
     let total_promoted_entries: usize = incoming_entries_by_sys.values().map(|e| e.len()).sum();
+    let total_promoted_roots: usize = incoming_roots_by_sys.values().map(|r| r.len()).sum();
 
-    if !session_found && receipt_paths.is_empty() && total_promoted_entries == 0 {
-        info!("No session manifest or receipts found to promote. Merging with existing baseline.");
+    if receipt_paths.is_empty() || (total_promoted_entries == 0 && total_promoted_roots == 0) {
+        info!("No receipt entries or GC roots found to promote. Merging with existing baseline.");
     }
 
     // 2. 探查现存 Baseline 数据涉及的所有架构
@@ -268,7 +223,8 @@ pub async fn run_promote(
 
             root_index.version = SCHEMA_VERSION_V6;
             root_index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            root_index.last_promoted_run = run_id;
+            root_index.last_promoted_run =
+                env::var("GITHUB_RUN_ID").ok().and_then(|v| v.parse().ok());
 
             // 3.5 推送架构专属 Sub-Manifest (如 cache-index-x86_64-linux)
             let arch_tag = format!("{}-{}", target_tag, sys.as_str());
@@ -319,23 +275,9 @@ pub async fn run_promote(
         target_tag
     );
 
-    // 5. 清理会话标签 (删除全局会话与各架构专属主标签)
-    if cleanup_session && let Some(rid) = run_id {
-        let main_tag = format!("run-{}", rid);
-        let mut delete_tags = vec![main_tag];
-
-        for sys in SystemArch::all() {
-            delete_tags.push(format!("run-{}-{}", rid, sys.as_str()));
-        }
-
-        let delete_futures = delete_tags.into_iter().map(|tag| {
-            let oci = oci.clone();
-            async move { oci.delete_tag_strict(&tag).await }
-        });
-        try_join_all(delete_futures).await?;
-        info!("Cleaned up session tags for run-{}", rid);
-    }
-
+    let run_id = env::var("GITHUB_RUN_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     write_promote_step_summary(
         run_id,
         target_tag,

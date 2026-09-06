@@ -513,11 +513,8 @@ npins update
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | 代理服务监听端口 |
 | `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | 绑定监听地址（设置为 `0.0.0.0` 可对局域网提供服务） |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测宿主机） | 目标平台系统架构（例如 `x86_64-linux`） |
-| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` / `GITHUB_RUN_ID` | （无） | GitHub Actions 工作流 Run ID（启用 Tier 1 会话级缓存） |
-| `--branch <BRANCH>` | `NIXCACHE_BRANCH` / `GITHUB_REF_NAME` | （无） | 分支名称或 PR 编号（启用 Tier 2 分支级缓存） |
-| `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag（Tier 3 基线缓存） |
-| `--session-ttl <TTL>` | `NIXCACHE_SESSION_TTL` | `10` | Tier 1/Tier 2 会话索引刷新周期（单位：秒） |
-| `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | Tier 3 生产基线索引刷新周期（单位：秒） |
+| `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag（Tier 1 基线缓存） |
+| `--index-ttl <TTL>` | `NIXCACHE_INDEX_TTL` | `300` | 生产基线索引刷新周期（单位：秒） |
 | `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游缓存的 URL 地址（多个以空格分隔） |
 | `--index-dir <DIR>` | `NIXCACHE_INDEX_DIR` | （见下方说明） | 缓存索引存储目录（若未指定，回退至 `CACHE_DIRECTORY` 环境变量或 `~/.cache/nixcache-proxy/...`） |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （自动探测） | 用于认证 GitHub 接口/私有仓库的 Token（支持 `gh auth token` 自动发现） |
@@ -530,18 +527,18 @@ npins update
 
 #### 1. `session` (流水线会话全生命周期与级联协调)
 
-支持 GitHub Actions 工作流在不同 Job 阶段进行透明级联缓存与原子 CAS 上传：
+支持 GitHub Actions 工作流在不同 Job 阶段进行透明级联缓存与本地极速热穿透：
 
 - **`session init`**：启动本地 `nixcache-proxy` 代理后台守护进程，配置 Nix 客户端 substituters（安全注入 `NIX_CONFIG`），并记录基线 Store 快照。
-- **`session capture`**：自动差异比对基线快照（或显式指定 Store 路径），并发上传 NAR Blobs 到 GHCR，通过 CAS 机制原子更新 `run-<run_id>` 会话清单，并向本地 Proxy 注册热条目。
+- **`session capture`**：自动差异比对基线快照（或显式指定 Store 路径），并发上传 NAR Blobs 到 OCI 镜像仓库，向本地 Proxy 注册热条目（实现步骤间 0ms 热穿透），并输出标准轻量构建回执（Build Receipt JSON）。
 - **`session clean`**：清理本地会话快照与临时状态文件。
 
 ```bash
 # 1. 在 Job 开始前初始化会话
-nixcache-builder session init --run-id 123456 --branch main
+nixcache-builder session init
 
-# 2. 在构建步骤后捕获并上传新产物
-nixcache-builder session capture --run-id 123456 --job-id "build-x86"
+# 2. 在构建步骤后捕获并上传新产物，生成构建回执
+nixcache-builder session capture --system x86_64-linux --output-receipt receipt-x86_64-linux.json
 
 # 3. 在步骤结束时清理
 nixcache-builder session clean
@@ -554,12 +551,9 @@ nixcache-builder session clean
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
-| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID（Tier 1 会话） |
-| `--branch <BRANCH>` | `NIXCACHE_BRANCH` | （无） | 分支名称或 PR 编号（Tier 2 会话） |
 | `--port <PORT>` | `NIXCACHE_PORT` | `37515` | Proxy 代理后台守护进程监听端口 |
 | `--listen <LISTEN>` | `NIXCACHE_LISTEN` | `127.0.0.1` | Proxy 代理后台守护进程监听地址 |
 | `--upstream <UPSTREAM>` | `NIXCACHE_UPSTREAM` | `https://cache.nixos.org` | 上游回退二进制缓存列表 |
-| `--session-ttl <TTL>` | `NIXCACHE_SESSION_TTL` | `10` | 会话索引刷新周期（秒） |
 | `--baseline-ttl <TTL>` | `NIXCACHE_BASELINE_TTL` | `300` | 基线索引刷新周期（秒） |
 | `--baseline-tag <TAG>` | `NIXCACHE_BASELINE_TAG` | `cache-index` | 生产基线 OCI Tag |
 | `--signing-key-file <FILE>` | `NIXCACHE_SIGNING_KEY_FILE` | （无） | 签名私钥文件路径 |
@@ -573,15 +567,13 @@ nixcache-builder session clean
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
-| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | GitHub Actions Workflow Run ID |
-| `--job-id <JOB_ID>` | `NIXCACHE_JOB_ID` | （无） | 当前 GitHub Actions Job 标识符 |
 | `--system <SYSTEM>` | `NIXCACHE_SYSTEM` | （自动探测） | 目标平台系统架构 |
 | `--out-link <PATTERN>` | `NIXCACHE_OUT_LINK` | `./result*` | 产物软链接匹配 Glob 模式（自动发现目标根节点） |
 | `--targets <EXPR>` | `NIXCACHE_TARGETS` | （无） | 显式 Flake 目标表达式（如 `.#my-app` 或 `.#pkg1 .#pkg2`） |
 | `--capture-mode <MODE>` | `NIXCACHE_CAPTURE_MODE` | `runtime-closure` | 捕获模式：`runtime-closure`(默认)、`build-closure`、`roots-only`、`diff-all` |
 | `--strict-closure` / `--no-strict-closure` | `NIXCACHE_STRICT_CLOSURE` | `true` | 严格模式（默认开启，无产物时报错退出；关闭时回退为全量 diff 模式） |
 | `--signing-key-file <FILE>` | `NIXCACHE_SIGNING_KEY_FILE` | （无） | 签名私钥文件路径 |
-| `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（可选） |
+| `--output-receipt <FILE>` | `NIXCACHE_OUTPUT_RECEIPT` | （无） | 生成的 BuildReceipt JSON 文件路径（建议指定） |
 | `--proxy-url <URL>` | `NIXCACHE_PROXY_URL` | `http://127.0.0.1:37515` | 本地 Proxy 代理地址（用于热注册新产物） |
 | `--snapshot-path <PATH>` | `NIXCACHE_SNAPSHOT_PATH` | `/tmp/nixcache-snapshot-before.txt` | 构建前 Store 路径快照文件路径（用于自动 diff） |
 | `--export-concurrency <NUM>` | `NIXCACHE_EXPORT_CONCURRENCY` | 自适应 (`num_cpus.clamp(2, 8)`) | 并行导出与上传的最大并发 Worker 数 |
@@ -628,7 +620,7 @@ nixcache-builder build \
 
 #### 3. `promote` (Coordinator 汇聚与晋升发布节点专用)
 
-收集所有 Matrix 节点的 Build Receipts 或工作流会话（`run-<run_id>`），原子晋升合并全局索引清单并发布到 GHCR：
+单写模式（Single-Writer）收集所有 Matrix 节点的 Build Receipts，压实合并全局分片索引清单并发布至目标 OCI 仓库：
 
 ```bash
 # 方式 A：通过 Receipts 目录合并发布
@@ -637,21 +629,20 @@ nixcache-builder promote \
   --repo owner/repo \
   --registry ghcr.io
 
-# 方式 B：通过 Workflow Run ID 晋升发布
+# 方式 B：通过单独 Receipt 文件合并发布
 nixcache-builder promote \
-  --run-id 123456 \
+  --receipt receipt-x86_64-linux.json \
+  --receipt receipt-aarch64-linux.json \
   --repo owner/repo \
   --registry ghcr.io
 ```
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 | --- | --- | --- | --- |
-| `--run-id <RUN_ID>` | `NIXCACHE_RUN_ID` | （无） | 要晋升的 GitHub Actions Workflow Run ID |
 | `--receipts-dir <DIR>` | `NIXCACHE_RECEIPTS_DIR` | （无） | 存放 BuildReceipt JSON 文件的目录 |
 | `--receipt <FILE...>` | - | （无） | 单独指定的 BuildReceipt JSON 文件路径（可多次指定） |
 | `[PATHS...]` | - | （无） | 位置参数：Receipt 文件或目录路径 |
 | `--target-tag <TAG>` | `NIXCACHE_TARGET_TAG` | `cache-index` | 生产基线目标 OCI 镜像 Tag |
-| `--cleanup-session` / `--no-cleanup-session` | - | `true` | 晋升成功后是否清理临时 Session Tag |
 | `--repo <REPO>` | `NIXCACHE_REPO` | `shaogme/nixcache-oci` | 目标 OCI 仓库名称 |
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
@@ -773,7 +764,7 @@ nixcache-builder list \
 | 端点路径 | HTTP 方法 | Content-Type | 描述 |
 | --- | --- | --- | --- |
 | `/nix-cache-info` | GET | `text/x-nix-cache-info` | Nix 替代器握手端点（返回 StoreDir、WantMassQuery、Priority 等元数据） |
-| `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持本地 Tier 0~3 / Worker 3 级级联与 Read-Through SWR 自愈穿透，以及上游透明回退） |
+| `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持本地 Tier 0 (Hot) -> Tier 1 (Baseline) 2 级级联与 Read-Through SWR 自愈穿透，以及上游透明回退） |
 | `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/zstd` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
 
 > [!TIP]
@@ -811,39 +802,33 @@ curl -X POST http://localhost:37515/_refresh
 | `remote_error` | `string \| null` | **错误诊断信息**：当 `remote_connected` 为 `false` 时提供具体的错误原因（如网络超时、503 服务不可用、401 鉴权失败等）；正常时省略。 |
 | `registry` | `string` | 当前代理所绑定的 OCI 注册表地址（如 `ghcr.io` 或 `127.0.0.1:5001`）。 |
 | `repo` | `string` | 目标包存储库路径（如 `shaogme/nixcache-oci`）。 |
-| `run_id` | `number \| null` | 当前绑定的 GitHub Actions Workflow Run ID（Tier 1 会话）。 |
-| `branch_or_pr` | `string \| null` | 当前绑定的分支名称或 PR 编号（Tier 2 会话）。 |
+| `system` | `string \| null` | 当前绑定的目标系统架构（例如 `x86_64-linux`）。 |
 | `tier0_hot_entries` | `number` | Tier 0 内存即时热注册的条目数（本地代理专用；Worker 纯无状态模式下恒为 `0`）。 |
-| `tier1_session_entries` | `number` | Tier 1 工作流会话（`run-<run_id>`）条目数。 |
-| `tier2_branch_entries` | `number` | Tier 2 分支/PR 会话（`branch-<name>`）条目数。 |
-| `tier3_baseline_entries` | `number` | Tier 3 生产全局基线（`cache-index`）条目数。 |
+| `baseline_entries` | `number` | Tier 1 生产全局基线（`cache-index`）条目数。 |
 | `total_unique_entries` | `number` | 去重后的全局总有效条目数。 |
 | `index_entries` | `number` | 当前已载入内存/KV 的缓存索引总数（等同于 `total_unique_entries`）。 |
-| `session_ttl` | `number` | Tier 1/2 会话刷新周期（秒），默认 10 秒。 |
-| `baseline_ttl` | `number` | Tier 3 基线刷新周期（秒），默认 300 秒。 |
+| `index_ttl` | `number` | 生产基线索引刷新周期（秒），默认 300 秒。 |
+| `baseline_ttl` | `number` | 等同于 `index_ttl`。 |
 | `upstream` | `string[]` | 配置的上游回退二进制缓存列表（如 `["https://cache.nixos.org"]`）。 |
 | `manifest_digest` | `string` | （Worker 提供）当前边缘节点持有的基线 OCI 清单摘要（如 `sha256:...`）。 |
 | `generated` | `string` | （Worker 提供）基线索引生成时间戳（RFC 3339 格式）。 |
 
 ##### 典型响应示例
 
-- **场景 1：正常运行与 4 级级联就绪**
+- **场景 1：正常运行与 2 级级联就绪**
 
   ```json
   {
     "remote_connected": true,
+    "remote_error": null,
     "registry": "ghcr.io",
     "repo": "shaogme/nixcache-oci",
-    "run_id": 123456,
-    "branch_or_pr": "main",
+    "system": "x86_64-linux",
     "tier0_hot_entries": 2,
-    "tier1_session_entries": 10,
-    "tier2_branch_entries": 5,
-    "tier3_baseline_entries": 100,
-    "total_unique_entries": 115,
-    "index_entries": 115,
+    "baseline_entries": 100,
+    "total_unique_entries": 102,
+    "index_entries": 102,
     "index_ttl": 300,
-    "session_ttl": 10,
     "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
@@ -851,7 +836,7 @@ curl -X POST http://localhost:37515/_refresh
   }
   ```
 
-- **场景 2：远程 Registry 故障/离线（安全降级使用本地快照或上游）**
+- **场景 2：远程 Registry 故障/离线（安全降级使用本地热表或上游）**
 
   ```json
   {
@@ -859,14 +844,12 @@ curl -X POST http://localhost:37515/_refresh
     "remote_error": "Failed to connect to remote: OCI registry manifest request failed with status: 503 Service Unavailable",
     "registry": "127.0.0.1:5001",
     "repo": "test/cache",
+    "system": "x86_64-linux",
     "tier0_hot_entries": 0,
-    "tier1_session_entries": 0,
-    "tier2_branch_entries": 0,
-    "tier3_baseline_entries": 12,
+    "baseline_entries": 12,
     "total_unique_entries": 12,
     "index_entries": 12,
     "index_ttl": 300,
-    "session_ttl": 10,
     "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
@@ -879,16 +862,15 @@ curl -X POST http://localhost:37515/_refresh
   ```json
   {
     "remote_connected": true,
+    "remote_error": null,
     "registry": "ghcr.io",
     "repo": "user/new-repo",
+    "system": "x86_64-linux",
     "tier0_hot_entries": 0,
-    "tier1_session_entries": 0,
-    "tier2_branch_entries": 0,
-    "tier3_baseline_entries": 0,
+    "baseline_entries": 0,
     "total_unique_entries": 0,
     "index_entries": 0,
     "index_ttl": 300,
-    "session_ttl": 10,
     "baseline_ttl": 300,
     "upstream": [
       "https://cache.nixos.org"
@@ -913,12 +895,10 @@ curl -X POST http://localhost:37515/_refresh
 
 针对本地开发构建与全球边缘 CDN 分发两种不同物理场景，系统提供两套分工明确的级联解析引擎：
 
-- **本地代理 (`nixcache-proxy`) 4 级全量级联**：
+- **本地代理 (`nixcache-proxy`) 2 级精炼级联**：
   1. **Tier 0（内存即时热注册表）**：本地 CI/CD 构建步骤产物通过 `POST /_session/register` 动态写入内存，实现后续步骤 $0\text{ ms}$ 即时热穿透。
-  2. **Tier 1（工作流会话缓存 `run-<run_id>`）**：矩阵并行 Job 共享的当前构建流增量清单。
-  3. **Tier 2（分支/PR 会话缓存 `branch-<name>`）**：当前功能分支或 PR 的历史迭代缓存。
-  4. **Tier 3（生产全局基线 `cache-index`）**：合并至主干后的生产基线 1024 阶分片索引。
-  5. **Upstream**：当未命中任何 Tier 时，透明回退并流式代理上游公共缓存（如 `cache.nixos.org`）。
+  2. **Tier 1（生产全局基线 `cache-index`）**：生产主干基线的 1024 阶分片索引。
+  3. **Upstream**：当未命中任何本地或基线 Tier 时，透明回退并流式代理上游公共缓存（如 `cache.nixos.org`）。
 - **边缘代理 (`nixcache-worker`) 纯无状态网关与自愈穿透**：
   - **单原子 KV 存储协议 (`baseline_v6_{system}`)**：Worker 剥离本地单机内存热表，基线数据以单 Key 原子写入 Cloudflare KV，杜绝跨 Key 最终一致性复制延迟造成的时序死锁。
   - **Read-Through SWR 自愈穿透机制**：当边缘节点遇到 Cache Miss 时，在防抖冷却（> 2 秒）后，主动对远程 OCI Registry 发起超轻量 `HEAD` 请求校验 Manifest Digest。若检测到远端已有新基线发布，立即原子拉取最新根索引与目标分片自愈刷新，消除分布式 Anycast 节点同步时间差导致的 404 假阴性。
@@ -944,8 +924,8 @@ flowchart TD
         ReceiptC["receipt-aarch64-darwin.json"]
     end
 
-    subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
-        Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
+    subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单写单节点)"]
+        Merger["nixcache-builder promote<br>(单写聚合所有 Receipts + 获取旧 cache-index)"]
         MergedIndex["全局分片根索引 (Schema v6 Root)<br>(1024 分片 Merkle 纯局部压实 + 零回读变动推送 + 跨平台 gc_roots)"]
         TagPush["更新 GHCR tag: cache-index"]
     end
@@ -954,9 +934,9 @@ flowchart TD
     RunnerB -->|1. 并发上传 NAR| BlobStorage
     RunnerC -->|1. 并发上传 NAR| BlobStorage
 
-    RunnerA -->|2. 输出构建凭证| ReceiptA
-    RunnerB -->|2. 输出构建凭证| ReceiptB
-    RunnerC -->|2. 输出构建凭证| ReceiptC
+    RunnerA -->|2. 输出构建回执| ReceiptA
+    RunnerB -->|2. 输出构建回执| ReceiptB
+    RunnerC -->|2. 输出构建回执| ReceiptC
 
     ReceiptA --> Merger
     ReceiptB --> Merger
@@ -966,8 +946,8 @@ flowchart TD
     MergedIndex --> TagPush
 ```
 
-- **增量补丁与 CAS 并发安全写入**：各 Matrix Runner 独立构建目标架构产物并上传 NAR Blob，仅产出新增条目的轻量增量补丁（`DeltaPatchData`，~3 KB），利用 CAS（Compare-And-Swap）条件更新机制和抖动退避追加至会话清单，杜绝多节点竞争下的数据覆盖。
-- **纯局部压实（Pure Partial Compaction）**：Coordinator 节点汇聚 Receipts 后，基于 1024 分片 Merkle 差集精准定位变动分片。**仅需下载并追加合并存在新增条目的极少数分片（通常 1~5 个）**；对于未修改的分片（通常 1000+ 个），直接保留原有的 `blob_digest`、`compressed_size` 与 `merkle_hash`，**未变动分片网络下载与上传量严格为 0**，彻底消除了全量回读引发的网络放大。
+- **构建回执（Build Receipt）与 OCI 零临时标签污染**：各 Matrix Runner 独立构建目标架构产物并上传 NAR Blob，Worker 节点彻底脱离对 OCI 临时会话状态（如 `run-<run_id>`）的维护，仅向本地 Proxy 内存热表注册条目并生成标准的轻量 `receipt.json`，彻底消除临时 tag 污染与分布式会话清单并发写入竞争。
+- **单写压实聚合（Single-Writer Compaction）与纯局部压实**：Promote 阶段由单写聚合进程收集所有 Matrix 节点的 Receipts，基于 1024 分片 Merkle 差集精准定位变动分片。**仅需下载并追加合并存在新增条目的极少数分片（通常 1~5 个）**；对于未修改的分片（通常 1000+ 个），直接保留原有的 `blob_digest`、`compressed_size` 与 `merkle_hash`，**未变动分片网络下载与上传量严格为 0**，彻底消除了全量回读引发的网络放大。
 
 ### 4. 运行时闭包精准捕获与 GC / Purge 统一引擎
 
@@ -1023,13 +1003,13 @@ flowchart TD
     Utils --> Worker
 ```
 
-- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），定义 Schema v6 规范 `ShardedArchCacheIndexData`、1024 阶分片描述符 `ShardDescriptor`、`ShardDataPayload`、`DeltaPatchData`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台原生 IO 依赖，全环境及 Wasm 兼容。
+- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），定义 Schema v6 规范 `ShardedArchCacheIndexData`、1024 阶分片描述符 `ShardDescriptor`、`ShardDataPayload`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台原生 IO 依赖，全环境及 Wasm 兼容。
 - **`crates/nixcache-utils`**：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
 - **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`（包含 `--registry-kind` 强类型后端种类与自动探测）、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
 - **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
 - **`crates/nixcache-oci-backend`**：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引分片读写与高并发确定性流式传输。
-- **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
-- **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过驱动特性矩阵执行确定性无降级上传，并通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
+- **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 (Hot) -> Tier 1 (Baseline) 2 级精炼级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
+- **`crates/nixcache-builder`**：CI 构建与多架构流水线协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过驱动特性矩阵执行确定性无降级上传，导出标准构建回执 `BuildReceipt`，并通过单写压实聚合模式发布多架构全局基线索引。
 - **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器无状态代理，共享 `nixcache-core` 与 `nixcache-utils`，采用单原子 KV 存储模型（`baseline_v6_{system}`）与 Read-Through SWR 自愈穿透机制，通过 L1 内存 -> L2 KV -> L3 OCI 3 级穿透提供低延迟、高确定性边缘加速。
 
 ## 测试与质量保障（Testing & QA）
@@ -1112,8 +1092,8 @@ nix-build default.nix -A tests.vmtest --no-out-link
 # 4. 模拟 12 节点并发生成 Receipts，验证原子合并的幂等性与多架构 GC 根聚合
 ./test/test-concurrency-merge.sh
 
-# 5. 验证流水线 Session 级联与 CAS 并发冲突退避重试机制
-./test/test-pipeline-session-cas.sh
+# 5. 验证流水线 BuildReceipt 单写聚合、0 临时标签污染与 2 级代理级联
+./test/test-pipeline-receipt-single-writer.sh
 
 # 6. 验证基于图论的运行时闭包精准捕获、编译期依赖剥离 (Rust 软件包零中间产物泄漏) 与替代执行
 ./test/test-capture-closure.sh

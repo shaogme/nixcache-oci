@@ -30,8 +30,8 @@ pub use sharding::{
     shard_id_to_prefix_bytes,
 };
 pub use types::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry, JobSummaryMetadata,
-    NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
+    NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
     SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
     SystemArch,
 };
@@ -40,17 +40,16 @@ pub use types::{
 mod tests {
     use super::{
         BloomError, BloomFilter, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheQueryResult,
-        CacheSelector, CascadeMode, CoreError, DeltaPatchData, EMPTY_SHARD_MERKLE_HASH,
-        FastBlockedBloomFilter, FilterPredicates, IndexEntry, JobSummaryMetadata,
-        NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, NarInfoParseError,
-        RECEIPT_VERSION, SCHEMA_VERSION_V6, SelectionScope, ShardDataPayload, ShardDescriptor,
-        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
-        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
-        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
-        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
-        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
-        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
-        shard_id_to_prefix,
+        CacheSelector, CascadeMode, CoreError, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter,
+        FilterPredicates, IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS,
+        NarDigest, NarInfo, NarInfoMeta, NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V6,
+        SelectionScope, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SizeFilter,
+        StoreHash, SystemArch, TimeFilter, TypeError, build_nar_lookup_map, calculate_shard_id,
+        calculate_shard_id_from_str, compute_merkle_root, compute_shard_merkle_hash,
+        diff_shard_descriptors, evaluate_arch_cache_purge, evaluate_arch_cache_query,
+        evaluate_cache_purge, evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc,
+        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
+        nix_base32_char, nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -491,32 +490,49 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(loaded_payload.shard_id, 838);
         assert_eq!(loaded_payload.len(), 1);
 
-        // DeltaPatchData
-        let mut delta = DeltaPatchData::new(12345, "job-build", SystemArch::X86_64Linux);
-        delta.new_entries.insert(h1.clone(), IndexEntry::default());
-        delta.active_gc_roots.push(h1.clone());
+        // BuildReceipt merge_with
+        let mut receipt1 = BuildReceipt::new(
+            SystemArch::X86_64Linux,
+            "owner/repo".to_string(),
+            "2026-08-29T10:00:00Z".to_string(),
+            Some("key1".to_string()),
+            HashMap::from([(h1.clone(), IndexEntry::default())]),
+            vec![h1.clone()],
+            BuildStats {
+                discovered_outputs: 1,
+                built_paths: 1,
+                substituted_paths: 0,
+                uploaded_blobs: 1,
+                total_bytes_uploaded: 500,
+            },
+        );
 
-        let delta_json = serde_json::to_string(&delta).unwrap();
-        let loaded_delta: DeltaPatchData = serde_json::from_str(&delta_json).unwrap();
-        assert_eq!(loaded_delta.run_id, 12345);
-        assert_eq!(loaded_delta.new_entries.len(), 1);
-        let partitioned = loaded_delta.partition_by_shard();
-        assert_eq!(partitioned.get(&838).unwrap().len(), 1);
-        assert!(loaded_delta.contains_all_entries(&delta.new_entries));
-        assert!(loaded_delta.contains_all_roots(&delta.active_gc_roots));
-
-        let mut delta2 = DeltaPatchData::new(12345, "job-build-2", SystemArch::X86_64Linux);
         let h2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
-        delta2.new_entries.insert(h2.clone(), IndexEntry::default());
-        delta2.active_gc_roots.push(h2.clone());
-        assert!(!loaded_delta.contains_all_entries(&delta2.new_entries));
+        let receipt2 = BuildReceipt::new(
+            SystemArch::X86_64Linux,
+            "owner/repo".to_string(),
+            "2026-08-29T10:01:00Z".to_string(),
+            None,
+            HashMap::from([(h2.clone(), IndexEntry::default())]),
+            vec![h2.clone()],
+            BuildStats {
+                discovered_outputs: 2,
+                built_paths: 1,
+                substituted_paths: 1,
+                uploaded_blobs: 2,
+                total_bytes_uploaded: 1000,
+            },
+        );
 
-        let mut merged = loaded_delta.clone();
-        merged.merge_union(delta2.clone());
-        assert_eq!(merged.new_entries.len(), 2);
-        assert_eq!(merged.active_gc_roots.len(), 2);
-        assert!(merged.contains_all_entries(&delta.new_entries));
-        assert!(merged.contains_all_entries(&delta2.new_entries));
+        receipt1.merge_with(receipt2);
+        assert_eq!(receipt1.new_entries.len(), 2);
+        assert_eq!(receipt1.active_gc_roots.len(), 2);
+        assert_eq!(receipt1.stats.discovered_outputs, 3);
+        assert_eq!(receipt1.stats.built_paths, 2);
+        assert_eq!(receipt1.stats.substituted_paths, 1);
+        assert_eq!(receipt1.stats.uploaded_blobs, 3);
+        assert_eq!(receipt1.stats.total_bytes_uploaded, 1500);
+        assert_eq!(receipt1.public_key.as_deref(), Some("key1"));
 
         // JobSummaryMetadata
         let job_summary = JobSummaryMetadata {

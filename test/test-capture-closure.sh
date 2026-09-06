@@ -31,6 +31,7 @@ REGISTRY_PORT=5025
 PROXY_PORT=37525
 REGISTRY_PID=""
 RUN_ID=654321
+export GITHUB_RUN_ID="$RUN_ID"
 
 cleanup() {
     echo ">>> 清理测试临时环境与进程..."
@@ -309,43 +310,36 @@ fi
 grep -q "No valid target outputs or result symlinks found" "$TMP_DIR/strict_error.log"
 echo ">>> [PASS] 严格模式在目标缺失时按预期拦截并给出友好错误提示！"
 
-# 8. 验证远程 OCI 会话清单 (Schema v6 Delta Patch CAS 追加与 GC 根纯净度)
-echo ">>> [7/9] 验证远程 OCI 镜像仓库会话清单 (run-${RUN_ID}-x86_64-linux)..."
-SESSION_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
-
+# 8. 验证 OCI 零临时标签污染 & 代理热注册表状态
+echo ">>> [7/9] 验证 OCI 零临时标签污染 & 本地代理热注册表 (Tier 0)..."
+TAGS_JSON=$(curl -s "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/tags/list" || true)
 python3 -c "
-import json, subprocess
-manifest = json.loads('''$SESSION_MANIFEST''')
-layer_digest = manifest['layers'][0]['digest']
-blob_bytes = subprocess.check_output([
-    'curl', '-fsSL',
-    f'http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/blobs/{layer_digest}'
-])
-decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
-session_data = json.loads(decompressed)
-
-app1_h = '$APP_PATH_1'.split('/')[-1][:32]
-lib1_h = '$RUNTIME_LIB_PATH_1'.split('/')[-1][:32]
-rust_h = '$RUST_APP_PATH'.split('/')[-1][:32]
-exp_h = '$EXPLICIT_STORE_PATH'.split('/')[-1][:32]
-
-entries = session_data['new_entries']
-gc_roots = session_data['active_gc_roots']
-
-assert session_data['version'] == 6, f'Schema version must be 6, got {session_data.get(\"version\")}'
-assert session_data['run_id'] == $RUN_ID, 'run_id mismatch'
-assert len(entries) == 4, f'Expected 4 entries merged via CAS, got {len(entries)}'
-assert app1_h in entries and lib1_h in entries and rust_h in entries and exp_h in entries
-
-# 关键断言：gc_roots 严格仅包含 3 个顶层目标根 (app1, rust, exp)，绝不含 lib1 或 compiler tool
-assert set(gc_roots) == {app1_h, rust_h, exp_h}, f'GC Roots mismatch: {gc_roots}'
-print('>>> [PASS] 远程 OCI 会话清单 Schema v6 Delta Patch CAS 追加与 GC Roots 纯净度检验完全通过！')
+import json
+try:
+    tags_data = json.loads('''$TAGS_JSON''')
+    tags = tags_data.get('tags') or []
+except Exception:
+    tags = []
+run_tags = [t for t in tags if t.startswith('run-')]
+assert len(run_tags) == 0, f'Expected 0 ephemeral run-* tags, got {run_tags}'
+print('>>> [PASS] 镜像仓库完全干净，零 run-* 临时标签污染！')
 "
 
-# 9. 会话提升 (Promote) 与临时 Session Tag 清理
-echo ">>> [8/9] 执行 promote 提升会话至基线索引 (cache-index)..."
+# 验证本地代理热注册表已包含条目
+PROXY_STATUS=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
+python3 -c "
+import json
+status = json.loads('''$PROXY_STATUS''')
+assert status['tier0_hot_entries'] >= 4, f'Expected at least 4 tier0 hot entries, got {status[\"tier0_hot_entries\"]}'
+print('>>> [PASS] 本地代理热注册表 (Tier 0) 确认命中全部产物条目！')
+"
+
+# 9. 单写提升 (Single-Writer Promote) 聚合所有 Receipt 并构建全局分片索引
+echo ">>> [8/9] 执行 promote 单写压实提升至基线索引 (cache-index)..."
 "$BUILDER_BIN" promote \
-    --run-id "$RUN_ID" \
+    --receipt "$RECEIPT_1" \
+    --receipt "$RECEIPT_2" \
+    --receipt "$RECEIPT_3" \
     --target-tag "cache-index"
 
 BASE_INDEX=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/manifests/cache-index")
@@ -371,19 +365,18 @@ blob_bytes = subprocess.check_output([
 decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 idx = json.loads(decompressed)
 assert idx['version'] == 6, f'Expected version 6, got {idx.get(\"version\")}'
-assert idx['last_promoted_run'] == $RUN_ID
+assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx.get(\"last_promoted_run\")}'
 total_entries = sum(s['entry_count'] for s in idx['shards'])
 assert total_entries == 4, f'Expected 4 entries across shards, got {total_entries}'
-print('>>> [PASS] 基线全局分片索引 cache-index 验证通过 (4 个条目，last_promoted_run 记录正确)！')
-"
 
-# 验证临时会话 tag 已被安全清理
-SESSION_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
-if [[ "$SESSION_STATUS" -ne 404 ]]; then
-    echo "!!! Expected 404 for deleted session tag, got $SESSION_STATUS"
-    exit 1
-fi
-echo ">>> [PASS] 临时会话标签 run-${RUN_ID}-x86_64-linux 已成功自动清理！"
+# 验证 GC Roots 纯净度
+app1_h = '$APP_PATH_1'.split('/')[-1][:32]
+rust_h = '$RUST_APP_PATH'.split('/')[-1][:32]
+exp_h = '$EXPLICIT_STORE_PATH'.split('/')[-1][:32]
+assert set(idx['gc_roots']) == {app1_h, rust_h, exp_h}, f'GC Roots mismatch: {idx[\"gc_roots\"]}'
+
+print('>>> [PASS] 基线全局分片索引 cache-index 单写聚合验证通过 (4 个条目，GC Roots 纯净)！')
+"
 
 # 10. 二进制替换 (Substitution) 与执行验证
 echo ">>> [9/9] 验证 Nix 通过 nixcache-proxy 从 OCI 缓存中替代替换并执行 Rust 程序..."

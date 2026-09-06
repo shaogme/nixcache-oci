@@ -215,10 +215,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     let output_paths = nix::build_outputs(&discovered).await?;
     info!("Built {} top-level output path(s)", output_paths.len());
 
-    // 4. 关闭代理并恢复配置
-    proxy_guard.stop().await;
-
-    // 5. 获取已有远端 hashes
+    // 4. 获取已有远端 hashes
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
     let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
     info!(
@@ -229,7 +226,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
 
     let own_hashes_vec: Vec<String> = own_hashes.into_iter().map(|h| h.into_inner()).collect();
 
-    // 6. 查找本地新构建的路径并执行端到端无盘流式并行 Export
+    // 5. 查找本地新构建的路径并执行端到端无盘流式并行 Export
     let upload_list = nix::find_locally_built_paths(&output_paths, &own_hashes_vec).await?;
 
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
@@ -274,6 +271,33 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     } else {
         info!("Nothing to upload — every path has an external or existing signature");
     }
+
+    // 6. 本地 Proxy 热注册 (Tier 0)
+    if !new_entries.is_empty()
+        && let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
+            .build()
+        && let Ok(resp) = client
+            .get("http://127.0.0.1:37515/nix-cache-info")
+            .send()
+            .await
+        && resp.status().is_success()
+        && let Ok(reg_resp) = client
+            .post("http://127.0.0.1:37515/_session/register")
+            .json(&new_entries)
+            .send()
+            .await
+        && reg_resp.status().is_success()
+    {
+        info!(
+            "Successfully hot-registered {} entries to local proxy at http://127.0.0.1:37515",
+            new_entries.len()
+        );
+    }
+
+    // 7. 关闭代理并恢复配置
+    proxy_guard.stop().await;
 
     // 7. 提取 active_gc_roots
     let mut active_gc_roots: Vec<StoreHash> = Vec::new();

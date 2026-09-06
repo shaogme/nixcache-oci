@@ -12,9 +12,9 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
-use nixcache_oci::{SessionMutationRequest, UploadConfig};
+use nixcache_oci::UploadConfig;
 use nixcache_oci_backend::create_tokio_reqwest_client;
-use std::{collections::HashMap, env, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::fs;
 use tracing::{error, info};
 
@@ -102,15 +102,8 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
 
     let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
 
-    // 4. 并行获取远端已缓存 StoreHash 集合 (cache-index + 当前 run-id session)
-    let own_cached_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;
-    let mut all_known_hashes = own_cached_hashes;
-    if let Ok(Some((delta_data, _))) = oci
-        .get_delta_patch_manifest(&format!("run-{}-{}", opts.run_id, system.as_str()))
-        .await
-    {
-        all_known_hashes.extend(delta_data.new_entries.into_keys());
-    }
+    // 4. 获取远端已缓存 StoreHash 集合 (从生产基线 cache-index)
+    let all_known_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;
 
     // 5. 先验过滤分类 (直接消费 closure_res.items，零二次 path-info 查询)
     let own_pub_key = get_own_public_key(opts.signing_key_file).await;
@@ -187,37 +180,21 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         }
     }
 
-    let head_sha = env::var("GITHUB_SHA").ok();
-    let ref_name = env::var("GITHUB_REF_NAME").ok();
-
-    // 8. 主标签单调并集收敛写入 (集合超集写后校验自愈收敛)
-    if !new_entries.is_empty() || !closure_res.active_gc_roots.is_empty() {
-        let request = SessionMutationRequest::new(opts.run_id, opts.job_id, system)
-            .with_entries(new_entries.clone())
-            .with_roots(closure_res.active_gc_roots.clone())
-            .with_git_info(head_sha, ref_name)
-            .with_public_key(own_pub_key.clone())
-            .with_upload_stats(uploaded_count, total_bytes_uploaded)
-            .with_max_retries(5);
-
-        oci.converge_run_session_manifest(&request).await?;
-    }
-
-    // 9. 代理热注册与 BuildReceipt 写入
-    if let Some(purl) = opts.proxy_url
-        && !new_entries.is_empty()
-    {
+    // 8. 本地 Proxy 热注册 (Tier 0)
+    if !new_entries.is_empty() {
+        let purl = opts.proxy_url.unwrap_or("http://127.0.0.1:37515");
         let register_endpoint = format!("{}/_session/register", purl.trim_end_matches('/'));
         if let Ok(client) = reqwest::Client::builder()
-            .timeout(Duration::from_millis(300))
-            .connect_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
             .build()
-        {
-            let _ = client
+            && let Ok(resp) = client
                 .post(&register_endpoint)
                 .json(&new_entries)
                 .send()
-                .await;
+                .await
+            && resp.status().is_success()
+        {
             info!(
                 "Hot-registered {} entries to proxy at {}",
                 new_entries.len(),
@@ -231,36 +208,39 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         + decision_report.already_cached_count
         + decision_report.ignored_count;
 
-    if let Some(receipt_path) = opts.output_receipt_path {
-        let stats = BuildStats {
-            discovered_outputs: candidate_count,
-            built_paths: decision_report.to_export.len(),
-            uploaded_blobs: uploaded_count,
-            total_bytes_uploaded,
-            substituted_paths: decision_report.substituted_count,
-        };
+    // 9. 强制输出 BuildReceipt
+    let receipt_path = opts
+        .output_receipt_path
+        .unwrap_or_else(|| Path::new("receipt.json"));
 
-        let receipt = BuildReceipt::new(
-            system,
-            opts.repo.to_string(),
-            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            own_pub_key,
-            new_entries,
-            closure_res.active_gc_roots,
-            stats,
-        )
-        .with_run_info(Some(opts.run_id), Some(opts.job_id.to_string()));
+    let stats = BuildStats {
+        discovered_outputs: candidate_count,
+        built_paths: decision_report.to_export.len(),
+        uploaded_blobs: uploaded_count,
+        total_bytes_uploaded,
+        substituted_paths: decision_report.substituted_count,
+    };
 
-        if let Some(parent) = receipt_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            let _ = fs::create_dir_all(parent).await;
-        }
+    let receipt = BuildReceipt::new(
+        system,
+        opts.repo.to_string(),
+        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        own_pub_key,
+        new_entries,
+        closure_res.active_gc_roots,
+        stats,
+    )
+    .with_run_info(Some(opts.run_id), Some(opts.job_id.to_string()));
 
-        let receipt_json = serde_json::to_string(&receipt)?;
-        fs::write(receipt_path, receipt_json).await?;
-        info!("Build receipt written to {:?}", receipt_path);
+    if let Some(parent) = receipt_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent).await;
     }
+
+    let receipt_json = serde_json::to_string(&receipt)?;
+    fs::write(receipt_path, receipt_json).await?;
+    info!("Build receipt written to {:?}", receipt_path);
 
     write_session_capture_summary(
         opts.job_id,

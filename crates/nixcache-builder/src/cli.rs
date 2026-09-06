@@ -399,12 +399,6 @@ pub struct PromoteArgs {
 
     #[arg(
         long,
-        help = "GitHub Actions Workflow Run ID to promote [env: NIXCACHE_RUN_ID]"
-    )]
-    pub run_id: Option<u64>,
-
-    #[arg(
-        long,
         help = "Directory containing BuildReceipt JSON files [env: NIXCACHE_RECEIPTS_DIR]"
     )]
     pub receipts_dir: Option<PathBuf>,
@@ -423,25 +417,9 @@ pub struct PromoteArgs {
         help = "Target OCI tag for production baseline [env: NIXCACHE_TARGET_TAG]"
     )]
     pub target_tag: Option<String>,
-
-    #[arg(
-        long,
-        default_missing_value = "true",
-        num_args = 0..=1,
-        help = "Clean up workflow run session tag after promotion"
-    )]
-    pub cleanup_session: Option<bool>,
-
-    #[arg(long, help = "Disable cleaning up workflow run session tag")]
-    pub no_cleanup_session: bool,
 }
 
 impl PromoteArgs {
-    pub fn resolve_run_id(&self) -> Option<u64> {
-        self.run_id
-            .or_else(|| Env::parse_first(&["NIXCACHE_RUN_ID", "GITHUB_RUN_ID"]))
-    }
-
     pub fn resolve_target_tag(&self) -> String {
         self.target_tag
             .as_deref()
@@ -465,13 +443,6 @@ impl PromoteArgs {
         }
         paths.extend(self.positional_paths.clone());
         paths
-    }
-
-    pub fn resolve_cleanup_session(&self) -> bool {
-        if self.no_cleanup_session {
-            return false;
-        }
-        self.cleanup_session.unwrap_or(true)
     }
 }
 

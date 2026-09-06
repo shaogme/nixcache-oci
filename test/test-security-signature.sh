@@ -129,9 +129,10 @@ done
 
 # 6. Test Security Scenario 1: Untrusted Public Key (Signature verification must fail)
 echo ">>> Security Test 1: Verifying that Nix rejects substitution when signed by untrusted key..."
-nix-store --delete "$TEST_STORE_PATH" 2>/dev/null || true
+nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
 
 if nix-store --realise "$TEST_STORE_PATH" \
+    --max-jobs 0 \
     --option substituters "http://127.0.0.1:${PROXY_PORT}" \
     --option trusted-public-keys "$(cat rogue-public.key)" \
     --option require-sigs true 2>/dev/null; then
@@ -146,13 +147,14 @@ echo ">>> Security Test 2: Tampering with cached blob contents in OCI registry..
 for blob_file in /tmp/nixcache-test-registry/docker/registry/v2/blobs/sha256/*/*/data; do
     if [[ -f "$blob_file" ]] && [[ $(wc -c < "$blob_file") -gt 100 ]]; then
         echo "Corrupting blob: $blob_file"
-        echo "CORRUPTED_PAYLOAD_TAMPERED_CONTENT" >> "$blob_file"
+        echo "CORRUPTED_PAYLOAD_TAMPERED_CONTENT" > "$blob_file"
     fi
 done
 
-nix-store --delete "$TEST_STORE_PATH" 2>/dev/null || true
+nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
 
 if nix-store --realise "$TEST_STORE_PATH" \
+    --max-jobs 0 \
     --option substituters "http://127.0.0.1:${PROXY_PORT}" \
     --option trusted-public-keys "$(cat valid-public.key)" \
     --option require-sigs true 2>/dev/null; then
@@ -189,9 +191,10 @@ rm -f "$RECEIPT_FILE"
 PROXY_PID=$!
 sleep 1
 
-nix-store --delete "$TEST_STORE_PATH" 2>/dev/null || true
+nix-store --delete "$TEST_STORE_PATH" --ignore-liveness 2>/dev/null || true
 
 nix-store --realise "$TEST_STORE_PATH" \
+    --max-jobs 0 \
     --option substituters "http://127.0.0.1:${PROXY_PORT}" \
     --option trusted-public-keys "$(cat valid-public.key)" \
     --option require-sigs true

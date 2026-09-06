@@ -16,9 +16,8 @@ export GITHUB_PATH="$TMP_DIR/github_path"
 touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
 unset NIX_CONFIG || true
 
-# 1. Start local OCI registry container via run_registry
-REGISTRY_CONTAINER="nixcache-registry-${REGISTRY_PORT}"
 REGISTRY_PORT=5002
+REGISTRY_CONTAINER="nixcache-registry-${REGISTRY_PORT}"
 REGISTRY_PID=""
 
 echo ">>> Launching OCI registry container on port ${REGISTRY_PORT}..."
@@ -403,7 +402,7 @@ for m in manifests:
 ")
 
 echo ">>> Testing substitution for: $SAMPLE_STORE_PATH"
-nix-store --delete "$SAMPLE_STORE_PATH" 2>/dev/null || true
+nix-store --delete "$SAMPLE_STORE_PATH" --ignore-liveness 2>/dev/null || true
 
 nix-store --realise "$SAMPLE_STORE_PATH" \
   --option substituters "http://127.0.0.1:37516" \

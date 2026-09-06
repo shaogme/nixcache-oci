@@ -1,6 +1,7 @@
 use nixcache_core::{
-    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, ShardDataPayload, StoreHash,
-    SystemArch, calculate_shard_id, compute_shard_merkle_hash, partition_entries_by_shard,
+    BuildReceipt, BuildStats, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, ShardDataPayload,
+    StoreHash, SystemArch, calculate_shard_id, compute_shard_merkle_hash,
+    partition_entries_by_shard,
 };
 use scc::HashMap as SccHashMap;
 use serde::{Deserialize, Serialize};
@@ -187,7 +188,7 @@ pub async fn simulate_concurrent_delta_and_compaction(
     let total_base_entries = base_entries.len();
     let total_new_entries = concurrent_builders * entries_per_builder;
 
-    // 1. 并发模拟 Matrix CI Runners 生成 Delta Patch
+    // 1. 并发模拟 Matrix CI Runners 生成 BuildReceipt
     let wal_start = Instant::now();
     let mut join_set = JoinSet::new();
 
@@ -197,27 +198,30 @@ pub async fn simulate_concurrent_delta_and_compaction(
             let new_sub_entries =
                 generate_index_entries(entries_per_builder, (builder_id as u64 + 1) * 9999, system);
             let active_roots: Vec<StoreHash> = new_sub_entries.keys().cloned().collect();
-            DeltaPatchData::with_entries_and_roots(
-                1001,
-                format!("job-runner-{}", builder_id),
+            BuildReceipt::new(
                 system,
+                "owner/repo".to_string(),
+                "2026-08-29T10:00:00Z".to_string(),
+                None,
                 new_sub_entries,
                 active_roots,
+                BuildStats::default(),
             )
+            .with_run_info(Some(1001), Some(format!("job-runner-{}", builder_id)))
         });
     }
 
-    let mut delta_patches = Vec::with_capacity(concurrent_builders);
+    let mut receipts = Vec::with_capacity(concurrent_builders);
     while let Some(res) = join_set.join_next().await {
-        let delta = res.map_err(|e| format!("Builder delta generation failed: {}", e))?;
-        delta_patches.push(delta);
+        let receipt = res.map_err(|e| format!("Builder receipt generation failed: {}", e))?;
+        receipts.push(receipt);
     }
     let wal_generation_duration_ms = wal_start.elapsed().as_secs_f64() * 1000.0;
 
-    // 2. 汇聚所有 Delta Patches 中的新增条目
+    // 2. 汇聚所有 Receipts 中的新增条目
     let mut all_incoming_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
-    for delta in delta_patches {
-        all_incoming_entries.extend(delta.new_entries);
+    for receipt in receipts {
+        all_incoming_entries.extend(receipt.new_entries);
     }
 
     let base_partitioned = partition_entries_by_shard(base_entries);

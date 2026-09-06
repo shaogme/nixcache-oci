@@ -21,8 +21,6 @@ impl CacheLayerMediaTypeV6 {
     pub const ROOT_INDEX_V6_ZSTD: &'static str = "application/vnd.nix.cache.root.v6+zstd";
     /// 单个分片数据内容层
     pub const SHARD_DATA_V6_ZSTD: &'static str = "application/vnd.nix.cache.shard.v6+zstd";
-    /// 增量 Delta Patch 补丁层
-    pub const DELTA_PATCH_V6_ZSTD: &'static str = "application/vnd.nix.cache.delta.v6+zstd";
 }
 
 /// 强类型 OCI NixCache Layer 媒体类型 (Schema v6)
@@ -30,20 +28,17 @@ impl CacheLayerMediaTypeV6 {
 pub enum CacheLayerMediaType {
     RootIndexV6Zstd,
     ShardDataV6Zstd,
-    DeltaPatchV6Zstd,
 }
 
 impl CacheLayerMediaType {
     pub const ROOT_INDEX_V6_ZSTD: &'static str = CacheLayerMediaTypeV6::ROOT_INDEX_V6_ZSTD;
     pub const SHARD_DATA_V6_ZSTD: &'static str = CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD;
-    pub const DELTA_PATCH_V6_ZSTD: &'static str = CacheLayerMediaTypeV6::DELTA_PATCH_V6_ZSTD;
 
     /// 从媒体类型字符串严格解析
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             Self::ROOT_INDEX_V6_ZSTD => Some(Self::RootIndexV6Zstd),
             Self::SHARD_DATA_V6_ZSTD => Some(Self::ShardDataV6Zstd),
-            Self::DELTA_PATCH_V6_ZSTD => Some(Self::DeltaPatchV6Zstd),
             _ => None,
         }
     }
@@ -53,7 +48,6 @@ impl CacheLayerMediaType {
         match self {
             Self::RootIndexV6Zstd => Self::ROOT_INDEX_V6_ZSTD,
             Self::ShardDataV6Zstd => Self::SHARD_DATA_V6_ZSTD,
-            Self::DeltaPatchV6Zstd => Self::DELTA_PATCH_V6_ZSTD,
         }
     }
 
@@ -65,11 +59,6 @@ impl CacheLayerMediaType {
     /// 是否为分片数据类型
     pub const fn is_shard_data(&self) -> bool {
         matches!(self, Self::ShardDataV6Zstd)
-    }
-
-    /// 是否为增量补丁类型
-    pub const fn is_delta_patch(&self) -> bool {
-        matches!(self, Self::DeltaPatchV6Zstd)
     }
 }
 
@@ -323,56 +312,6 @@ pub fn build_sharded_arch_index_manifest(
             annotations: None,
         },
         layers,
-        annotations: Some(manifest_annotations),
-    }
-}
-
-/// 构造强类型的单架构 Delta Patch Image Manifest
-pub fn build_delta_patch_manifest(
-    delta_blob_digest: &str,
-    delta_blob_size: u64,
-    config_digest: &str,
-    config_size: u64,
-    run_id: u64,
-    job_id: &str,
-    system: &SystemArch,
-) -> OciImageManifest {
-    let mut layer_annotations = HashMap::new();
-    layer_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
-    layer_annotations.insert("org.nixos.nixcache.job_id".to_string(), job_id.to_string());
-    layer_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
-    layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
-
-    let mut manifest_annotations = HashMap::new();
-    manifest_annotations.insert(
-        "org.opencontainers.image.created".to_string(),
-        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    );
-    manifest_annotations.insert(
-        "org.opencontainers.image.description".to_string(),
-        format!("NixCache Delta Patch ({})", system.as_str()),
-    );
-    manifest_annotations.insert("org.nixos.nixcache.system".to_string(), system.to_string());
-    manifest_annotations.insert("org.nixos.nixcache.run_id".to_string(), run_id.to_string());
-    manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
-
-    OciImageManifest {
-        schema_version: 2,
-        media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-        config: OciDescriptor {
-            media_type: OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
-            digest: config_digest.to_string(),
-            size: config_size,
-            platform: None,
-            annotations: None,
-        },
-        layers: vec![OciDescriptor {
-            media_type: CacheLayerMediaTypeV6::DELTA_PATCH_V6_ZSTD.to_string(),
-            digest: delta_blob_digest.to_string(),
-            size: delta_blob_size,
-            platform: Some(OciPlatform::from_system(system)),
-            annotations: Some(layer_annotations),
-        }],
         annotations: Some(manifest_annotations),
     }
 }

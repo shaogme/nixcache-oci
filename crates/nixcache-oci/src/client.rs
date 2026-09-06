@@ -9,9 +9,8 @@ use crate::{
         CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
         OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
         OciImageIndex, OciImageManifest, ShardedArchIndexManifestParams,
-        build_delta_patch_manifest, build_sharded_arch_index_manifest,
+        build_sharded_arch_index_manifest,
     },
-    mutation::SessionMutationRequest,
     token::TokenManager,
     transport::{HashingStream, OciBlobStream, OciTransport},
     upload::UploadConfig,
@@ -19,14 +18,12 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
-use nixcache_core::{
-    DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch,
-};
+use nixcache_core::{NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
 use nixcache_utils::get_process_id;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{pin::pin, str::from_utf8, sync::Arc, time::Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -919,66 +916,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
         self.push_zstd_blob(payload).await
     }
 
-    /// 下载并解压指定 Blob Digest 的增量 Delta Patch
-    pub async fn get_delta_patch(&self, blob_digest: &str) -> Result<DeltaPatchData, OciError> {
-        let blob_bytes = self.get_blob(blob_digest).await?;
-        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV6::DELTA_PATCH_V6_ZSTD)
-    }
-
-    /// 压缩并推送增量 Delta Patch Blob
-    pub async fn push_delta_patch(
-        &self,
-        delta: &DeltaPatchData,
-    ) -> Result<(String, u64, u64), OciError> {
-        self.push_zstd_blob(delta).await
-    }
-
-    /// 按 Tag 获取 Delta Patch Manifest 并下载反序列化
-    pub async fn get_delta_patch_manifest(
-        &self,
-        tag: &str,
-    ) -> Result<Option<(DeltaPatchData, String)>, OciError> {
-        let (manifest_json, manifest_digest) = match self.get_manifest_with_digest(tag).await? {
-            Some(res) => res,
-            None => return Ok(None),
-        };
-
-        let manifest: OciImageManifest = serde_json::from_str(&manifest_json)?;
-        let layer = match manifest.layers.first() {
-            Some(l) => l,
-            None => return Ok(None),
-        };
-
-        let blob_bytes = self.get_blob(&layer.digest).await?;
-        let delta: DeltaPatchData = IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
-        Ok(Some((delta, manifest_digest)))
-    }
-
-    /// 构造并推送 Delta Patch 的 Image Manifest
-    pub async fn push_delta_patch_manifest(
-        &self,
-        tag: &str,
-        delta: &DeltaPatchData,
-        previous_digest: Option<&str>,
-    ) -> Result<String, OciError> {
-        let (delta_blob_digest, delta_blob_size, _) = self.push_delta_patch(delta).await?;
-        let manifest = build_delta_patch_manifest(
-            &delta_blob_digest,
-            delta_blob_size,
-            EMPTY_CONFIG_DIGEST,
-            EMPTY_CONFIG_SIZE,
-            delta.run_id,
-            &delta.job_id,
-            &delta.system,
-        );
-
-        let manifest_str = manifest.to_json_string()?;
-        self.put_manifest_conditional(tag, &manifest_str, previous_digest)
-            .await?;
-        let manifest_digest = compute_sha256_digest(manifest_str.as_bytes());
-        Ok(manifest_digest)
-    }
-
     pub async fn put_manifest_conditional(
         &self,
         tag: &str,
@@ -1485,176 +1422,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    /// 会话清单单调并集自愈收敛
-    pub async fn converge_run_session_manifest(
-        &self,
-        request: &SessionMutationRequest,
-    ) -> Result<(), OciError> {
-        let system_str = request.system.as_str();
-        let main_tag = format!("run-{}-{}", request.run_id, system_str);
-
-        let mut attempt = 0;
-        let max_retries = request.max_retries.max(6);
-
-        loop {
-            attempt += 1;
-
-            // 1. 拉取当前主标签已有数据
-            let (mut merged_delta, prev_digest) =
-                match self.get_delta_patch_manifest(&main_tag).await? {
-                    Some((remote_delta, digest)) => (remote_delta, Some(digest)),
-                    None => (
-                        DeltaPatchData::new(request.run_id, &request.job_id, request.system),
-                        None,
-                    ),
-                };
-
-            // 2. 快速跳出: 若远端已是超集，无需任何写入
-            let entries_contained = request.new_entries.is_empty()
-                || merged_delta.contains_all_entries(&request.new_entries);
-            let roots_contained =
-                request.new_roots.is_empty() || merged_delta.contains_all_roots(&request.new_roots);
-            if entries_contained && roots_contained && attempt > 1 {
-                info!(
-                    "Main session tag {} already contains our entries. Converged early.",
-                    main_tag
-                );
-                return Ok(());
-            }
-
-            // 3. 执行本地集合并集
-            request.apply_to_delta(&mut merged_delta);
-
-            // 4. 推送合并后的全量清单
-            let push_res = self
-                .push_delta_patch_manifest(&main_tag, &merged_delta, prev_digest.as_deref())
-                .await;
-
-            let pushed_digest = match push_res {
-                Ok(digest) => digest,
-                Err(OciError::CasPreconditionFailed { .. }) if attempt <= max_retries => {
-                    let pid = get_process_id();
-                    let jitter = (pid * 37 + attempt as u64 * 53) % 100;
-                    let backoff_ms = (50 * (1 << attempt.min(5))) + jitter;
-                    warn!(
-                        "CAS precondition failed on {}, retrying convergence in {}ms (attempt {}/{})",
-                        main_tag, backoff_ms, attempt, max_retries
-                    );
-                    self.transport
-                        .sleep(Duration::from_millis(backoff_ms))
-                        .await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            // 5. 写后超集校验 (Read-After-Write Superset Verification)
-            if let Some((manifest_json, latest_digest)) =
-                self.get_manifest_with_digest(&main_tag).await?
-            {
-                let is_exact = latest_digest == pushed_digest;
-                let is_superset = if is_exact {
-                    true
-                } else if let Ok(manifest) = serde_json::from_str::<OciImageManifest>(&manifest_json)
-                    && let Some(layer) = manifest.layers.first()
-                    && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                    && let Ok(latest_delta) =
-                        IndexCodec::decode_zstd::<DeltaPatchData>(&blob_bytes, &layer.media_type)
-                {
-                    let latest_entries_contained = request.new_entries.is_empty()
-                        || latest_delta.contains_all_entries(&request.new_entries);
-                    let latest_roots_contained = request.new_roots.is_empty()
-                        || latest_delta.contains_all_roots(&request.new_roots);
-                    latest_entries_contained && latest_roots_contained
-                } else {
-                    false
-                };
-
-                if is_superset {
-                    // 5.1 稳态静默校验窗口 (Settling Window):
-                    // 等待随机微小窗口并二次复核，防止并发 Worker 几乎同时盲目 PUT 造成数据被后发 Worker 冲掉
-                    let pid = get_process_id();
-                    let settle_ms = 80 + (pid * 37 + attempt as u64 * 31) % 100;
-                    self.transport
-                        .sleep(Duration::from_millis(settle_ms))
-                        .await;
-
-                    if let Some((settle_json, settle_digest)) =
-                        self.get_manifest_with_digest(&main_tag).await?
-                    {
-                        if settle_digest == pushed_digest || settle_digest == latest_digest {
-                            info!(
-                                "Main session tag {} verified stable on attempt {}",
-                                main_tag, attempt
-                            );
-                            return Ok(());
-                        }
-
-                        if let Ok(manifest) =
-                            serde_json::from_str::<OciImageManifest>(&settle_json)
-                            && let Some(layer) = manifest.layers.first()
-                            && let Ok(blob_bytes) = self.get_blob(&layer.digest).await
-                            && let Ok(settle_delta) = IndexCodec::decode_zstd::<DeltaPatchData>(
-                                &blob_bytes,
-                                &layer.media_type,
-                            )
-                        {
-                            let settle_entries_contained = request.new_entries.is_empty()
-                                || settle_delta.contains_all_entries(&request.new_entries);
-                            let settle_roots_contained = request.new_roots.is_empty()
-                                || settle_delta.contains_all_roots(&request.new_roots);
-                            if settle_entries_contained && settle_roots_contained {
-                                info!(
-                                    "Main session tag {} verified by settling superset containment on attempt {}",
-                                    main_tag, attempt
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 6. 未通过超集校验 (发生写覆盖导致条目丢失)，退避重试
-            if attempt >= max_retries {
-                error!(
-                    "Main session tag {} did not converge after {} attempts",
-                    main_tag, attempt
-                );
-                return Err(OciError::CasPreconditionFailed {
-                    tag: main_tag,
-                    expected: Some("superset containment".to_string()),
-                    actual: None,
-                });
-            }
-
-            let pid = get_process_id();
-            let jitter = (pid * 37 + attempt as u64 * 53) % 100;
-            let backoff_ms = (50 * (1 << attempt.min(5))) + jitter;
-            warn!(
-                "Concurrent overwrite detected on {}, retrying convergence in {}ms (attempt {}/{})",
-                main_tag, backoff_ms, attempt, max_retries
-            );
-            self.transport
-                .sleep(Duration::from_millis(backoff_ms))
-                .await;
-        }
-    }
-
-    pub async fn update_run_session_with_cas(
-        &self,
-        request: SessionMutationRequest,
-    ) -> Result<(), OciError> {
-        self.converge_run_session_manifest(&request).await
-    }
-
-    pub async fn update_arch_session_with_cas(
-        &self,
-        request: SessionMutationRequest,
-    ) -> Result<(), OciError> {
-        self.converge_run_session_manifest(&request).await
     }
 
     pub async fn get_blob(&self, digest: &str) -> Result<Bytes, OciError> {

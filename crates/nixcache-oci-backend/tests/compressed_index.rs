@@ -1,12 +1,11 @@
 use nixcache_core::{
-    DeltaPatchData, IndexEntry, NUM_SHARDS, NarDigest, NarInfoMeta, ShardDataPayload,
-    ShardedArchCacheIndexData, StoreHash, SystemArch,
+    IndexEntry, NUM_SHARDS, NarDigest, NarInfoMeta, ShardDataPayload, ShardedArchCacheIndexData,
+    StoreHash, SystemArch,
 };
 use nixcache_oci::{
     CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciError, OciImageManifest, OciPlatform,
-    SessionMutationRequest, ShardedArchIndexManifestParams, build_delta_patch_manifest,
-    build_image_index, build_sharded_arch_index_manifest,
+    ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use sha2::{Digest, Sha256};
@@ -68,34 +67,6 @@ fn sample_sharded_arch_index_data(
     (root_index, shard_payload)
 }
 
-fn sample_delta_patch_data(run_id: u64, system: SystemArch) -> DeltaPatchData {
-    let mut delta = DeltaPatchData::new(run_id, "job:workflow-step", system);
-    let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-    delta.new_entries.insert(
-        hash.clone(),
-        IndexEntry {
-            name: format!("session-pkg-{}", system.as_str()),
-            system: Some(system),
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-session-pkg", hash),
-                nar_basename: format!("session-pkg-{}.nar.xz", system.as_str()),
-                nar_hash: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "1111111111111111111111111111111111111111111111111111111111111111",
-            )
-            .unwrap(),
-            nar_size: 4096,
-            added: "2026-08-29T12:00:00Z".to_string(),
-            origin_job: Some("job:workflow-step".to_string()),
-        },
-    );
-    delta.active_gc_roots.push(hash);
-    delta
-}
-
 #[test]
 fn test_manifest_builder_generates_v6_zstd_descriptors() {
     let system = SystemArch::X86_64Linux;
@@ -138,42 +109,6 @@ fn test_manifest_builder_generates_v6_zstd_descriptors() {
             .get("org.nixos.nixcache.merkle_root")
             .map(|s| s.as_str()),
         Some("sha256:merkle123")
-    );
-
-    let delta_manifest = build_delta_patch_manifest(
-        "sha256:deltablob789",
-        600,
-        "sha256:config123",
-        2,
-        999,
-        "job:build-worker",
-        &system,
-    );
-
-    assert_eq!(delta_manifest.schema_version, 2);
-    assert_eq!(delta_manifest.layers.len(), 1);
-
-    let d_layer = &delta_manifest.layers[0];
-    assert_eq!(d_layer.media_type, CacheLayerMediaType::DELTA_PATCH_V6_ZSTD);
-    assert_eq!(d_layer.digest, "sha256:deltablob789");
-    assert_eq!(d_layer.size, 600);
-
-    let d_ann = d_layer.annotations.as_ref().unwrap();
-    assert_eq!(
-        d_ann.get("org.nixos.nixcache.schema").map(|s| s.as_str()),
-        Some("6")
-    );
-    assert_eq!(
-        d_ann.get("org.nixos.nixcache.run_id").map(|s| s.as_str()),
-        Some("999")
-    );
-    assert_eq!(
-        d_ann.get("org.nixos.nixcache.job_id").map(|s| s.as_str()),
-        Some("job:build-worker")
-    );
-    assert_eq!(
-        d_ann.get("org.nixos.nixcache.system").map(|s| s.as_str()),
-        Some("x86_64-linux")
     );
 }
 
@@ -275,80 +210,6 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     assert_eq!(fetched_data.shards.len(), NUM_SHARDS);
     assert_eq!(fetched_data.total_entries(), 1);
     assert_eq!(fetched_data.shards[42].blob_digest, shard_digest);
-}
-
-#[tokio::test]
-async fn test_push_zstd_blob_and_fetch_delta_patch_manifest() {
-    let server = MockServer::start().await;
-    let host = server.address().to_string();
-
-    let delta_data = sample_delta_patch_data(101, SystemArch::Aarch64Linux);
-    let compressed_bytes = IndexCodec::encode_zstd(&delta_data, 3).unwrap();
-    let blob_digest = compute_sha256(&compressed_bytes);
-    let blob_size = compressed_bytes.len() as u64;
-
-    let sub_manifest = build_delta_patch_manifest(
-        &blob_digest,
-        blob_size,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        101,
-        "job:workflow-step",
-        &SystemArch::Aarch64Linux,
-    );
-    let manifest_json = sub_manifest.to_json_string().unwrap();
-
-    Mock::given(method("HEAD"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(201).insert_header("Docker-Content-Digest", blob_digest.as_str()),
-        )
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-101-aarch64-linux",
-        ))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(&manifest_json)
-                .insert_header("Docker-Content-Digest", "sha256:sessionsubdigest"),
-        )
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/test/repo/nix-cache/blobs/{}",
-            blob_digest
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(compressed_bytes.to_vec()))
-        .mount(&server)
-        .await;
-
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
-
-    let (pushed_digest, comp_size, _) = client.push_zstd_blob(&delta_data).await.unwrap();
-    assert_eq!(pushed_digest, blob_digest);
-    assert_eq!(comp_size, blob_size);
-
-    let fetched = client
-        .get_delta_patch_manifest("run-101-aarch64-linux")
-        .await
-        .unwrap();
-    assert!(fetched.is_some());
-
-    let (fetched_delta, digest) = fetched.unwrap();
-    assert_eq!(digest, "sha256:sessionsubdigest");
-    assert_eq!(fetched_delta.run_id, 101);
-    assert_eq!(fetched_delta.system, SystemArch::Aarch64Linux);
-    assert_eq!(fetched_delta.new_entries.len(), 1);
-    assert_eq!(fetched_delta.active_gc_roots.len(), 1);
 }
 
 #[tokio::test]
@@ -651,126 +512,6 @@ async fn test_get_shard_data_roundtrip() {
     let retrieved_shard = client.get_shard_data(&shard_digest).await.unwrap();
     assert_eq!(retrieved_shard.shard_id, 42);
     assert_eq!(retrieved_shard.entries.len(), 1);
-}
-
-#[tokio::test]
-async fn test_update_arch_session_with_cas_zstd_roundtrip() {
-    let server = MockServer::start().await;
-    let host = server.address().to_string();
-
-    Mock::given(method("HEAD"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v2/test/repo/nix-cache/blobs/uploads/"))
-        .respond_with(ResponseTemplate::new(202).insert_header(
-            "Location",
-            "/v2/test/repo/nix-cache/blobs/uploads/upload-session-cas",
-        ))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(path(
-            "/v2/test/repo/nix-cache/blobs/uploads/upload-session-cas",
-        ))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&server)
-        .await;
-
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
-    let mut entries = HashMap::new();
-    let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-    entries.insert(
-        hash.clone(),
-        IndexEntry {
-            name: "pkg-cas".to_string(),
-            system: Some(SystemArch::X86_64Linux),
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-pkg-cas", hash),
-                nar_basename: "pkg-cas.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-            )
-            .unwrap(),
-            nar_size: 1024,
-            added: "2026-08-29T12:00:00Z".to_string(),
-            origin_job: Some("job:cas-test".to_string()),
-        },
-    );
-
-    let req = SessionMutationRequest::new(555, "cas-test", SystemArch::X86_64Linux)
-        .with_entries(entries)
-        .with_roots(vec![hash])
-        .with_git_info(
-            Some("sha-123".to_string()),
-            Some("refs/heads/main".to_string()),
-        )
-        .with_public_key(Some("pubkey:123".to_string()))
-        .with_upload_stats(1, 1024);
-
-    let delta = req.to_delta_patch();
-    let delta_bytes = IndexCodec::encode_zstd(&delta, 3).unwrap();
-    let delta_blob_digest = compute_sha256(&delta_bytes);
-    let delta_blob_size = delta_bytes.len() as u64;
-    let manifest = build_delta_patch_manifest(
-        &delta_blob_digest,
-        delta_blob_size,
-        EMPTY_CONFIG_DIGEST,
-        EMPTY_CONFIG_SIZE,
-        delta.run_id,
-        &delta.job_id,
-        &delta.system,
-    );
-    let manifest_json = manifest.to_json_string().unwrap();
-    let manifest_digest = compute_sha256(manifest_json.as_bytes());
-
-    Mock::given(method("GET"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
-        ))
-        .respond_with(ResponseTemplate::new(404))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
-        ))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(&manifest_json)
-                .insert_header("Docker-Content-Digest", manifest_digest.as_str()),
-        )
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/test/repo/nix-cache/blobs/{}",
-            delta_blob_digest
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(delta_bytes.to_vec()))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("PUT"))
-        .and(path(
-            "/v2/test/repo/nix-cache/manifests/run-555-x86_64-linux",
-        ))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&server)
-        .await;
-
-    let res = client.update_arch_session_with_cas(req).await;
-    assert!(res.is_ok());
 }
 
 #[tokio::test]

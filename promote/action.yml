@@ -13,18 +13,10 @@ inputs:
     description: 'Target repository name (owner/repo)'
     required: false
     default: ${{ github.repository }}
-  run-id:
-    description: 'Workflow run ID to promote'
-    required: false
-    default: ${{ github.run_id }}
   target-tag:
     description: 'Target OCI tag for production baseline'
     required: false
     default: 'cache-index'
-  cleanup-session:
-    description: 'Clean up workflow run session tag after promotion'
-    required: false
-    default: 'true'
   receipts-dir:
     description: 'Directory containing Build Receipts'
     required: false
@@ -58,10 +50,9 @@ runs:
         chmod +x "${{ github.action_path }}/../install/install.sh"
         "${{ github.action_path }}/../install/install.sh"
 
-    - name: Promote Session & Receipts to Baseline
+    - name: Promote Receipts to Baseline
       shell: bash
       env:
-        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
         NIXCACHE_RECEIPTS_DIR: ${{ inputs.receipts-dir != '' && inputs.receipts-dir || format('{0}/receipts', runner.temp) }}
         NIXCACHE_TARGET_TAG: ${{ inputs.target-tag }}
         NIXCACHE_REPO: ${{ inputs.repo }}
@@ -69,8 +60,4 @@ runs:
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
-        EXTRA_ARGS=()
-        if [[ "${{ inputs.cleanup-session }}" == "false" ]]; then
-          EXTRA_ARGS+=(--no-cleanup-session)
-        fi
-        nixcache-builder promote "${EXTRA_ARGS[@]}"
+        nixcache-builder promote

@@ -4,7 +4,6 @@ pub mod codec;
 pub mod error;
 pub mod manifest;
 pub mod mock;
-pub mod mutation;
 pub mod token;
 pub mod transport;
 pub mod upload;
@@ -22,17 +21,15 @@ pub use manifest::{
     CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
     OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
-    ShardedArchIndexManifestParams, build_delta_patch_manifest, build_image_index,
-    build_sharded_arch_index_manifest,
+    ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
 };
 pub use mock::{MockResponse, MockRouterTransport};
-pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry, JobSummaryMetadata,
-    NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
-    SCHEMA_VERSION, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
-    ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
-    compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors, evaluate_multi_arch_gc,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
+    NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
+    SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
+    SystemArch, build_nar_lookup_map, calculate_shard_id, compute_merkle_root,
+    compute_shard_merkle_hash, diff_shard_descriptors, evaluate_multi_arch_gc,
     extract_nar_basename, extract_store_hash, extract_store_hash_str, partition_entries_by_shard,
     shard_id_to_prefix,
 };
@@ -48,10 +45,9 @@ mod tests {
     use super::{
         AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
         GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
-        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
-        RegistryDeletionStrategy, RegistryKind, SessionMutationRequest, ShardDataPayload,
-        ShardedArchCacheIndexData, StoreHash, StreamHashState, SystemArch, TransportError,
-        UploadConfig, build_image_index, parse_range_header,
+        OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryDeletionStrategy,
+        RegistryKind, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, StreamHashState,
+        SystemArch, TransportError, UploadConfig, build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -442,94 +438,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_run_session_with_cas_mock() {
-        let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
-
-        let mut entries = HashMap::new();
-        let hash_x86 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        entries.insert(
-            hash_x86.clone(),
-            IndexEntry {
-                name: "pkg-x86".to_string(),
-                system: Some(SystemArch::X86_64Linux),
-                narinfo_meta: NarInfoMeta {
-                    store_path: format!("/nix/store/{}-pkg", hash_x86),
-                    nar_basename: "pkg-x86.nar.xz".to_string(),
-                    nar_hash:
-                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                            .to_string(),
-                    ..Default::default()
-                },
-                nar_digest: NarDigest::new_sha256(
-                    "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-                )
-                .unwrap(),
-                nar_size: 1024,
-                added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: Some("job:vm-tests".to_string()),
-            },
-        );
-
-        let request = SessionMutationRequest::new(12345, "vm-tests", SystemArch::X86_64Linux)
-            .with_entries(entries)
-            .with_roots(vec![hash_x86])
-            .with_git_info(
-                Some("commit-sha-123".to_string()),
-                Some("refs/heads/main".to_string()),
-            )
-            .with_public_key(Some("key:pub".to_string()))
-            .with_upload_stats(1, 1024)
-            .with_max_retries(3);
-
-        let res = client.update_run_session_with_cas(request).await;
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_converge_run_session_manifest_concurrent_mock() {
-        let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
-
-        let hash_1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        let mut entries_1 = HashMap::new();
-        entries_1.insert(hash_1.clone(), IndexEntry::default());
-        let req1 = SessionMutationRequest::new(999, "worker-1", SystemArch::X86_64Linux)
-            .with_entries(entries_1)
-            .with_roots(vec![hash_1.clone()]);
-
-        let hash_2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
-        let mut entries_2 = HashMap::new();
-        entries_2.insert(hash_2.clone(), IndexEntry::default());
-        let req2 = SessionMutationRequest::new(999, "worker-2", SystemArch::X86_64Linux)
-            .with_entries(entries_2)
-            .with_roots(vec![hash_2.clone()]);
-
-        // 并发收敛两个 Worker
-        let (res1, res2) = tokio::join!(
-            client.converge_run_session_manifest(&req1),
-            client.converge_run_session_manifest(&req2)
-        );
-        assert!(res1.is_ok());
-        assert!(res2.is_ok());
-
-        // 验证主标签收敛包含两个条目
-        let (main_delta, _) = client
-            .get_delta_patch_manifest("run-999-x86_64-linux")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(main_delta.new_entries.len(), 2);
-        assert!(main_delta.new_entries.contains_key(&hash_1));
-        assert!(main_delta.new_entries.contains_key(&hash_2));
-
-        // 验证仅生成唯一主会话标签
-        let tags = client.list_tags().await.unwrap();
-        assert!(tags.contains(&"run-999-x86_64-linux".to_string()));
-        assert!(!tags.iter().any(|t| t.contains("-chunk-")));
-    }
-
-    #[tokio::test]
     async fn test_sharded_root_index_and_shard_data_flow_mock() {
         let transport = MockRouterTransport::default();
         let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
@@ -841,36 +749,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(invalid_err, OciError::InvalidUtf8Manifest(_)));
-    }
-
-    #[tokio::test]
-    async fn test_delta_patch_manifest_roundtrip_mock() {
-        let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
-
-        let mut delta = super::DeltaPatchData::new(8888, "build-job", SystemArch::Aarch64Linux);
-        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        delta.new_entries.insert(h1.clone(), IndexEntry::default());
-        delta.active_gc_roots.push(h1.clone());
-
-        let manifest_digest = client
-            .push_delta_patch_manifest("run-8888-aarch64-linux", &delta, None)
-            .await
-            .expect("Push delta patch manifest should succeed");
-        assert!(manifest_digest.starts_with("sha256:"));
-
-        let (fetched_delta, fetched_digest) = client
-            .get_delta_patch_manifest("run-8888-aarch64-linux")
-            .await
-            .expect("Get delta patch manifest should succeed")
-            .expect("Delta patch should exist");
-
-        assert_eq!(fetched_digest, manifest_digest);
-        assert_eq!(fetched_delta.run_id, 8888);
-        assert_eq!(fetched_delta.job_id, "build-job");
-        assert_eq!(fetched_delta.system, SystemArch::Aarch64Linux);
-        assert_eq!(fetched_delta.new_entries.len(), 1);
-        assert_eq!(fetched_delta.active_gc_roots, vec![h1]);
     }
 
     #[tokio::test]

@@ -16,9 +16,8 @@ export GITHUB_PATH="$TMP_DIR/github_path"
 touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
 unset NIX_CONFIG || true
 
-# 1. Start local OCI registry container via run_registry
-REGISTRY_CONTAINER="nixcache-registry-${REGISTRY_PORT}"
 REGISTRY_PORT=5001
+REGISTRY_CONTAINER="nixcache-registry-${REGISTRY_PORT}"
 REGISTRY_PID=""
 
 echo ">>> Launching OCI registry container on port ${REGISTRY_PORT}..."
@@ -200,7 +199,7 @@ fi
 
 # 7. Perform substitution test
 echo ">>> Deleting local store path from Nix store (if possible)..."
-nix-store --delete "$TEST_STORE_PATH" || true
+nix-store --delete "$TEST_STORE_PATH" --ignore-liveness || true
 
 echo ">>> Realising store path from local proxy substituter..."
 nix-store --realise "$TEST_STORE_PATH" \

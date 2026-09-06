@@ -13,22 +13,10 @@ inputs:
     description: 'Target repository name (owner/repo)'
     required: false
     default: ${{ github.repository }}
-  run-id:
-    description: 'Workflow run ID for Tier 1 session'
-    required: false
-    default: ${{ github.run_id }}
-  branch:
-    description: 'Branch name or PR number for Tier 2 session'
-    required: false
-    default: ${{ github.ref_name }}
   signing-key:
     description: 'Nix secret key used to sign store paths'
     required: false
     default: ''
-  session-ttl:
-    description: 'Session index TTL in seconds'
-    required: false
-    default: '10'
   baseline-ttl:
     description: 'Baseline index TTL in seconds'
     required: false
@@ -77,9 +65,6 @@ runs:
         NIXCACHE_REPO: ${{ inputs.repo }}
         NIXCACHE_REGISTRY: ${{ inputs.registry }}
         NIXCACHE_REGISTRY_KIND: ${{ inputs.registry-kind }}
-        NIXCACHE_RUN_ID: ${{ inputs.run-id }}
-        NIXCACHE_BRANCH: ${{ inputs.branch }}
-        NIXCACHE_SESSION_TTL: ${{ inputs.session-ttl }}
         NIXCACHE_BASELINE_TTL: ${{ inputs.baseline-ttl }}
         NIXCACHE_BASELINE_TAG: ${{ inputs.baseline-tag }}
         NIXCACHE_UPSTREAM: ${{ inputs.upstream }}

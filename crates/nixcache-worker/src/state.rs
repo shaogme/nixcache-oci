@@ -1,5 +1,5 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
-use nixcache_core::{DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData};
+use nixcache_core::{NarDigest, ShardDataPayload, ShardedArchCacheIndexData};
 use scc::HashMap as SccHashMap;
 use std::{
     collections::HashMap,
@@ -31,13 +31,6 @@ impl Default for RemoteHealthState {
 }
 
 #[derive(Clone, Debug)]
-pub struct CachedSessionEntry {
-    pub delta: DeltaPatchData,
-    pub nar_lookup: HashMap<String, NarDigest>,
-    pub expires_at: f64,
-}
-
-#[derive(Clone, Debug)]
 pub struct CachedBaselineEntry {
     pub root: ShardedArchCacheIndexData,
     pub manifest_digest: String,
@@ -54,7 +47,6 @@ pub struct CachedShardEntry {
 
 /// 收敛的 Worker 全局内存状态 (Schema v6 SMRI with SWR Self-Healing)
 pub struct WorkerState {
-    pub mem_session_cache: SccHashMap<String, Arc<CachedSessionEntry>>,
     pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
     pub mem_shard_cache: SccHashMap<u16, Arc<CachedShardEntry>>,
     pub remote_status: ArcSwap<RemoteHealthState>,
@@ -62,7 +54,6 @@ pub struct WorkerState {
 }
 
 static GLOBAL_STATE: LazyLock<WorkerState> = LazyLock::new(|| WorkerState {
-    mem_session_cache: SccHashMap::new(),
     mem_baseline_cache: ArcSwapOption::from(None),
     mem_shard_cache: SccHashMap::new(),
     remote_status: ArcSwap::from_pointee(RemoteHealthState::default()),
@@ -97,7 +88,6 @@ impl WorkerState {
 
     /// 清空所有 L1 内存缓存
     pub fn clear_l1_caches(&self) {
-        self.mem_session_cache.clear_sync();
         self.mem_baseline_cache.store(None);
         self.mem_shard_cache.clear_sync();
     }

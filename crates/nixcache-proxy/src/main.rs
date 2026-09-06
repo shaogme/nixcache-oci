@@ -2,10 +2,11 @@ use clap::Parser;
 use mimalloc::MiMalloc;
 use nixcache_cli::{
     AuthTokenArgs, CachePolicyArgs, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT, OciTargetArgs,
-    ServerBindArgs, SessionContextArgs,
+    ServerBindArgs,
 };
 use nixcache_core::SystemArch;
 use nixcache_oci_backend::create_tokio_reqwest_client;
+use nixcache_utils::Env;
 use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -29,7 +30,7 @@ use proxy::{AppState, create_router};
 #[command(
     name = "nixcache-proxy",
     version,
-    about = "OCI-backed Nix Cache Proxy with 4-tier cascading resolution"
+    about = "OCI-backed Nix Cache Proxy with 2-tier cascading resolution"
 )]
 struct Args {
     #[command(flatten)]
@@ -38,8 +39,11 @@ struct Args {
     #[command(flatten)]
     bind: ServerBindArgs,
 
-    #[command(flatten)]
-    session: SessionContextArgs,
+    #[arg(
+        long,
+        help = "Target platform system architecture [env: NIXCACHE_SYSTEM]"
+    )]
+    system: Option<String>,
 
     #[command(flatten)]
     auth: AuthTokenArgs,
@@ -85,16 +89,18 @@ async fn main() -> Result<(), ProxyError> {
         .bind
         .resolve(DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT);
     let github_token = args.auth.resolve_token().await;
-    let run_id = args.session.resolve_run_id();
-    let branch = args.session.resolve_branch();
 
     let index_dir = args.cache.resolve_index_dir(&repo);
     let upstream_caches = args.cache.resolve_upstream_list();
-    let session_ttl = args.cache.resolve_session_ttl();
     let index_ttl = args.cache.resolve_baseline_ttl();
     let baseline_tag = args.cache.resolve_baseline_tag();
 
-    let system_arch_opt = args.session.resolve_system();
+    let system_arch_opt = args
+        .system
+        .as_deref()
+        .and_then(Env::non_empty_str)
+        .map(|s| s.to_string())
+        .or_else(|| Env::get("NIXCACHE_SYSTEM"));
 
     let target_system = match system_arch_opt {
         Some(ref s) => SystemArch::from(s.as_str()),
@@ -106,8 +112,8 @@ async fn main() -> Result<(), ProxyError> {
         registry, repo, listen, port
     );
     info!(
-        "Config: run_id={:?}, branch={:?}, baseline_tag={}, session_ttl={}s, index_ttl={}s, system={:?}",
-        run_id, branch, baseline_tag, session_ttl, index_ttl, target_system
+        "Config: baseline_tag={}, index_ttl={}s, system={:?}",
+        baseline_tag, index_ttl, target_system
     );
     info!("Index cache directory: {:?}", index_dir);
     info!("Upstream caches: {:?}", upstream_caches);
@@ -117,11 +123,8 @@ async fn main() -> Result<(), ProxyError> {
     let proxy_config = CascadingProxyConfig {
         repo: repo.clone(),
         registry,
-        run_id,
-        branch_or_pr: branch,
         baseline_tag,
         upstream_caches,
-        session_ttl: Duration::from_secs(session_ttl),
         baseline_ttl: Duration::from_secs(index_ttl),
         index_dir,
         target_system,

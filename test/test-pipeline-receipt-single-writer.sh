@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# test-pipeline-session-cas.sh — End-to-end integration test for Schema v6 Session CAS & Cascading Proxy
+# test-pipeline-receipt-single-writer.sh — End-to-end integration test for Schema v6 BuildReceipt Single-Writer Pipeline & 2-Tier Proxy
+# Verifies:
+#   1. Clean OCI Registry setup and proxy startup (2-Tier cascade)
+#   2. Concurrent matrix workers generating derivations and exporting BuildReceipts
+#   3. Zero OCI ephemeral tags (no run-<run_id> or chunk tags created)
+#   4. Proxy Tier 0 hot registration (0ms memory hit for newly built store paths)
+#   5. Single-Writer Promote aggregating all receipts into cache-index
+#   6. Baseline cache-index structure and Merkle root verification
+#   7. Proxy /_refresh baseline synchronization and Tier 1 query validation
+#   8. Session clean and snapshot deletion
 
 set -euo pipefail
 
@@ -7,9 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-echo "=== Starting NixCache Schema v6 Pipeline Session CAS & Cascading Test ==="
+echo "=== Starting NixCache Schema v6 BuildReceipt Single-Writer Pipeline Test ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-pipeline-test-XXXXXX)
+RECEIPTS_DIR="$TMP_DIR/receipts"
+mkdir -p "$RECEIPTS_DIR"
 export GITHUB_ENV="$TMP_DIR/github_env"
 export GITHUB_OUTPUT="$TMP_DIR/github_output"
 export GITHUB_PATH="$TMP_DIR/github_path"
@@ -19,6 +30,7 @@ REGISTRY_PORT=5003
 PROXY_PORT=37515
 REGISTRY_PID=""
 RUN_ID=987654
+export GITHUB_RUN_ID="$RUN_ID"
 
 cleanup() {
     echo ">>> Cleaning up test resources..."
@@ -51,7 +63,7 @@ for _ in {1..20}; do
     sleep 0.5
 done
 
-# 2. Build binaries
+# 2. Build binaries or locate
 find_binaries() {
     if [[ -n "${BUILDER_BIN:-}" && -x "$BUILDER_BIN" && -n "${PROXY_BIN:-}" && -x "$PROXY_BIN" ]]; then
         echo ">>> Using binaries from environment variables: BUILDER_BIN=$BUILDER_BIN, PROXY_BIN=$PROXY_BIN"
@@ -90,12 +102,9 @@ export GITHUB_TOKEN="dummy-token"
 SNAPSHOT_FILE="/tmp/nixcache-test-snapshot.txt"
 echo ">>> Initializing session via nixcache-builder session init..."
 "$BUILDER_BIN" session init \
-    --run-id "$RUN_ID" \
-    --branch "main" \
     --port "$PROXY_PORT" \
     --listen "127.0.0.1" \
     --upstream "https://cache.nixos.org" \
-    --session-ttl 2 \
     --baseline-ttl 10 \
     --snapshot-path "$SNAPSHOT_FILE"
 
@@ -105,26 +114,38 @@ INFO_RESP=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/nix-cache-info")
 echo "$INFO_RESP" | grep -q "StoreDir: /nix/store"
 echo ">>> Proxy is healthy and running."
 
-# 4. Test Concurrent Session Capture with CAS
+# Initial status check
+STATUS_INIT=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
+echo "Initial Proxy Status: $STATUS_INIT"
+python3 -c "
+import json
+st = json.loads('''$STATUS_INIT''')
+assert st['tier0_hot_entries'] == 0, f'Expected 0 tier0 entries, got {st[\"tier0_hot_entries\"]}'
+assert st['baseline_entries'] == 0, f'Expected 0 baseline entries, got {st[\"baseline_entries\"]}'
+"
+
+# 4. Test Concurrent Matrix Worker Session Capture & Receipt Generation
 echo ">>> Simulating concurrent worker jobs executing session capture..."
 WORKER_PIDS=()
+STORE_PATHS=()
+STORE_HASHES=()
 
 for worker_id in {1..4}; do
     TMP_FILE="/tmp/nixcache-test-dummy-${worker_id}.txt"
     echo "test payload for worker ${worker_id} $(date +%s%N)" > "$TMP_FILE"
     STORE_PATH=$(nix-store --add "$TMP_FILE")
     rm -f "$TMP_FILE"
+    STORE_PATHS+=("$STORE_PATH")
+    STORE_HASH=$(basename "$STORE_PATH" | cut -c1-32)
+    STORE_HASHES+=("$STORE_HASH")
 
     (
-        JOB_NAME="job-matrix-${worker_id}"
-        
-        # Call session capture directly with explicit paths
+        RECEIPT_OUT="$RECEIPTS_DIR/receipt-${worker_id}.json"
+        # Worker exports blobs to OCI, registers hot entries with local proxy, and outputs receipt.json
         "$BUILDER_BIN" session capture \
-            --run-id "$RUN_ID" \
-            --job-id "$JOB_NAME" \
             --system "x86_64-linux" \
             --proxy-url "http://127.0.0.1:${PROXY_PORT}" \
-            --output-receipt "/tmp/nixcache-test-receipt-${worker_id}.json" \
+            --output-receipt "$RECEIPT_OUT" \
             "$STORE_PATH"
     ) &
     WORKER_PIDS+=($!)
@@ -133,51 +154,51 @@ done
 wait "${WORKER_PIDS[@]}"
 echo ">>> All concurrent worker session captures completed."
 
-# 5. Verify ArchRunSessionManifest in OCI Registry (run-<run_id>-x86_64-linux)
-echo ">>> Verifying session manifest in OCI registry..."
-SESSION_MANIFEST=$(curl -fs -H "Accept: application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
-echo "Session Manifest:"
-echo "$SESSION_MANIFEST"
-
+# 5. Verify Zero Ephemeral Tags in OCI Registry
+echo ">>> Verifying 0 ephemeral session tags in OCI registry..."
+TAGS_RESP=$(curl -s "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/tags/list" || true)
 python3 -c "
-import json, subprocess
-manifest = json.loads('''$SESSION_MANIFEST''')
-layer_digest = manifest['layers'][0]['digest']
-blob_bytes = subprocess.check_output([
-    'curl', '-fsSL',
-    f'http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/blobs/{layer_digest}'
-])
-decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
-session_data = json.loads(decompressed)
-assert session_data['version'] == 6, f'Expected version 6, got {session_data[\"version\"]}'
-assert session_data['run_id'] == $RUN_ID, f'Expected run_id $RUN_ID, got {session_data[\"run_id\"]}'
-assert len(session_data['new_entries']) == 4, f'Expected 4 entries from 4 workers, got {len(session_data[\"new_entries\"])}'
-print('>>> Session manifest verified: Schema v6, 4 entries merged via monotonic convergence.')
-
-import urllib.request
-with urllib.request.urlopen('http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/tags/list') as resp:
-    tags = json.loads(resp.read().decode())['tags']
+import json
+try:
+    data = json.loads('''$TAGS_RESP''')
+    tags = data.get('tags') or []
+except Exception:
+    tags = []
+run_tags = [t for t in tags if t.startswith('run-')]
 chunk_tags = [t for t in tags if '-chunk-' in t]
-assert len(chunk_tags) == 0, f'Expected 0 chunk tags in registry, found {chunk_tags}'
-print('>>> Confirmed: 0 ephemeral chunk tags generated (Pure Main-Tag Monotonic Convergence).')
+assert len(run_tags) == 0, f'Found unexpected run tags: {run_tags}'
+assert len(chunk_tags) == 0, f'Found unexpected chunk tags: {chunk_tags}'
+print('>>> Confirmed: Zero ephemeral tags (run-* or -chunk-) in OCI registry!')
 "
 
-# 6. Test Cascading Proxy Tier 0 (Hot Registry) & Tier 1 (run-<run_id>)
-echo ">>> Testing Cascading Proxy status..."
-STATUS_RESP=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
-echo "Proxy Status: $STATUS_RESP"
+# 6. Verify Proxy Tier 0 (Hot Registry) Instant Hit & Status
+echo ">>> Verifying Proxy Tier 0 Hot In-Memory hits..."
+for h in "${STORE_HASHES[@]}"; do
+    NARINFO_RESP=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/${h}.narinfo")
+    echo "$NARINFO_RESP" | grep -q "StorePath: "
+    echo ">>> Store path with hash $h hit Tier 0 hot registry instantly!"
+done
 
-# 7. Test Promote (run-<run_id> -> cache-index and cleanup session tag)
-echo ">>> Running nixcache-builder promote for run-${RUN_ID}..."
+STATUS_HOT=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
+echo "Proxy Status After Hot Registration: $STATUS_HOT"
+python3 -c "
+import json
+st = json.loads('''$STATUS_HOT''')
+assert st['tier0_hot_entries'] == 4, f'Expected 4 hot entries, got {st[\"tier0_hot_entries\"]}'
+assert st['total_unique_entries'] == 4, f'Expected 4 total unique entries, got {st[\"total_unique_entries\"]}'
+print('>>> Proxy 2-tier status verified: Tier 0 has 4 entries.')
+"
+
+# 7. Single-Writer Promote (Aggregating all receipts into cache-index)
+echo ">>> Running nixcache-builder promote to compact and merge all receipts..."
 "$BUILDER_BIN" promote \
-    --run-id "$RUN_ID" \
+    --receipts-dir "$RECEIPTS_DIR" \
     --target-tag "cache-index"
 
-# 8. Verify Promoted Baseline cache-index
-echo ">>> Verifying promoted baseline cache-index..."
+# 8. Verify Promoted Baseline cache-index in OCI Registry
+echo ">>> Verifying promoted baseline cache-index in OCI registry..."
 BASE_INDEX=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/cache-index")
-echo "Base Index Manifest:"
-echo "$BASE_INDEX"
+echo "Base Index Manifest: $BASE_INDEX"
 
 python3 -c "
 import json, subprocess
@@ -203,17 +224,22 @@ assert idx['version'] == 6, f'Expected version 6, got {idx[\"version\"]}'
 assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx[\"last_promoted_run\"]}'
 total_entries = sum(s['entry_count'] for s in idx['shards'])
 assert total_entries == 4, f'Expected 4 promoted entries across shards, got {total_entries}'
-print('>>> Promoted cache-index verified (Schema v6, last_promoted_run & 4 entries).')
+print('>>> Promoted cache-index verified (Schema v6, single-writer compacted 4 entries across shards).')
 "
 
-# 9. Verify ephemeral session tag cleanup
-echo ">>> Verifying session tag run-${RUN_ID}-x86_64-linux was cleaned up..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/testrepo/nix-cache/manifests/run-${RUN_ID}-x86_64-linux")
-if [[ "$HTTP_CODE" -ne 404 ]]; then
-    echo "!!! Expected 404 for deleted session tag, got $HTTP_CODE"
-    exit 1
-fi
-echo ">>> Ephemeral session tag cleanup verified."
+# 9. Test Proxy Refresh: Baseline Tier 1 Loading
+echo ">>> Testing Proxy /_refresh to load baseline cache-index into Tier 1..."
+REFRESH_RESP=$(curl -fs -X POST "http://127.0.0.1:${PROXY_PORT}/_refresh")
+echo "Refresh response: $REFRESH_RESP"
+
+STATUS_SYNC=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/_status")
+echo "Proxy Status After Baseline Sync: $STATUS_SYNC"
+python3 -c "
+import json
+st = json.loads('''$STATUS_SYNC''')
+assert st['baseline_entries'] == 4, f'Expected 4 baseline entries, got {st[\"baseline_entries\"]}'
+print('>>> Proxy successfully refreshed and populated Tier 1 baseline with 4 entries.')
+"
 
 # 10. Test Session Clean
 echo ">>> Testing nixcache-builder session clean..."
@@ -224,4 +250,4 @@ if [[ -f "$SNAPSHOT_FILE" ]]; then
 fi
 echo ">>> Session clean verified."
 
-echo "=== ALL SCHEMA V6 PIPELINE CAS & CASCADING TESTS PASSED ==="
+echo "=== ALL SCHEMA V6 RECEIPT & SINGLE-WRITER PIPELINE TESTS PASSED ==="

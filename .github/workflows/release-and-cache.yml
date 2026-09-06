@@ -282,7 +282,6 @@ jobs:
           NIXCACHE_REPO: ${{ github.repository }}
           NIXCACHE_REGISTRY: 'ghcr.io'
           NIXCACHE_STRICT: 'true'
-          NIXCACHE_RUN_ID: ${{ github.run_id }}
           NIXCACHE_OUTPUT_RECEIPT: ${{ runner.temp }}/receipt-${{ matrix.system }}.json
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -334,7 +333,6 @@ jobs:
 
       - name: Promote Receipts & Publish Multi-Arch Index
         env:
-          NIXCACHE_RUN_ID: ${{ github.run_id }}
           NIXCACHE_RECEIPTS_DIR: ${{ runner.temp }}/receipts
           NIXCACHE_TARGET_TAG: 'cache-index'
           NIXCACHE_REPO: ${{ github.repository }}

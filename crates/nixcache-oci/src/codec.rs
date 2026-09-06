@@ -65,7 +65,7 @@ mod tests {
         );
         assert_eq!(
             CacheLayerMediaType::parse("application/vnd.nix.cache.delta.v6+zstd"),
-            Some(CacheLayerMediaType::DeltaPatchV6Zstd)
+            None
         );
         assert_eq!(
             CacheLayerMediaType::parse("application/vnd.oci.image.layer.v1.tar+gzip"),
@@ -130,7 +130,7 @@ mod tests {
     fn test_decode_rejects_short_or_empty_bytes() {
         let empty = b"";
         let err =
-            IndexCodec::decode_zstd::<SampleData>(empty, CacheLayerMediaType::DELTA_PATCH_V6_ZSTD)
+            IndexCodec::decode_zstd::<SampleData>(empty, CacheLayerMediaType::SHARD_DATA_V6_ZSTD)
                 .expect_err("Should reject empty bytes");
 
         match err {

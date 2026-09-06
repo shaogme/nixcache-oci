@@ -34,10 +34,7 @@ async fn main() -> Result<(), BuilderError> {
                 let (listen, port) = args
                     .bind
                     .resolve(DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT);
-                let run_id = args.session.resolve_run_id();
-                let branch = args.session.resolve_branch();
                 let upstream = args.cache.resolve_upstream();
-                let session_ttl = args.cache.resolve_session_ttl();
                 let baseline_ttl = args.cache.resolve_baseline_ttl();
                 let baseline_tag = args.cache.resolve_baseline_tag();
                 let signing_key = args.signing.resolve_signing_key_str();
@@ -46,12 +43,9 @@ async fn main() -> Result<(), BuilderError> {
                 let init_opts = SessionInitOptions {
                     repo: &repo,
                     registry: &registry,
-                    run_id,
-                    branch,
                     port,
                     listen: &listen,
                     upstream: &upstream,
-                    session_ttl,
                     baseline_ttl,
                     baseline_tag: &baseline_tag,
                     github_token: &active_token,
@@ -156,21 +150,10 @@ async fn main() -> Result<(), BuilderError> {
         Commands::Promote(args) => {
             let active_token = args.auth.resolve_token().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
-            let run_id = args.resolve_run_id();
             let target_tag = args.resolve_target_tag();
-            let cleanup_session = args.resolve_cleanup_session();
             let paths = args.resolve_receipt_paths();
 
-            if let Err(e) = run_promote(
-                run_id,
-                &paths,
-                &repo,
-                &registry,
-                &target_tag,
-                cleanup_session,
-                &active_token,
-            )
-            .await
+            if let Err(e) = run_promote(&paths, &repo, &registry, &target_tag, &active_token).await
             {
                 eprintln!("Promote failed: {}", e);
                 process::exit(1);

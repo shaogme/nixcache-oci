@@ -35,21 +35,6 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         ));
     }
 
-    let run_id = env
-        .var("NIXCACHE_RUN_ID")
-        .or_else(|_| env.var("GITHUB_RUN_ID"))
-        .ok()
-        .and_then(|v| v.to_string().parse::<u64>().ok());
-
-    let branch_or_pr = env
-        .var("NIXCACHE_BRANCH")
-        .or_else(|_| env.var("GITHUB_REF_NAME"))
-        .or_else(|_| env.var("GITHUB_HEAD_REF"))
-        .or_else(|_| env.var("NIXCACHE_PR"))
-        .map(|v| v.to_string())
-        .ok()
-        .filter(|s| !s.is_empty());
-
     let baseline_tag = env
         .var("NIXCACHE_BASELINE_TAG")
         .map(|v| v.to_string())
@@ -68,11 +53,6 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         .map(|v| v.to_string().parse::<u64>().unwrap_or(300))
         .unwrap_or(300);
 
-    let session_ttl_secs = env
-        .var("NIXCACHE_SESSION_TTL")
-        .map(|v| v.to_string().parse::<u64>().unwrap_or(10))
-        .unwrap_or(10);
-
     let target_system = env
         .var("NIXCACHE_SYSTEM")
         .map(|v| SystemArch::from(v.to_string().as_str()))
@@ -81,11 +61,8 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
     Ok(WorkerProxyConfig {
         registry,
         repo,
-        run_id,
-        branch_or_pr,
         baseline_tag,
         upstream_caches,
-        session_ttl_secs,
         baseline_ttl_secs,
         target_system,
     })
@@ -144,13 +121,10 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                         "registry": "ghcr.io",
                         "repo": "",
                         "tier0_hot_entries": 0,
-                        "tier1_session_entries": 0,
-                        "tier2_branch_entries": 0,
-                        "tier3_baseline_entries": 0,
+                        "baseline_entries": 0,
                         "total_unique_entries": 0,
                         "index_entries": 0,
                         "index_ttl": 300,
-                        "session_ttl": 10,
                         "baseline_ttl": 300,
                         "upstream": ["https://cache.nixos.org"],
                         "manifest_digest": "",

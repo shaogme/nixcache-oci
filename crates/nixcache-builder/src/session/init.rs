@@ -162,12 +162,9 @@ pub async fn record_store_snapshot_from_dir(
 pub struct SessionInitOptions<'a> {
     pub repo: &'a str,
     pub registry: &'a str,
-    pub run_id: Option<u64>,
-    pub branch: Option<String>,
     pub port: u16,
     pub listen: &'a str,
     pub upstream: &'a str,
-    pub session_ttl: u64,
     pub baseline_ttl: u64,
     pub baseline_tag: &'a str,
     pub github_token: &'a str,
@@ -178,8 +175,8 @@ pub struct SessionInitOptions<'a> {
 /// Session Init: 启动后台 Proxy 守护进程，零侵入注入 NIX_CONFIG，并记录 store 快照
 pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), BuilderError> {
     info!(
-        "Initializing NixCache Session: Run ID: {:?}, Branch: {:?}, Repo: {}/{}",
-        opts.run_id, opts.branch, opts.registry, opts.repo
+        "Initializing NixCache Session: Repo: {}/{}",
+        opts.registry, opts.repo
     );
 
     let proxy_bin = find_proxy_binary();
@@ -192,19 +189,11 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         .env("NIXCACHE_PORT", opts.port.to_string())
         .env("NIXCACHE_LISTEN", opts.listen)
         .env("NIXCACHE_UPSTREAM", opts.upstream)
-        .env("NIXCACHE_SESSION_TTL", opts.session_ttl.to_string())
         .env("NIXCACHE_INDEX_TTL", opts.baseline_ttl.to_string())
         .env("NIXCACHE_BASELINE_TAG", opts.baseline_tag)
         .env("GITHUB_TOKEN", opts.github_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-
-    if let Some(rid) = opts.run_id {
-        proxy_cmd.env("NIXCACHE_RUN_ID", rid.to_string());
-    }
-    if let Some(ref br) = opts.branch {
-        proxy_cmd.env("NIXCACHE_BRANCH", br);
-    }
 
     let mut child = proxy_cmd.spawn()?;
 
@@ -258,7 +247,7 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         record_store_snapshot(snap).await?;
     }
 
-    write_session_init_summary(opts.repo, opts.run_id, opts.branch.as_deref(), opts.port).await;
+    write_session_init_summary(opts.repo, opts.port).await;
     Ok(())
 }
 

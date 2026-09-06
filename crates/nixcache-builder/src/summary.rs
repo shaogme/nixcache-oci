@@ -16,25 +16,14 @@ async fn append_summary(content: String, target_file_opt: Option<&str>) {
 }
 
 /// 为 Session Init 步骤生成并写入 GitHub Actions Step Summary
-pub async fn write_session_init_summary(
-    repo: &str,
-    run_id: Option<u64>,
-    branch: Option<&str>,
-    port: u16,
-) {
-    write_session_init_summary_to(repo, run_id, branch, port, None).await;
+pub async fn write_session_init_summary(repo: &str, port: u16) {
+    write_session_init_summary_to(repo, port, None).await;
 }
 
-pub async fn write_session_init_summary_to(
-    repo: &str,
-    run_id: Option<u64>,
-    branch: Option<&str>,
-    port: u16,
-    file_opt: Option<&str>,
-) {
+pub async fn write_session_init_summary_to(repo: &str, port: u16, file_opt: Option<&str>) {
     let content = format!(
-        "### 🚀 NixCache Session Initialized\n\n- **Repository:** `{}`\n- **Run ID:** `{:?}`\n- **Branch/PR:** `{:?}`\n- **Proxy Daemon Port:** `{}`\n",
-        repo, run_id, branch, port
+        "### 🚀 NixCache Session Initialized\n\n- **Repository:** `{}`\n- **Proxy Daemon Port:** `{}`\n",
+        repo, port
     );
     append_summary(content, file_opt).await;
 }
@@ -275,17 +264,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path_str = temp_file.path().to_string_lossy().to_string();
 
-        write_session_init_summary_to(
-            "shaogme/nixcache-oci",
-            Some(12345),
-            Some("main"),
-            37515,
-            Some(&path_str),
-        )
-        .await;
+        write_session_init_summary_to("shaogme/nixcache-oci", 37515, Some(&path_str)).await;
         let content1 = fs::read_to_string(&path_str).await.unwrap();
         assert!(content1.contains("NixCache Session Initialized"));
-        assert!(content1.contains("12345"));
+        assert!(content1.contains("37515"));
 
         write_session_capture_summary_to("build-job", "x86_64-linux", 5, 3, 10240, Some(&path_str))
             .await;

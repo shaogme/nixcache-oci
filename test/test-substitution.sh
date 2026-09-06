@@ -13,12 +13,17 @@ echo "Repo: $REPO"
 echo ">>> Fetching cache index from GHCR..."
 CRED_TOKEN=$(gh auth token 2>/dev/null || echo "")
 # Exchange for OCI registry token
-TOKEN=$(curl -s -u "token:${CRED_TOKEN}" \
+AUTH_ARGS=()
+if [[ -n "$CRED_TOKEN" ]]; then
+    AUTH_ARGS=(-u "token:${CRED_TOKEN}")
+fi
+TOKEN=$(curl -s "${AUTH_ARGS[@]}" \
     "https://ghcr.io/token?scope=repository:${REPO}/nix-cache:pull&service=ghcr.io" 2>/dev/null \
     | jq -r '.token // empty')
 if [[ -z "$TOKEN" ]]; then
     TOKEN="$CRED_TOKEN"
 fi
+
 
 STORE_INFO=$(python3 -c "
 import json, subprocess, sys
@@ -102,8 +107,12 @@ STORE_HASH="$2"
 
 echo "=== Inside container ==="
 
-echo ">>> Installing curl..."
-nix-env -iA nixpkgs.curl 2>&1 | tail -3
+git config --global --add safe.directory '*' || true
+
+if ! command -v curl &>/dev/null; then
+    echo ">>> Installing curl..."
+    nix-env -iA nixpkgs.curl 2>&1 | tail -3
+fi
 
 echo ">>> Building proxy..."
 nix build /workspace#cache-proxy --profile /tmp/proxy-profile
@@ -151,7 +160,7 @@ experimental-features = nix-command flakes
 EOF
 
 echo ">>> Realising $STORE_PATH from cache..."
-nix-store --realise "$STORE_PATH" 2>&1 || {
+nix-store --realise "$STORE_PATH" --max-jobs 0 2>&1 || {
     echo "!!! Failed to realise store path"
     kill $PROXY_PID 2>/dev/null; exit 1
 }
@@ -172,6 +181,7 @@ echo "=== Test PASSED ==="
 kill $PROXY_PID 2>/dev/null
 CONTAINER_SCRIPT
 chmod +x "$PROJECT_DIR/test/run-in-container.sh"
+trap 'rm -f "$PROJECT_DIR/test/run-in-container.sh"' EXIT
 
 CONTAINER_ENGINE="podman"
 if ! command -v podman &>/dev/null; then
@@ -183,10 +193,16 @@ if ! command -v podman &>/dev/null; then
     fi
 fi
 
+EXTRA_CONTAINER_ARGS=()
+if [[ "$CONTAINER_ENGINE" == *"podman"* ]]; then
+    EXTRA_CONTAINER_ARGS=(--net=host --cgroups=disabled)
+fi
+
 echo ">>> Running test in $CONTAINER_ENGINE container..."
 # Pass GH token for GHCR access (package may be private)
 GH_TOKEN_FOR_CONTAINER=$(gh auth token 2>/dev/null || echo "")
 $CONTAINER_ENGINE run --rm \
+    "${EXTRA_CONTAINER_ARGS[@]}" \
     -v "$PROJECT_DIR:/workspace:ro" \
     -v "$PROJECT_DIR/test/run-in-container.sh:/run-test.sh:ro" \
     -e "NIX_CONFIG=experimental-features = nix-command flakes" \

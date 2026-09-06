@@ -10,8 +10,8 @@ pub mod signing;
 
 pub use auth::AuthTokenArgs;
 pub use cache::{
-    CachePolicyArgs, DEFAULT_BASELINE_TAG, DEFAULT_BASELINE_TTL, DEFAULT_SESSION_TTL,
-    DEFAULT_SNAPSHOT_PATH, DEFAULT_UPSTREAM_CACHE,
+    CachePolicyArgs, DEFAULT_BASELINE_TAG, DEFAULT_BASELINE_TTL, DEFAULT_SNAPSHOT_PATH,
+    DEFAULT_UPSTREAM_CACHE,
 };
 pub use list::{ListArgs, OutputFormat};
 pub use oci::{DEFAULT_NIXCACHE_REGISTRY, DEFAULT_NIXCACHE_REPO, OciTargetArgs};

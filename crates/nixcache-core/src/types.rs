@@ -2,7 +2,7 @@ use crate::{
     error::TypeError,
     sharding::{
         EMPTY_SHARD_MERKLE_HASH, calculate_shard_id, compute_merkle_root,
-        compute_shard_merkle_hash, partition_entries_by_shard, shard_id_to_prefix,
+        compute_shard_merkle_hash, shard_id_to_prefix,
     },
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -766,79 +766,6 @@ impl ShardDataPayload {
     }
 }
 
-/// 增量 Patch 数据结构 (CI 构建节点产物，零写放大)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DeltaPatchData {
-    pub version: u32,
-    pub run_id: u64,
-    pub job_id: String,
-    pub system: SystemArch,
-    pub timestamp: String,
-    pub new_entries: HashMap<StoreHash, IndexEntry>,
-    pub active_gc_roots: Vec<StoreHash>,
-}
-
-impl DeltaPatchData {
-    pub fn new(run_id: u64, job_id: impl Into<String>, system: SystemArch) -> Self {
-        Self {
-            version: SCHEMA_VERSION_V6,
-            run_id,
-            job_id: job_id.into(),
-            system,
-            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            new_entries: HashMap::new(),
-            active_gc_roots: Vec::new(),
-        }
-    }
-
-    pub fn with_entries_and_roots(
-        run_id: u64,
-        job_id: impl Into<String>,
-        system: SystemArch,
-        new_entries: HashMap<StoreHash, IndexEntry>,
-        active_gc_roots: Vec<StoreHash>,
-    ) -> Self {
-        Self {
-            version: SCHEMA_VERSION_V6,
-            run_id,
-            job_id: job_id.into(),
-            system,
-            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            new_entries,
-            active_gc_roots,
-        }
-    }
-
-    /// 将新增条目按 1024 个分片进行分组分桶
-    pub fn partition_by_shard(&self) -> HashMap<u16, HashMap<StoreHash, IndexEntry>> {
-        partition_entries_by_shard(self.new_entries.clone())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.new_entries.is_empty() && self.active_gc_roots.is_empty()
-    }
-
-    /// 检查当前 DeltaPatchData 是否完全包含了指定的条目集 (超集校验)
-    pub fn contains_all_entries(&self, entries: &HashMap<StoreHash, IndexEntry>) -> bool {
-        entries
-            .keys()
-            .all(|hash| self.new_entries.contains_key(hash))
-    }
-
-    /// 检查当前 DeltaPatchData 是否完全包含了指定的 GC Roots (超集校验)
-    pub fn contains_all_roots(&self, roots: &[StoreHash]) -> bool {
-        roots.iter().all(|root| self.active_gc_roots.contains(root))
-    }
-
-    /// 执行两份 DeltaPatchData 的无损并集合并
-    pub fn merge_union(&mut self, other: DeltaPatchData) {
-        self.new_entries.extend(other.new_entries);
-        self.active_gc_roots.extend(other.active_gc_roots);
-        self.active_gc_roots.sort_unstable();
-        self.active_gc_roots.dedup();
-    }
-}
-
 /// 单个构建节点的统计数据
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BuildStats {
@@ -892,5 +819,25 @@ impl BuildReceipt {
         self.run_id = run_id;
         self.job_id = job_id;
         self
+    }
+
+    /// 执行两个相同架构回执的无损合并
+    pub fn merge_with(&mut self, other: BuildReceipt) {
+        debug_assert_eq!(
+            self.system, other.system,
+            "Cannot merge receipts of different architectures"
+        );
+        self.new_entries.extend(other.new_entries);
+        self.active_gc_roots.extend(other.active_gc_roots);
+        self.active_gc_roots.sort_unstable();
+        self.active_gc_roots.dedup();
+        self.stats.discovered_outputs += other.stats.discovered_outputs;
+        self.stats.built_paths += other.stats.built_paths;
+        self.stats.uploaded_blobs += other.stats.uploaded_blobs;
+        self.stats.total_bytes_uploaded += other.stats.total_bytes_uploaded;
+        self.stats.substituted_paths += other.stats.substituted_paths;
+        if self.public_key.is_none() {
+            self.public_key = other.public_key;
+        }
     }
 }
