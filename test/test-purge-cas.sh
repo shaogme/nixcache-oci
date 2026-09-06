@@ -24,19 +24,21 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry-purge "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-registry-purge "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
 
-# 1. Start clean Mock Registry
-echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry-purge
-mkdir -p /tmp/mock-oci-registry-purge
+# 1. Start clean OCI Registry Container
+echo ">>> Launching OCI registry on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry-purge
+mkdir -p /tmp/nixcache-test-registry-purge
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" /tmp/nixcache-test-registry-purge &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -77,13 +79,13 @@ export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export GITHUB_TOKEN="dummy-token"
 
 # 3. Promote a dummy receipt to establish initial baseline cache-index
-RECEIPT_DIR="/tmp/mock-oci-registry-purge/receipts"
+RECEIPT_DIR="/tmp/nixcache-test-registry-purge/receipts"
 mkdir -p "$RECEIPT_DIR"
-# Create dummy blobs in mock registry
-mkdir -p /tmp/mock-oci-registry-purge/blobs
-touch /tmp/mock-oci-registry-purge/blobs/sha256_0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
-touch /tmp/mock-oci-registry-purge/blobs/sha256_1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
-touch /tmp/mock-oci-registry-purge/blobs/sha256_2d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
+# Create dummy blobs in registry storage
+mkdir -p /tmp/nixcache-test-registry-purge/blobs
+touch /tmp/nixcache-test-registry-purge/blobs/sha256_0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
+touch /tmp/nixcache-test-registry-purge/blobs/sha256_1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
+touch /tmp/nixcache-test-registry-purge/blobs/sha256_2d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0
 
 cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
 {

@@ -1126,7 +1126,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 #### 端到端（E2E）与替换器测试
 
 > [!TIP]
-> **自适应免 Docker 运行**：本地集成测试内置了轻量级 Python Mock OCI Registry（`test/mock_registry.py`）。当宿主机未安装或未启动 Docker 守护进程时，测试脚本会自动无缝启动内置 Mock 服务完成全套 E2E 闭环测试。
+> **容器化 OCI Registry 驱动**：本地集成测试统一采用 Podman 或 Docker 自动启动官方 OCI Registry 容器（`test/run_registry.py`），提供与真实生产环境完全一致的 OCI Distribution v2 规范能力与 CAS/并发/物理删除测试闭环。
 
 ```bash
 # 1. 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])

@@ -35,18 +35,19 @@ cleanup() {
     if [[ -n "${UPSTREAM_PID:-}" ]]; then
         kill -9 "$UPSTREAM_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-upstream-cache /tmp/mock-oci-registry "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-upstream /tmp/nixcache-test-registry "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
 
-# 1. Start Mock Upstream HTTP Server
-echo ">>> Setting up mock upstream binary cache on port ${UPSTREAM_PORT}..."
-rm -rf /tmp/mock-upstream-cache
-mkdir -p /tmp/mock-upstream-cache/nar
+# 1. Start Upstream HTTP Server
+echo ">>> Setting up upstream binary cache on port ${UPSTREAM_PORT}..."
+rm -rf /tmp/nixcache-test-upstream
+mkdir -p /tmp/nixcache-test-upstream/nar
 
-cat << 'UPSTREAM_INFO' > /tmp/mock-upstream-cache/faulttest123.narinfo
+cat << 'UPSTREAM_INFO' > /tmp/nixcache-test-upstream/faulttest123.narinfo
 StorePath: /nix/store/faulttest123-fallback-pkg
 URL: nar/faulttest.nar.xz
 Compression: xz
@@ -56,15 +57,17 @@ NarHash: sha256:555566667777888899990000aaaabbbbccccddddeeeeffff1111222233334444
 NarSize: 12
 UPSTREAM_INFO
 
-echo "MOCK_NAR_DATA" > /tmp/mock-upstream-cache/nar/faulttest.nar.xz
+echo "MOCK_NAR_DATA" > /tmp/nixcache-test-upstream/nar/faulttest.nar.xz
 
-python3 -m http.server "${UPSTREAM_PORT}" --directory /tmp/mock-upstream-cache &
+python3 -m http.server "${UPSTREAM_PORT}" --directory /tmp/nixcache-test-upstream &
 UPSTREAM_PID=$!
 
-# 2. Start Mock OCI Registry with Injected 503 Service Unavailable Fault
-echo ">>> Launching mock OCI registry with 503 Service Unavailable injection on port ${REGISTRY_PORT}..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-MOCK_FAULT_STATUS=503 python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+# 2. Start OCI Registry Container
+echo ">>> Launching OCI registry container on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -136,6 +139,13 @@ fi
 echo ">>> /nix-cache-info verified."
 
 # 5. Verify upstream narinfo fallback when OCI registry is down
+echo ">>> Simulating OCI registry failure by stopping registry container..."
+if [[ -n "${REGISTRY_PID:-}" ]]; then
+    kill -9 "$REGISTRY_PID" 2>/dev/null || true
+fi
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+
 echo ">>> Testing narinfo fallback to upstream during OCI registry failure..."
 NARINFO_RESP=$(curl -fs "http://127.0.0.1:${PROXY_PORT}/faulttest123.narinfo")
 echo "Retrieved narinfo response:"

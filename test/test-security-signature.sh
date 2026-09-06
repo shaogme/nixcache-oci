@@ -30,8 +30,9 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-registry "$TMP_DIR"
     rm -f valid-secret.key valid-public.key rogue-secret.key rogue-public.key
     echo ">>> Cleanup complete."
 }
@@ -43,11 +44,12 @@ rm -f valid-secret.key valid-public.key rogue-secret.key rogue-public.key
 nix-store --generate-binary-cache-key valid-key-1 valid-secret.key valid-public.key
 nix-store --generate-binary-cache-key rogue-key-1 rogue-secret.key rogue-public.key
 
-# 2. Start clean Mock Registry
-echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+# 2. Start clean OCI Registry Container
+echo ">>> Launching OCI registry container on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -141,7 +143,7 @@ fi
 
 # 7. Test Security Scenario 2: Tampered Blob Rejection (Hash mismatch must fail)
 echo ">>> Security Test 2: Tampering with cached blob contents in OCI registry..."
-for blob_file in /tmp/mock-oci-registry/blobs/*; do
+for blob_file in /tmp/nixcache-test-registry/docker/registry/v2/blobs/sha256/*/*/data; do
     if [[ -f "$blob_file" ]] && [[ $(wc -c < "$blob_file") -gt 100 ]]; then
         echo "Corrupting blob: $blob_file"
         echo "CORRUPTED_PAYLOAD_TAMPERED_CONTENT" >> "$blob_file"
@@ -165,11 +167,18 @@ echo ">>> Security Test 3: Verifying successful substitution with authentic pack
 # Clean registry and re-push pristine package
 kill -9 "$PROXY_PID" 2>/dev/null || true
 kill -9 "$REGISTRY_PID" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
-sleep 1
+for _ in {1..20}; do
+    if curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
 
 RECEIPT_FILE="$(mktemp --suffix=.json)"
 PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --output-receipt "$RECEIPT_FILE"

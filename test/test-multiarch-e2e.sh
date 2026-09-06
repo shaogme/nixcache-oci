@@ -16,33 +16,23 @@ export GITHUB_PATH="$TMP_DIR/github_path"
 touch "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"
 unset NIX_CONFIG || true
 
-# 1. Start a local OCI registry container or mock registry
-REGISTRY_CONTAINER="nixcache-multiarch-registry"
+# 1. Start local OCI registry container via run_registry
+REGISTRY_CONTAINER="nixcache-registry-${REGISTRY_PORT}"
 REGISTRY_PORT=5002
 REGISTRY_PID=""
 
-if command -v docker &>/dev/null && docker ps &>/dev/null; then
-    if docker ps -a --format '{{.Names}}' | grep -q "^${REGISTRY_CONTAINER}$"; then
-        echo ">>> Stopping existing registry container..."
-        docker rm -f "$REGISTRY_CONTAINER" >/dev/null
+echo ">>> Launching OCI registry container on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "$REGISTRY_CONTAINER" 2>/dev/null || docker rm -f "$REGISTRY_CONTAINER" 2>/dev/null || true
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
+REGISTRY_PID=$!
+
+for _ in {1..20}; do
+    if curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+        break
     fi
-
-    echo ">>> Launching local OCI registry on port ${REGISTRY_PORT} via Docker..."
-    docker run -d -p "${REGISTRY_PORT}:5000" --name "$REGISTRY_CONTAINER" registry:2
-else
-    echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    lsof -ti:"${REGISTRY_PORT}" | xargs -r kill -9 2>/dev/null || true
-    python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
-    REGISTRY_PID=$!
-    for _ in {1..20}; do
-        if curl -fs "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
-            break
-        fi
-        sleep 0.5
-    done
-
-fi
+    sleep 0.5
+done
 
 # Cleanup on exit
 RECEIPTS_DIR="$(mktemp -d)"
@@ -58,11 +48,9 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    if command -v docker &>/dev/null && docker ps &>/dev/null; then
-        docker rm -f "$REGISTRY_CONTAINER" >/dev/null 2>&1 || true
-    fi
-    rm -rf "$RECEIPTS_DIR" /tmp/mock-oci-registry "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "$REGISTRY_CONTAINER" 2>/dev/null || docker rm -f "$REGISTRY_CONTAINER" 2>/dev/null || true
+    rm -rf "$RECEIPTS_DIR" /tmp/nixcache-test-registry "$TMP_DIR"
     rm -f test-multi-secret.key test-multi-public.key
     echo ">>> Cleanup complete."
 }

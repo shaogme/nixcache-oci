@@ -25,8 +25,9 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-registry "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -100,13 +101,14 @@ assert report['concurrent_write_compaction']['write_amplification_reduction_pct'
 print(f'>>> JSON Metrics Verified: Scale={report[\"scale_entries\"]}, Read QPS={report[\"concurrent_read\"][\"throughput_qps\"]:.0f}, Bloom FPR={report[\"bloom_filter\"][\"false_positive_rate\"]*100:.3f}%, Write Amplification Reduction={report[\"concurrent_write_compaction\"][\"write_amplification_reduction_pct\"]:.2f}%')
 "
 
-# 4. 启动 Mock OCI Registry 验证端到端分片索引发布与 Partial Compaction
-echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT} for E2E Sharding verification..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry
-mkdir -p /tmp/mock-oci-registry
+# 4. 启动 OCI Registry 容器验证端到端分片索引发布与 Partial Compaction
+echo ">>> Launching OCI registry container on port ${REGISTRY_PORT} for E2E Sharding verification..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
+mkdir -p /tmp/nixcache-test-registry
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -222,19 +224,26 @@ import json, subprocess
 
 manifest_index = json.loads('''$MANIFEST_INDEX_JSON''')
 sub_manifest_digest = manifest_index['manifests'][0]['digest']
-sub_safe = sub_manifest_digest.replace(':', '_')
 
-with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
-    sub_manifest = json.load(f)
+sub_raw = subprocess.check_output([
+    'curl', '-fsSL',
+    '-H', 'Accept: application/vnd.oci.image.manifest.v1+json',
+    f'http://127.0.0.1:${REGISTRY_PORT}/v2/scale-test/cache/nix-cache/manifests/{sub_manifest_digest}'
+])
+sub_manifest = json.loads(sub_raw)
 
-assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V6), got {len(sub_manifest[\"layers\"])}'
+assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V6), got {len(sub_manifest["layers"])}'
 root_layer = sub_manifest['layers'][0]
 
 assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v6+zstd'
 
 # Decompress and verify Root Index
-blob_path = f'/tmp/mock-oci-registry/blobs/{root_layer[\"digest\"].replace(\":\", \"_\")}'
-decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+blob_digest = root_layer['digest']
+blob_bytes = subprocess.check_output([
+    'curl', '-fsSL',
+    f'http://127.0.0.1:${REGISTRY_PORT}/v2/scale-test/cache/nix-cache/blobs/{blob_digest}'
+])
+decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 root_data = json.loads(decompressed)
 
 assert root_data['version'] == 6

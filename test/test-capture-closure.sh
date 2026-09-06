@@ -37,9 +37,10 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
     pkill -9 -f "nixcache-proxy" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry "$TMP_DIR"
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-registry "$TMP_DIR"
     echo ">>> 清理完成。"
 }
 trap cleanup EXIT
@@ -79,13 +80,14 @@ export NIXCACHE_REPO="testorg/closure-app"
 export NIXCACHE_REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 export GITHUB_TOKEN="dummy-token"
 
-# 2. 启动隔离的 Mock OCI Registry
-echo ">>> [1/9] 启动隔离的 Mock OCI 镜像仓库 (Port: ${REGISTRY_PORT})..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry
-mkdir -p /tmp/mock-oci-registry
+# 2. 启动隔离的 OCI Registry 容器
+echo ">>> [1/9] 启动隔离的 OCI 镜像仓库容器 (Port: ${REGISTRY_PORT})..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
+mkdir -p /tmp/nixcache-test-registry
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -315,9 +317,11 @@ python3 -c "
 import json, subprocess
 manifest = json.loads('''$SESSION_MANIFEST''')
 layer_digest = manifest['layers'][0]['digest']
-layer_safe = layer_digest.replace(':', '_')
-blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
-decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+blob_bytes = subprocess.check_output([
+    'curl', '-fsSL',
+    f'http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/blobs/{layer_digest}'
+])
+decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 session_data = json.loads(decompressed)
 
 app1_h = '$APP_PATH_1'.split('/')[-1][:32]
@@ -350,16 +354,21 @@ python3 -c "
 import json, subprocess
 manifest_index = json.loads('''$BASE_INDEX''')
 sub_manifest_digest = manifest_index['manifests'][0]['digest']
-sub_safe = sub_manifest_digest.replace(':', '_')
 
-with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
-    sub_manifest = json.load(f)
+sub_raw = subprocess.check_output([
+    'curl', '-fsSL',
+    '-H', 'Accept: application/vnd.oci.image.manifest.v1+json',
+    f'http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/manifests/{sub_manifest_digest}'
+])
+sub_manifest = json.loads(sub_raw)
 
 layer_digest = sub_manifest['layers'][0]['digest']
-layer_safe = layer_digest.replace(':', '_')
-blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+blob_bytes = subprocess.check_output([
+    'curl', '-fsSL',
+    f'http://127.0.0.1:${REGISTRY_PORT}/v2/testorg/closure-app/nix-cache/blobs/{layer_digest}'
+])
 
-decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 idx = json.loads(decompressed)
 assert idx['version'] == 6, f'Expected version 6, got {idx.get(\"version\")}'
 assert idx['last_promoted_run'] == $RUN_ID

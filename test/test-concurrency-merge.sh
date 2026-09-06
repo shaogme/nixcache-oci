@@ -25,19 +25,21 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf "$RECEIPTS_DIR" /tmp/mock-oci-registry "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf "$RECEIPTS_DIR" /tmp/nixcache-test-registry "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
 
-# 1. Start clean Mock Registry
-echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry "$RECEIPTS_DIR"
+# 1. Start clean OCI Registry Container
+echo ">>> Launching OCI registry on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry "$RECEIPTS_DIR"
 mkdir -p "$RECEIPTS_DIR"
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -185,25 +187,34 @@ gc_roots = {}
 
 for m in manifests:
     sub_manifest_digest = m['digest']
-    sub_safe = sub_manifest_digest.replace(':', '_')
-    with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
-        sub_manifest = json.load(f)
+    sub_raw = subprocess.check_output([
+        'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json',
+        f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/{sub_manifest_digest}'
+    ])
+    sub_manifest = json.loads(sub_raw)
     
     layer_digest = sub_manifest['layers'][0]['digest']
-    layer_safe = layer_digest.replace(':', '_')
-    blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/blobs/{layer_digest}'
+    ])
     
     # Decompress zstd blob (ShardedArchCacheIndexData)
-    decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 6, f'Expected version 6, got {arch_data[\"version\"]}'
+    assert arch_data['version'] == 6, f'Expected version 6, got {arch_data["version"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']
     for shard in arch_data['shards']:
-        if shard['entry_count'] > 0 and shard['blob_digest']:
-            s_blob_path = f'/tmp/mock-oci-registry/blobs/{shard[\"blob_digest\"].replace(\":\", \"_\")}'
-            s_decomp = subprocess.check_output(['zstd', '-dc', s_blob_path])
+        b_digest = shard.get('blob_digest')
+        if shard['entry_count'] > 0 and b_digest:
+            s_bytes = subprocess.check_output([
+                'curl', '-fsSL',
+                f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/blobs/{b_digest}'
+            ])
+            s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
             s_data = json.loads(s_decomp)
             for k, v in s_data['entries'].items():
                 all_entries[k] = v
@@ -235,20 +246,29 @@ assert len(manifests) >= 3, f'Expected at least 3 architecture manifests, got {l
 all_entries = {}
 for m in manifests:
     sub_manifest_digest = m['digest']
-    sub_safe = sub_manifest_digest.replace(':', '_')
-    with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
-        sub_manifest = json.load(f)
+    sub_raw = subprocess.check_output([
+        'curl', '-fsSL',
+        '-H', 'Accept: application/vnd.oci.image.manifest.v1+json',
+        f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/manifests/{sub_manifest_digest}'
+    ])
+    sub_manifest = json.loads(sub_raw)
     
     layer_digest = sub_manifest['layers'][0]['digest']
-    layer_safe = layer_digest.replace(':', '_')
-    blob_path = f'/tmp/mock-oci-registry/blobs/{layer_safe}'
+    blob_bytes = subprocess.check_output([
+        'curl', '-fsSL',
+        f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/blobs/{layer_digest}'
+    ])
     
-    decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
+    decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
     for shard in arch_data['shards']:
-        if shard['entry_count'] > 0 and shard['blob_digest']:
-            s_blob_path = f'/tmp/mock-oci-registry/blobs/{shard[\"blob_digest\"].replace(\":\", \"_\")}'
-            s_decomp = subprocess.check_output(['zstd', '-dc', s_blob_path])
+        b_digest = shard.get('blob_digest')
+        if shard['entry_count'] > 0 and b_digest:
+            s_bytes = subprocess.check_output([
+                'curl', '-fsSL',
+                f'http://127.0.0.1:${REGISTRY_PORT}/v2/concurrency-test/cache/nix-cache/blobs/{b_digest}'
+            ])
+            s_decomp = subprocess.check_output(['zstd', '-dc'], input=s_bytes)
             s_data = json.loads(s_decomp)
             for k, v in s_data['entries'].items():
                 all_entries[k] = v

@@ -24,8 +24,9 @@ cleanup() {
     if [[ -n "${REGISTRY_PID:-}" ]]; then
         kill -9 "$REGISTRY_PID" 2>/dev/null || true
     fi
-    pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-    rm -rf /tmp/mock-oci-registry /tmp/nixcache-backend-test-* "$TMP_DIR"
+    pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+    podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+    rm -rf /tmp/nixcache-test-registry /tmp/nixcache-backend-test-* "$TMP_DIR"
     echo ">>> Cleanup complete."
 }
 trap cleanup EXIT
@@ -56,13 +57,14 @@ find_binaries() {
 
 find_binaries
 
-# 2. Launch Mock Registry
-echo ">>> Launching mock OCI registry on port ${REGISTRY_PORT}..."
-pkill -9 -f "mock_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
-rm -rf /tmp/mock-oci-registry
-mkdir -p /tmp/mock-oci-registry
+# 2. Launch OCI Registry Container
+echo ">>> Launching OCI registry on port ${REGISTRY_PORT}..."
+pkill -9 -f "run_registry.py.*${REGISTRY_PORT}" 2>/dev/null || true
+podman rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || docker rm -f "nixcache-registry-${REGISTRY_PORT}" 2>/dev/null || true
+rm -rf /tmp/nixcache-test-registry
+mkdir -p /tmp/nixcache-test-registry
 
-python3 "$SCRIPT_DIR/mock_registry.py" "$REGISTRY_PORT" &
+python3 "$SCRIPT_DIR/run_registry.py" "$REGISTRY_PORT" &
 REGISTRY_PID=$!
 
 for _ in {1..20}; do
@@ -160,7 +162,7 @@ echo ">>> [TEST D] Testing Promote on multi-backend session..."
     --receipt "$RECEIPT_GHCR" \
     --target-tag "cache-index"
 
-echo ">>> Verifying Promoted cache-index in Mock Registry..."
+echo ">>> Verifying Promoted cache-index in OCI Registry..."
 INDEX_RESP=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/owner/repo/nix-cache/manifests/cache-index")
 echo "$INDEX_RESP" | grep -q "schemaVersion"
 echo ">>> Promoted cache-index successfully verified."
