@@ -5,17 +5,16 @@ use crate::{
     },
     transport::WorkerFetchTransport,
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use nixcache_core::{
-    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
-    ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
-    diff_shard_descriptors, extract_nar_basename, extract_store_hash,
+    DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors, extract_nar_basename,
+    extract_store_hash,
 };
 use nixcache_oci::OciClient;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
 };
 use worker::{Env, js_sys::Date};
 
@@ -49,13 +48,12 @@ pub struct KVCacheWrapper<T> {
     pub manifest_digest: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct BloomFilterKvWrapper {
-    pub num_entries: u64,
-    pub num_hashes: u8,
-    pub bytes_base64: String,
-    pub last_refresh: f64,
-    pub blob_digest: String,
+#[derive(Clone, Debug)]
+pub struct NarInfoLookupResult {
+    pub narinfo_content: String,
+    pub shard_id: Option<u16>,
+    pub manifest_digest: Option<String>,
+    pub self_healed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,59 +139,51 @@ impl CacheStore {
         WorkerState::global().set_remote_status(connected, error);
     }
 
-    /// 动态注册新编译完成的条目到 Tier 0 内存热表中 (0ms 延迟可用)
-    pub fn register_hot_entries(entries: HashMap<StoreHash, IndexEntry>) {
-        WorkerState::global().register_hot(entries);
-    }
-
-    /// 级联查询 Store Hash 对应的 narinfo (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3 布隆过滤器拦截与分片精准查找)
+    /// 级联查询 Store Hash 对应的 narinfo (Tier 1 Session -> Tier 2 Branch -> Tier 3 Baseline -> Read-Through SWR 自愈)
     pub async fn lookup_narinfo(
         &self,
         env: &Env,
         store_hash: &str,
-    ) -> Result<Option<String>, WorkerStoreError> {
+    ) -> Result<Option<NarInfoLookupResult>, WorkerStoreError> {
         let parsed_hash = match StoreHash::parse(store_hash) {
             Ok(h) => h,
             Err(_) => return Ok(None),
         };
 
-        // 1. Tier 0: In-Memory Hot Registry
-        if let Some(entry) = WorkerState::global()
-            .hot_entries
-            .read_sync(&parsed_hash, |_, v| (**v).clone())
-        {
-            return Ok(Some(entry.to_narinfo_string()));
-        }
-
-        // 2. Tier 1: Workflow Run Session (run-<id>)
+        // 1. Tier 1: Workflow Run Session (run-<id>)
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             if let Some((session, _)) = self.get_session_data(env, &tag).await?
                 && let Some(entry) = session.new_entries.get(&parsed_hash)
             {
-                return Ok(Some(entry.to_narinfo_string()));
+                return Ok(Some(NarInfoLookupResult {
+                    narinfo_content: entry.to_narinfo_string(),
+                    shard_id: None,
+                    manifest_digest: None,
+                    self_healed: false,
+                }));
             }
         }
 
-        // 3. Tier 2: Branch / PR Session
+        // 2. Tier 2: Branch / PR Session
         if let Some(ref br) = self.config.branch_or_pr {
             let tag = format_branch_tag(br);
             if let Some((branch_sess, _)) = self.get_session_data(env, &tag).await?
                 && let Some(entry) = branch_sess.new_entries.get(&parsed_hash)
             {
-                return Ok(Some(entry.to_narinfo_string()));
+                return Ok(Some(NarInfoLookupResult {
+                    narinfo_content: entry.to_narinfo_string(),
+                    shard_id: None,
+                    manifest_digest: None,
+                    self_healed: false,
+                }));
             }
         }
 
-        // 4. Tier 3: Production Baseline (SMRI with Bloom Guard)
-        let (baseline, bloom_filter) = self.get_baseline_data(env).await?;
-
-        // 前置布隆过滤器 O(1) 负向拒绝拦截
-        if !bloom_filter.is_empty() && !bloom_filter.contains(&parsed_hash) {
-            return Ok(None);
-        }
-
+        // 3. Tier 3: Production Baseline (SMRI 1024 阶确定性分片)
+        let (baseline, manifest_digest) = self.get_baseline_data(env).await?;
         let shard_id = calculate_shard_id(&parsed_hash);
+
         if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
             && !shard_desc.is_empty()
             && !shard_desc.blob_digest.is_empty()
@@ -202,7 +192,56 @@ impl CacheStore {
                 .get_shard_data(env, shard_id, &shard_desc.blob_digest)
                 .await?;
             if let Some(entry) = shard_payload.entries.get(&parsed_hash) {
-                return Ok(Some(entry.to_narinfo_string()));
+                return Ok(Some(NarInfoLookupResult {
+                    narinfo_content: entry.to_narinfo_string(),
+                    shard_id: Some(shard_id),
+                    manifest_digest: Some(manifest_digest),
+                    self_healed: false,
+                }));
+            }
+        }
+
+        // 4. Cache Miss: Read-Through SWR 防抖自愈穿透探查
+        if WorkerState::global().should_revalidate() {
+            let arch_tag = format!(
+                "{}-{}",
+                self.config.baseline_tag,
+                self.config.target_system.as_str()
+            );
+            let remote_head = match self.oci_client.head_manifest(&arch_tag).await {
+                Ok(Some(h)) => Some(h),
+                Ok(None) => self
+                    .oci_client
+                    .head_manifest(&self.config.baseline_tag)
+                    .await
+                    .ok()
+                    .flatten(),
+                Err(_) => None,
+            };
+
+            if let Some(remote_digest) = remote_head
+                && !remote_digest.is_empty()
+                && remote_digest != manifest_digest
+            {
+                // 探测到远端存在更新的基线清单摘要，执行轻量自愈刷新
+                if let Ok((refreshed_baseline, new_manifest_digest)) =
+                    self.refresh_baseline_from_ghcr(env).await
+                    && let Some(new_shard_desc) = refreshed_baseline.find_shard_by_id(shard_id)
+                    && !new_shard_desc.is_empty()
+                    && !new_shard_desc.blob_digest.is_empty()
+                {
+                    let (refreshed_shard, _) = self
+                        .get_shard_data(env, shard_id, &new_shard_desc.blob_digest)
+                        .await?;
+                    if let Some(entry) = refreshed_shard.entries.get(&parsed_hash) {
+                        return Ok(Some(NarInfoLookupResult {
+                            narinfo_content: entry.to_narinfo_string(),
+                            shard_id: Some(shard_id),
+                            manifest_digest: Some(new_manifest_digest),
+                            self_healed: true,
+                        }));
+                    }
+                }
             }
         }
 
@@ -217,15 +256,7 @@ impl CacheStore {
     ) -> Result<Option<NarDigest>, WorkerStoreError> {
         let normalized = extract_nar_basename(nar_basename);
 
-        // 1. Tier 0: In-Memory Hot Registry
-        if let Some(digest) = WorkerState::global()
-            .hot_nar_lookup
-            .read_sync(normalized, |_, v| v.clone())
-        {
-            return Ok(Some(digest));
-        }
-
-        // 2. Tier 1: Workflow Run Session (run-<run_id>)
+        // 1. Tier 1: Workflow Run Session (run-<run_id>)
         if let Some(run_id) = self.config.run_id {
             let tag = format!("run-{}", run_id);
             if let Some((_, nar_lookup)) = self.get_session_data(env, &tag).await?
@@ -235,7 +266,7 @@ impl CacheStore {
             }
         }
 
-        // 3. Tier 2: Branch / PR Session
+        // 2. Tier 2: Branch / PR Session
         if let Some(ref br) = self.config.branch_or_pr {
             let tag = format_branch_tag(br);
             if let Some((_, nar_lookup)) = self.get_session_data(env, &tag).await?
@@ -245,12 +276,11 @@ impl CacheStore {
             }
         }
 
-        // 4. Tier 3: Production Baseline (StoreHash Shard Routing with Bloom Guard)
-        let (baseline, bloom_filter) = self.get_baseline_data(env).await?;
+        // 3. Tier 3: Production Baseline (StoreHash Shard Routing)
+        let (baseline, _) = self.get_baseline_data(env).await?;
 
         if let Some(store_hash) = extract_store_hash(nar_basename)
             && let Ok(parsed_hash) = StoreHash::parse(store_hash.as_str())
-            && (bloom_filter.is_empty() || bloom_filter.contains(&parsed_hash))
         {
             let shard_id = calculate_shard_id(&parsed_hash);
             if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
@@ -334,8 +364,8 @@ impl CacheStore {
             return Ok((cached.payload.clone(), cached.nar_lookup.clone()));
         }
 
-        // 2. L2 Cloudflare KV (Content-Addressable: shard_v5_{blob_digest})
-        let kv_key = format!("shard_v5_{}", blob_digest);
+        // 2. L2 Cloudflare KV (Content-Addressable: shard_v6_{blob_digest})
+        let kv_key = format!("shard_v6_{}", blob_digest);
 
         if let Ok(kv) = env.kv("NIXCACHE_KV")
             && let Ok(Some(wrapper)) = kv
@@ -423,7 +453,7 @@ impl CacheStore {
             Err(e) => Err(e),
         };
 
-        let kv_key = format!("session_v5_{}_{}", self.config.target_system.as_str(), tag);
+        let kv_key = format!("session_v6_{}_{}", self.config.target_system.as_str(), tag);
 
         match fetch_res {
             Ok(Some((delta, manifest_digest))) => {
@@ -496,7 +526,7 @@ impl CacheStore {
         }
 
         // 2. L2 Cloudflare KV (带多架构命名空间隔离)
-        let kv_key = format!("session_v5_{}_{}", self.config.target_system.as_str(), tag);
+        let kv_key = format!("session_v6_{}_{}", self.config.target_system.as_str(), tag);
         if let Ok(kv) = env.kv("NIXCACHE_KV")
             && let Ok(Some(wrapper)) = kv
                 .get(&kv_key)
@@ -522,77 +552,58 @@ impl CacheStore {
         self.refresh_session_from_ghcr(env, tag).await
     }
 
-    /// 获取生产基线分片根索引与布隆过滤器 (L1 Memory -> L2 KV -> L3 GHCR)
+    /// 获取生产基线分片根索引 (L1 Memory -> L2 KV -> L3 GHCR，纯粹单原子 baseline_v6_{system})
     pub async fn get_baseline_data(
         &self,
         env: &Env,
-    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), WorkerStoreError> {
+    ) -> Result<(ShardedArchCacheIndexData, String), WorkerStoreError> {
         let now = Date::now();
 
         // 1. L1 Memory Cache
         if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full()
             && now < cached.expires_at
         {
-            return Ok((cached.root.clone(), cached.bloom_filter.clone()));
+            return Ok((cached.root.clone(), cached.manifest_digest.clone()));
         }
 
-        // 2. L2 Cloudflare KV (单次写入与读取，无 Legacy 双重冗余)
+        // 2. L2 Cloudflare KV (单原子 baseline_v6_{system})
         let kv = env
             .kv("NIXCACHE_KV")
             .map_err(|e| WorkerStoreError::KvGetFailed {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
-        let bloom_key = format!("baseline_bloom_v5_{}", self.config.target_system.as_str());
+        let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
 
-        if let Ok(Some(root_wrapper)) = kv
-            .get(&root_key)
+        if let Ok(Some(wrapper)) = kv
+            .get(&baseline_key)
             .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
             .await
-            && now - root_wrapper.last_refresh < self.baseline_ttl_ms
+            && now - wrapper.last_refresh < self.baseline_ttl_ms
         {
-            let root_data = root_wrapper.data;
-            let manifest_digest = root_wrapper.manifest_digest;
-            let bloom_filter = if let Ok(Some(bloom_wrapper)) =
-                kv.get(&bloom_key).json::<BloomFilterKvWrapper>().await
-            {
-                let bloom_bytes = STANDARD.decode(&bloom_wrapper.bytes_base64)?;
-                Arc::new(
-                    FastBlockedBloomFilter::from_bytes(
-                        &bloom_bytes,
-                        bloom_wrapper.num_entries,
-                        bloom_wrapper.num_hashes,
-                    )
-                    .unwrap_or_else(|_| FastBlockedBloomFilter::new_with_defaults(0)),
-                )
-            } else {
-                Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
-            };
+            let root_data = wrapper.data;
+            let manifest_digest = wrapper.manifest_digest;
 
             WorkerState::global()
                 .mem_baseline_cache
                 .store(Some(Arc::new(CachedBaselineEntry {
                     root: root_data.clone(),
-                    bloom_filter: bloom_filter.clone(),
-                    manifest_digest,
+                    manifest_digest: manifest_digest.clone(),
                     expires_at: now + L1_MEM_TTL_MS,
                 })));
-            return Ok((root_data, bloom_filter));
+            return Ok((root_data, manifest_digest));
         }
 
         // 3. L3 OCI GHCR
         match self.refresh_baseline_from_ghcr(env).await {
             Ok(res) => Ok(res),
             Err(e) => {
-                if let Ok(Some(root_wrapper)) = kv
-                    .get(&root_key)
+                if let Ok(Some(wrapper)) = kv
+                    .get(&baseline_key)
                     .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                     .await
                 {
-                    let root_data = root_wrapper.data;
-                    let bloom_filter = Arc::new(FastBlockedBloomFilter::new_with_defaults(0));
-                    return Ok((root_data, bloom_filter));
+                    return Ok((wrapper.data, wrapper.manifest_digest));
                 }
                 Err(e)
             }
@@ -602,7 +613,7 @@ impl CacheStore {
     async fn refresh_baseline_from_ghcr(
         &self,
         env: &Env,
-    ) -> Result<(ShardedArchCacheIndexData, Arc<FastBlockedBloomFilter>), WorkerStoreError> {
+    ) -> Result<(ShardedArchCacheIndexData, String), WorkerStoreError> {
         let now = Date::now();
         let old_cached = WorkerState::global().mem_baseline_cache.load_full();
 
@@ -633,37 +644,6 @@ impl CacheStore {
             }
         };
 
-        let bloom_filter = if !root_data.bloom_filter.blob_digest.is_empty() {
-            match self
-                .oci_client
-                .get_bloom_filter(
-                    &root_data.bloom_filter.blob_digest,
-                    root_data.bloom_filter.num_entries,
-                    root_data.bloom_filter.num_hashes,
-                )
-                .await
-            {
-                Ok(f) => {
-                    self.set_remote_status(true, None);
-                    Arc::new(f)
-                }
-                Err(e) => {
-                    self.set_remote_status(
-                        false,
-                        Some(format!(
-                            "GHCR bloom filter {}: {}",
-                            root_data.bloom_filter.blob_digest, e
-                        )),
-                    );
-                    Arc::new(FastBlockedBloomFilter::new_with_defaults(
-                        root_data.bloom_filter.num_entries as usize,
-                    ))
-                }
-            }
-        } else {
-            Arc::new(FastBlockedBloomFilter::new_with_defaults(0))
-        };
-
         // 比对新旧基线 Merkle Root 与 Shards 描述符，淘汰已失效分片
         if let Some(old_b) = old_cached
             && old_b.root.merkle_root != root_data.merkle_root
@@ -680,34 +660,17 @@ impl CacheStore {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
-        let bloom_key = format!("baseline_bloom_v5_{}", self.config.target_system.as_str());
+        let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
 
-        let root_wrapper = KVCacheWrapper {
+        let wrapper = KVCacheWrapper {
             data: root_data.clone(),
             last_refresh: now,
             manifest_digest: manifest_digest.clone(),
         };
         let _ = kv
-            .put(&root_key, &root_wrapper)
+            .put(&baseline_key, &wrapper)
             .map_err(|e| WorkerStoreError::KvPutFailed {
-                key: root_key.clone(),
-                message: e.to_string(),
-            })?
-            .execute()
-            .await;
-
-        let bloom_wrapper = BloomFilterKvWrapper {
-            num_entries: bloom_filter.num_entries(),
-            num_hashes: bloom_filter.num_hashes(),
-            bytes_base64: STANDARD.encode(bloom_filter.to_bytes()),
-            last_refresh: now,
-            blob_digest: root_data.bloom_filter.blob_digest.clone(),
-        };
-        let _ = kv
-            .put(&bloom_key, &bloom_wrapper)
-            .map_err(|e| WorkerStoreError::KvPutFailed {
-                key: bloom_key.clone(),
+                key: baseline_key.clone(),
                 message: e.to_string(),
             })?
             .execute()
@@ -717,12 +680,11 @@ impl CacheStore {
             .mem_baseline_cache
             .store(Some(Arc::new(CachedBaselineEntry {
                 root: root_data.clone(),
-                bloom_filter: bloom_filter.clone(),
-                manifest_digest,
+                manifest_digest: manifest_digest.clone(),
                 expires_at: now + L1_MEM_TTL_MS,
             })));
 
-        Ok((root_data, bloom_filter))
+        Ok((root_data, manifest_digest))
     }
 
     /// 强制刷新所有层级的索引并主动预热变更分片 (Tier 1 -> Tier 2 -> Tier 3)
@@ -734,9 +696,9 @@ impl CacheStore {
         {
             cached.root.shards.clone()
         } else if let Ok(kv) = env.kv("NIXCACHE_KV") {
-            let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
+            let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
             if let Ok(Some(wrapper)) = kv
-                .get(&root_key)
+                .get(&baseline_key)
                 .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                 .await
             {
@@ -774,7 +736,7 @@ impl CacheStore {
                         &self.config.repo,
                         &self.config.registry,
                     ),
-                    Arc::new(FastBlockedBloomFilter::new_with_defaults(0)),
+                    String::new(),
                 )
             }
         };
@@ -815,8 +777,6 @@ impl CacheStore {
 
     /// 获取完整的状态元信息与各层级统计 (实时 RCU 远端连通度)
     pub async fn get_status(&self, env: &Env) -> RemoteStatus {
-        let hot_count = WorkerState::global().hot_count.load(Ordering::Relaxed);
-
         let mut tier1_count = 0;
         let mut session_opt = None;
         if let Some(run_id) = self.config.run_id {
@@ -839,19 +799,12 @@ impl CacheStore {
 
         let baseline_res = self.get_baseline_data(env).await;
         let (tier3_count, manifest_digest, generated) = match baseline_res {
-            Ok((ref b, _)) => {
-                let digest = WorkerState::global()
-                    .mem_baseline_cache
-                    .load_full()
-                    .map(|c| c.manifest_digest.clone())
-                    .unwrap_or_default();
-                (b.total_entries(), digest, b.generated.clone())
-            }
+            Ok((ref b, ref digest)) => (b.total_entries(), digest.clone(), b.generated.clone()),
             Err(_) => {
-                let root_key = format!("baseline_root_v5_{}", self.config.target_system.as_str());
+                let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
                 let kv_data = match env.kv("NIXCACHE_KV") {
                     Ok(kv) => kv
-                        .get(&root_key)
+                        .get(&baseline_key)
                         .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                         .await
                         .ok()
@@ -870,10 +823,6 @@ impl CacheStore {
         let remote_error = remote_state.last_error.clone();
 
         let mut unique_hashes: HashSet<StoreHash> = HashSet::new();
-        WorkerState::global().hot_entries.iter_sync(|k, _| {
-            unique_hashes.insert((*k).clone());
-            true
-        });
         if let Some(s) = session_opt {
             unique_hashes.extend(s.new_entries.keys().cloned());
         }
@@ -890,7 +839,7 @@ impl CacheStore {
             repo: self.config.repo.clone(),
             run_id: self.config.run_id,
             branch_or_pr: self.config.branch_or_pr.clone(),
-            tier0_hot_entries: hot_count,
+            tier0_hot_entries: 0,
             tier1_session_entries: tier1_count,
             tier2_branch_entries: tier2_count,
             tier3_baseline_entries: tier3_count,
@@ -910,9 +859,9 @@ impl CacheStore {
 mod tests {
     use super::{RemoteStatus, WorkerProxyConfig, format_branch_tag};
     use nixcache_core::{
-        DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, NarInfoMeta,
-        SCHEMA_VERSION_V5, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
-        build_nar_lookup_map, diff_shard_descriptors,
+        DeltaPatchData, IndexEntry, NarDigest, NarInfoMeta, SCHEMA_VERSION_V6, ShardDataPayload,
+        ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map,
+        diff_shard_descriptors,
     };
     use std::collections::HashMap;
 
@@ -925,39 +874,6 @@ mod tests {
         assert_eq!(format_branch_tag("42"), "pr-42");
         assert_eq!(format_branch_tag("refs/heads/main"), "branch-main");
         assert_eq!(format_branch_tag("refs/pull/123/head"), "pr-123");
-    }
-
-    #[test]
-    fn test_hot_registration_and_lookup() {
-        let mut entries = HashMap::new();
-        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        let digest1 = NarDigest::new_sha256(
-            "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-        )
-        .unwrap();
-
-        entries.insert(
-            hash1.clone(),
-            IndexEntry {
-                name: "pkg1".to_string(),
-                system: Some(SystemArch::X86_64Linux),
-                narinfo_meta: NarInfoMeta {
-                    store_path: format!("/nix/store/{}-pkg1", hash1),
-                    nar_basename: "pkg1.nar.xz".to_string(),
-                    nar_hash:
-                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                            .to_string(),
-                    ..Default::default()
-                },
-                nar_digest: digest1.clone(),
-                nar_size: 100,
-                added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
-            },
-        );
-
-        let nar_map = build_nar_lookup_map(&entries);
-        assert_eq!(nar_map.get("pkg1.nar.xz"), Some(&digest1));
     }
 
     #[test]
@@ -1002,12 +918,12 @@ mod tests {
             repo: "test/repo".to_string(),
             run_id: Some(123456),
             branch_or_pr: Some("main".to_string()),
-            tier0_hot_entries: 1,
+            tier0_hot_entries: 0,
             tier1_session_entries: 2,
             tier2_branch_entries: 0,
             tier3_baseline_entries: 3,
-            total_unique_entries: 6,
-            index_entries: 6,
+            total_unique_entries: 5,
+            index_entries: 5,
             index_ttl: 300,
             session_ttl: 10,
             baseline_ttl: 300,
@@ -1032,33 +948,21 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_v5_delta_and_sharding_serialization() {
+    fn test_schema_v6_delta_and_sharding_serialization() {
         let mut delta = DeltaPatchData::new(12345, "job1", SystemArch::X86_64Linux);
         delta.active_gc_roots.push(StoreHash::default());
 
-        assert_eq!(delta.version, SCHEMA_VERSION_V5);
+        assert_eq!(delta.version, SCHEMA_VERSION_V6);
         let delta_json = serde_json::to_string(&delta).unwrap();
         let loaded: DeltaPatchData = serde_json::from_str(&delta_json).unwrap();
         assert_eq!(loaded.run_id, 12345);
 
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
-        assert_eq!(root.version, SCHEMA_VERSION_V5);
+        assert_eq!(root.version, SCHEMA_VERSION_V6);
         assert_eq!(root.shards.len(), 1024);
 
         let shard = ShardDataPayload::new(0);
-        assert_eq!(shard.version, SCHEMA_VERSION_V5);
-    }
-
-    #[test]
-    fn test_bloom_filter_guard() {
-        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        let hash2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
-
-        let mut bloom = FastBlockedBloomFilter::new_with_defaults(10);
-        bloom.insert(&hash1);
-
-        assert!(bloom.contains(&hash1));
-        assert!(!bloom.contains(&hash2));
+        assert_eq!(shard.version, SCHEMA_VERSION_V6);
     }
 
     #[test]

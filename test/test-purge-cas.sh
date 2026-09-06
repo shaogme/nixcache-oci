@@ -87,7 +87,7 @@ touch /tmp/mock-oci-registry-purge/blobs/sha256_2d1b50428e2194f481ad1cf387f3b890
 
 cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
 {
-  "version": 5,
+  "version": 6,
   "system": "x86_64-linux",
   "repo": "testorg/testrepo",
   "timestamp": "2026-08-29T10:00:00Z",

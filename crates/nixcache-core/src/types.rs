@@ -12,11 +12,11 @@ use std::{
 };
 use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
-pub const SCHEMA_VERSION: u32 = 5;
-pub const SCHEMA_VERSION_V5: u32 = 5;
-pub const CACHE_INDEX_VERSION: u32 = 5;
-pub const RUN_SESSION_VERSION: u32 = 5;
-pub const RECEIPT_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION_V6: u32 = 6;
+pub const CACHE_INDEX_VERSION: u32 = 6;
+pub const RUN_SESSION_VERSION: u32 = 6;
+pub const RECEIPT_VERSION: u32 = 6;
 pub const NUM_SHARDS: usize = 1024;
 
 /// Nix 32 字符 Base32 散列值 (例如: `s66mzxpvicwk07gjbjfw9izjfa797vsw`)
@@ -643,49 +643,7 @@ impl ShardDescriptor {
     }
 }
 
-/// 全局紧凑布隆过滤器元数据容器
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BloomFilterManifest {
-    pub num_entries: u64,
-    pub num_bits: u64,
-    pub num_hashes: u8,
-    pub blob_digest: String,
-    pub compressed_size: u64,
-}
-
-impl BloomFilterManifest {
-    pub fn empty() -> Self {
-        Self {
-            num_entries: 0,
-            num_bits: 512,
-            num_hashes: 7,
-            blob_digest: String::new(),
-            compressed_size: 0,
-        }
-    }
-
-    pub fn new(
-        num_entries: u64,
-        num_bits: u64,
-        num_hashes: u8,
-        blob_digest: impl Into<String>,
-        compressed_size: u64,
-    ) -> Self {
-        Self {
-            num_entries,
-            num_bits,
-            num_hashes,
-            blob_digest: blob_digest.into(),
-            compressed_size,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.num_entries == 0
-    }
-}
-
-/// 单架构全局分片索引根目录 (Schema v5 Root)
+/// 单架构全局分片索引根目录 (Schema v6 Root)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardedArchCacheIndexData {
     pub version: u32,
@@ -698,15 +656,13 @@ pub struct ShardedArchCacheIndexData {
     pub shards: Vec<ShardDescriptor>,
     /// 全局 Merkle Root 签名
     pub merkle_root: String,
-    /// 布隆过滤器描述符
-    pub bloom_filter: BloomFilterManifest,
     /// 跨分片聚合的活跃 GC Roots 列表
     pub gc_roots: Vec<StoreHash>,
     pub last_promoted_run: Option<u64>,
 }
 
 impl ShardedArchCacheIndexData {
-    /// 创建一个全新的 Schema v5 单架构分片索引根目录 (包含 1024 个空分片描述符)
+    /// 创建一个全新的 Schema v6 单架构分片索引根目录 (包含 1024 个空分片描述符)
     pub fn new(system: SystemArch, repo: impl Into<String>, registry: impl Into<String>) -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for id in 0..NUM_SHARDS {
@@ -715,7 +671,7 @@ impl ShardedArchCacheIndexData {
         let merkle_root = compute_merkle_root(&shards);
 
         Self {
-            version: SCHEMA_VERSION_V5,
+            version: SCHEMA_VERSION_V6,
             system,
             repo: repo.into(),
             registry: registry.into(),
@@ -723,7 +679,6 @@ impl ShardedArchCacheIndexData {
             public_key: String::new(),
             shards,
             merkle_root,
-            bloom_filter: BloomFilterManifest::empty(),
             gc_roots: Vec::new(),
             last_promoted_run: None,
         }
@@ -782,7 +737,7 @@ pub struct ShardDataPayload {
 impl ShardDataPayload {
     pub fn new(shard_id: u16) -> Self {
         Self {
-            version: SCHEMA_VERSION_V5,
+            version: SCHEMA_VERSION_V6,
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             entries: HashMap::new(),
@@ -791,7 +746,7 @@ impl ShardDataPayload {
 
     pub fn with_entries(shard_id: u16, entries: HashMap<StoreHash, IndexEntry>) -> Self {
         Self {
-            version: SCHEMA_VERSION_V5,
+            version: SCHEMA_VERSION_V6,
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             entries,
@@ -826,7 +781,7 @@ pub struct DeltaPatchData {
 impl DeltaPatchData {
     pub fn new(run_id: u64, job_id: impl Into<String>, system: SystemArch) -> Self {
         Self {
-            version: SCHEMA_VERSION_V5,
+            version: SCHEMA_VERSION_V6,
             run_id,
             job_id: job_id.into(),
             system,
@@ -844,7 +799,7 @@ impl DeltaPatchData {
         active_gc_roots: Vec<StoreHash>,
     ) -> Self {
         Self {
-            version: SCHEMA_VERSION_V5,
+            version: SCHEMA_VERSION_V6,
             run_id,
             job_id: job_id.into(),
             system,

@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-echo "=== Starting NixCache Schema v5 Sharding Scale & Concurrency Stress Test Suite ==="
+echo "=== Starting NixCache Schema v6 Sharding Scale & Concurrency Stress Test Suite ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-scale-test-XXXXXX)
 export GITHUB_ENV="$TMP_DIR/github_env"
@@ -213,8 +213,8 @@ export GITHUB_TOKEN="dummy-token"
 echo ">>> Executing nixcache-builder promote across 5,000 entries..."
 "$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR" --target-tag "cache-index"
 
-# 7. 校验 OCI 中的 Sharded Root Index、Bloom Filter 和 Shards
-echo ">>> Verifying OCI Sharded Root Index and Bloom Filter Layers..."
+# 7. 校验 OCI 中的 Sharded Root Index (Schema v6 单层架构)
+echo ">>> Verifying OCI Sharded Root Index Layer (Schema v6)..."
 MANIFEST_INDEX_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/scale-test/cache/nix-cache/manifests/cache-index")
 
 python3 -c "
@@ -227,19 +227,17 @@ sub_safe = sub_manifest_digest.replace(':', '_')
 with open(f'/tmp/mock-oci-registry/manifests/{sub_safe}', 'rb') as f:
     sub_manifest = json.load(f)
 
-assert len(sub_manifest['layers']) == 2, f'Expected 2 layers (Root + Bloom), got {len(sub_manifest[\"layers\"])}'
+assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V6), got {len(sub_manifest[\"layers\"])}'
 root_layer = sub_manifest['layers'][0]
-bloom_layer = sub_manifest['layers'][1]
 
-assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v5+zstd'
-assert bloom_layer['mediaType'] == 'application/vnd.nix.cache.bloom.v5+zstd'
+assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v6+zstd'
 
 # Decompress and verify Root Index
 blob_path = f'/tmp/mock-oci-registry/blobs/{root_layer[\"digest\"].replace(\":\", \"_\")}'
 decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
 root_data = json.loads(decompressed)
 
-assert root_data['version'] == 5
+assert root_data['version'] == 6
 assert len(root_data['shards']) == 1024
 total_entries = sum(s['entry_count'] for s in root_data['shards'])
 assert total_entries == 5000, f'Expected 5000 entries across shards, got {total_entries}'

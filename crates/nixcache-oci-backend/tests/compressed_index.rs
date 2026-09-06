@@ -1,6 +1,6 @@
 use nixcache_core::{
-    BloomFilterManifest, DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, NarDigest,
-    NarInfoMeta, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    DeltaPatchData, IndexEntry, NUM_SHARDS, NarDigest, NarInfoMeta, ShardDataPayload,
+    ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 use nixcache_oci::{
     CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec,
@@ -30,11 +30,7 @@ fn compute_sha256(bytes: &[u8]) -> String {
 
 fn sample_sharded_arch_index_data(
     system: SystemArch,
-) -> (
-    ShardedArchCacheIndexData,
-    FastBlockedBloomFilter,
-    ShardDataPayload,
-) {
+) -> (ShardedArchCacheIndexData, ShardDataPayload) {
     let mut shard_payload = ShardDataPayload::new(42);
     let hash_str = if system == SystemArch::X86_64Linux {
         "s66mzxpvicwk07gjbjfw9izjfa797vsw"
@@ -64,15 +60,12 @@ fn sample_sharded_arch_index_data(
         },
     );
 
-    let mut bloom = FastBlockedBloomFilter::new_with_defaults(100);
-    bloom.insert(&hash);
-
     let mut root_index = ShardedArchCacheIndexData::new(system, "test/repo", "ghcr.io");
     root_index.public_key = "cache.example.com-1:key123".to_string();
     root_index.last_promoted_run = Some(42);
     root_index.gc_roots = vec![hash];
 
-    (root_index, bloom, shard_payload)
+    (root_index, shard_payload)
 }
 
 fn sample_delta_patch_data(run_id: u64, system: SystemArch) -> DeltaPatchData {
@@ -104,13 +97,11 @@ fn sample_delta_patch_data(run_id: u64, system: SystemArch) -> DeltaPatchData {
 }
 
 #[test]
-fn test_manifest_builder_generates_v5_zstd_descriptors() {
+fn test_manifest_builder_generates_v6_zstd_descriptors() {
     let system = SystemArch::X86_64Linux;
     let index_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: "sha256:rootblob123",
         root_blob_size: 500,
-        bloom_blob_digest: "sha256:bloomblob456",
-        bloom_blob_size: 120,
         config_digest: "sha256:config123",
         config_size: 2,
         system: &system,
@@ -119,12 +110,12 @@ fn test_manifest_builder_generates_v5_zstd_descriptors() {
 
     assert_eq!(index_manifest.schema_version, 2);
     assert_eq!(index_manifest.media_type, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
-    assert_eq!(index_manifest.layers.len(), 2);
+    assert_eq!(index_manifest.layers.len(), 1);
 
     let root_layer = &index_manifest.layers[0];
     assert_eq!(
         root_layer.media_type,
-        CacheLayerMediaType::ROOT_INDEX_V5_ZSTD
+        CacheLayerMediaType::ROOT_INDEX_V6_ZSTD
     );
     assert_eq!(root_layer.digest, "sha256:rootblob123");
     assert_eq!(root_layer.size, 500);
@@ -134,7 +125,7 @@ fn test_manifest_builder_generates_v5_zstd_descriptors() {
         annotations
             .get("org.nixos.nixcache.schema")
             .map(|s| s.as_str()),
-        Some("5")
+        Some("6")
     );
     assert_eq!(
         annotations
@@ -147,24 +138,6 @@ fn test_manifest_builder_generates_v5_zstd_descriptors() {
             .get("org.nixos.nixcache.merkle_root")
             .map(|s| s.as_str()),
         Some("sha256:merkle123")
-    );
-
-    let bloom_layer = &index_manifest.layers[1];
-    assert_eq!(
-        bloom_layer.media_type,
-        CacheLayerMediaType::BLOOM_FILTER_V5_ZSTD
-    );
-    assert_eq!(bloom_layer.digest, "sha256:bloomblob456");
-    assert_eq!(bloom_layer.size, 120);
-
-    let b_ann = bloom_layer.annotations.as_ref().unwrap();
-    assert_eq!(
-        b_ann.get("org.nixos.nixcache.type").map(|s| s.as_str()),
-        Some("bloom_filter")
-    );
-    assert_eq!(
-        b_ann.get("org.nixos.nixcache.schema").map(|s| s.as_str()),
-        Some("5")
     );
 
     let delta_manifest = build_delta_patch_manifest(
@@ -181,14 +154,14 @@ fn test_manifest_builder_generates_v5_zstd_descriptors() {
     assert_eq!(delta_manifest.layers.len(), 1);
 
     let d_layer = &delta_manifest.layers[0];
-    assert_eq!(d_layer.media_type, CacheLayerMediaType::DELTA_PATCH_V5_ZSTD);
+    assert_eq!(d_layer.media_type, CacheLayerMediaType::DELTA_PATCH_V6_ZSTD);
     assert_eq!(d_layer.digest, "sha256:deltablob789");
     assert_eq!(d_layer.size, 600);
 
     let d_ann = d_layer.annotations.as_ref().unwrap();
     assert_eq!(
         d_ann.get("org.nixos.nixcache.schema").map(|s| s.as_str()),
-        Some("5")
+        Some("6")
     );
     assert_eq!(
         d_ann.get("org.nixos.nixcache.run_id").map(|s| s.as_str()),
@@ -209,21 +182,11 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
-    let (mut arch_data, bloom, shard_payload) =
-        sample_sharded_arch_index_data(SystemArch::X86_64Linux);
-    let bloom_bytes = IndexCodec::encode_bloom_filter(&bloom, 3).unwrap();
-    let bloom_digest = compute_sha256(&bloom_bytes);
+    let (mut arch_data, shard_payload) = sample_sharded_arch_index_data(SystemArch::X86_64Linux);
 
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = compute_sha256(&shard_bytes);
 
-    arch_data.bloom_filter = BloomFilterManifest::new(
-        bloom.num_entries(),
-        bloom.num_bits(),
-        bloom.num_hashes(),
-        &bloom_digest,
-        bloom_bytes.len() as u64,
-    );
     arch_data.shards[42] = nixcache_core::ShardDescriptor::new(
         42,
         &shard_digest,
@@ -241,8 +204,6 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     let sub_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: &blob_digest,
         root_blob_size: blob_size,
-        bloom_blob_digest: &bloom_digest,
-        bloom_blob_size: bloom_bytes.len() as u64,
         config_digest: EMPTY_CONFIG_DIGEST,
         config_size: EMPTY_CONFIG_SIZE,
         system: &SystemArch::X86_64Linux,
@@ -395,20 +356,10 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
-    let (mut data_x86, bloom_x86, shard_x86) =
-        sample_sharded_arch_index_data(SystemArch::X86_64Linux);
-    let bloom_bytes_x86 = IndexCodec::encode_bloom_filter(&bloom_x86, 3).unwrap();
-    let bloom_digest_x86 = compute_sha256(&bloom_bytes_x86);
+    let (mut data_x86, shard_x86) = sample_sharded_arch_index_data(SystemArch::X86_64Linux);
     let shard_bytes_x86 = IndexCodec::encode_zstd(&shard_x86, 3).unwrap();
     let shard_digest_x86 = compute_sha256(&shard_bytes_x86);
 
-    data_x86.bloom_filter = BloomFilterManifest::new(
-        bloom_x86.num_entries(),
-        bloom_x86.num_bits(),
-        bloom_x86.num_hashes(),
-        &bloom_digest_x86,
-        bloom_bytes_x86.len() as u64,
-    );
     data_x86.shards[42] = nixcache_core::ShardDescriptor::new(
         42,
         &shard_digest_x86,
@@ -422,20 +373,10 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let bytes_x86 = IndexCodec::encode_zstd(&data_x86, 3).unwrap();
     let digest_x86 = compute_sha256(&bytes_x86);
 
-    let (mut data_arm, bloom_arm, shard_arm) =
-        sample_sharded_arch_index_data(SystemArch::Aarch64Linux);
-    let bloom_bytes_arm = IndexCodec::encode_bloom_filter(&bloom_arm, 3).unwrap();
-    let bloom_digest_arm = compute_sha256(&bloom_bytes_arm);
+    let (mut data_arm, shard_arm) = sample_sharded_arch_index_data(SystemArch::Aarch64Linux);
     let shard_bytes_arm = IndexCodec::encode_zstd(&shard_arm, 3).unwrap();
     let shard_digest_arm = compute_sha256(&shard_bytes_arm);
 
-    data_arm.bloom_filter = BloomFilterManifest::new(
-        bloom_arm.num_entries(),
-        bloom_arm.num_bits(),
-        bloom_arm.num_hashes(),
-        &bloom_digest_arm,
-        bloom_bytes_arm.len() as u64,
-    );
     data_arm.shards[42] = nixcache_core::ShardDescriptor::new(
         42,
         &shard_digest_arm,
@@ -452,8 +393,6 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let manifest_x86 = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: &digest_x86,
         root_blob_size: bytes_x86.len() as u64,
-        bloom_blob_digest: &bloom_digest_x86,
-        bloom_blob_size: bloom_bytes_x86.len() as u64,
         config_digest: EMPTY_CONFIG_DIGEST,
         config_size: EMPTY_CONFIG_SIZE,
         system: &SystemArch::X86_64Linux,
@@ -465,8 +404,6 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let manifest_arm = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: &digest_arm,
         root_blob_size: bytes_arm.len() as u64,
-        bloom_blob_digest: &bloom_digest_arm,
-        bloom_blob_size: bloom_bytes_arm.len() as u64,
         config_digest: EMPTY_CONFIG_DIGEST,
         config_size: EMPTY_CONFIG_SIZE,
         system: &SystemArch::Aarch64Linux,
@@ -644,8 +581,6 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
     let sub_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: "sha256:corruptblob",
         root_blob_size: 100,
-        bloom_blob_digest: "sha256:bloomblob",
-        bloom_blob_size: 100,
         config_digest: EMPTY_CONFIG_DIGEST,
         config_size: EMPTY_CONFIG_SIZE,
         system: &SystemArch::X86_64Linux,
@@ -677,17 +612,13 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
 }
 
 #[tokio::test]
-async fn test_get_shard_data_and_bloom_filter_roundtrip() {
+async fn test_get_shard_data_roundtrip() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
-    let (_root_data, bloom, shard_payload) =
-        sample_sharded_arch_index_data(SystemArch::X86_64Linux);
+    let (_root_data, shard_payload) = sample_sharded_arch_index_data(SystemArch::X86_64Linux);
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = compute_sha256(&shard_bytes);
-
-    let bloom_bytes = IndexCodec::encode_bloom_filter(&bloom, 3).unwrap();
-    let bloom_digest = compute_sha256(&bloom_bytes);
 
     Mock::given(method("HEAD"))
         .respond_with(ResponseTemplate::new(404))
@@ -711,15 +642,6 @@ async fn test_get_shard_data_and_bloom_filter_roundtrip() {
         .mount(&server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/test/repo/nix-cache/blobs/{}",
-            bloom_digest
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(bloom_bytes.to_vec()))
-        .mount(&server)
-        .await;
-
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     let (pushed_digest, comp_size, _) = client.push_shard_data(&shard_payload).await.unwrap();
@@ -729,13 +651,6 @@ async fn test_get_shard_data_and_bloom_filter_roundtrip() {
     let retrieved_shard = client.get_shard_data(&shard_digest).await.unwrap();
     assert_eq!(retrieved_shard.shard_id, 42);
     assert_eq!(retrieved_shard.entries.len(), 1);
-
-    let retrieved_bloom = client
-        .get_bloom_filter(&bloom_digest, bloom.num_entries(), bloom.num_hashes())
-        .await
-        .unwrap();
-    let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-    assert!(retrieved_bloom.contains(&h1));
 }
 
 #[tokio::test]
@@ -871,7 +786,7 @@ async fn test_update_sharded_arch_index_cas_flow() {
                 ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io")
             });
             root.public_key = "cache.example.com-1:key123".to_string();
-            Ok((root, "sha256:bloomblob123".to_string(), 120))
+            Ok(root)
         })
         .await
         .unwrap();

@@ -19,6 +19,7 @@ rm -rf /homeless-shelter 2>/dev/null || true
 # 1. 测试默认安装 (binary)
 echo ">>> Test 1: Default Binary Installation..."
 unset NIX_CONFIG || true
+unset CARGO_TARGET_DIR || true
 export GITHUB_WORKSPACE="$PROJECT_DIR"
 export RUNNER_TEMP="$TMP_DIR/run1"
 export GITHUB_ENV="$TMP_DIR/github_env"

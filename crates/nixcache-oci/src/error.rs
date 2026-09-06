@@ -108,7 +108,7 @@ pub enum OciError {
     #[error("Manifest missing target layer with root index / delta patch media type")]
     LayerDescriptorMissing,
 
-    #[error("Unsupported layer media type: '{0}' (only Schema v5 Zstd media types supported)")]
+    #[error("Unsupported layer media type: '{0}' (only Schema v6 Zstd media types supported)")]
     UnsupportedMediaType(String),
 
     #[error("Manifest JSON contains invalid UTF-8 bytes: {0}")]
@@ -131,12 +131,6 @@ pub enum OciError {
 
     #[error(transparent)]
     Io(#[from] IoError),
-}
-
-impl From<nixcache_core::BloomError> for OciError {
-    fn from(err: nixcache_core::BloomError) -> Self {
-        Self::Core(CoreError::Bloom(err))
-    }
 }
 
 impl From<nixcache_core::TypeError> for OciError {

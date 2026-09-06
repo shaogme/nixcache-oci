@@ -109,51 +109,41 @@ PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --outpu
 "$BUILDER_BIN" promote --receipt "$RECEIPT_FILE"
 rm -f "$RECEIPT_FILE"
 
-# 5. Force Worker to refresh its cache index
-echo ">>> Triggering Worker cache index refresh..."
-REFRESH_RESP=$(curl -fs -X POST "$TEST_WORKER_URL/_refresh")
-echo "Worker refresh response: $REFRESH_RESP"
+# 5. Deterministic Resource Convergence Verification
+# Instead of polling /_status (which has edge KV propagation delays and false convergence),
+# we directly verify deterministic convergence on the target .narinfo endpoint.
+# With Read-Through SWR self-healing in Worker, this resolves deterministically with zero jitter.
+echo ">>> Verifying deterministic convergence on target .narinfo endpoint..."
+NARINFO_RESP_HEADERS="$(mktemp)"
+NARINFO_CONTENT=""
+CONVERGED=false
 
-EXPECTED_DIGEST=$(echo "$REFRESH_RESP" | python3 -c "import sys, json; print(json.load(sys.stdin).get('manifest_digest', ''))")
-echo ">>> Expected manifest digest: $EXPECTED_DIGEST"
-
-if [[ -n "$EXPECTED_DIGEST" ]]; then
-    echo ">>> Polling Worker /_status until manifest_digest matches expected digest..."
-    for i in {1..20}; do
-        CURRENT_DIGEST=$(curl -fsSL "$TEST_WORKER_URL/_status" 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('manifest_digest', ''))" 2>/dev/null || true)
-        if [[ "$CURRENT_DIGEST" == "$EXPECTED_DIGEST" ]]; then
-            echo ">>> Worker status converged to expected manifest digest ($CURRENT_DIGEST) at attempt $i."
+for i in {1..20}; do
+    HTTP_CODE=$(curl -s -o /tmp/narinfo_body.tmp -w "%{http_code}" -D "$NARINFO_RESP_HEADERS" "$TEST_WORKER_URL/${TEST_HASH}.narinfo" || true)
+    
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        NARINFO_CONTENT=$(cat /tmp/narinfo_body.tmp)
+        if echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
+            echo ">>> Deterministic convergence achieved at attempt $i!"
+            echo ">>> Diagnostic Headers:"
+            grep -i "^x-nixcache" "$NARINFO_RESP_HEADERS" || true
+            echo ">>> Retrieved narinfo:"
+            echo "$NARINFO_CONTENT"
+            CONVERGED=true
             break
         fi
-        echo ">>> Stale manifest digest ($CURRENT_DIGEST), retrying in 3 seconds ($i/20)..."
-        sleep 3
-    done
-fi
-
-# 6. Verify Narinfo resolves on Worker (deterministic resolution without custom bypass headers)
-echo ">>> Verifying .narinfo endpoint on Worker..."
-NARINFO_CONTENT=""
-for i in {1..20}; do
-    if NARINFO_CONTENT=$(curl -fs "$TEST_WORKER_URL/${TEST_HASH}.narinfo" 2>/dev/null); then
-        echo ">>> Retrieved narinfo:"
-        echo "$NARINFO_CONTENT"
-        break
     fi
-    echo ">>> Stale or 404 response, retrying in 3 seconds ($i/20)..."
-    sleep 3
+    echo ">>> Waiting for target .narinfo convergence (HTTP $HTTP_CODE), retrying in 2 seconds ($i/20)..."
+    sleep 2
 done
+rm -f "$NARINFO_RESP_HEADERS" /tmp/narinfo_body.tmp
 
-if [[ -z "${NARINFO_CONTENT:-}" ]]; then
-    echo "!!! Failed to retrieve narinfo from Worker after retries."
+if [[ "$CONVERGED" != "true" ]]; then
+    echo "!!! Failed to deterministically converge on target .narinfo after retries."
     exit 1
 fi
 
-if ! echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
-    echo "!!! Retrieved narinfo from Worker does not match target store path!"
-    exit 1
-fi
-
-# 7. Perform substitution test from Worker
+# 6. Perform substitution test from Worker
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 

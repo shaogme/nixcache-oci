@@ -5,8 +5,8 @@ use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_cli::PurgeArgs;
 use nixcache_core::{
-    FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V5, ShardDataPayload,
-    ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
+    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
     partition_entries_by_shard,
 };
 use nixcache_oci::{
@@ -17,7 +17,7 @@ use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-/// 执行缓存主动清理与失效工作流 (Schema v5 分片梅克尔基数索引)
+/// 执行缓存主动清理与失效工作流 (Schema v6 分片梅克尔基数索引)
 pub async fn run_purge(
     args: &PurgeArgs,
     repo: &str,
@@ -237,29 +237,13 @@ pub async fn run_purge(
                 root_index.gc_roots = updated_roots;
                 root_index.recalculate_merkle_root();
 
-                // 重建 Bloom Filter
-                let total_entries = root_index.total_entries();
-                let mut bloom_filter =
-                    FastBlockedBloomFilter::new_with_defaults(total_entries.max(100));
-                for hash in kept_entries_for_sys.keys() {
-                    bloom_filter.insert(hash);
-                }
-
-                let bf_manifest = oci.push_bloom_filter(&bloom_filter).await?;
-                root_index.bloom_filter = bf_manifest.clone();
-                root_index.version = SCHEMA_VERSION_V5;
+                root_index.version = SCHEMA_VERSION_V6;
                 root_index.generated =
                     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                 let arch_tag = format!("cache-index-{}", sys.as_str());
                 let sub_manifest_digest = oci
-                    .push_sharded_root_index(
-                        &arch_tag,
-                        &root_index,
-                        &bf_manifest.blob_digest,
-                        bf_manifest.compressed_size,
-                        None,
-                    )
+                    .push_sharded_root_index(&arch_tag, &root_index, None)
                     .await?;
 
                 info!(

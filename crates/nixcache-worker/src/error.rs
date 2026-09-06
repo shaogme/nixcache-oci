@@ -1,4 +1,4 @@
-use nixcache_core::{BloomError, CoreError, TypeError};
+use nixcache_core::{CoreError, TypeError};
 use nixcache_oci::OciError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,9 +17,6 @@ pub enum WorkerStoreError {
     #[error("Worker HTTP Header parse/set error: {0}")]
     Header(String),
 
-    #[error("Bloom filter decode failure: {0}")]
-    Bloom(String),
-
     #[error("OCI registry operation error: {0}")]
     Oci(String),
 
@@ -28,18 +25,6 @@ pub enum WorkerStoreError {
 
     #[error("Aggregated refresh failed for components: {errors:?}")]
     AggregatedRefreshFailed { errors: Vec<String> },
-}
-
-impl From<base64::DecodeError> for WorkerStoreError {
-    fn from(err: base64::DecodeError) -> Self {
-        Self::Bloom(err.to_string())
-    }
-}
-
-impl From<BloomError> for WorkerStoreError {
-    fn from(err: BloomError) -> Self {
-        Self::Bloom(err.to_string())
-    }
 }
 
 impl From<TypeError> for WorkerStoreError {

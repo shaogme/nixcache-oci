@@ -19,7 +19,7 @@ pub use client::{DeletionSummary, FetchedOciArtifact, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TokenError, TransportError};
 pub use manifest::{
-    CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
+    CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
     OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
     ShardedArchIndexManifestParams, build_delta_patch_manifest, build_image_index,
@@ -28,13 +28,13 @@ pub use manifest::{
 pub use mock::{MockResponse, MockRouterTransport};
 pub use mutation::SessionMutationRequest;
 pub use nixcache_core::{
-    BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION,
-    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, JobSummaryMetadata, NUM_SHARDS, NarDigest,
-    NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION, SCHEMA_VERSION_V5,
-    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
-    build_nar_lookup_map, calculate_shard_id, compute_merkle_root, compute_shard_merkle_hash,
-    diff_shard_descriptors, evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash,
-    extract_store_hash_str, partition_entries_by_shard, shard_id_to_prefix,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry, JobSummaryMetadata,
+    NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
+    SCHEMA_VERSION, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map, calculate_shard_id,
+    compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors, evaluate_multi_arch_gc,
+    extract_nar_basename, extract_store_hash, extract_store_hash_str, partition_entries_by_shard,
+    shard_id_to_prefix,
 };
 pub use token::TokenManager;
 pub use transport::{
@@ -46,13 +46,12 @@ pub use upload::{BlobPayload, UploadConfig};
 #[cfg(test)]
 mod tests {
     use super::{
-        AwsEcrDriver, BlobUploadStrategy, BloomFilterManifest, DockerHubDriver,
-        EMPTY_CONFIG_DIGEST, FastBlockedBloomFilter, GenericOciDriver, GhcrDriver, HashingStream,
-        IndexEntry, MockResponse, MockRouterTransport, NarDigest, NarInfoMeta, OciClient,
-        OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryDeletionStrategy,
-        RegistryKind, SessionMutationRequest, ShardDataPayload, ShardedArchCacheIndexData,
-        StoreHash, StreamHashState, SystemArch, TransportError, UploadConfig, build_image_index,
-        parse_range_header,
+        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
+        GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
+        NarInfoMeta, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
+        RegistryDeletionStrategy, RegistryKind, SessionMutationRequest, ShardDataPayload,
+        ShardedArchCacheIndexData, StoreHash, StreamHashState, SystemArch, TransportError,
+        UploadConfig, build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -514,41 +513,16 @@ mod tests {
         assert_eq!(retrieved_shard.shard_id, 42);
         assert_eq!(retrieved_shard.entries.len(), 1);
 
-        // 2. Bloom filter
-        let mut bloom = FastBlockedBloomFilter::new_with_defaults(100);
-        bloom.insert(&h1);
-        let bf_manifest: BloomFilterManifest = client
-            .push_bloom_filter(&bloom)
-            .await
-            .expect("Push bloom filter should succeed");
-
-        let retrieved_bloom = client
-            .get_bloom_filter(
-                &bf_manifest.blob_digest,
-                bf_manifest.num_entries,
-                bf_manifest.num_hashes,
-            )
-            .await
-            .expect("Get bloom filter should succeed");
-        assert!(retrieved_bloom.contains(&h1));
-
-        // 3. ShardedArchCacheIndexData
+        // 2. ShardedArchCacheIndexData
         let mut root_index =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
-        root_index.bloom_filter = bf_manifest.clone();
         root_index.shards[42].blob_digest = shard_digest.clone();
         root_index.shards[42].entry_count = 1;
         root_index.shards[42].merkle_hash = shard_payload.compute_merkle_hash();
         root_index.recalculate_merkle_root();
 
         let manifest_digest = client
-            .push_sharded_root_index(
-                "cache-index-x86_64-linux",
-                &root_index,
-                &bf_manifest.blob_digest,
-                bf_manifest.compressed_size,
-                None,
-            )
+            .push_sharded_root_index("cache-index-x86_64-linux", &root_index, None)
             .await
             .expect("Push sharded root index should succeed");
         assert!(manifest_digest.starts_with("sha256:"));
@@ -861,11 +835,6 @@ mod tests {
         let transport = MockRouterTransport::default();
         let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
 
-        let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let mut filter = FastBlockedBloomFilter::new_with_defaults(10);
-        filter.insert(&h1);
-        let bf_manifest = client.push_bloom_filter(&filter).await.unwrap();
-
         let res = client
             .update_sharded_arch_index_cas(
                 "cache-index-x86_64-linux",
@@ -879,14 +848,9 @@ mod tests {
                             "example.com",
                         )
                     });
-                    root.bloom_filter = bf_manifest.clone();
                     root.shards[42].entry_count = 5;
                     root.recalculate_merkle_root();
-                    Ok((
-                        root,
-                        bf_manifest.blob_digest.clone(),
-                        bf_manifest.compressed_size,
-                    ))
+                    Ok(root)
                 },
             )
             .await;
@@ -907,42 +871,18 @@ mod tests {
         let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
 
         // 1. x86_64-linux root
-        let mut filter_x86 = FastBlockedBloomFilter::new_with_defaults(10);
-        let h_x86 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        filter_x86.insert(&h_x86);
-        let bf_x86 = client.push_bloom_filter(&filter_x86).await.unwrap();
-
-        let mut root_x86 =
+        let root_x86 =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
-        root_x86.bloom_filter = bf_x86.clone();
         let digest_x86 = client
-            .push_sharded_root_index(
-                "sub-manifest-x86",
-                &root_x86,
-                &bf_x86.blob_digest,
-                bf_x86.compressed_size,
-                None,
-            )
+            .push_sharded_root_index("sub-manifest-x86", &root_x86, None)
             .await
             .unwrap();
 
         // 2. aarch64-linux root
-        let mut filter_arm = FastBlockedBloomFilter::new_with_defaults(10);
-        let h_arm = StoreHash::parse("00000000000000000000000000000001").unwrap();
-        filter_arm.insert(&h_arm);
-        let bf_arm = client.push_bloom_filter(&filter_arm).await.unwrap();
-
-        let mut root_arm =
+        let root_arm =
             ShardedArchCacheIndexData::new(SystemArch::Aarch64Linux, "test/repo", "example.com");
-        root_arm.bloom_filter = bf_arm.clone();
         let digest_arm = client
-            .push_sharded_root_index(
-                "sub-manifest-arm",
-                &root_arm,
-                &bf_arm.blob_digest,
-                bf_arm.compressed_size,
-                None,
-            )
+            .push_sharded_root_index("sub-manifest-arm", &root_arm, None)
             .await
             .unwrap();
 

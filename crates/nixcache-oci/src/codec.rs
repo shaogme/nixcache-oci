@@ -1,11 +1,10 @@
 use crate::{error::OciError, manifest::CacheLayerMediaType};
 use bytes::Bytes;
-use nixcache_core::FastBlockedBloomFilter;
 pub use nixcache_utils::DEFAULT_ZSTD_COMPRESSION_LEVEL;
 use nixcache_utils::ZstdCodec;
 use serde::{Serialize, de::DeserializeOwned};
 
-/// 强类型索引与清单编解码器 (Schema v5)
+/// 强类型索引与清单编解码器 (Schema v6)
 pub struct IndexCodec;
 
 impl IndexCodec {
@@ -34,27 +33,6 @@ impl IndexCodec {
         Ok(parsed)
     }
 
-    /// 将布隆过滤器紧凑二进制序列化并使用 Zstd 压缩
-    pub fn encode_bloom_filter(
-        filter: &FastBlockedBloomFilter,
-        level: i32,
-    ) -> Result<Bytes, OciError> {
-        let raw_bytes = filter.to_bytes();
-        let compressed = ZstdCodec::compress(&raw_bytes, level)?;
-        Ok(compressed)
-    }
-
-    /// 严格通过 Zstd 解压并反序列化布隆过滤器
-    pub fn decode_bloom_filter(
-        raw_bytes: &[u8],
-        num_entries: u64,
-        num_hashes: u8,
-    ) -> Result<FastBlockedBloomFilter, OciError> {
-        let uncompressed = ZstdCodec::decompress(raw_bytes)?;
-        let filter = FastBlockedBloomFilter::from_bytes(&uncompressed, num_entries, num_hashes)?;
-        Ok(filter)
-    }
-
     /// 探测并校验 Zstd Magic Number
     pub fn is_valid_zstd_magic(bytes: &[u8]) -> bool {
         ZstdCodec::is_valid_magic(bytes)
@@ -65,7 +43,6 @@ impl IndexCodec {
 mod tests {
     use super::IndexCodec;
     use crate::{error::OciError, manifest::CacheLayerMediaType};
-    use nixcache_core::{FastBlockedBloomFilter, StoreHash};
     use nixcache_utils::CompressionError;
     use serde::{Deserialize, Serialize};
 
@@ -79,20 +56,16 @@ mod tests {
     #[test]
     fn test_cache_layer_media_type_parsing_and_helpers() {
         assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.root.v5+zstd"),
-            Some(CacheLayerMediaType::RootIndexV5Zstd)
+            CacheLayerMediaType::parse("application/vnd.nix.cache.root.v6+zstd"),
+            Some(CacheLayerMediaType::RootIndexV6Zstd)
         );
         assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.shard.v5+zstd"),
-            Some(CacheLayerMediaType::ShardDataV5Zstd)
+            CacheLayerMediaType::parse("application/vnd.nix.cache.shard.v6+zstd"),
+            Some(CacheLayerMediaType::ShardDataV6Zstd)
         );
         assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.delta.v5+zstd"),
-            Some(CacheLayerMediaType::DeltaPatchV5Zstd)
-        );
-        assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.bloom.v5+zstd"),
-            Some(CacheLayerMediaType::BloomFilterV5Zstd)
+            CacheLayerMediaType::parse("application/vnd.nix.cache.delta.v6+zstd"),
+            Some(CacheLayerMediaType::DeltaPatchV6Zstd)
         );
         assert_eq!(
             CacheLayerMediaType::parse("application/vnd.oci.image.layer.v1.tar+gzip"),
@@ -112,27 +85,9 @@ mod tests {
         assert!(IndexCodec::is_valid_zstd_magic(&encoded));
 
         let decoded: SampleData =
-            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V5_ZSTD)
+            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V6_ZSTD)
                 .expect("Decoding should succeed");
         assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_encode_and_decode_bloom_filter_roundtrip() {
-        let mut filter = FastBlockedBloomFilter::new_with_defaults(100);
-        let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let hash2 = StoreHash::parse("00000000000000000000000000000000").unwrap();
-        filter.insert(&hash1);
-        filter.insert(&hash2);
-
-        let encoded = IndexCodec::encode_bloom_filter(&filter, 3)
-            .expect("Bloom filter encode should succeed");
-        assert!(IndexCodec::is_valid_zstd_magic(&encoded));
-
-        let decoded = IndexCodec::decode_bloom_filter(&encoded, 100u64, filter.num_hashes())
-            .expect("Bloom filter decode should succeed");
-        assert!(decoded.contains(&hash1));
-        assert!(decoded.contains(&hash2));
     }
 
     #[test]
@@ -161,7 +116,7 @@ mod tests {
         let plain_json = br#"{"name":"test","items":[1,2,3],"nested":null}"#;
         let err = IndexCodec::decode_zstd::<SampleData>(
             plain_json,
-            CacheLayerMediaType::ROOT_INDEX_V5_ZSTD,
+            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
         )
         .expect_err("Should reject non-zstd plain JSON payload");
 
@@ -175,7 +130,7 @@ mod tests {
     fn test_decode_rejects_short_or_empty_bytes() {
         let empty = b"";
         let err =
-            IndexCodec::decode_zstd::<SampleData>(empty, CacheLayerMediaType::DELTA_PATCH_V5_ZSTD)
+            IndexCodec::decode_zstd::<SampleData>(empty, CacheLayerMediaType::DELTA_PATCH_V6_ZSTD)
                 .expect_err("Should reject empty bytes");
 
         match err {
@@ -191,7 +146,7 @@ mod tests {
 
         let err = IndexCodec::decode_zstd::<SampleData>(
             &corrupt,
-            CacheLayerMediaType::ROOT_INDEX_V5_ZSTD,
+            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
         )
         .expect_err("Should reject corrupted payload");
 

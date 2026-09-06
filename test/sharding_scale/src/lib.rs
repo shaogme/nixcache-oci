@@ -49,7 +49,7 @@ pub async fn run_full_scale_simulation(
     system: SystemArch,
 ) -> Result<FullScaleReport, String> {
     info!(
-        "=== 启动 Schema v5 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
+        "=== 启动 Schema v6 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
         entries_count
     );
 

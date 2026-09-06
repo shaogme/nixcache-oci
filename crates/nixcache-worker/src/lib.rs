@@ -9,20 +9,8 @@ use crate::{
 };
 pub use error::WorkerStoreError;
 use futures_util::TryStreamExt;
-use nixcache_core::{IndexEntry, StoreHash, SystemArch};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use nixcache_core::SystemArch;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-pub enum RegisterPayload {
-    Map(HashMap<StoreHash, IndexEntry>),
-    List(Vec<IndexEntry>),
-    Object {
-        entries: HashMap<StoreHash, IndexEntry>,
-    },
-}
 
 pub fn parse_upstream_list(upstream_str: &str) -> Vec<String> {
     upstream_str
@@ -197,35 +185,6 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 }
             }
         })
-        .post_async("/_session/register", |mut req, _ctx| async move {
-            let payload = match req.json::<RegisterPayload>().await {
-                Ok(p) => p,
-                Err(e) => return Response::error(format!("Invalid register payload: {}", e), 400),
-            };
-
-            let map: HashMap<StoreHash, IndexEntry> = match payload {
-                RegisterPayload::Map(m) => m,
-                RegisterPayload::List(list) => {
-                    let mut m = HashMap::new();
-                    for entry in list {
-                        if let Some(sh) = entry.store_hash() {
-                            m.insert(sh, entry);
-                        }
-                    }
-                    m
-                }
-                RegisterPayload::Object { entries } => entries,
-            };
-
-            let count = map.len();
-            CacheStore::register_hot_entries(map);
-
-            let res = serde_json::json!({
-                "status": "ok",
-                "registered": count,
-            });
-            Response::from_json(&res)
-        })
         .get_async("/nar/:nar_name", |_req, ctx| async move {
             let nar_name = match ctx.param("nar_name") {
                 Some(name) => name,
@@ -302,12 +261,24 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             let store = get_store(&ctx.env)?;
 
-            // 1. 级联解析 (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
+            // 1. 级联解析与自愈穿透 (Tier 1 -> Tier 2 -> Tier 3 -> Read-Through SWR)
             match store.lookup_narinfo(&ctx.env, store_hash).await {
-                Ok(Some(narinfo)) => {
+                Ok(Some(res)) => {
                     let headers = Headers::new();
                     headers.set("Content-Type", "text/x-nix-narinfo")?;
-                    return Ok(Response::ok(&narinfo)?.with_headers(headers));
+                    headers.set("X-NixCache-Version", "6")?;
+                    if res.self_healed {
+                        headers.set("X-NixCache-Self-Healed", "1")?;
+                    } else {
+                        headers.set("X-NixCache-Self-Healed", "0")?;
+                    }
+                    if let Some(shard_id) = res.shard_id {
+                        headers.set("X-NixCache-Shard", &shard_id.to_string())?;
+                    }
+                    if let Some(ref digest) = res.manifest_digest {
+                        headers.set("X-NixCache-Digest", digest)?;
+                    }
+                    return Ok(Response::ok(&res.narinfo_content)?.with_headers(headers));
                 }
                 Ok(None) => {}
                 Err(e) => return Response::error(format!("Failed to query narinfo: {}", e), 500),
@@ -328,11 +299,16 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 {
                     let headers = resp.headers().clone();
                     headers.set("Content-Type", "text/x-nix-narinfo")?;
+                    headers.set("X-NixCache-Version", "6")?;
+                    headers.set("X-NixCache-Self-Healed", "0")?;
                     return Ok(Response::ok(body)?.with_headers(headers));
                 }
             }
 
-            Response::error("narinfo not found", 404)
+            let headers = Headers::new();
+            headers.set("X-NixCache-Version", "6")?;
+            headers.set("X-NixCache-Self-Healed", "0")?;
+            Ok(Response::error("narinfo not found", 404)?.with_headers(headers))
         })
         .run(req, env)
         .await
@@ -340,9 +316,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
 #[cfg(test)]
 mod tests {
-    use super::{RegisterPayload, parse_upstream_list};
-    use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash};
-    use std::collections::HashMap;
+    use super::parse_upstream_list;
 
     #[test]
     fn test_worker_upstream_parsing() {
@@ -372,105 +346,5 @@ mod tests {
 
         let empty = "   \n\t  ";
         assert!(parse_upstream_list(empty).is_empty());
-    }
-
-    #[test]
-    fn test_register_payload_deserialization() {
-        let hash1_str = "00000000000000000000000000000001";
-        let hash2_str = "00000000000000000000000000000002";
-        let hash3_str = "00000000000000000000000000000003";
-
-        let entry1 = IndexEntry {
-            name: "pkg1".to_string(),
-            system: None,
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-pkg1", hash1_str),
-                nar_basename: "pkg1.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-            )
-            .unwrap(),
-            nar_size: 100,
-            added: "2026-08-29T10:00:00Z".to_string(),
-            origin_job: None,
-        };
-
-        let mut map = HashMap::new();
-        let sh1 = StoreHash::parse(hash1_str).unwrap();
-        map.insert(sh1.clone(), entry1.clone());
-        let map_json = serde_json::to_string(&map).unwrap();
-
-        let payload: RegisterPayload = serde_json::from_str(&map_json).unwrap();
-        match payload {
-            RegisterPayload::Map(m) => {
-                assert_eq!(m.len(), 1);
-                assert_eq!(m.get(&sh1).unwrap().name, "pkg1");
-            }
-            _ => panic!("Expected Map payload"),
-        }
-
-        let entry2 = IndexEntry {
-            name: "pkg2".to_string(),
-            system: None,
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-pkg2", hash2_str),
-                nar_basename: "pkg2.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-            )
-            .unwrap(),
-            nar_size: 200,
-            added: "2026-08-29T10:00:00Z".to_string(),
-            origin_job: None,
-        };
-        let list_json = serde_json::to_string(&vec![entry2]).unwrap();
-        let payload_list: RegisterPayload = serde_json::from_str(&list_json).unwrap();
-        match payload_list {
-            RegisterPayload::List(l) => {
-                assert_eq!(l.len(), 1);
-                assert_eq!(l[0].name, "pkg2");
-            }
-            _ => panic!("Expected List payload"),
-        }
-
-        let entry3 = IndexEntry {
-            name: "pkg3".to_string(),
-            system: None,
-            narinfo_meta: NarInfoMeta {
-                store_path: format!("/nix/store/{}-pkg3", hash3_str),
-                nar_basename: "pkg3.nar.xz".to_string(),
-                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                    .to_string(),
-                ..Default::default()
-            },
-            nar_digest: NarDigest::new_sha256(
-                "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
-            )
-            .unwrap(),
-            nar_size: 300,
-            added: "2026-08-29T10:00:00Z".to_string(),
-            origin_job: None,
-        };
-        let mut obj_map = HashMap::new();
-        let sh3 = StoreHash::parse(hash3_str).unwrap();
-        obj_map.insert(sh3.clone(), entry3);
-        let obj = RegisterPayload::Object { entries: obj_map };
-        let obj_json = serde_json::to_string(&obj).unwrap();
-        let payload_obj: RegisterPayload = serde_json::from_str(&obj_json).unwrap();
-        match payload_obj {
-            RegisterPayload::Object { entries } => {
-                assert_eq!(entries.len(), 1);
-                assert_eq!(entries.get(&sh3).unwrap().name, "pkg3");
-            }
-            _ => panic!("Expected Object payload"),
-        }
     }
 }

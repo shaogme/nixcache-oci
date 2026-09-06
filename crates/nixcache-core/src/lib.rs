@@ -30,27 +30,27 @@ pub use sharding::{
     shard_id_to_prefix_bytes,
 };
 pub use types::{
-    BloomFilterManifest, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry,
-    JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION,
-    SCHEMA_VERSION, SCHEMA_VERSION_V5, ShardDataPayload, ShardDescriptor,
-    ShardedArchCacheIndexData, StoreHash, SystemArch,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DeltaPatchData, IndexEntry, JobSummaryMetadata,
+    NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
+    SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
+    SystemArch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BloomError, BloomFilter, BloomFilterManifest, BuildReceipt, BuildStats,
-        CACHE_INDEX_VERSION, CacheQueryResult, CacheSelector, CascadeMode, CoreError,
-        DeltaPatchData, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, FilterPredicates,
-        IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo,
-        NarInfoMeta, NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V5, SelectionScope,
-        ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash,
-        SystemArch, TimeFilter, TypeError, build_nar_lookup_map, calculate_shard_id,
-        calculate_shard_id_from_str, compute_merkle_root, compute_shard_merkle_hash,
-        diff_shard_descriptors, evaluate_arch_cache_purge, evaluate_arch_cache_query,
-        evaluate_cache_purge, evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc,
-        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
-        nix_base32_char, nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
+        BloomError, BloomFilter, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheQueryResult,
+        CacheSelector, CascadeMode, CoreError, DeltaPatchData, EMPTY_SHARD_MERKLE_HASH,
+        FastBlockedBloomFilter, FilterPredicates, IndexEntry, JobSummaryMetadata,
+        NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, NarInfoParseError,
+        RECEIPT_VERSION, SCHEMA_VERSION_V6, SelectionScope, ShardDataPayload, ShardDescriptor,
+        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
+        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
+        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
+        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
+        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
+        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
+        shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -443,10 +443,10 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
-    fn test_schema_v5_structures_and_serialization() {
+    fn test_schema_v6_structures_and_serialization() {
         let mut root_index =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "owner/repo", "ghcr.io");
-        assert_eq!(root_index.version, SCHEMA_VERSION_V5);
+        assert_eq!(root_index.version, SCHEMA_VERSION_V6);
         assert_eq!(root_index.shards.len(), NUM_SHARDS);
         assert_eq!(root_index.total_entries(), 0);
 
@@ -465,7 +465,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let deserialized: ShardedArchCacheIndexData =
             serde_json::from_str(&json).expect("Deserialize root index");
 
-        assert_eq!(deserialized.version, SCHEMA_VERSION_V5);
+        assert_eq!(deserialized.version, SCHEMA_VERSION_V6);
         assert_eq!(deserialized.system, SystemArch::X86_64Linux);
         assert_eq!(deserialized.total_entries(), 1);
         assert_eq!(deserialized.shards.len(), NUM_SHARDS);
@@ -487,7 +487,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
         let payload_json = serde_json::to_string(&payload).unwrap();
         let loaded_payload: ShardDataPayload = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V5);
+        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V6);
         assert_eq!(loaded_payload.shard_id, 838);
         assert_eq!(loaded_payload.len(), 1);
 
@@ -502,13 +502,6 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(loaded_delta.new_entries.len(), 1);
         let partitioned = loaded_delta.partition_by_shard();
         assert_eq!(partitioned.get(&838).unwrap().len(), 1);
-
-        // BloomFilterManifest
-        let bf_manifest = BloomFilterManifest::new(100u64, 1024, 7, "sha256:bloom_blob", 120);
-        let bf_json = serde_json::to_string(&bf_manifest).unwrap();
-        let loaded_bf: BloomFilterManifest = serde_json::from_str(&bf_json).unwrap();
-        assert_eq!(loaded_bf.num_entries, 100);
-        assert!(!loaded_bf.is_empty());
 
         // JobSummaryMetadata
         let job_summary = JobSummaryMetadata {
@@ -540,7 +533,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         )
         .with_run_info(Some(12345), Some("job1".to_string()));
         assert_eq!(receipt.version, RECEIPT_VERSION);
-        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V5);
+        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V6);
     }
 
     #[test]

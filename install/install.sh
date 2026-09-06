@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset CARGO_TARGET_DIR || true
 
 # 统一安装 nixcache 工具链 (nixcache-builder & nixcache-proxy)
 # 支持通过二进制安装 (binary) 或从源码安装 (source)

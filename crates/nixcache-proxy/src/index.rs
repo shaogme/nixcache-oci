@@ -5,7 +5,7 @@ use nixcache_core::{
     SystemArch, build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors,
     extract_nar_basename, extract_store_hash,
 };
-use nixcache_oci::{CacheLayerMediaTypeV5, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
+use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use scc::HashMap as SccHashMap;
 use std::{
@@ -19,9 +19,6 @@ use std::{
 };
 use tokio::fs;
 use tracing::{error, info, warn};
-
-#[cfg(test)]
-use nixcache_core::FastBlockedBloomFilter;
 
 pub fn detect_current_system() -> SystemArch {
     SystemArch::detect_current()
@@ -442,7 +439,7 @@ impl CacheIndex {
         self.fetch_or_get_session(&tag).await
     }
 
-    /// 获取生产基线全局分片索引与布隆过滤器 (Schema v5 Root)
+    /// 获取生产基线全局分片索引 (Schema v6 Root)
     pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
         let system = &self.config.target_system;
@@ -530,7 +527,7 @@ impl CacheIndex {
                     Ok(bytes) => {
                         if let Ok(root_data) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
                             &bytes,
-                            CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD,
+                            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
                         ) {
                             info!(
                                 "[nixcache-proxy] Loaded backup sharded root index from {:?}",
@@ -680,9 +677,8 @@ impl CacheIndex {
         &self,
         mut root: ShardedArchCacheIndexData,
         shards: Vec<ShardDataPayload>,
-        bloom: Option<FastBlockedBloomFilter>,
     ) {
-        use nixcache_core::{BloomFilterManifest, ShardDescriptor};
+        use nixcache_core::ShardDescriptor;
 
         let cache_key = format!(
             "{}-{}",
@@ -690,12 +686,7 @@ impl CacheIndex {
             self.config.target_system.as_str()
         );
 
-        let mut bloom_filter =
-            bloom.unwrap_or_else(|| FastBlockedBloomFilter::new_with_defaults(100));
         for shard in &shards {
-            for hash in shard.entries.keys() {
-                bloom_filter.insert(hash);
-            }
             let shard_desc = ShardDescriptor::new(
                 shard.shard_id,
                 format!("sha256:mock_shard_{}", shard.shard_id),
@@ -718,13 +709,6 @@ impl CacheIndex {
             );
         }
 
-        root.bloom_filter = BloomFilterManifest::new(
-            bloom_filter.num_entries(),
-            bloom_filter.num_bits(),
-            bloom_filter.num_hashes(),
-            "sha256:mock_bloom",
-            100,
-        );
         root.recalculate_merkle_root();
 
         let baseline = Arc::new(CachedBaseline::new(root));
@@ -818,7 +802,7 @@ mod tests {
             .insert(hash_base.clone(), baseline_entry);
 
         index
-            .update_sharded_baseline_in_memory(base_root, vec![shard_payload], None)
+            .update_sharded_baseline_in_memory(base_root, vec![shard_payload])
             .await;
 
         // 2. 设置 Tier 1 Run Session 产物

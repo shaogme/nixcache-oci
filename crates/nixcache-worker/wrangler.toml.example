@@ -13,4 +13,4 @@ binding = "NIXCACHE_KV"
 id = "nixcache_kv_placeholder"
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "command -v worker-build >/dev/null 2>&1 || cargo install -q worker-build && worker-build --release"

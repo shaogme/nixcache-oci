@@ -79,37 +79,50 @@ impl OciTransport for MockRouterTransport {
     #[cfg(target_arch = "wasm32")]
     type BodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
-    async fn head(&self, url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
+    async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
+        self.head_with_headers(url, headers).await.map(|(s, _)| s)
+    }
+
+    async fn head_with_headers(
+        &self,
+        url: &str,
+        _headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
             if m == "HEAD" && path.ends_with(suffix) {
-                found = Some(resp.status);
+                found = Some((resp.status, resp.headers.clone()));
                 false
             } else {
                 true
             }
         });
-        if let Some(st) = found {
-            return Ok(st);
+        if let Some(res) = found {
+            return Ok(res);
         }
 
         if let Some(idx) = path.rfind("/blobs/") {
             let digest = &path[idx + 7..];
             if self.stored_blobs.contains_sync(digest) {
-                return Ok(StatusCode::OK);
+                return Ok((StatusCode::OK, HeaderMap::new()));
             }
         }
 
         if let Some(idx) = path.rfind("/manifests/") {
             let tag = &path[idx + 11..];
-            if self.stored_manifests.contains_sync(tag) {
-                return Ok(StatusCode::OK);
+            if let Some(entry) = self.stored_manifests.get_sync(tag) {
+                let (_bytes, digest) = entry.get();
+                let mut headers = HeaderMap::new();
+                if let Ok(val) = HeaderValue::from_str(digest) {
+                    headers.insert("Docker-Content-Digest", val);
+                }
+                return Ok((StatusCode::OK, headers));
             }
         }
 
-        Ok(StatusCode::NOT_FOUND)
+        Ok((StatusCode::NOT_FOUND, HeaderMap::new()))
     }
 
     async fn get(

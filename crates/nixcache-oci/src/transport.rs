@@ -186,6 +186,12 @@ pub trait OciTransport: 'static {
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
 
+    async fn head_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError>;
+
     async fn get(
         &self,
         url: &str,

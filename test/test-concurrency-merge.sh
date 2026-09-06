@@ -136,7 +136,7 @@ active_roots = [
 ]
 
 receipt = {
-    'version': 5,
+    'version': 6,
     'system': sys_name,
     'repo': 'concurrency-test/cache',
     'timestamp': '2026-08-28T00:00:00Z',
@@ -196,7 +196,7 @@ for m in manifests:
     # Decompress zstd blob (ShardedArchCacheIndexData)
     decompressed = subprocess.check_output(['zstd', '-dc', blob_path])
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 5, f'Expected version 5, got {arch_data[\"version\"]}'
+    assert arch_data['version'] == 6, f'Expected version 6, got {arch_data[\"version\"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']

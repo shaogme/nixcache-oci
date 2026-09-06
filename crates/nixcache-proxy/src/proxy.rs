@@ -304,9 +304,7 @@ mod tests {
         let mut root =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
-        index
-            .update_sharded_baseline_in_memory(root, vec![], None)
-            .await;
+        index.update_sharded_baseline_in_memory(root, vec![]).await;
 
         let state = AppState {
             repo: "test/repo".to_string(),
@@ -352,9 +350,7 @@ mod tests {
         let mut root =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
-        index
-            .update_sharded_baseline_in_memory(root, vec![], None)
-            .await;
+        index.update_sharded_baseline_in_memory(root, vec![]).await;
 
         let state = AppState {
             repo: "test/repo".to_string(),
@@ -386,7 +382,6 @@ mod tests {
             .update_sharded_baseline_in_memory(
                 ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io"),
                 vec![],
-                None,
             )
             .await;
         let empty_state = AppState {
@@ -449,7 +444,7 @@ mod tests {
 
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         index
-            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
 
         let state = AppState {
@@ -522,7 +517,7 @@ mod tests {
 
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         index
-            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
 
         let upstream_narinfo = "StorePath: /nix/store/11111111111111111111111111111111-pkg\nURL: nar/upstream.nar.xz\nNarHash: sha256:000\nNarSize: 10\n";
@@ -654,7 +649,7 @@ mod tests {
 
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         index
-            .update_sharded_baseline_in_memory(root, vec![shard], None)
+            .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
 
         // Mock OCI Blob streaming

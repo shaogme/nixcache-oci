@@ -26,5 +26,4 @@ arc-swap = { workspace = true }
 scc = { workspace = true }
 
 # Utilities & Error handling
-base64 = { workspace = true }
 thiserror = { workspace = true }

@@ -343,8 +343,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
 mod tests {
     use super::*;
     use nixcache_core::{
-        FastBlockedBloomFilter, IndexEntry, ShardDataPayload, ShardedArchCacheIndexData, StoreHash,
-        SystemArch,
+        IndexEntry, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
     };
     use nixcache_oci::MockRouterTransport;
 
@@ -378,17 +377,8 @@ mod tests {
         root_data.shards[sid].merkle_hash = payload.compute_merkle_hash();
         root_data.recalculate_merkle_root();
 
-        let bloom = FastBlockedBloomFilter::new_with_defaults(10);
-        let bf_manifest = client.push_bloom_filter(&bloom).await.unwrap();
-
         client
-            .push_sharded_root_index(
-                "cache-index-x86_64-linux",
-                &root_data,
-                &bf_manifest.blob_digest,
-                bf_manifest.compressed_size,
-                None,
-            )
+            .push_sharded_root_index("cache-index-x86_64-linux", &root_data, None)
             .await
             .unwrap();
 

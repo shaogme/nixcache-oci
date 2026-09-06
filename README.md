@@ -2,35 +2,7 @@
 
 将任何 GitHub 仓库或企业私有 OCI 镜像仓库转变为高性能 Nix 二进制缓存（Binary Cache）。推送你的 Flake，即可自动获得专属的二进制缓存。对公开仓库完全免费。
 
-本项目以 OCI 镜像分发协议为基础 —— NAR 包将作为 OCI blob 存储，并结合分片梅克尔基数索引清单（Sharded Merkle-Radix Index Manifest）与全局布隆过滤器（Bloom Filter）实现极速的路径查找。无需维护专用的外部二进制缓存服务、CDN 或复杂数据库。
-
-## 工作原理与核心架构
-
-1. **基于图论依赖分析的运行时闭包精准捕获（Runtime Closure Capture）**：**GitHub Actions** 构建完成后，基于 Nix DAG 图论可达性分析自动计算目标产物的纯净运行时闭包 $C(R)$ 与本地构建差集 $\Delta$ 的交集，**彻底剔除 `rustc`、`cargo`、`gcc` 等重型编译期工具（`nativeBuildInputs`）与中间派生构建产物**，提纯 `active_gc_roots` 严格仅保留目标根节点，并自动过滤 `cache.nixos.org` 上已存在的 store 路径，将真正属于运行时的本地构建 NAR 文件作为内容寻址的 OCI blob 推送到 OCI 注册表（如 GHCR）。
-
-2. **多后端原生驱动与静态确定性（Static Determinism）**：
-   - **多态后端驱动体系（First-Class Provider Drivers）**：原生支持 GitHub Packages (GHCR)、Docker Hub、AWS ECR、Google Cloud Artifact Registry (GAR)、Azure ACR 与通用 OCI (Harbor / Zot / Distribution / Quay)。
-   - **Docker Hub 原生适配**：自动规范化 `docker.io` 域名为 `registry-1.docker.io`，自动扩展官方单段镜像为 `library/<name>` 命名空间，专用 Token Auth 路由。
-
-3. **4 级级联缓存与 $O(1)$ 极速解析（Cascading Resolver）**：
-   - **Tier 0（即时内存热缓存）**：流水线当前构建步骤产生的产物，动态注册后 $0\text{ ms}$ 极速穿透供后续步骤使用。
-   - **Tier 1（工作流会话缓存 `run-<run_id>`）**：同一 Workflow Run 中各矩阵并行 Job 共享的会话级缓存。
-   - **Tier 2（分支/PR 会话缓存 `branch-<name>`）**：同分支或 PR 历史迭代的快速增量缓存。
-   - **Tier 3（生产基线缓存 `cache-index`）**：合并发布后的生产全局统一索引清单。
-   - **Upstream（上游透明回退）**：请求不存在于任何 Tier 时，透明重定向并回退至 `cache.nixos.org` 等公共缓存源。
-   - 全链路在内存中维护双向哈希与 NAR Basename 映射表，彻底消除线性扫描，将路径与 NAR Blob 寻址降为 **$O(1)$ 常数时间**。
-
-4. **直通式流传输与零常驻开销**：从 OCI Registry 或上游获取的 NAR blob 以流式（Streaming）形式直接转发给 Nix 客户端，无需在本地磁盘缓冲解压。全链路集成 **`mimalloc` 高性能全局内存分配器**，显著降低高并发与 musl 静态目标下的锁争用与内存碎片，常驻开销极低。
-
-5. **解耦的 8-Crate 架构体系**：
-   - `nixcache-core`：纯核心数据模型、Schema v5 分片梅克尔与布隆索引规范、NarInfo 解析器、统一的依赖图闭包分析与 Purge/GC 核心算法（零原生 IO 依赖，全平台与 Wasm 兼容）。
-   - `nixcache-utils`：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及统一的 Zstd 压缩解压抽象（原生 `zstd` 与 Wasm `ruzstd` 统一接口，零 tokio/clap 依赖）。
-   - `nixcache-cli`：共享 CLI 参数组件（`PurgeFilterArgs`、`OciTargetArgs`、`AuthTokenArgs`、`ServerBindArgs` 等）与声明式强类型领域配置转换体系。
-   - `nixcache-oci`：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`BlobUploadStrategy`、CAS 并发安全更新器、批量物理删除与并发防击穿 Token 管理器。
-   - `nixcache-oci-backend`：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持压缩索引分片与高并发流式传输。
-   - `nixcache-proxy`：高性能本地 4 级级联反向代理服务（基于 Axum 与 `nixcache-cli`）。
-   - `nixcache-builder`：现代化 Nix 构建与多架构会话协调器（统一收敛的 Purge/GC 执行引擎、NixDriver 与 CAS 更新器）。
-   - `nixcache-worker`：基于 Cloudflare Worker 的边缘无服务器代理（L1 内存 -> L2 KV -> L3 OCI 3 级穿透）。
+本项目以 OCI 镜像分发协议为基础 —— NAR 包将作为 OCI blob 存储，并结合 1024 阶分片梅克尔基数索引清单（Sharded Merkle-Radix Index Manifest, Schema v6）实现极速的路径查找与纳秒级分片定位。无需维护专用的外部二进制缓存服务、CDN 或复杂数据库。
 
 ## 主流 OCI 注册表支持矩阵
 
@@ -269,6 +241,8 @@ jobs:
 - **全量清空与彻底重置 (`--all`)**：若指定 `--all`，GHCR 后端将通过 GitHub Packages REST API 直接彻底物理删除远程 Package 容器包及其所有历史版本；Generic OCI 后端将清空索引并物理回收 Blobs。
 - **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收。
 - **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
+
+##### 6. 构建缓存多维查询与统计（list Action）
 
 你可以通过官方 `list` Action 或直接触发 `List & Inspect Build Cache` 交互式工作流，实时查询、过滤并审查远程 OCI 镜像仓库中的构建缓存状态：
 
@@ -790,20 +764,7 @@ nixcache-builder list \
 
 ---
 
-### 代理如何工作
-
-代理服务基于 **Schema v5 分片梅克尔基数索引（SMRI）与全局布隆过滤器** 进行元数据管理与极速解析：
-
-1. **轻量冷启动**：代理冷启动时仅拉取单架构**分片根目录元数据清单（Root Directory，~15 KB）**与**全局紧凑布隆过滤器（Bloom Filter，~120 KB）**，总传输量 $< 150\text{ KB}$，瞬时完成初始化就绪。
-2. **两级极速查询与分片按需加载 (`GET /{store_hash}.narinfo`)**：
-   - **布隆过滤器前置守卫**：查询请求到达时，首先通过内存布隆过滤器快速探测。若判定不存在，则 **$0\text{ ms}$ 零网络开销直接穿透回退至上游公共缓存**，彻底消除未命中包的检索延迟；
-   - **均匀前缀基数定位与二级分片缓存**：若布隆过滤器判定可能存在，根据 Nix Base32 哈希前缀直接定位分片 ID（$0\sim 1023$），优先从本地内存二级分片缓存（`scc::HashMap`）中检索；
-   - **按需惰性拉取单个分片**：若分片未在本地缓存，仅按需向 OCI Registry 请求该特定分片 Blob（单分片仅 ~2 KB，传输 $< 15\text{ ms}$），解压后写入本地内存并在分片内部完成 $O(1)$ 查找返回 `.narinfo`。
-3. **梅克尔树状态校验与增量刷新**：代理根据 `NIXCACHE_INDEX_TTL`（默认 5 分钟）定期检查远端根清单的 `merkle_root`。若发生变动，仅下载 Root Directory 比对各分片的 `merkle_hash`，精准逐出变动的分片，其余未变动分片继续安全复用。
-
-**NAR blob 采用直通式流传输**：从 GHCR（或上游缓存）获取的数据会直接以 64 KB 的块流式传输给 Nix 客户端。代理服务不会在内存中缓冲整个包，也不会将其写入代理主机的磁盘。同时，服务内置 `mimalloc` 全局内存分配器，消除 musl/Linux 默认分配器在高并发下的锁争用问题。Nix 客户端收到数据后，会像往常一样直接将其解压存入本地的 `/nix/store/`。这保证了本地代理服务几乎不占用磁盘空间，并且内存消耗极低。
-
-### 代理服务通信与管理端点
+### 服务通信与管理端点
 
 `nixcache-proxy` 与 `nixcache-worker` 完整实现了 Nix 标准二进制缓存协议，并提供了丰富的运维与热注册管理端点：
 
@@ -812,17 +773,25 @@ nixcache-builder list \
 | 端点路径 | HTTP 方法 | Content-Type | 描述 |
 | --- | --- | --- | --- |
 | `/nix-cache-info` | GET | `text/x-nix-cache-info` | Nix 替代器握手端点（返回 StoreDir、WantMassQuery、Priority 等元数据） |
-| `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持 Tier 0~3 级联与上游透明回退） |
+| `/{store_hash}.narinfo` | GET | `text/x-nix-narinfo` | 查询特定 Store 路径的 NarInfo 元数据文本（支持本地 Tier 0~3 / Worker 3 级级联与 Read-Through SWR 自愈穿透，以及上游透明回退） |
 | `/nar/{nar_name}` | GET | `application/x-nix-nar` / `application/zstd` | 以流式（Streaming）形式直通下载 NAR 包内容（支持 Range 请求与上游直通） |
+
+> [!TIP]
+> **可观测性与诊断响应头**：Worker 在响应 `/{store_hash}.narinfo` 时会携带标准化诊断头信息：
+>
+> - `X-NixCache-Version: 6`：当前协议与索引版本；
+> - `X-NixCache-Shard: <shard_id>`：目标产物命中的 1024 分片编号；
+> - `X-NixCache-Digest: <manifest_digest>`：当前生效的 OCI Manifest 摘要；
+> - `X-NixCache-Self-Healed: <1|0>`：指示本次请求是否通过 Read-Through SWR 机制成功自愈。
 
 #### 2. 代理管理与运维端点
 
-| 端点路径 | HTTP 方法 | 描述 |
-| --- | --- | --- |
-| `/_status` | GET | 查看远端连接状态 (`remote_connected`)、各 Tier 索引条目统计、配置和上游缓存状态 |
-| `/_refresh` | POST | 强制立即刷新索引（无需等待 TTL 过期） |
-| `/_session/register` | POST | 动态注册当前会话构建产物热条目（实现 CI 步骤间 0ms 极速热穿透） |
-| `/public-key` | GET | 获取配置的二进制缓存签名公钥（如果已启用签名） |
+| 端点路径 | HTTP 方法 | 支持组件 | 描述 |
+| --- | --- | --- | --- |
+| `/_status` | GET | Proxy / Worker | 查看远端连接状态 (`remote_connected`)、各 Tier 索引条目统计、配置和上游缓存状态 |
+| `/_refresh` | POST | Proxy / Worker | 强制立即刷新索引。Worker 端会主动回源 OCI 探查最新 Manifest Digest，原子写入 `baseline_v6_{system}` 并预热变动分片 |
+| `/_session/register` | POST | **仅限 nixcache-proxy** | 动态注册当前会话构建产物热条目（实现本地 CI 步骤间 0ms 极速热穿透；无服务器 `nixcache-worker` 纯无状态运行，不提供此端点） |
+| `/public-key` | GET | Proxy / Worker | 获取配置的二进制缓存签名公钥（如果已启用签名） |
 
 ```bash
 # 查看状态（包含 remote_connected、registry、repo、各 Tier 条目统计等）
@@ -844,7 +813,7 @@ curl -X POST http://localhost:37515/_refresh
 | `repo` | `string` | 目标包存储库路径（如 `shaogme/nixcache-oci`）。 |
 | `run_id` | `number \| null` | 当前绑定的 GitHub Actions Workflow Run ID（Tier 1 会话）。 |
 | `branch_or_pr` | `string \| null` | 当前绑定的分支名称或 PR 编号（Tier 2 会话）。 |
-| `tier0_hot_entries` | `number` | Tier 0 内存即时热注册的条目数。 |
+| `tier0_hot_entries` | `number` | Tier 0 内存即时热注册的条目数（本地代理专用；Worker 纯无状态模式下恒为 `0`）。 |
 | `tier1_session_entries` | `number` | Tier 1 工作流会话（`run-<run_id>`）条目数。 |
 | `tier2_branch_entries` | `number` | Tier 2 分支/PR 会话（`branch-<name>`）条目数。 |
 | `tier3_baseline_entries` | `number` | Tier 3 生产全局基线（`cache-index`）条目数。 |
@@ -853,6 +822,8 @@ curl -X POST http://localhost:37515/_refresh
 | `session_ttl` | `number` | Tier 1/2 会话刷新周期（秒），默认 10 秒。 |
 | `baseline_ttl` | `number` | Tier 3 基线刷新周期（秒），默认 300 秒。 |
 | `upstream` | `string[]` | 配置的上游回退二进制缓存列表（如 `["https://cache.nixos.org"]`）。 |
+| `manifest_digest` | `string` | （Worker 提供）当前边缘节点持有的基线 OCI 清单摘要（如 `sha256:...`）。 |
+| `generated` | `string` | （Worker 提供）基线索引生成时间戳（RFC 3339 格式）。 |
 
 ##### 典型响应示例
 
@@ -925,22 +896,111 @@ curl -X POST http://localhost:37515/_refresh
   }
   ```
 
-## 架构与分层设计
+## 系统架构与实现原理
 
-### 1. Workspace Crate 拓扑与分层
+### 1. Schema v6 纯净 1024 阶确定性分片梅克尔索引（SMRI）
 
-本项目严格遵循领域驱动与单一职责原则，划分为 8 个清晰解耦的 Crate：
+系统以 OCI 镜像分发协议为基础，结合内容寻址与哈希前缀，实现了纯净的 1024 阶分片梅克尔基数索引体系：
+
+- **0 纳秒空分片本地判定（彻底废除全局布隆过滤器）**：
+  任何 `StoreHash` 均可通过首两位 Nix Base32 字符（`calculate_shard_id`）在 $O(1)$ 常数时间映射到唯一的 `shard_id`（0..1023）。当 `root_index.shards[shard_id].is_empty()` 为真时，本地与边缘均可在 0 纳秒内断定目标产物不存在并直接回退上游公共缓存。1024 阶分片天然将哈希空间高度离散化（每分片平均仅容纳千分之一的条目），彻底消除了旧版全局布隆过滤器在版本复制失步时引发的负向误杀（False Negative）与双 Key 裂脑隐患。
+- **极致轻量冷启动与按需二级分片拉取**：
+  冷启动阶段仅需下载单架构分片根索引清单（Root Index，仅 ~15 KB），较旧架构减少 90% 的初始化网络流量。查询命中非空分片时，系统按需惰性拉取该分片的紧凑 Blob（单分片仅 ~2 KB，网络延时 $< 15\text{ ms}$），并在内存完成 $O(1)$ 元数据检索。
+- **Merkle Tree 增量校验与分片级淘汰**：
+  根清单记录 1024 分片的 `merkle_root` 与每个分片的 `merkle_hash`。基线刷新时仅比对各分片哈希，精确按需逐出变动分片，未变动分片在客户端与边缘节点终身有效复用。
+
+### 2. 双模型分层级联解析与 Worker 边缘无状态自愈
+
+针对本地开发构建与全球边缘 CDN 分发两种不同物理场景，系统提供两套分工明确的级联解析引擎：
+
+- **本地代理 (`nixcache-proxy`) 4 级全量级联**：
+  1. **Tier 0（内存即时热注册表）**：本地 CI/CD 构建步骤产物通过 `POST /_session/register` 动态写入内存，实现后续步骤 $0\text{ ms}$ 即时热穿透。
+  2. **Tier 1（工作流会话缓存 `run-<run_id>`）**：矩阵并行 Job 共享的当前构建流增量清单。
+  3. **Tier 2（分支/PR 会话缓存 `branch-<name>`）**：当前功能分支或 PR 的历史迭代缓存。
+  4. **Tier 3（生产全局基线 `cache-index`）**：合并至主干后的生产基线 1024 阶分片索引。
+  5. **Upstream**：当未命中任何 Tier 时，透明回退并流式代理上游公共缓存（如 `cache.nixos.org`）。
+- **边缘代理 (`nixcache-worker`) 纯无状态网关与自愈穿透**：
+  - **单原子 KV 存储协议 (`baseline_v6_{system}`)**：Worker 剥离本地单机内存热表，基线数据以单 Key 原子写入 Cloudflare KV，杜绝跨 Key 最终一致性复制延迟造成的时序死锁。
+  - **Read-Through SWR 自愈穿透机制**：当边缘节点遇到 Cache Miss 时，在防抖冷却（> 2 秒）后，主动对远程 OCI Registry 发起超轻量 `HEAD` 请求校验 Manifest Digest。若检测到远端已有新基线发布，立即原子拉取最新根索引与目标分片自愈刷新，消除分布式 Anycast 节点同步时间差导致的 404 假阴性。
+  - **全链路直通式流传输与内存优化**：从 OCI Registry 或上游拉取的 NAR Blob 以 64 KB 分块流式透传给 Nix 客户端，代理与 Worker 均不落盘；全库集成 `mimalloc` 消除高并发锁争用与内存碎片。
+
+### 3. 多架构 Scatter-Gather 并行构建与纯局部压实（Pure Partial Compaction）
 
 ```mermaid
 flowchart TD
-    Core["crates/nixcache-core<br>(纯核心模型 / Schema v5 分片与布隆索引 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
+    subgraph Matrix ["Phase 1: 并行构建 (Scatter - GitHub Matrix Runners)"]
+        RunnerA["Runner 1 (x86_64-linux)<br>nixcache-builder build --system x86_64-linux"]
+        RunnerB["Runner 2 (aarch64-linux)<br>nixcache-builder build --system aarch64-linux"]
+        RunnerC["Runner 3 (aarch64-darwin)<br>nixcache-builder build --system aarch64-darwin"]
+    end
+
+    subgraph OCI_Blobs ["GHCR (OCI Blobs 存储)"]
+        BlobStorage["NAR Blobs<br>(内容寻址, 并发上传天然幂等)"]
+    end
+
+    subgraph Receipts ["中间产物交换 (Artifacts)"]
+        ReceiptA["receipt-x86_64-linux.json"]
+        ReceiptB["receipt-aarch64-linux.json"]
+        ReceiptC["receipt-aarch64-darwin.json"]
+    end
+
+    subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
+        Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
+        MergedIndex["全局分片根索引 (Schema v6 Root)<br>(1024 分片 Merkle 纯局部压实 + 零回读变动推送 + 跨平台 gc_roots)"]
+        TagPush["更新 GHCR tag: cache-index"]
+    end
+
+    RunnerA -->|1. 并发上传 NAR| BlobStorage
+    RunnerB -->|1. 并发上传 NAR| BlobStorage
+    RunnerC -->|1. 并发上传 NAR| BlobStorage
+
+    RunnerA -->|2. 输出构建凭证| ReceiptA
+    RunnerB -->|2. 输出构建凭证| ReceiptB
+    RunnerC -->|2. 输出构建凭证| ReceiptC
+
+    ReceiptA --> Merger
+    ReceiptB --> Merger
+    ReceiptC --> Merger
+
+    Merger --> MergedIndex
+    MergedIndex --> TagPush
+```
+
+- **增量补丁与 CAS 并发安全写入**：各 Matrix Runner 独立构建目标架构产物并上传 NAR Blob，仅产出新增条目的轻量增量补丁（`DeltaPatchData`，~3 KB），利用 CAS（Compare-And-Swap）条件更新机制和抖动退避追加至会话清单，杜绝多节点竞争下的数据覆盖。
+- **纯局部压实（Pure Partial Compaction）**：Coordinator 节点汇聚 Receipts 后，基于 1024 分片 Merkle 差集精准定位变动分片。**仅需下载并追加合并存在新增条目的极少数分片（通常 1~5 个）**；对于未修改的分片（通常 1000+ 个），直接保留原有的 `blob_digest`、`compressed_size` 与 `merkle_hash`，**未变动分片网络下载与上传量严格为 0**，彻底消除了全量回读引发的网络放大。
+
+### 4. 运行时闭包精准捕获与 GC / Purge 统一引擎
+
+- **图论依赖分析与编译期工具剥离**：构建完成后，系统基于 Nix DAG 可达性图分析，精准计算目标产物的纯净运行时闭包 $C(R)$ 与本地构建差集 $\Delta$ 的交集，**100% 剔除 `rustc`、`cargo`、`gcc` 等重型编译期工具（`nativeBuildInputs`）与中间派生产物**，提纯 `active_gc_roots` 仅保留目标根节点，并自动跳过已存在于公共上游缓存的路径，实现最小化 OCI 存储占用。
+- **统一的依赖分析与清理内核**：垃圾回收（`gc`）与主动失效（`purge`）在底层全面收敛至同一套图论依赖遍历、CAS 提交与 OCI 物理 Blob 清理引擎。`gc` 核心逻辑即为 `protect_gc_roots = true` 模式下的安全特例：
+
+| 核心维度 | 垃圾回收 (`gc` / `gc-cache.yml`) | 主动清理与失效 (`purge` / `clean-cache.yml`) |
+| :--- | :--- | :--- |
+| **底层实现** | **直接复用 Purge 引擎** (`protect_gc_roots = true`) | 原生 Purge 引擎 (`protect_gc_roots = false` 默认) |
+| **设计哲学** | 保守安全、被动维护、防止误删 | 主动控制、精准打击、允许破坏性重置 |
+| **当前 Flake 闭包** | **绝对保护**（通过 `protect_gc_roots` 保护可达闭包） | **允许强行清理**（直接支持清理当前 Flake 的指定包/闭包） |
+| **GC Roots 交互** | 以当前 Flake 的 GC Roots 为起点计算可达图并保护 | 主动**剔除/修剪**匹配到的 GC Roots，同步重构活跃根集合 |
+| **触发方式** | 每周定时自动巡检 (`schedule`) 或手动触发 | 主要是手动交互式触发 (`workflow_dispatch`) 或 API 驱动 |
+| **筛选维度** | 按保留天数（`retention-days`）和图可达性 | 支持按 Hash、包名模式、架构、时间窗口、CI Job、大小阈值等 |
+| **依赖级联能力** | 锁定为 `exact` 模式 | 支持 `exact`、`dependents`（下游反向）、`transitive`（前向闭包）、`full`（双向全树） |
+| **清理范围** | 全局生产基线 `cache-index` | 支持全局基线 (`cache-index`)、单架构分片、会话标签与历史产物 |
+| **Blob 物理删除** | 支持 `--delete-blobs` 物理删除失效 Blobs | 支持 `--delete-blobs` 物理删除失效 Blobs |
+| **执行模式** | 默认直接执行（生产推荐） | 默认开启 `--dry-run` 预览审计 |
+
+### 5. Workspace Crate 模块解耦与职责划分
+
+系统采用领域驱动设计，解耦为 8 个高内聚、职责单一的 Crate：
+
+```mermaid
+flowchart TD
+    Core["crates/nixcache-core<br>(纯核心模型 / Schema v6 1024 阶分片 Merkle 索引 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
     Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 纯标准库 Env 工具)"]
     CLI["crates/nixcache-cli<br>(共享 CLI 参数组件 / 认证探测 / 强类型配置转换)"]
     OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
     Backend["crates/nixcache-oci-backend<br>(通用 OCI 后端抽象 / tokio-reqwest / 压缩索引切片)"]
     Proxy["crates/nixcache-proxy<br>(Axum 4 级级联代理 / O(1) 内存双向查找 / 流式转发)"]
     Builder["crates/nixcache-builder<br>(CI 构建协调 / 会话生命周期 / 安全环境隔离)"]
-    Worker["crates/nixcache-worker<br>(Cloudflare Worker 边缘无服务器代理 / 3 级穿透)"]
+    Worker["crates/nixcache-worker<br>(Cloudflare Worker 边缘无服务器无状态代理 / 单原子 KV 与自愈穿透)"]
 
     Core --> Utils
     Core --> OCI
@@ -963,102 +1023,14 @@ flowchart TD
     Utils --> Worker
 ```
 
-- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），包含 `ShardedArchCacheIndexData`、`ShardDescriptor`、`FastBlockedBloomFilter`、`ShardDataPayload`、`DeltaPatchData`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台 IO 依赖，全环境及 Wasm 兼容。
-- **`crates/nixcache-utils`**：跨平台底层系统调用、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
+- **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），定义 Schema v6 规范 `ShardedArchCacheIndexData`、1024 阶分片描述符 `ShardDescriptor`、`ShardDataPayload`、`DeltaPatchData`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台原生 IO 依赖，全环境及 Wasm 兼容。
+- **`crates/nixcache-utils`**：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
 - **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`（包含 `--registry-kind` 强类型后端种类与自动探测）、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
 - **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
-- **`crates/nixcache-oci-backend`**：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引（Compressed Index）分片读写与高并发确定性流式传输。
+- **`crates/nixcache-oci-backend`**：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引分片读写与高并发确定性流式传输。
 - **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 ~ Tier 3 级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
 - **`crates/nixcache-builder`**：CI 构建与多架构会话协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过驱动特性矩阵执行确定性无降级上传，并通过 CAS 机制原子更新 `run-<run_id>` 清单与架构分片索引。
-- **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器代理，共享 `nixcache-core` 与 `nixcache-utils`，通过内存 -> KV -> OCI 3 级穿透提供边缘低延迟加速。
-
----
-
-### 2. 多架构 Scatter-Gather 并行构建与原子发布
-
-```mermaid
-flowchart TD
-    subgraph Matrix ["Phase 1: 并行构建 (Scatter - GitHub Matrix Runners)"]
-        RunnerA["Runner 1 (x86_64-linux)<br>nixcache-builder build --system x86_64-linux"]
-        RunnerB["Runner 2 (aarch64-linux)<br>nixcache-builder build --system aarch64-linux"]
-        RunnerC["Runner 3 (aarch64-darwin)<br>nixcache-builder build --system aarch64-darwin"]
-    end
-
-    subgraph OCI_Blobs ["GHCR (OCI Blobs 存储)"]
-        BlobStorage["NAR Blobs<br>(内容寻址, 并发上传天然幂等)"]
-    end
-
-    subgraph Receipts ["中间产物交换 (Artifacts)"]
-        ReceiptA["receipt-x86_64-linux.json"]
-        ReceiptB["receipt-aarch64-linux.json"]
-        ReceiptC["receipt-aarch64-darwin.json"]
-    end
-
-    subgraph Gather ["Phase 2: 汇聚与索引发布 (Gather - 单节点)"]
-        Merger["nixcache-builder promote<br>(收集所有 Receipts / Session + 获取旧 cache-index)"]
-        MergedIndex["全局分片根索引 (Schema v5 Root)<br>(1024 分片 Merkle 局部压实 + Bloom Filter + 跨平台 gc_roots)"]
-        TagPush["更新 GHCR tag: cache-index"]
-    end
-
-    RunnerA -->|1. 并发上传 NAR| BlobStorage
-    RunnerB -->|1. 并发上传 NAR| BlobStorage
-    RunnerC -->|1. 并发上传 NAR| BlobStorage
-
-    RunnerA -->|2. 输出构建凭证| ReceiptA
-    RunnerB -->|2. 输出构建凭证| ReceiptB
-    RunnerC -->|2. 输出构建凭证| ReceiptC
-
-    ReceiptA --> Merger
-    ReceiptB --> Merger
-    ReceiptC --> Merger
-
-    Merger --> MergedIndex
-    MergedIndex --> TagPush
-```
-
-- **构建期轻量 Delta Patch (WAL 机制)**：在并行 Matrix 阶段，各 Runner 独立构建目标平台产物，仅产出当前 Job 新增条目的轻量增量补丁（`DeltaPatchData`，体积 ~3 KB），通过 CAS 机制将增量描述符追加至会话清单（`run-<run_id>-<system>`），避免了全量覆写与并发争用。
-- **CAS（Compare-And-Swap）原子更新与指数退避**：所有 OCI 清单的更新均通过 CAS 条件写入机制进行，在并发竞争时采用抖动指数退避自动重试，确保多节点无锁并发提交时绝对不会发生数据覆盖或丢失。
-- **Coordinator 汇聚与分片局部压实（Partial Compaction）**：在 `promote` 阶段，汇聚节点聚合各架构的 Build Receipts 或 Session Delta Patches，基于 1024 分片梅克尔差集精准计算受影响的分片（未变动分片 0 传输 0 上传，直接复用原 digest 与 merkle_hash），局部压实并上传变动分片，生成新 Merkle Root 与全局布隆过滤器，原子发布全局分片根索引 `cache-index`（Schema v5），同时跨平台汇总所有架构的活跃包（GC Roots），保证垃圾回收不会误删其他架构的依赖闭包。
-
-### 输出自动发现机制
-
-GitHub Actions 工作流会自动发现并构建您指定的 Flake 配置中的下列输出：
-
-- `packages.<system>.<name>` -- 该运行器架构下的所有软件包。
-- `nixosConfigurations.<hostname>` -- 构建每个主机的 `config.system.build.toplevel`。
-- `devShells.<system>.<name>` -- 所有的开发环境 Shell。
-
-### 哪些路径会被缓存
-
-为了节省存储空间，**只有本地构建生成的 store 路径**会被上传到 OCI 注册表。如果在 `cache.nixos.org` 上已经存在该路径，工作流在上传时会自动跳过它。本地代理会自动重定向并向上游请求这些公共路径，使得客户端能够获取完整的依赖关系，而无需占用你个人的 OCI 存储空间。
-
-### 为什么选择 OCI 注册表 (GHCR / Docker Hub / 自建 Harbor 等)
-
-- **天然的内容寻址**：NAR 包的 sha256 哈希值可以直接映射为 OCI blob 的哈希，天然实现去重。
-- **广泛的生态兼容性**：不仅支持 GitHub 官方托管的 GHCR（公开仓库完全免费且无容量限制），还可无缝迁移至 Docker Hub、AWS ECR、Google Cloud Artifact Registry、Azure ACR 或企业内网自建 Harbor/Zot。
-- **无文件数限制**：OCI 仓库允许存储任意数量的 blob，无需担心传统存储服务的分区限制。
-- **分片梅克尔基数索引与布隆过滤器 (SMRI)**：元数据按 Nix Base32 前缀均匀划分为 1,024 个轻量级分片（单分片仅 ~2 KB），并配备全局紧凑布隆过滤器（Bloom Filter）与 Merkle Tree 状态校验。冷启动仅需拉取 ~135 KB 根元数据，未命中包 0ms 旁路直通上游，命中包按需加载分片并缓存，彻底消除超大规模仓库下的单文件读写放大与内存瓶颈。
-- **超大文件支持**：单个 blob 支持最大约 10 GiB，能够轻松应对超大型软件包。
-
-### 垃圾回收与主动清理（GC vs. Purge 统一架构）
-
-`nixcache-oci` 在底层全面统一收敛至同一套**图论依赖分析、CAS 原子提交流程与 OCI 物理 Blob 清理引擎**。GC 子命令与工作流直接作为 Purge 引擎在开启 `protect_gc_roots = true` 模式下的安全特例：
-
-| 核心维度 | 垃圾回收 (`gc` / `gc-cache.yml`) | 主动清理与失效 (`purge` / `clean-cache.yml`) |
-| :--- | :--- | :--- |
-| **底层实现** | **直接复用 Purge 引擎** (`protect_gc_roots = true`) | 原生 Purge 引擎 (`protect_gc_roots = false` 默认) |
-| **设计哲学** | 保守安全、被动维护、防止误删 | 主动控制、精准打击、允许破坏性重置 |
-| **对当前 Flake 闭包的态度** | **绝对保护**（通过 `protect_gc_roots` 保护可达闭包） | **允许强行清理**（直接支持清理当前 Flake 的任何包/闭包） |
-| **GC Roots 交互** | 以当前 Flake 的 GC Roots 为起点计算可达图并保护 | 主动**剔除/修剪**匹配到的 GC Roots，同步重构活跃根集合 |
-| **触发方式** | 每周定时自动巡检 (`schedule`) 或手动触发 | 主要是手动交互式触发 (`workflow_dispatch`) 或 API 驱动 |
-| **筛选维度** | 仅支持按保留天数（`retention-days`）和图可达性 | 支持按 Hash、包名模式、架构、时间窗口、CI Job、大小阈值、Flake 输出等 |
-| **依赖级联能力** | 锁定为 `exact` 模式 | 支持 `exact`（仅自身）、`dependents`（下游反向）、`transitive`（前向闭包）、`full`（双向全树） |
-| **清理范围** | 仅限全局生产基线 `cache-index` | 支持全局基线 (`cache-index`)、单架构分片、会话标签与历史产物 |
-| **Blob 物理删除** | 支持通过 `--delete-blobs` 进行物理删除 | 支持通过 `--delete-blobs` 进行物理删除 |
-| **默认安全模式** | 默认直接执行（生产推荐） | 默认开启 `--dry-run`（预览变更并输出审计报告后由用户确认） |
-
-- **被动垃圾回收 (`gc-cache.yml`)**：每周自动运行，清理超过保留天数（默认 30 天）且不属于当前闭包的孤立条目。手动触发：`gh workflow run gc-cache.yml`。
-- **主动清理与失效 (`clean-cache.yml`)**：支持破坏性清理、单包/单架构重置或全局清空。手动触发：`gh workflow run clean-cache.yml`。
+- **`crates/nixcache-worker`**：基于 Cloudflare Worker 的边缘无服务器无状态代理，共享 `nixcache-core` 与 `nixcache-utils`，采用单原子 KV 存储模型（`baseline_v6_{system}`）与 Read-Through SWR 自愈穿透机制，通过 L1 内存 -> L2 KV -> L3 OCI 3 级穿透提供低延迟、高确定性边缘加速。
 
 ## 测试与质量保障（Testing & QA）
 
@@ -1146,7 +1118,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 # 6. 验证基于图论的运行时闭包精准捕获、编译期依赖剥离 (Rust 软件包零中间产物泄漏) 与替代执行
 ./test/test-capture-closure.sh
 
-# 7. 验证 10 万 ~ 100 万条目下 Schema v5 分片离散均匀度、Merkle Tree 状态检验与高并发压测仿真
+# 7. 验证 10 万 ~ 100 万条目下 Schema v6 分片离散均匀度、Merkle Tree 状态检验与高并发压测仿真
 ./test/test-sharding-scale-simulation.sh
 # 或执行 100 万条目极限压测: ./test/test-sharding-scale-simulation.sh --million
 ```
@@ -1166,7 +1138,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 # 3. 验证 Nix 客户端真实替换器 substituters 下载与完整性链路
 ./test/test-substitution.sh
 
-# 4. Cloudflare Worker 边缘代理端到端功能测试
+# 4. Cloudflare Worker 边缘代理端到端功能测试（验证语义端点真实收敛门禁与 Read-Through SWR 自愈穿透）
 ./test/test-worker.sh
 ```
 

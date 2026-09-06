@@ -1,19 +1,17 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
-use nixcache_core::{
-    DeltaPatchData, FastBlockedBloomFilter, IndexEntry, NarDigest, ShardDataPayload,
-    ShardedArchCacheIndexData, StoreHash, build_nar_lookup_map,
-};
+use nixcache_core::{DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData};
 use scc::HashMap as SccHashMap;
 use std::{
     collections::HashMap,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 use worker::js_sys::Date;
 
 pub const L1_MEM_TTL_MS: f64 = 30_000.0;
+pub const REVALIDATE_DEBOUNCE_MS: u64 = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteHealthState {
@@ -42,7 +40,6 @@ pub struct CachedSessionEntry {
 #[derive(Clone, Debug)]
 pub struct CachedBaselineEntry {
     pub root: ShardedArchCacheIndexData,
-    pub bloom_filter: Arc<FastBlockedBloomFilter>,
     pub manifest_digest: String,
     pub expires_at: f64,
 }
@@ -55,25 +52,21 @@ pub struct CachedShardEntry {
     pub expires_at: f64,
 }
 
-/// 收敛的 Worker 全局内存状态 (Schema v5 SMRI with Bloom Filter)
+/// 收敛的 Worker 全局内存状态 (Schema v6 SMRI with SWR Self-Healing)
 pub struct WorkerState {
-    pub hot_entries: SccHashMap<StoreHash, Arc<IndexEntry>>,
-    pub hot_nar_lookup: SccHashMap<String, NarDigest>,
-    pub hot_count: AtomicUsize,
     pub mem_session_cache: SccHashMap<String, Arc<CachedSessionEntry>>,
     pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
     pub mem_shard_cache: SccHashMap<u16, Arc<CachedShardEntry>>,
     pub remote_status: ArcSwap<RemoteHealthState>,
+    pub last_revalidate_ms: AtomicU64,
 }
 
 static GLOBAL_STATE: LazyLock<WorkerState> = LazyLock::new(|| WorkerState {
-    hot_entries: SccHashMap::new(),
-    hot_nar_lookup: SccHashMap::new(),
-    hot_count: AtomicUsize::new(0),
     mem_session_cache: SccHashMap::new(),
     mem_baseline_cache: ArcSwapOption::from(None),
     mem_shard_cache: SccHashMap::new(),
     remote_status: ArcSwap::from_pointee(RemoteHealthState::default()),
+    last_revalidate_ms: AtomicU64::new(0),
 });
 
 impl WorkerState {
@@ -90,23 +83,15 @@ impl WorkerState {
         }));
     }
 
-    /// 动态注册 Tier 0 热条目
-    pub fn register_hot(&self, entries: HashMap<StoreHash, IndexEntry>) {
-        if entries.is_empty() {
-            return;
-        }
-        let nar_map = build_nar_lookup_map(&entries);
-        let mut newly_added = 0;
-        for (k, v) in entries {
-            if self.hot_entries.upsert_sync(k, Arc::new(v)).is_none() {
-                newly_added += 1;
-            }
-        }
-        for (k, v) in nar_map {
-            let _ = self.hot_nar_lookup.upsert_sync(k, v);
-        }
-        if newly_added > 0 {
-            self.hot_count.fetch_add(newly_added, Ordering::Relaxed);
+    /// 检查是否允许触发 Cache Miss 防抖自愈探查
+    pub fn should_revalidate(&self) -> bool {
+        let now = Date::now() as u64;
+        let last = self.last_revalidate_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= REVALIDATE_DEBOUNCE_MS {
+            self.last_revalidate_ms.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 

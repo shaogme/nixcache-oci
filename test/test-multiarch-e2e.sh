@@ -188,13 +188,13 @@ echo ">>> [Phase 2] Running Promote Coordinator..."
     --repo "$NIXCACHE_REPO" \
     --registry "$NIXCACHE_REGISTRY"
 
-echo ">>> Fetching published cache-index from local registry to verify Schema v5..."
+echo ">>> Fetching published cache-index from local registry to verify Schema v6..."
 INDEX_MANIFEST=$(curl -fsSL -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://${NIXCACHE_REGISTRY}/v2/${NIXCACHE_REPO}/nix-cache/manifests/cache-index")
 
 echo ">>> Published Cache Index Manifest:"
 echo "$INDEX_MANIFEST" | python3 -m json.tool
 
-# Verify Schema v5 and multi-arch entries
+# Verify Schema v6 and multi-arch entries
 python3 -c "
 import json, subprocess, sys
 
@@ -222,7 +222,7 @@ for m in manifests:
     
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 5, f'Expected version 5, got {arch_data[\"version\"]}'
+    assert arch_data['version'] == 6, f'Expected version 6, got {arch_data[\"version\"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']
@@ -241,7 +241,7 @@ print(f'>>> Aggregated {len(all_entries)} entries across {len(gc_roots)} archite
 assert len(all_entries) >= 2, f'Expected at least 2 entries, got {len(all_entries)}'
 assert 'x86_64-linux' in gc_roots, f'Missing x86_64-linux in gc_roots: {gc_roots}'
 assert 'aarch64-linux' in gc_roots, f'Missing aarch64-linux in gc_roots: {gc_roots}'
-print('>>> Schema v5 and Multi-Arch verification SUCCESS!')
+print('>>> Schema v6 and Multi-Arch verification SUCCESS!')
 "
 
 # =========================================================================

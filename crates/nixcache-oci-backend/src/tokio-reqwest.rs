@@ -77,6 +77,14 @@ impl OciTransport for ReqwestTransport {
     type BodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
 
     async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
+        self.head_with_headers(url, headers).await.map(|(s, _)| s)
+    }
+
+    async fn head_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         let resp = self
             .client
             .head(url)
@@ -84,7 +92,7 @@ impl OciTransport for ReqwestTransport {
             .send()
             .await
             .map_err(map_reqwest_error)?;
-        Ok(resp.status())
+        Ok((resp.status(), resp.headers().clone()))
     }
 
     async fn get(

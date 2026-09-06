@@ -20,7 +20,7 @@
       # Custom package that won't be on cache.nixos.org
       nixcache-test = pkgs.writeShellScriptBin "nixcache-test" ''
         echo "Hello from nixcache-oci! Cache is working."
-        echo "Built at: 2026-04-05"
+        echo "Built at: 1788661200874507915"
       '';
     });
 

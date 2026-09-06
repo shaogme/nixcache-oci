@@ -76,7 +76,11 @@ impl OciTransport for WorkerFetchTransport {
     #[cfg(target_arch = "wasm32")]
     type BodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
-    async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
+    async fn head_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         let mut current_url = url.to_string();
         let mut current_headers = headers;
         let mut redirect_count = 0;
@@ -106,11 +110,19 @@ impl OciTransport for WorkerFetchTransport {
                 continue;
             }
 
-            return StatusCode::from_u16(status_code).map_err(|_| TransportError::HttpStatus {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: Some(format!("Invalid status code {}", status_code)),
-            });
+            let status =
+                StatusCode::from_u16(status_code).map_err(|_| TransportError::HttpStatus {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: Some(format!("Invalid status code {}", status_code)),
+                })?;
+            let resp_headers = convert_from_worker_headers(resp.headers())?;
+            return Ok((status, resp_headers));
         }
+    }
+
+    async fn head(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
+        let (status, _) = self.head_with_headers(url, headers).await?;
+        Ok(status)
     }
 
     async fn get(

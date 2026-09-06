@@ -6,7 +6,7 @@ use crate::{
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::OciError,
     manifest::{
-        CacheLayerMediaType, CacheLayerMediaTypeV5, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
+        CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
         OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
         OciImageIndex, OciImageManifest, ShardedArchIndexManifestParams,
         build_delta_patch_manifest, build_sharded_arch_index_manifest,
@@ -20,8 +20,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{
-    BloomFilterManifest, DeltaPatchData, FastBlockedBloomFilter, NarDigest, ShardDataPayload,
-    ShardedArchCacheIndexData, SystemArch,
+    DeltaPatchData, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch,
 };
 use nixcache_utils::get_process_id;
 use serde::Serialize;
@@ -630,6 +629,38 @@ impl<T: OciTransport + Clone> OciClient<T> {
             .map(|opt| opt.map(|(body, _)| body))
     }
 
+    /// 轻量级探测远端 Manifest 是否存在并获取其摘要 (HEAD 请求)
+    pub async fn head_manifest(&self, tag: &str) -> Result<Option<String>, OciError> {
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag
+        );
+
+        let headers = self.get_auth_headers().await?;
+        let (status, resp_headers) = self.transport.head_with_headers(&url, headers).await?;
+
+        if status == StatusCode::OK {
+            let digest = resp_headers
+                .get("Docker-Content-Digest")
+                .or_else(|| resp_headers.get("ETag"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| {
+                    s.trim_matches('"')
+                        .trim_start_matches("W/\"")
+                        .trim_end_matches('"')
+                        .to_string()
+                });
+            Ok(digest)
+        } else if status == StatusCode::NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(OciError::ManifestFetchFailed(status))
+        }
+    }
+
     /// 拉取并解析 OCI 产物（强类型枚举支持 OciImageIndex 与 OciImageManifest）
     pub async fn fetch_artifact(
         &self,
@@ -670,7 +701,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 针对特定系统架构，按需拉取单架构 Schema v5 分片根索引目录数据
+    /// 针对特定系统架构，按需拉取单架构 Schema v6 分片根索引目录数据
     pub async fn get_sharded_root_index(
         &self,
         tag: &str,
@@ -687,9 +718,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 .layers
                 .iter()
                 .find(|l| {
-                    l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
-                        || CacheLayerMediaType::parse(&l.media_type)
-                            .is_some_and(|m| m.is_root_index())
+                    CacheLayerMediaType::parse(&l.media_type).is_some_and(|m| m.is_root_index())
                 })
                 .or_else(|| sub_manifest.layers.first())
         {
@@ -723,9 +752,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     .layers
                     .iter()
                     .find(|l| {
-                        l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
-                            || CacheLayerMediaType::parse(&l.media_type)
-                                .is_some_and(|m| m.is_root_index())
+                        CacheLayerMediaType::parse(&l.media_type).is_some_and(|m| m.is_root_index())
                     })
                     .or_else(|| sub_manifest.layers.first())
                     .ok_or(OciError::LayerDescriptorMissing)?;
@@ -740,9 +767,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     .layers
                     .iter()
                     .find(|l| {
-                        l.media_type == CacheLayerMediaTypeV5::ROOT_INDEX_V5_ZSTD
-                            || CacheLayerMediaType::parse(&l.media_type)
-                                .is_some_and(|m| m.is_root_index())
+                        CacheLayerMediaType::parse(&l.media_type).is_some_and(|m| m.is_root_index())
                     })
                     .or_else(|| sub_manifest.layers.first())
                 {
@@ -757,13 +782,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    /// 推送单架构 Schema v5 分片根索引目录清单 (包含 Root Index 与 Bloom Filter Layers)
+    /// 推送单架构 Schema v6 分片根索引目录清单 (内置 1024 分片描述符，彻底废除全局 Bloom Filter)
     pub async fn push_sharded_root_index(
         &self,
         tag: &str,
         root_data: &ShardedArchCacheIndexData,
-        bloom_blob_digest: &str,
-        bloom_blob_size: u64,
         previous_digest: Option<&str>,
     ) -> Result<String, OciError> {
         let (root_blob_digest, root_compressed_size, _) = self.push_zstd_blob(root_data).await?;
@@ -771,8 +794,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
             root_blob_digest: &root_blob_digest,
             root_blob_size: root_compressed_size,
-            bloom_blob_digest,
-            bloom_blob_size,
             config_digest: EMPTY_CONFIG_DIGEST,
             config_size: EMPTY_CONFIG_SIZE,
             system: &root_data.system,
@@ -786,45 +807,10 @@ impl<T: OciTransport + Clone> OciClient<T> {
         Ok(manifest_digest)
     }
 
-    /// 下载并恢复指定 Blob Digest 的布隆过滤器
-    pub async fn get_bloom_filter(
-        &self,
-        bloom_blob_digest: &str,
-        num_entries: u64,
-        num_hashes: u8,
-    ) -> Result<FastBlockedBloomFilter, OciError> {
-        let raw_bytes = self.get_blob(bloom_blob_digest).await?;
-        IndexCodec::decode_bloom_filter(&raw_bytes, num_entries, num_hashes)
-    }
-
-    /// 压缩并推送布隆过滤器 Blob，返回对应的 BloomFilterManifest
-    pub async fn push_bloom_filter(
-        &self,
-        filter: &FastBlockedBloomFilter,
-    ) -> Result<BloomFilterManifest, OciError> {
-        let compressed_bytes =
-            IndexCodec::encode_bloom_filter(filter, DEFAULT_ZSTD_COMPRESSION_LEVEL)?;
-        let blob_digest = compute_sha256_digest(&compressed_bytes);
-        let compressed_size = compressed_bytes.len() as u64;
-
-        if !self.head_blob(&blob_digest).await? {
-            self.push_blob_bytes_with_digest(&blob_digest, compressed_bytes)
-                .await?;
-        }
-
-        Ok(BloomFilterManifest::new(
-            filter.num_entries(),
-            filter.num_bits(),
-            filter.num_hashes(),
-            blob_digest,
-            compressed_size,
-        ))
-    }
-
     /// 下载并解压指定 Blob Digest 的单分片数据 Payload
     pub async fn get_shard_data(&self, blob_digest: &str) -> Result<ShardDataPayload, OciError> {
         let blob_bytes = self.get_blob(blob_digest).await?;
-        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV5::SHARD_DATA_V5_ZSTD)
+        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD)
     }
 
     /// 压缩并推送单分片数据 Payload
@@ -838,7 +824,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     /// 下载并解压指定 Blob Digest 的增量 Delta Patch
     pub async fn get_delta_patch(&self, blob_digest: &str) -> Result<DeltaPatchData, OciError> {
         let blob_bytes = self.get_blob(blob_digest).await?;
-        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV5::DELTA_PATCH_V5_ZSTD)
+        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV6::DELTA_PATCH_V6_ZSTD)
     }
 
     /// 压缩并推送增量 Delta Patch Blob
@@ -1362,9 +1348,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         mut mutator: F,
     ) -> Result<String, OciError>
     where
-        F: FnMut(
-            Option<ShardedArchCacheIndexData>,
-        ) -> Result<(ShardedArchCacheIndexData, String, u64), OciError>,
+        F: FnMut(Option<ShardedArchCacheIndexData>) -> Result<ShardedArchCacheIndexData, OciError>,
     {
         let mut attempt = 0;
         let arch_tag = if tag.ends_with(system.as_str()) {
@@ -1381,16 +1365,10 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     None => (None, None),
                 };
 
-            let (updated_root, bloom_digest, bloom_size) = mutator(existing_root)?;
+            let updated_root = mutator(existing_root)?;
 
             match self
-                .push_sharded_root_index(
-                    &arch_tag,
-                    &updated_root,
-                    &bloom_digest,
-                    bloom_size,
-                    prev_digest.as_deref(),
-                )
+                .push_sharded_root_index(&arch_tag, &updated_root, prev_digest.as_deref())
                 .await
             {
                 Ok(digest) => return Ok(digest),
