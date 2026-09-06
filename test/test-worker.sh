@@ -21,7 +21,11 @@ echo "Worker URL: $TEST_WORKER_URL"
 # Ensure clean state on exit
 cleanup() {
     echo ">>> Cleaning up worker test resources..."
-    git checkout -- examples/flake/flake.nix 2>/dev/null || true
+    if [[ -f examples/flake/flake.nix.bak ]]; then
+        mv -f examples/flake/flake.nix.bak examples/flake/flake.nix
+    else
+        git checkout -- examples/flake/flake.nix 2>/dev/null || true
+    fi
     rm -f test-worker-secret.key test-worker-public.key result-builder-worker
     echo ">>> Cleanup complete."
 }
@@ -96,17 +100,23 @@ fi
 
 # Modify flake.nix to guarantee a unique hash that has no signatures and is not cached
 echo ">>> Modifying examples/flake/flake.nix to generate a unique package hash..."
-sed -i "s/2026-04-05/$(date +%s)/" examples/flake/flake.nix
+cp examples/flake/flake.nix examples/flake/flake.nix.bak
+sed -i "s/Built at: [^\"]*/Built at: $(date +%s%N)/" examples/flake/flake.nix
 
-TEST_STORE_PATH=$(nix build "./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
+if cmp -s examples/flake/flake.nix examples/flake/flake.nix.bak; then
+    echo "::error::Failed to mutate examples/flake/flake.nix. Hash will not be unique!"
+    exit 1
+fi
+
+TEST_STORE_PATH=$(nix build "path:./${NIXCACHE_CONFIG_DIR}#nixcache-test" --no-link --print-out-paths)
 echo ">>> Target package store path: $TEST_STORE_PATH"
 TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
 RECEIPT_FILE="$(mktemp --suffix=.json)"
-PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --output-receipt "$RECEIPT_FILE"
-"$BUILDER_BIN" promote --receipt "$RECEIPT_FILE"
+RUST_LOG="${RUST_LOG:-info}" PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --output-receipt "$RECEIPT_FILE"
+RUST_LOG="${RUST_LOG:-info}" "$BUILDER_BIN" promote --receipt "$RECEIPT_FILE"
 rm -f "$RECEIPT_FILE"
 
 # 5. Deterministic Resource Convergence Verification
