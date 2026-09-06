@@ -412,7 +412,7 @@ jobs:
           chmod +x test/test-concurrency-merge.sh
           ./test/test-concurrency-merge.sh
 
-      - name: Run Schema v5 Session CAS & Cascading Pipeline Test
+      - name: Run Schema v6 Session CAS & Cascading Pipeline Test
         env:
           PRECOMPILED_BIN_DIR: ${{ runner.temp }}/bin
         run: |
