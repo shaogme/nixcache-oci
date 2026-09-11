@@ -12,8 +12,8 @@ use nixcache_core::{
     partition_entries_by_shard,
 };
 use nixcache_oci::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciError, OciPlatform,
-    PackageDeletionSupport, RegistryCredentials, build_image_index,
+    ManifestCasSupport, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor,
+    OciError, OciPlatform, PackageDeletionSupport, RegistryCredentials, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
@@ -313,15 +313,34 @@ pub async fn run_purge(
     let manifest_descriptors: Vec<OciDescriptor> = try_join_all(push_futures).await?;
 
     let final_descriptors = manifest_descriptors;
-    oci.update_image_index_cas("cache-index", 5, |_existing| {
-        let mut index = build_image_index(
-            final_descriptors.clone(),
-            "NixCache Multi-Architecture Global Index",
-        );
-        index.schema_version = 2;
-        Ok(index)
-    })
-    .await?;
+    match oci.capabilities().manifest_cas_support {
+        ManifestCasSupport::IfMatch => {
+            oci.update_image_index_cas("cache-index", 5, |_existing| {
+                let mut index = build_image_index(
+                    final_descriptors.clone(),
+                    "NixCache Multi-Architecture Global Index",
+                );
+                index.schema_version = 2;
+                Ok(index)
+            })
+            .await?;
+        }
+        ManifestCasSupport::Unsupported => {
+            info!(
+                "Registry backend '{}' does not support manifest CAS; using explicit single-writer index update",
+                oci.kind()
+            );
+            oci.update_image_index_single_writer("cache-index", |_existing| {
+                let mut index = build_image_index(
+                    final_descriptors.clone(),
+                    "NixCache Multi-Architecture Global Index",
+                );
+                index.schema_version = 2;
+                Ok(index)
+            })
+            .await?;
+        }
+    }
 
     info!("Successfully updated multi-arch cache-index after purge.");
 

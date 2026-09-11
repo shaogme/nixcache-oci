@@ -710,7 +710,7 @@ nixcache-builder purge \
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
-`purge` 的索引合并路径使用严格 CAS。GHCR、AWS ECR 和 Generic OCI 不支持该条件发布能力时会直接失败，避免清理结果覆盖其他 writer；请改用单写者调度或外部锁后重新执行。
+`purge` 的索引合并路径会根据后端能力选择严格 CAS 或显式 single-writer 更新。GHCR、AWS ECR 和 Generic OCI 不支持条件发布能力时，必须由 CI concurrency 或外部锁保证同一目标索引不会并发更新；不满足该约束时请先配置单写者调度或外部锁。
 
 #### 6. `list` (构建缓存多维查询、列表与统计)
 

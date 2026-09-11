@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
 use nixcache_utils::get_process_id;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -77,7 +77,15 @@ fn hex_digit(value: u8) -> char {
 
 #[derive(Deserialize)]
 struct OciTagsListResponse {
+    #[serde(deserialize_with = "deserialize_nullable_tags")]
     tags: Vec<String>,
+}
+
+fn deserialize_nullable_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
