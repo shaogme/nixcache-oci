@@ -1,12 +1,12 @@
 use super::{DeletionClient, PackageDeletionSummary};
 use crate::{
     backend::{GitHubPackagesClient, RegistryDeletionStrategy},
-    client::endpoint,
     codec::IndexCodec,
     error::OciError,
+    integrity::ContentDigest,
     manifest::{
-        CacheLayerMediaType, CacheLayerMediaTypeV6, OCI_IMAGE_INDEX_MEDIA_TYPE,
-        OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest,
+        CacheLayerMediaType, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        OciArtifactManifest,
     },
     transport::OciTransport,
 };
@@ -60,21 +60,6 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
             else {
                 continue;
             };
-            if !valid_digest(&digest) {
-                return Err(discovery_error(
-                    "manifest_digest",
-                    tag,
-                    "registry returned an invalid Docker-Content-Digest",
-                ));
-            }
-            let computed = endpoint::compute_sha256_digest(body.as_bytes());
-            if computed != digest {
-                return Err(discovery_error(
-                    "manifest_digest",
-                    tag,
-                    format!("digest header/body mismatch: header {digest}, body {computed}"),
-                ));
-            }
             if queued_manifests.contains(&digest) {
                 continue;
             }
@@ -96,27 +81,17 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                     target: self.client.repo().to_string(),
                 });
             }
-            let computed = endpoint::compute_sha256_digest(body.as_bytes());
-            if computed != digest {
-                return Err(discovery_error(
-                    "manifest_digest",
-                    &digest,
-                    format!("digest/body mismatch while traversing tag {source}"),
-                ));
-            }
             let artifact = parse_discovered_manifest(&body, &digest)?;
             plan.manifests.insert(digest.clone(), body);
 
             match artifact {
                 OciArtifactManifest::Index(index) => {
                     for descriptor in index.manifests {
-                        if !valid_digest(&descriptor.digest) {
-                            return Err(discovery_error(
-                                "manifest_descriptor",
-                                &digest,
-                                "index contains an invalid manifest digest",
-                            ));
-                        }
+                        descriptor
+                            .validate_for(&digest, self.client.limits().max_manifest_bytes())
+                            .map_err(|error| {
+                                discovery_error("manifest_descriptor", &digest, error)
+                            })?;
                         if !matches!(
                             descriptor.media_type.as_str(),
                             OCI_IMAGE_INDEX_MEDIA_TYPE | OCI_IMAGE_MANIFEST_MEDIA_TYPE
@@ -139,10 +114,10 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                             });
                         }
                         queued_manifests.insert(descriptor.digest.clone());
-                        let Some((child_body, child_digest)) = self
+                        let Some((child_body, _child_digest)) = self
                             .client
                             .manifests()
-                            .get_with_digest(&descriptor.digest)
+                            .get_with_digest_and_size(&descriptor.digest, descriptor.size)
                             .await
                             .map_err(|error| {
                                 discovery_error("manifest_get", &descriptor.digest, error)
@@ -154,16 +129,6 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                                 "child manifest disappeared during discovery",
                             ));
                         };
-                        if child_digest != descriptor.digest
-                            || endpoint::compute_sha256_digest(child_body.as_bytes())
-                                != descriptor.digest
-                        {
-                            return Err(discovery_error(
-                                "manifest_digest",
-                                &descriptor.digest,
-                                "child manifest digest does not match descriptor",
-                            ));
-                        }
                         pending.push_back((descriptor.digest, child_body, source.clone()));
                     }
                 }
@@ -189,43 +154,36 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                         let Some(layer_type) = CacheLayerMediaType::parse(&layer.media_type) else {
                             continue;
                         };
-                        let layer_bytes =
-                            self.client
-                                .blobs()
-                                .get(&layer.digest)
-                                .await
-                                .map_err(|error| {
-                                    discovery_error("cache_layer_get", &layer.digest, error)
-                                })?;
-                        let computed_layer_digest = endpoint::compute_sha256_digest(&layer_bytes);
-                        if computed_layer_digest != layer.digest {
-                            return Err(discovery_error(
-                                "cache_layer_digest",
-                                &layer.digest,
-                                format!(
-                                    "cache layer body digest mismatch: expected {}, got {}",
-                                    layer.digest, computed_layer_digest
-                                ),
-                            ));
-                        }
+                        let layer_bytes = self
+                            .client
+                            .blobs()
+                            .get_descriptor(&layer)
+                            .await
+                            .map_err(|error| {
+                                discovery_error("cache_layer_get", &layer.digest, error)
+                            })?;
                         if layer_type.is_root_index() {
-                            let root: ShardedArchCacheIndexData =
-                                IndexCodec::decode_zstd(&layer_bytes, &layer.media_type).map_err(
-                                    |error| {
-                                        discovery_error("root_index_decode", &layer.digest, error)
-                                    },
-                                )?;
+                            let root: ShardedArchCacheIndexData = IndexCodec::decode_zstd(
+                                &layer_bytes,
+                                &layer.media_type,
+                                self.client.limits().max_index_uncompressed_bytes(),
+                            )
+                            .map(|decoded| decoded.value)
+                            .map_err(|error| {
+                                discovery_error("root_index_decode", &layer.digest, error)
+                            })?;
+                            root.validate_for(
+                                &root.system,
+                                self.client.repo(),
+                                self.client.registry(),
+                                self.client.limits(),
+                            )
+                            .map_err(|error| {
+                                discovery_error("root_index_validate", &layer.digest, error)
+                            })?;
                             for shard in root.shards {
                                 if shard.entry_count == 0 {
                                     continue;
-                                }
-                                if shard.blob_digest.is_empty() || !valid_digest(&shard.blob_digest)
-                                {
-                                    return Err(discovery_error(
-                                        "root_index_decode",
-                                        &layer.digest,
-                                        "root index contains an invalid shard digest",
-                                    ));
                                 }
                                 let shard_digest = shard.blob_digest.clone();
                                 add_blob(
@@ -237,27 +195,14 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                                     self.client.repo(),
                                 )?;
                                 if decoded_shard_blobs.insert(shard_digest.clone()) {
-                                    let shard_bytes =
-                                        self.client.blobs().get(&shard_digest).await.map_err(
-                                            |error| {
-                                                discovery_error("shard_get", &shard_digest, error)
-                                            },
-                                        )?;
-                                    if endpoint::compute_sha256_digest(&shard_bytes) != shard_digest
-                                    {
-                                        return Err(discovery_error(
-                                            "shard_digest",
-                                            &shard_digest,
-                                            "shard body digest does not match descriptor",
-                                        ));
-                                    }
-                                    let shard_data: ShardDataPayload = IndexCodec::decode_zstd(
-                                        &shard_bytes,
-                                        CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD,
-                                    )
-                                    .map_err(|error| {
-                                        discovery_error("shard_decode", &shard_digest, error)
-                                    })?;
+                                    let shard_data = self
+                                        .client
+                                        .indexes()
+                                        .get_shard_data(&shard, &root.system)
+                                        .await
+                                        .map_err(|error| {
+                                            discovery_error("shard_get", &shard_digest, error)
+                                        })?;
                                     add_nar_blobs(
                                         &mut plan,
                                         &shard_data,
@@ -267,10 +212,15 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                                 }
                             }
                         } else {
-                            let shard: ShardDataPayload =
-                                IndexCodec::decode_zstd(&layer_bytes, &layer.media_type).map_err(
-                                    |error| discovery_error("shard_decode", &layer.digest, error),
-                                )?;
+                            let shard: ShardDataPayload = IndexCodec::decode_zstd(
+                                &layer_bytes,
+                                &layer.media_type,
+                                self.client.limits().max_index_uncompressed_bytes(),
+                            )
+                            .map(|decoded| decoded.value)
+                            .map_err(|error| {
+                                discovery_error("shard_decode", &layer.digest, error)
+                            })?;
                             add_nar_blobs(&mut plan, &shard, &layer.digest, self.client.repo())?;
                         }
                     }
@@ -306,10 +256,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
 }
 
 fn valid_digest(digest: &str) -> bool {
-    let Some(hex) = digest.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    ContentDigest::parse(digest).is_ok()
 }
 
 fn discovery_error(

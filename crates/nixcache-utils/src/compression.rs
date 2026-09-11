@@ -47,10 +47,13 @@ impl ZstdCodec {
         }
     }
 
-    /// 严格解压 Zstd 格式二进制 Blob
+    /// 严格解压 Zstd 格式二进制 Blob，并限制解压输出。
     ///
     /// 在 Native 平台使用 libzstd 解码器，在 wasm32 目标下使用纯 Rust ruzstd 流式解码器。
-    pub fn decompress(raw_bytes: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    pub fn decompress_limited(
+        raw_bytes: &[u8],
+        max_output_bytes: u64,
+    ) -> Result<Vec<u8>, CompressionError> {
         if raw_bytes.is_empty() {
             return Err(CompressionError::EmptyBuffer);
         }
@@ -67,23 +70,36 @@ impl ZstdCodec {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut decoder =
-                zstd::stream::Decoder::new(raw_bytes).map_err(CompressionError::Io)?;
+            let decoder = zstd::stream::Decoder::new(raw_bytes).map_err(CompressionError::Io)?;
             let mut uncompressed = Vec::new();
             decoder
+                .take(max_output_bytes.saturating_add(1))
                 .read_to_end(&mut uncompressed)
                 .map_err(CompressionError::Io)?;
+            if uncompressed.len() as u64 > max_output_bytes {
+                return Err(CompressionError::OutputLimitExceeded {
+                    limit: max_output_bytes,
+                    actual: uncompressed.len() as u64,
+                });
+            }
             Ok(uncompressed)
         }
 
         #[cfg(target_arch = "wasm32")]
         {
-            let mut decoder = StreamingDecoder::new(raw_bytes)
+            let decoder = StreamingDecoder::new(raw_bytes)
                 .map_err(|_| CompressionError::ZstdDecompress { code: 1 })?;
             let mut uncompressed = Vec::new();
             decoder
+                .take(max_output_bytes.saturating_add(1))
                 .read_to_end(&mut uncompressed)
                 .map_err(CompressionError::Io)?;
+            if uncompressed.len() as u64 > max_output_bytes {
+                return Err(CompressionError::OutputLimitExceeded {
+                    limit: max_output_bytes,
+                    actual: uncompressed.len() as u64,
+                });
+            }
             Ok(uncompressed)
         }
     }
@@ -114,14 +130,15 @@ mod tests {
         assert!(ZstdCodec::is_valid_magic(&compressed));
 
         let decompressed =
-            ZstdCodec::decompress(&compressed).expect("Decompression should succeed");
+            ZstdCodec::decompress_limited(&compressed, 1024).expect("Decompression should succeed");
         assert_eq!(sample_payload.as_slice(), decompressed.as_slice());
     }
 
     #[test]
     fn test_decompress_rejects_invalid_magic() {
         let invalid = b"plain text without zstd header";
-        let err = ZstdCodec::decompress(invalid).expect_err("Should reject invalid magic");
+        let err =
+            ZstdCodec::decompress_limited(invalid, 1024).expect_err("Should reject invalid magic");
         match err {
             CompressionError::InvalidMagic { .. } => {}
             _ => panic!("Expected InvalidMagic, got: {:?}", err),
@@ -131,7 +148,8 @@ mod tests {
     #[test]
     fn test_decompress_rejects_empty_payload() {
         let empty = b"";
-        let err = ZstdCodec::decompress(empty).expect_err("Should reject empty bytes");
+        let err =
+            ZstdCodec::decompress_limited(empty, 1024).expect_err("Should reject empty bytes");
         match err {
             CompressionError::EmptyBuffer => {}
             _ => panic!("Expected EmptyBuffer, got: {:?}", err),
@@ -142,10 +160,33 @@ mod tests {
     fn test_decompress_rejects_corrupted_data_with_magic() {
         let mut corrupted = ZSTD_MAGIC.to_vec();
         corrupted.extend_from_slice(b"corrupted-invalid-stream-payload");
-        let err = ZstdCodec::decompress(&corrupted).expect_err("Should reject corrupted data");
+        let err = ZstdCodec::decompress_limited(&corrupted, 1024)
+            .expect_err("Should reject corrupted data");
         assert!(matches!(
             err,
             CompressionError::ZstdDecompress { .. } | CompressionError::Io(_)
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_decompress_enforces_output_limit_at_the_boundary() {
+        let payload = vec![b'x'; 1025];
+        let compressed = ZstdCodec::compress(&payload, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+            .expect("Compression should succeed");
+
+        assert_eq!(
+            ZstdCodec::decompress_limited(&compressed, 1025)
+                .expect("exact output limit should succeed")
+                .len(),
+            1025
+        );
+        assert!(matches!(
+            ZstdCodec::decompress_limited(&compressed, 1024),
+            Err(CompressionError::OutputLimitExceeded {
+                limit: 1024,
+                actual: 1025
+            })
         ));
     }
 

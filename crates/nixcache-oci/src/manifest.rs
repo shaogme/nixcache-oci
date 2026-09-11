@@ -1,7 +1,8 @@
+use crate::{error::OciError, integrity::ContentDigest, limits::OciReadLimits};
 use chrono::Utc;
 use nixcache_core::SystemArch;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
@@ -113,6 +114,29 @@ pub struct OciDescriptor {
     pub annotations: Option<HashMap<String, String>>,
 }
 
+impl OciDescriptor {
+    pub fn validate_for(&self, target: &str, max_size: u64) -> Result<(), OciError> {
+        ContentDigest::parse(&self.digest).map_err(|_| OciError::InvalidDescriptor {
+            target: target.to_string(),
+            details: "descriptor digest is not a canonical SHA-256 digest".to_string(),
+        })?;
+        if self.size > max_size {
+            return Err(OciError::SizeLimitExceeded {
+                target: target.to_string(),
+                limit: max_size,
+                actual: self.size,
+            });
+        }
+        if self.media_type.trim().is_empty() {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "descriptor media type is empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// 强类型 OCI Image Index 规范结构体
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct OciImageIndex {
@@ -143,6 +167,67 @@ impl OciImageIndex {
     /// 序列化为 JSON 字符串
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    pub fn validate_for(&self, limits: &OciReadLimits, target: &str) -> Result<(), OciError> {
+        if self.schema_version != 2 {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "image index schemaVersion must be 2".to_string(),
+            });
+        }
+        if self.media_type != OCI_IMAGE_INDEX_MEDIA_TYPE {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "image index mediaType is not the OCI image index type".to_string(),
+            });
+        }
+        if self.manifests.len() as u64 > limits.max_image_index_descriptors() {
+            return Err(OciError::SizeLimitExceeded {
+                target: target.to_string(),
+                limit: limits.max_image_index_descriptors(),
+                actual: self.manifests.len() as u64,
+            });
+        }
+        let mut systems = HashSet::new();
+        for descriptor in &self.manifests {
+            descriptor.validate_for(target, limits.max_manifest_bytes())?;
+            if descriptor.media_type != OCI_IMAGE_MANIFEST_MEDIA_TYPE {
+                return Err(OciError::InvalidDescriptor {
+                    target: descriptor.digest.clone(),
+                    details: "image index child is not an OCI image manifest".to_string(),
+                });
+            }
+            let platform_system = descriptor.platform.as_ref().map(OciPlatform::to_system);
+            let annotation_system = descriptor
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("org.nixos.nixcache.system"))
+                .map(|system| SystemArch::from(system.as_str()));
+            if platform_system.is_some_and(|system| !system.is_known())
+                || annotation_system.is_some_and(|system| !system.is_known())
+                || matches!((platform_system, annotation_system), (Some(a), Some(b)) if a != b)
+            {
+                return Err(OciError::InvalidDescriptor {
+                    target: descriptor.digest.clone(),
+                    details: "descriptor platform is unknown or inconsistent".to_string(),
+                });
+            }
+            let system = platform_system
+                .or(annotation_system)
+                .filter(SystemArch::is_known)
+                .ok_or_else(|| OciError::InvalidDescriptor {
+                    target: descriptor.digest.clone(),
+                    details: "image index child has no known platform".to_string(),
+                })?;
+            if !systems.insert(system) {
+                return Err(OciError::InvalidDescriptor {
+                    target: descriptor.digest.clone(),
+                    details: "image index contains duplicate platforms".to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 在 Index 中匹配指定 SystemArch 的 Sub-Manifest 描述符
@@ -180,6 +265,81 @@ impl OciImageManifest {
     /// 序列化为 JSON 字符串
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    pub fn validate_for(&self, limits: &OciReadLimits, target: &str) -> Result<(), OciError> {
+        if self.schema_version != 2 {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "image manifest schemaVersion must be 2".to_string(),
+            });
+        }
+        if self.media_type != OCI_IMAGE_MANIFEST_MEDIA_TYPE {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "image manifest mediaType is not the OCI image manifest type".to_string(),
+            });
+        }
+        if self.layers.len() as u64 > limits.max_manifest_layers() {
+            return Err(OciError::SizeLimitExceeded {
+                target: target.to_string(),
+                limit: limits.max_manifest_layers(),
+                actual: self.layers.len() as u64,
+            });
+        }
+        self.config
+            .validate_for(target, limits.max_buffered_blob_bytes())?;
+        if self.config.media_type != OCI_IMAGE_CONFIG_MEDIA_TYPE {
+            return Err(OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "manifest config has an invalid media type".to_string(),
+            });
+        }
+        for layer in &self.layers {
+            layer.validate_for(target, limits.max_buffered_blob_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_schema_v6_root(
+        &self,
+        system: &SystemArch,
+        merkle_root: &str,
+        limits: &OciReadLimits,
+        target: &str,
+    ) -> Result<&OciDescriptor, OciError> {
+        self.validate_for(limits, target)?;
+        if self.layers.len() != 1 {
+            return Err(OciError::LayerDescriptorMissing);
+        }
+        let annotations = self
+            .annotations
+            .as_ref()
+            .ok_or_else(|| OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "Schema v6 root manifest annotations are missing".to_string(),
+            })?;
+        validate_v6_annotations(annotations, system, merkle_root, target)?;
+        let layer = &self.layers[0];
+        if layer.media_type != CacheLayerMediaTypeV6::ROOT_INDEX_V6_ZSTD {
+            return Err(OciError::UnsupportedMediaType(layer.media_type.clone()));
+        }
+        if layer.platform.as_ref().map(OciPlatform::to_system) != Some(*system) {
+            return Err(OciError::InvalidDescriptor {
+                target: layer.digest.clone(),
+                details: "root layer platform does not match requested system".to_string(),
+            });
+        }
+        let layer_annotations =
+            layer
+                .annotations
+                .as_ref()
+                .ok_or_else(|| OciError::InvalidDescriptor {
+                    target: layer.digest.clone(),
+                    details: "Schema v6 root layer annotations are missing".to_string(),
+                })?;
+        validate_v6_annotations(layer_annotations, system, merkle_root, &layer.digest)?;
+        Ok(layer)
     }
 
     /// 提取第一层 Layer 的 Digest
@@ -243,6 +403,46 @@ impl OciArtifactManifest {
             Self::Manifest(m) => Some(m),
         }
     }
+
+    pub fn validate_for(&self, limits: &OciReadLimits, target: &str) -> Result<(), OciError> {
+        match self {
+            Self::Index(index) => index.validate_for(limits, target),
+            Self::Manifest(manifest) => manifest.validate_for(limits, target),
+        }
+    }
+}
+
+fn validate_v6_annotations(
+    annotations: &HashMap<String, String>,
+    system: &SystemArch,
+    merkle_root: &str,
+    target: &str,
+) -> Result<(), OciError> {
+    let annotation_system = annotations
+        .get("org.nixos.nixcache.system")
+        .map(String::as_str)
+        .map(SystemArch::from)
+        .filter(SystemArch::is_known);
+    if annotation_system != Some(*system)
+        || annotations
+            .get("org.nixos.nixcache.schema")
+            .map(String::as_str)
+            != Some("6")
+        || annotations
+            .get("org.nixos.nixcache.merkle_root")
+            .map(String::as_str)
+            != Some(merkle_root)
+    {
+        return Err(OciError::InvalidDescriptor {
+            target: target.to_string(),
+            details: "Schema v6 annotations are missing or inconsistent".to_string(),
+        });
+    }
+    ContentDigest::parse(merkle_root).map_err(|_| OciError::InvalidDescriptor {
+        target: target.to_string(),
+        details: "Schema v6 merkle_root is not a canonical SHA-256 digest".to_string(),
+    })?;
+    Ok(())
 }
 
 /// 单架构 Schema v6 Baseline Root Index Image Manifest 构建参数

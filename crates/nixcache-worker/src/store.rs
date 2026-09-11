@@ -4,7 +4,7 @@ use crate::{
     transport::WorkerFetchTransport,
 };
 use nixcache_core::{
-    NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    NarDigest, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
     build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors, extract_nar_basename,
     extract_store_hash,
 };
@@ -100,6 +100,29 @@ impl CacheStore {
         &self.oci_client
     }
 
+    fn validate_root(&self, root: &ShardedArchCacheIndexData) -> Result<(), WorkerStoreError> {
+        root.validate_for(
+            &self.config.target_system,
+            &self.config.repo,
+            &self.config.registry,
+            self.oci_client.limits(),
+        )?;
+        Ok(())
+    }
+
+    fn validate_shard(
+        &self,
+        shard: &ShardDataPayload,
+        shard_id: u16,
+    ) -> Result<(), WorkerStoreError> {
+        shard.validate_for(
+            shard_id,
+            &self.config.target_system,
+            self.oci_client.limits(),
+        )?;
+        Ok(())
+    }
+
     /// 设置全局远端 GHCR 连通状态
     pub fn set_remote_status(&self, connected: bool, error: Option<String>) {
         WorkerState::global().set_remote_status(connected, error);
@@ -124,9 +147,7 @@ impl CacheStore {
             && !shard_desc.is_empty()
             && !shard_desc.blob_digest.is_empty()
         {
-            let (shard_payload, _) = self
-                .get_shard_data(env, shard_id, &shard_desc.blob_digest)
-                .await?;
+            let (shard_payload, _) = self.get_shard_data(env, shard_desc).await?;
             if let Some(entry) = shard_payload.entries.get(&parsed_hash) {
                 return Ok(Some(NarInfoLookupResult {
                     narinfo_content: entry.to_narinfo_string(),
@@ -167,9 +188,7 @@ impl CacheStore {
                     && !new_shard_desc.is_empty()
                     && !new_shard_desc.blob_digest.is_empty()
                 {
-                    let (refreshed_shard, _) = self
-                        .get_shard_data(env, shard_id, &new_shard_desc.blob_digest)
-                        .await?;
+                    let (refreshed_shard, _) = self.get_shard_data(env, new_shard_desc).await?;
                     if let Some(entry) = refreshed_shard.entries.get(&parsed_hash) {
                         return Ok(Some(NarInfoLookupResult {
                             narinfo_content: entry.to_narinfo_string(),
@@ -204,9 +223,7 @@ impl CacheStore {
                 && !shard_desc.is_empty()
                 && !shard_desc.blob_digest.is_empty()
             {
-                let (_, nar_lookup) = self
-                    .get_shard_data(env, shard_id, &shard_desc.blob_digest)
-                    .await?;
+                let (_, nar_lookup) = self.get_shard_data(env, shard_desc).await?;
                 if let Some(digest) = nar_lookup.get(normalized) {
                     return Ok(Some(digest.clone()));
                 }
@@ -249,9 +266,10 @@ impl CacheStore {
     pub async fn get_shard_data(
         &self,
         env: &Env,
-        shard_id: u16,
-        blob_digest: &str,
+        shard_desc: &ShardDescriptor,
     ) -> Result<(ShardDataPayload, HashMap<String, NarDigest>), WorkerStoreError> {
+        let shard_id = shard_desc.shard_id;
+        let blob_digest = shard_desc.blob_digest.as_str();
         if blob_digest.is_empty() {
             return Err(WorkerStoreError::Core(
                 "Empty blob digest for shard".to_string(),
@@ -280,22 +298,29 @@ impl CacheStore {
                 .await
         {
             let payload = wrapper.data;
-            let nar_lookup = build_nar_lookup_map(&payload.entries);
+            if self.validate_shard(&payload, shard_id).is_ok() {
+                let nar_lookup = build_nar_lookup_map(&payload.entries);
 
-            let _ = WorkerState::global().mem_shard_cache.upsert_sync(
-                shard_id,
-                Arc::new(CachedShardEntry {
-                    payload: payload.clone(),
-                    nar_lookup: nar_lookup.clone(),
-                    blob_digest: blob_digest.to_string(),
-                    expires_at: now + L1_MEM_TTL_MS,
-                }),
-            );
-            return Ok((payload, nar_lookup));
+                let _ = WorkerState::global().mem_shard_cache.upsert_sync(
+                    shard_id,
+                    Arc::new(CachedShardEntry {
+                        payload: payload.clone(),
+                        nar_lookup: nar_lookup.clone(),
+                        blob_digest: blob_digest.to_string(),
+                        expires_at: now + L1_MEM_TTL_MS,
+                    }),
+                );
+                return Ok((payload, nar_lookup));
+            }
         }
 
         // 3. L3 OCI GHCR
-        match self.oci_client.indexes().get_shard_data(blob_digest).await {
+        match self
+            .oci_client
+            .indexes()
+            .get_shard_data(shard_desc, &self.config.target_system)
+            .await
+        {
             Ok(payload) => {
                 self.set_remote_status(true, None);
                 let nar_lookup = build_nar_lookup_map(&payload.entries);
@@ -337,8 +362,10 @@ impl CacheStore {
                         .await
                 {
                     let payload = wrapper.data;
-                    let nar_lookup = build_nar_lookup_map(&payload.entries);
-                    return Ok((payload, nar_lookup));
+                    if self.validate_shard(&payload, shard_id).is_ok() {
+                        let nar_lookup = build_nar_lookup_map(&payload.entries);
+                        return Ok((payload, nar_lookup));
+                    }
                 }
                 Err(e.into())
             }
@@ -372,19 +399,21 @@ impl CacheStore {
             .get(&baseline_key)
             .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
             .await
-            && now - wrapper.last_refresh < self.baseline_ttl_ms
         {
             let root_data = wrapper.data;
             let manifest_digest = wrapper.manifest_digest;
-
-            WorkerState::global()
-                .mem_baseline_cache
-                .store(Some(Arc::new(CachedBaselineEntry {
-                    root: root_data.clone(),
-                    manifest_digest: manifest_digest.clone(),
-                    expires_at: now + L1_MEM_TTL_MS,
-                })));
-            return Ok((root_data, manifest_digest));
+            if now - wrapper.last_refresh < self.baseline_ttl_ms
+                && self.validate_root(&root_data).is_ok()
+            {
+                WorkerState::global()
+                    .mem_baseline_cache
+                    .store(Some(Arc::new(CachedBaselineEntry {
+                        root: root_data.clone(),
+                        manifest_digest: manifest_digest.clone(),
+                        expires_at: now + L1_MEM_TTL_MS,
+                    })));
+                return Ok((root_data, manifest_digest));
+            }
         }
 
         // 3. L3 OCI GHCR
@@ -395,6 +424,7 @@ impl CacheStore {
                     .get(&baseline_key)
                     .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                     .await
+                    && self.validate_root(&wrapper.data).is_ok()
                 {
                     return Ok((wrapper.data, wrapper.manifest_digest));
                 }
@@ -437,6 +467,7 @@ impl CacheStore {
                 return Err(e.into());
             }
         };
+        self.validate_root(&root_data)?;
 
         // 比对新旧基线 Merkle Root 与 Shards 描述符，淘汰已失效分片
         if let Some(old_b) = old_cached
@@ -496,7 +527,11 @@ impl CacheStore {
                 .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
                 .await
             {
-                wrapper.data.shards
+                if self.validate_root(&wrapper.data).is_ok() {
+                    wrapper.data.shards
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }
@@ -529,9 +564,8 @@ impl CacheStore {
                 && !shard_desc.is_empty()
                 && !shard_desc.blob_digest.is_empty()
             {
-                let digest = shard_desc.blob_digest.clone();
-                warm_up_futures
-                    .push(async move { self.get_shard_data(env, shard_id, &digest).await });
+                let descriptor = shard_desc.clone();
+                warm_up_futures.push(async move { self.get_shard_data(env, &descriptor).await });
             }
         }
 
@@ -572,8 +606,11 @@ impl CacheStore {
                     Err(_) => None,
                 };
                 match kv_data {
-                    Some(w) => (w.data.total_entries(), w.manifest_digest, w.data.generated),
+                    Some(w) if self.validate_root(&w.data).is_ok() => {
+                        (w.data.total_entries(), w.manifest_digest, w.data.generated)
+                    }
                     None => (0, String::new(), String::new()),
+                    Some(_) => (0, String::new(), String::new()),
                 }
             }
         };

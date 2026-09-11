@@ -32,6 +32,13 @@ pub enum TransportError {
 
     #[error("Header decode or parse error for '{header}'")]
     HeaderParse { header: &'static str },
+
+    #[error("Response body from '{url}' exceeds limit {limit} bytes (observed {actual})")]
+    ResponseTooLarge {
+        url: String,
+        limit: u64,
+        actual: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -54,6 +61,37 @@ pub enum TokenError {
 
 #[derive(Error, Debug)]
 pub enum OciError {
+    #[error("Digest mismatch for '{target}': expected {expected}, got {actual}")]
+    DigestMismatch {
+        target: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Response digest header mismatch for '{target}': header {header}, expected {expected}")]
+    HeaderDigestMismatch {
+        target: String,
+        header: String,
+        expected: String,
+    },
+
+    #[error("Invalid descriptor for '{target}': {details}")]
+    InvalidDescriptor { target: String, details: String },
+
+    #[error("Size mismatch for '{target}': expected {expected}, got {actual}")]
+    SizeMismatch {
+        target: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error("Size limit exceeded for '{target}': limit {limit}, observed {actual}")]
+    SizeLimitExceeded {
+        target: String,
+        limit: u64,
+        actual: u64,
+    },
+
     #[error("Invalid OCI authentication challenge: {details}")]
     AuthChallengeInvalid { details: String },
 
@@ -162,7 +200,7 @@ pub enum OciError {
     Token(#[from] TokenError),
 
     #[error(transparent)]
-    Transport(#[from] TransportError),
+    Transport(TransportError),
 
     #[error(transparent)]
     Compression(#[from] CompressionError),
@@ -175,6 +213,19 @@ pub enum OciError {
 
     #[error(transparent)]
     Io(#[from] IoError),
+}
+
+impl From<TransportError> for OciError {
+    fn from(error: TransportError) -> Self {
+        match error {
+            TransportError::ResponseTooLarge { url, limit, actual } => Self::SizeLimitExceeded {
+                target: url,
+                limit,
+                actual,
+            },
+            other => Self::Transport(other),
+        }
+    }
 }
 
 impl From<nixcache_core::TypeError> for OciError {

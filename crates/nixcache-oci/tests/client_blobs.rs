@@ -2,9 +2,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use nixcache_oci::{
-    DockerHubDriver, GenericOciDriver, GhcrDriver, HashingStream, MockPatchOutcome,
-    MockPatchRequest, MockResponse, MockRouterTransport, OciClient, OciError, StreamHashState,
-    TransportError, UploadConfig, parse_range_header,
+    ContentDigest, DockerHubDriver, GenericOciDriver, GhcrDriver, HashingStream, MockPatchOutcome,
+    MockPatchRequest, MockResponse, MockRouterTransport, OciClient, OciError, OciReadLimits,
+    StreamHashState, TransportError, UploadConfig, parse_range_header,
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -26,6 +26,7 @@ async fn monolithic_post_upload_is_available() {
         true,
         DockerHubDriver,
         MockRouterTransport::default(),
+        Default::default(),
     );
     let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     assert_eq!(
@@ -57,6 +58,7 @@ async fn ghcr_resumable_upload_uses_fixed_two_step_strategy() {
         true,
         GhcrDriver,
         transport,
+        Default::default(),
     );
     let data = Bytes::from_static(b"streamed nar xz chunk data for test");
     let stream = Box::pin(futures_util::stream::iter(vec![
@@ -105,6 +107,7 @@ fn chunked_client(transport: MockRouterTransport) -> OciClient<MockRouterTranspo
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     )
 }
 
@@ -132,6 +135,92 @@ fn range_response(status: StatusCode, range: &str) -> MockResponse {
         headers,
         body: Bytes::new(),
     }
+}
+
+#[tokio::test]
+async fn buffered_and_streamed_blob_reads_reject_digest_tampering() {
+    let body = Bytes::from_static(b"integrity body");
+    let body_digest = ContentDigest::from_bytes(&body).to_string();
+    let wrong_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Docker-Content-Digest",
+        HeaderValue::from_static(wrong_digest),
+    );
+    let transport = MockRouterTransport::default();
+    transport.add_route(
+        "GET",
+        &format!("/blobs/{body_digest}"),
+        MockResponse {
+            status: StatusCode::OK,
+            headers,
+            body: body.clone(),
+        },
+    );
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        transport,
+        Default::default(),
+    );
+    assert!(matches!(
+        client.blobs().get(&body_digest).await,
+        Err(OciError::HeaderDigestMismatch { .. })
+    ));
+
+    let stream_transport = MockRouterTransport::default();
+    stream_transport.add_route(
+        "GET",
+        &format!("/blobs/{wrong_digest}"),
+        MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body,
+        },
+    );
+    let stream_client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        stream_transport,
+        Default::default(),
+    );
+    let blob_stream = stream_client.blobs().stream(wrong_digest).await.unwrap();
+    let mut body_stream = blob_stream.stream;
+    assert!(body_stream.next().await.unwrap().is_ok());
+    assert!(matches!(
+        body_stream.next().await,
+        Some(Err(OciError::DigestMismatch { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn buffered_blob_reads_use_configured_limits() {
+    let limits = OciReadLimits::default()
+        .with_max_buffered_blob_bytes(3)
+        .unwrap();
+    let transport = MockRouterTransport::default();
+    transport.add_route(
+        "GET",
+        "/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"four"),
+        },
+    );
+    let client =
+        OciClient::with_transport("example.com", "test/repo", "", false, transport, limits);
+    assert!(matches!(
+        client
+            .blobs()
+            .get("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+            .await,
+        Err(OciError::SizeLimitExceeded { limit: 3, .. })
+    ));
 }
 
 fn stream_for(

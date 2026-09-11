@@ -31,7 +31,14 @@ async fn get_and_put_manifest_use_manifest_client() {
             body: Bytes::new(),
         },
     );
-    let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        true,
+        transport,
+        Default::default(),
+    );
     assert_eq!(
         client.manifests().get("cache-index").await.unwrap(),
         Some(manifest_content.to_string())
@@ -83,7 +90,14 @@ async fn put_manifest_ensures_empty_config_blob() {
             body: Bytes::new(),
         },
     );
-    let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        true,
+        transport,
+        Default::default(),
+    );
     assert!(
         client
             .manifests()
@@ -112,6 +126,7 @@ async fn manifest_cas_sets_the_expected_condition_header() {
         true,
         DockerHubDriver,
         transport,
+        Default::default(),
     );
     let error = client
         .manifests()
@@ -143,6 +158,7 @@ async fn create_only_manifest_cas_uses_if_none_match() {
         true,
         DockerHubDriver,
         MockRouterTransport::default(),
+        Default::default(),
     );
     client
         .manifests()
@@ -169,6 +185,7 @@ async fn stale_manifest_cas_writer_cannot_overwrite() {
         true,
         DockerHubDriver,
         MockRouterTransport::default(),
+        Default::default(),
     );
     client
         .manifests()
@@ -236,7 +253,14 @@ async fn get_manifest_with_digest_rejects_invalid_utf8() {
             body: Bytes::from_static(&[0xff, 0xfe, 0xfd]),
         },
     );
-    let client = OciClient::with_transport("example.com", "test/repo", "", false, transport);
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        transport,
+        Default::default(),
+    );
     assert!(
         client
             .manifests()

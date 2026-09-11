@@ -6,15 +6,17 @@ use crate::{
     codec::IndexCodec,
     error::{OciError, TransportError},
     manifest::{
-        CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
-        OCI_IMAGE_INDEX_MEDIA_TYPE, OciArtifactManifest, OciImageIndex, OciImageManifest,
+        CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest,
         ShardedArchIndexManifestParams, build_sharded_arch_index_manifest,
     },
     transport::OciTransport,
 };
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
-use nixcache_core::{ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
+use nixcache_core::{
+    NUM_SHARDS, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SystemArch,
+};
 use tracing::info;
 
 /// Image Index 和分片索引领域客户端。
@@ -32,7 +34,11 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         tag: &str,
     ) -> Result<Option<(OciImageManifest, String)>, OciError> {
         match self.client.manifests().get_with_digest(tag).await? {
-            Some((json, digest)) => Ok(Some((serde_json::from_str(&json)?, digest))),
+            Some((json, digest)) => {
+                let manifest = serde_json::from_str::<OciImageManifest>(&json)?;
+                manifest.validate_for(self.client.limits(), tag)?;
+                Ok(Some((manifest, digest)))
+            }
             None => Ok(None),
         }
     }
@@ -42,7 +48,11 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         tag: &str,
     ) -> Result<Option<(OciImageIndex, String)>, OciError> {
         match self.client.manifests().get_with_digest(tag).await? {
-            Some((json, digest)) => Ok(Some((serde_json::from_str(&json)?, digest))),
+            Some((json, digest)) => {
+                let index = serde_json::from_str::<OciImageIndex>(&json)?;
+                index.validate_for(self.client.limits(), tag)?;
+                Ok(Some((index, digest)))
+            }
             None => Ok(None),
         }
     }
@@ -58,18 +68,10 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
             format!("{}-{}", tag, system.as_str())
         };
 
-        if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await?
-            && let Some(layer) = sub_manifest
-                .layers
-                .iter()
-                .find(|layer| {
-                    CacheLayerMediaType::parse(&layer.media_type)
-                        .is_some_and(|media_type| media_type.is_root_index())
-                })
-                .or_else(|| sub_manifest.layers.first())
-        {
-            let blob_bytes = self.client.blobs().get(&layer.digest).await?;
-            let root_data = IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+        if let Some((sub_manifest, sub_digest)) = self.get_image_manifest(&arch_tag).await? {
+            let root_data = self
+                .decode_root_manifest(&sub_manifest, system, &arch_tag)
+                .await?;
             return Ok(Some((root_data, sub_digest)));
         }
 
@@ -83,45 +85,94 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
                     Some(descriptor) => descriptor,
                     None => return Ok(None),
                 };
+                let descriptor_system = descriptor
+                    .platform
+                    .as_ref()
+                    .map(|platform| platform.to_system())
+                    .or_else(|| {
+                        descriptor
+                            .annotations
+                            .as_ref()
+                            .and_then(|annotations| annotations.get("org.nixos.nixcache.system"))
+                            .map(|system| SystemArch::from(system.as_str()))
+                    });
+                if descriptor_system != Some(*system) {
+                    return Err(OciError::InvalidDescriptor {
+                        target: descriptor.digest.clone(),
+                        details: "image index descriptor platform does not match the request"
+                            .to_string(),
+                    });
+                }
                 let (manifest_json, _) = self
                     .client
                     .manifests()
-                    .get_with_digest(&descriptor.digest)
+                    .get_with_digest_and_size(&descriptor.digest, descriptor.size)
                     .await?
                     .ok_or_else(|| OciError::SubManifestMissing {
                         digest: descriptor.digest.clone(),
                     })?;
                 let sub_manifest: OciImageManifest = serde_json::from_str(&manifest_json)?;
-                let layer = sub_manifest
-                    .layers
-                    .iter()
-                    .find(|layer| {
-                        CacheLayerMediaType::parse(&layer.media_type)
-                            .is_some_and(|media_type| media_type.is_root_index())
-                    })
-                    .or_else(|| sub_manifest.layers.first())
-                    .ok_or(OciError::LayerDescriptorMissing)?;
-                let blob_bytes = self.client.blobs().get(&layer.digest).await?;
-                let root_data = IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                sub_manifest.validate_for(self.client.limits(), &descriptor.digest)?;
+                let root_data = self
+                    .decode_root_manifest(&sub_manifest, system, &descriptor.digest)
+                    .await?;
                 Ok(Some((root_data, artifact.digest)))
             }
             OciArtifactManifest::Manifest(manifest) => {
-                let Some(layer) = manifest
-                    .layers
-                    .iter()
-                    .find(|layer| {
-                        CacheLayerMediaType::parse(&layer.media_type)
-                            .is_some_and(|media_type| media_type.is_root_index())
-                    })
-                    .or_else(|| manifest.layers.first())
-                else {
-                    return Ok(None);
-                };
-                let blob_bytes = self.client.blobs().get(&layer.digest).await?;
-                let root_data = IndexCodec::decode_zstd(&blob_bytes, &layer.media_type)?;
+                let root_data = self.decode_root_manifest(&manifest, system, tag).await?;
                 Ok(Some((root_data, artifact.digest)))
             }
         }
+    }
+
+    async fn decode_root_manifest(
+        &self,
+        manifest: &OciImageManifest,
+        system: &SystemArch,
+        target: &str,
+    ) -> Result<ShardedArchCacheIndexData, OciError> {
+        let merkle_root = manifest
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("org.nixos.nixcache.merkle_root"))
+            .ok_or_else(|| OciError::InvalidDescriptor {
+                target: target.to_string(),
+                details: "Schema v6 root manifest merkle_root annotation is missing".to_string(),
+            })?;
+        let layer =
+            manifest.validate_schema_v6_root(system, merkle_root, self.client.limits(), target)?;
+        let blob_bytes = self.client.blobs().get_descriptor(layer).await?;
+        let decoded = IndexCodec::decode_zstd(
+            &blob_bytes,
+            &layer.media_type,
+            self.client.limits().max_index_uncompressed_bytes(),
+        )?;
+        let root_data: ShardedArchCacheIndexData = decoded.value;
+        root_data.validate_for(
+            system,
+            self.client.repo(),
+            self.client.registry(),
+            self.client.limits(),
+        )?;
+        for shard in &root_data.shards {
+            if !shard.is_empty()
+                && shard.compressed_size > self.client.limits().max_buffered_blob_bytes()
+            {
+                return Err(OciError::SizeLimitExceeded {
+                    target: shard.blob_digest.clone(),
+                    limit: self.client.limits().max_buffered_blob_bytes(),
+                    actual: shard.compressed_size,
+                });
+            }
+        }
+        if root_data.merkle_root != *merkle_root {
+            return Err(OciError::DigestMismatch {
+                target: target.to_string(),
+                expected: merkle_root.clone(),
+                actual: root_data.merkle_root,
+            });
+        }
+        Ok(root_data)
     }
 
     pub async fn push_sharded_root(
@@ -174,9 +225,57 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         Ok(endpoint::compute_sha256_digest(manifest_json.as_bytes()))
     }
 
-    pub async fn get_shard_data(&self, blob_digest: &str) -> Result<ShardDataPayload, OciError> {
-        let blob_bytes = self.client.blobs().get(blob_digest).await?;
-        IndexCodec::decode_zstd(&blob_bytes, CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD)
+    pub async fn get_shard_data(
+        &self,
+        descriptor: &ShardDescriptor,
+        system: &SystemArch,
+    ) -> Result<ShardDataPayload, OciError> {
+        if descriptor.entry_count == 0 {
+            if descriptor.shard_id >= NUM_SHARDS as u16
+                || !descriptor.blob_digest.is_empty()
+                || descriptor.compressed_size != 0
+                || descriptor.uncompressed_size != 0
+                || descriptor.merkle_hash
+                    != ShardDataPayload::new(descriptor.shard_id).compute_merkle_hash()
+            {
+                return Err(OciError::InvalidDescriptor {
+                    target: descriptor.shard_id.to_string(),
+                    details: "empty shard descriptor has non-empty metadata".to_string(),
+                });
+            }
+            return Ok(ShardDataPayload::new(descriptor.shard_id));
+        }
+        let blob_descriptor = OciDescriptor {
+            media_type: CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD.to_string(),
+            digest: descriptor.blob_digest.clone(),
+            size: descriptor.compressed_size,
+            platform: None,
+            annotations: None,
+        };
+        let blob_bytes = self.client.blobs().get_descriptor(&blob_descriptor).await?;
+        let decoded = IndexCodec::decode_zstd(
+            &blob_bytes,
+            CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD,
+            self.client.limits().max_index_uncompressed_bytes(),
+        )?;
+        if decoded.uncompressed_size != descriptor.uncompressed_size {
+            return Err(OciError::SizeMismatch {
+                target: descriptor.blob_digest.clone(),
+                expected: descriptor.uncompressed_size,
+                actual: decoded.uncompressed_size,
+            });
+        }
+        let payload: ShardDataPayload = decoded.value;
+        payload.validate_for(descriptor.shard_id, system, self.client.limits())?;
+        if payload.len() != descriptor.entry_count {
+            return Err(OciError::SizeMismatch {
+                target: descriptor.blob_digest.clone(),
+                expected: descriptor.entry_count as u64,
+                actual: payload.len() as u64,
+            });
+        }
+        payload.validate_merkle_hash(&descriptor.merkle_hash)?;
+        Ok(payload)
     }
 
     pub async fn push_shard_data(

@@ -15,6 +15,9 @@ pub enum CompressionError {
     #[error("Empty buffer supplied for decompression")]
     EmptyBuffer,
 
+    #[error("Zstd decompressed output exceeds limit {limit} bytes (observed {actual})")]
+    OutputLimitExceeded { limit: u64, actual: u64 },
+
     #[error("I/O error during compression streaming: {0}")]
     Io(#[from] io::Error),
 }

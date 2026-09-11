@@ -1,7 +1,9 @@
 use super::{OciClient, endpoint};
 use crate::{
     error::OciError,
-    transport::{OciBlobStream, OciTransport},
+    integrity::{ContentDigest, verify_buffered_body},
+    manifest::OciDescriptor,
+    transport::{OciBlobStream, OciTransport, VerifiedBlobStream, parse_content_length},
 };
 use bytes::Bytes;
 
@@ -37,18 +39,56 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
     }
 
     pub async fn get(&self, digest: &str) -> Result<Bytes, OciError> {
+        self.get_verified(digest, None).await
+    }
+
+    /// 按完整 OCI descriptor 读取 blob；descriptor 的 size 是完整性上下文的一部分。
+    pub async fn get_descriptor(&self, descriptor: &OciDescriptor) -> Result<Bytes, OciError> {
+        descriptor.validate_for(
+            "blob descriptor",
+            self.client.limits().max_buffered_blob_bytes(),
+        )?;
+        self.get_verified(&descriptor.digest, Some(descriptor.size))
+            .await
+    }
+
+    pub async fn get_with_descriptor(&self, descriptor: &OciDescriptor) -> Result<Bytes, OciError> {
+        self.get_descriptor(descriptor).await
+    }
+
+    async fn get_verified(
+        &self,
+        digest: &str,
+        expected_size: Option<u64>,
+    ) -> Result<Bytes, OciError> {
+        let _permit = self.client.acquire_index_read().await;
+        ContentDigest::parse(digest)?;
         let url = endpoint::blob_url(
             self.client.url_scheme(),
             self.client.registry(),
             self.client.repo(),
             digest,
         );
-        let (status, _, bytes) = self
+        let (status, response_headers, bytes) = self
             .client
-            .request_get_with_auth_retry(&url, "get blob")
+            .request_get_with_auth_retry(
+                &url,
+                "get blob",
+                self.client.limits().max_buffered_blob_bytes(),
+            )
             .await?;
 
         if status.is_success() {
+            let content_length =
+                parse_content_length(&response_headers).map_err(OciError::Transport)?;
+            verify_buffered_body(
+                &url,
+                Some(digest),
+                response_headers.get("Docker-Content-Digest"),
+                expected_size,
+                content_length,
+                &bytes,
+            )?;
             Ok(bytes)
         } else if status == http::StatusCode::NOT_FOUND {
             Err(OciError::BlobNotFound {
@@ -59,7 +99,11 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         }
     }
 
-    pub async fn stream(&self, digest: &str) -> Result<OciBlobStream<T::BodyStream>, OciError> {
+    pub async fn stream(
+        &self,
+        digest: &str,
+    ) -> Result<OciBlobStream<VerifiedBlobStream<T::BodyStream>>, OciError> {
+        ContentDigest::parse(digest)?;
         let url = endpoint::blob_url(
             self.client.url_scheme(),
             self.client.registry(),
@@ -68,11 +112,22 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         );
         let (status, headers, stream) = self
             .client
-            .request_stream_with_auth_retry(&url, "stream blob")
+            .request_stream_with_auth_retry(
+                &url,
+                "stream blob",
+                self.client.limits().max_streamed_blob_bytes(),
+            )
             .await?;
 
         if status.is_success() {
-            Ok(OciBlobStream::new(status, headers, stream))
+            let verified = VerifiedBlobStream::new(
+                stream,
+                &url,
+                digest,
+                &headers,
+                self.client.limits().max_streamed_blob_bytes(),
+            )?;
+            Ok(OciBlobStream::new(status, headers, verified))
         } else if status == http::StatusCode::NOT_FOUND {
             Err(OciError::BlobNotFound {
                 digest: digest.to_string(),

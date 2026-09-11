@@ -66,6 +66,7 @@ async fn token_exchange_failure_is_visible() {
         "fallback-token",
         true,
         transport,
+        Default::default(),
     );
     let challenge = BearerChallenge::new(
         "https://auth.example.test/token",

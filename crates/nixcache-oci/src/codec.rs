@@ -7,6 +7,12 @@ use serde::{Serialize, de::DeserializeOwned};
 /// 强类型索引与清单编解码器 (Schema v6)
 pub struct IndexCodec;
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct DecodedIndex<T> {
+    pub value: T,
+    pub uncompressed_size: u64,
+}
+
 impl IndexCodec {
     /// 紧凑序列化并使用 Zstd 压缩为二进制 Blob
     pub fn encode_zstd<T: Serialize>(data: &T, level: i32) -> Result<Bytes, OciError> {
@@ -22,15 +28,20 @@ impl IndexCodec {
     pub fn decode_zstd<T: DeserializeOwned>(
         raw_bytes: &[u8],
         media_type_str: &str,
-    ) -> Result<T, OciError> {
+        max_uncompressed_bytes: u64,
+    ) -> Result<DecodedIndex<T>, OciError> {
         // 1. 严格校验媒体类型
         let _media_type = CacheLayerMediaType::parse(media_type_str)
             .ok_or_else(|| OciError::UnsupportedMediaType(media_type_str.to_string()))?;
 
         // 2. 统一底层跨平台解压并反序列化
-        let uncompressed = ZstdCodec::decompress(raw_bytes)?;
+        let uncompressed = ZstdCodec::decompress_limited(raw_bytes, max_uncompressed_bytes)?;
+        let uncompressed_size = uncompressed.len() as u64;
         let parsed: T = serde_json::from_slice(&uncompressed)?;
-        Ok(parsed)
+        Ok(DecodedIndex {
+            value: parsed,
+            uncompressed_size,
+        })
     }
 
     /// 探测并校验 Zstd Magic Number
@@ -84,10 +95,10 @@ mod tests {
         let encoded = IndexCodec::encode_zstd(&original, 3).expect("Encoding should succeed");
         assert!(IndexCodec::is_valid_zstd_magic(&encoded));
 
-        let decoded: SampleData =
-            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V6_ZSTD)
+        let decoded =
+            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V6_ZSTD, 1024)
                 .expect("Decoding should succeed");
-        assert_eq!(original, decoded);
+        assert_eq!(original, decoded.value);
     }
 
     #[test]
@@ -100,7 +111,7 @@ mod tests {
         let encoded = IndexCodec::encode_zstd(&original, 3).unwrap();
 
         let legacy_media_type = "application/vnd.nix.cache.index.v3+zstd";
-        let err = IndexCodec::decode_zstd::<SampleData>(&encoded, legacy_media_type)
+        let err = IndexCodec::decode_zstd::<SampleData>(&encoded, legacy_media_type, 1024)
             .expect_err("Should reject legacy media type");
 
         match err {
@@ -117,6 +128,7 @@ mod tests {
         let err = IndexCodec::decode_zstd::<SampleData>(
             plain_json,
             CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+            1024,
         )
         .expect_err("Should reject non-zstd plain JSON payload");
 
@@ -129,9 +141,12 @@ mod tests {
     #[test]
     fn test_decode_rejects_short_or_empty_bytes() {
         let empty = b"";
-        let err =
-            IndexCodec::decode_zstd::<SampleData>(empty, CacheLayerMediaType::SHARD_DATA_V6_ZSTD)
-                .expect_err("Should reject empty bytes");
+        let err = IndexCodec::decode_zstd::<SampleData>(
+            empty,
+            CacheLayerMediaType::SHARD_DATA_V6_ZSTD,
+            1024,
+        )
+        .expect_err("Should reject empty bytes");
 
         match err {
             OciError::Compression(CompressionError::EmptyBuffer) => {}
@@ -147,6 +162,7 @@ mod tests {
         let err = IndexCodec::decode_zstd::<SampleData>(
             &corrupt,
             CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+            1024,
         )
         .expect_err("Should reject corrupted payload");
 

@@ -31,13 +31,13 @@ fn compute_sha256(bytes: &[u8]) -> String {
 fn sample_sharded_arch_index_data(
     system: SystemArch,
 ) -> (ShardedArchCacheIndexData, ShardDataPayload) {
-    let mut shard_payload = ShardDataPayload::new(42);
     let hash_str = if system == SystemArch::X86_64Linux {
         "s66mzxpvicwk07gjbjfw9izjfa797vsw"
     } else {
         "s66mzxpvicwk07gjbjfw9izjfa797vsa"
     };
     let hash = StoreHash::parse(hash_str).unwrap();
+    let mut shard_payload = ShardDataPayload::new(hash.shard_id());
     shard_payload.entries.insert(
         hash.clone(),
         IndexEntry {
@@ -119,15 +119,17 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     let host = server.address().to_string();
 
     let (mut arch_data, shard_payload) = sample_sharded_arch_index_data(SystemArch::X86_64Linux);
+    arch_data.registry = host.clone();
 
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = compute_sha256(&shard_bytes);
 
-    arch_data.shards[42] = nixcache_core::ShardDescriptor::new(
-        42,
+    let shard_id = shard_payload.shard_id;
+    arch_data.shards[shard_id as usize] = nixcache_core::ShardDescriptor::new(
+        shard_id,
         &shard_digest,
         shard_bytes.len() as u64,
-        1500,
+        serde_json::to_vec(&shard_payload).unwrap().len() as u64,
         shard_payload.len(),
         shard_payload.compute_merkle_hash(),
     );
@@ -174,7 +176,10 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(&manifest_json)
-                .insert_header("Docker-Content-Digest", "sha256:submanifestdigest"),
+                .insert_header(
+                    "Docker-Content-Digest",
+                    compute_sha256(manifest_json.as_bytes()),
+                ),
         )
         .mount(&server)
         .await;
@@ -189,7 +194,8 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client =
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
 
     // Push blob
     let (pushed_digest, comp_size, uncomp_size) =
@@ -207,12 +213,15 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     assert!(fetched.is_some());
 
     let (fetched_data, digest) = fetched.unwrap();
-    assert_eq!(digest, "sha256:submanifestdigest");
+    assert_eq!(digest, compute_sha256(manifest_json.as_bytes()));
     assert_eq!(fetched_data.system, SystemArch::X86_64Linux);
     assert_eq!(fetched_data.public_key, arch_data.public_key);
     assert_eq!(fetched_data.shards.len(), NUM_SHARDS);
     assert_eq!(fetched_data.total_entries(), 1);
-    assert_eq!(fetched_data.shards[42].blob_digest, shard_digest);
+    assert_eq!(
+        fetched_data.shards[shard_id as usize].blob_digest,
+        shard_digest
+    );
 }
 
 #[tokio::test]
@@ -221,14 +230,16 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let host = server.address().to_string();
 
     let (mut data_x86, shard_x86) = sample_sharded_arch_index_data(SystemArch::X86_64Linux);
+    data_x86.registry = host.clone();
     let shard_bytes_x86 = IndexCodec::encode_zstd(&shard_x86, 3).unwrap();
     let shard_digest_x86 = compute_sha256(&shard_bytes_x86);
 
-    data_x86.shards[42] = nixcache_core::ShardDescriptor::new(
-        42,
+    let shard_id_x86 = shard_x86.shard_id;
+    data_x86.shards[shard_id_x86 as usize] = nixcache_core::ShardDescriptor::new(
+        shard_id_x86,
         &shard_digest_x86,
         shard_bytes_x86.len() as u64,
-        1500,
+        serde_json::to_vec(&shard_x86).unwrap().len() as u64,
         shard_x86.len(),
         shard_x86.compute_merkle_hash(),
     );
@@ -238,14 +249,16 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let digest_x86 = compute_sha256(&bytes_x86);
 
     let (mut data_arm, shard_arm) = sample_sharded_arch_index_data(SystemArch::Aarch64Linux);
+    data_arm.registry = host.clone();
     let shard_bytes_arm = IndexCodec::encode_zstd(&shard_arm, 3).unwrap();
     let shard_digest_arm = compute_sha256(&shard_bytes_arm);
 
-    data_arm.shards[42] = nixcache_core::ShardDescriptor::new(
-        42,
+    let shard_id_arm = shard_arm.shard_id;
+    data_arm.shards[shard_id_arm as usize] = nixcache_core::ShardDescriptor::new(
+        shard_id_arm,
         &shard_digest_arm,
         shard_bytes_arm.len() as u64,
-        1500,
+        serde_json::to_vec(&shard_arm).unwrap().len() as u64,
         shard_arm.len(),
         shard_arm.compute_merkle_hash(),
     );
@@ -323,7 +336,10 @@ async fn test_get_multi_arch_sharded_index_routing() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(&index_json)
-                .insert_header("Docker-Content-Digest", "sha256:topindexdigest"),
+                .insert_header(
+                    "Docker-Content-Digest",
+                    compute_sha256(index_json.as_bytes()),
+                ),
         )
         .mount(&server)
         .await;
@@ -367,7 +383,8 @@ async fn test_get_multi_arch_sharded_index_routing() {
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client =
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
 
     let (fetched_x86, digest) = client
         .indexes()
@@ -375,7 +392,7 @@ async fn test_get_multi_arch_sharded_index_routing() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(digest, "sha256:topindexdigest");
+    assert_eq!(digest, compute_sha256(index_json.as_bytes()));
     assert_eq!(fetched_x86.system, SystemArch::X86_64Linux);
     assert_eq!(fetched_x86.total_entries(), 1);
 
@@ -385,7 +402,7 @@ async fn test_get_multi_arch_sharded_index_routing() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(digest, "sha256:topindexdigest");
+    assert_eq!(digest, compute_sha256(index_json.as_bytes()));
     assert_eq!(fetched_arm.system, SystemArch::Aarch64Linux);
     assert_eq!(fetched_arm.total_entries(), 1);
 }
@@ -395,24 +412,36 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
+    let legacy_root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", &host);
     let legacy_sub_manifest = OciImageManifest {
         schema_version: 2,
         media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
         config: OciDescriptor {
             media_type: "application/vnd.oci.image.config.v1+json".to_string(),
-            digest: "sha256:cfg123".to_string(),
+            digest: EMPTY_CONFIG_DIGEST.to_string(),
             size: 2,
             platform: None,
             annotations: None,
         },
         layers: vec![OciDescriptor {
             media_type: "application/vnd.nix.cache.index.v1+json".to_string(),
-            digest: "sha256:blob123".to_string(),
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             size: 100,
             platform: Some(OciPlatform::from_system(&SystemArch::X86_64Linux)),
             annotations: None,
         }],
-        annotations: None,
+        annotations: Some(HashMap::from([
+            (
+                "org.nixos.nixcache.system".to_string(),
+                "x86_64-linux".to_string(),
+            ),
+            ("org.nixos.nixcache.schema".to_string(), "6".to_string()),
+            (
+                "org.nixos.nixcache.merkle_root".to_string(),
+                legacy_root.merkle_root,
+            ),
+        ])),
     };
     let manifest_json = legacy_sub_manifest.to_json_string().unwrap();
 
@@ -425,12 +454,15 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v2/test/repo/nix-cache/blobs/sha256:blob123"))
+        .and(path(
+            "/v2/test/repo/nix-cache/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}"))
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client =
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
     let err = client
         .indexes()
         .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
@@ -445,13 +477,16 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
     let server = MockServer::start().await;
     let host = server.address().to_string();
 
+    let corrupt_body = b"not a valid zstd stream";
+    let corrupt_digest = compute_sha256(corrupt_body);
+    let valid_root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", &host);
     let sub_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
-        root_blob_digest: "sha256:corruptblob",
-        root_blob_size: 100,
+        root_blob_digest: &corrupt_digest,
+        root_blob_size: corrupt_body.len() as u64,
         config_digest: EMPTY_CONFIG_DIGEST,
         config_size: EMPTY_CONFIG_SIZE,
         system: &SystemArch::X86_64Linux,
-        merkle_root: "sha256:merkle123",
+        merkle_root: &valid_root.merkle_root,
     });
     let manifest_json = sub_manifest.to_json_string().unwrap();
 
@@ -464,12 +499,15 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/v2/test/repo/nix-cache/blobs/sha256:corruptblob"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a valid zstd stream"))
+        .and(path(format!(
+            "/v2/test/repo/nix-cache/blobs/{corrupt_digest}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(corrupt_body))
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client =
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
     let err = client
         .indexes()
         .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
@@ -510,9 +548,10 @@ async fn test_get_shard_data_roundtrip() {
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client =
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
 
-    let (pushed_digest, comp_size, _) = client
+    let (pushed_digest, comp_size, uncomp_size) = client
         .indexes()
         .push_shard_data(&shard_payload)
         .await
@@ -522,10 +561,20 @@ async fn test_get_shard_data_roundtrip() {
 
     let retrieved_shard = client
         .indexes()
-        .get_shard_data(&shard_digest)
+        .get_shard_data(
+            &nixcache_core::ShardDescriptor::new(
+                shard_payload.shard_id,
+                &shard_digest,
+                comp_size,
+                uncomp_size,
+                shard_payload.len(),
+                shard_payload.compute_merkle_hash(),
+            ),
+            &SystemArch::X86_64Linux,
+        )
         .await
         .unwrap();
-    assert_eq!(retrieved_shard.shard_id, 42);
+    assert_eq!(retrieved_shard.shard_id, shard_payload.shard_id);
     assert_eq!(retrieved_shard.entries.len(), 1);
 }
 
@@ -578,6 +627,7 @@ async fn test_update_sharded_arch_index_cas_flow() {
         "token123",
         true,
         GcpArtifactRegistryDriver,
+        Default::default(),
     );
 
     let updated_digest = client

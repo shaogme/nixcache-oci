@@ -30,26 +30,27 @@ pub use sharding::{
     shard_id_to_prefix_bytes,
 };
 pub use types::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
-    NarDigest, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
-    SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
-    SystemArch,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DefaultIndexValidationLimits, IndexEntry,
+    IndexValidationLimits, JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION,
+    RUN_SESSION_VERSION, SCHEMA_VERSION, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::{
         BloomError, BloomFilter, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheQueryResult,
-        CacheSelector, CascadeMode, CoreError, EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter,
-        FilterPredicates, IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS,
-        NarDigest, NarInfo, NarInfoMeta, NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V6,
-        SelectionScope, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SizeFilter,
-        StoreHash, SystemArch, TimeFilter, TypeError, build_nar_lookup_map, calculate_shard_id,
-        calculate_shard_id_from_str, compute_merkle_root, compute_shard_merkle_hash,
-        diff_shard_descriptors, evaluate_arch_cache_purge, evaluate_arch_cache_query,
-        evaluate_cache_purge, evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc,
-        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
-        nix_base32_char, nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
+        CacheSelector, CascadeMode, CoreError, DefaultIndexValidationLimits,
+        EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, FilterPredicates, IndexEntry,
+        JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta,
+        NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V6, SelectionScope, ShardDataPayload,
+        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
+        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
+        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
+        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
+        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
+        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
+        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::{HashMap, HashSet};
@@ -138,6 +139,44 @@ mod tests {
         // SystemArch detect_current returns a known arch on supported platforms
         let detected = SystemArch::detect_current();
         assert!(detected.is_known());
+    }
+
+    #[test]
+    fn schema_v6_root_and_shard_validators_reject_structural_tampering() {
+        let system = SystemArch::X86_64Linux;
+        let limits = DefaultIndexValidationLimits::default();
+        let mut root = ShardedArchCacheIndexData::new(system, "repo", "registry");
+        root.validate_for(&system, "repo", "registry", &limits)
+            .expect("fresh root should be valid");
+
+        root.shards.pop();
+        assert!(matches!(
+            root.validate_for(&system, "repo", "registry", &limits),
+            Err(CoreError::InvalidIndex { .. })
+        ));
+
+        let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let shard_id = hash.shard_id();
+        let payload = ShardDataPayload::with_entries(
+            shard_id,
+            HashMap::from([(
+                hash,
+                IndexEntry {
+                    system: Some(system),
+                    ..Default::default()
+                },
+            )]),
+        );
+        payload
+            .validate_for(shard_id, &system, &limits)
+            .expect("matching shard payload should be valid");
+
+        let mut wrong_system = payload.clone();
+        wrong_system.entries.values_mut().next().unwrap().system = None;
+        assert!(matches!(
+            wrong_system.validate_for(shard_id, &system, &limits),
+            Err(CoreError::InvalidShard { .. })
+        ));
     }
 
     #[test]

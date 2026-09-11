@@ -631,6 +631,7 @@ mod tests {
             "test/repo",
             "",
             true,
+            Default::default(),
         );
         let config = super::ParallelExportConfig::default();
         let report = ParallelExporter::export_and_upload_paths(&[], &oci, &config)
@@ -696,7 +697,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let oci = nixcache_oci_backend::create_tokio_reqwest_client(&host, "test/repo", "", true);
+        let oci = nixcache_oci_backend::create_tokio_reqwest_client(
+            &host,
+            "test/repo",
+            "",
+            true,
+            Default::default(),
+        );
         let config = super::ParallelExportConfig {
             concurrency: 4,
             signing_key_file: None,
@@ -782,6 +789,7 @@ mod tests {
             "",
             true,
             nixcache_oci::GhcrDriver,
+            Default::default(),
         );
         let config = super::ParallelExportConfig {
             concurrency: 2,

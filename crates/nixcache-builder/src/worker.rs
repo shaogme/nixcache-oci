@@ -149,12 +149,12 @@ pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
             .shards
             .iter()
             .filter(|s| s.entry_count > 0 && !s.blob_digest.is_empty())
-            .map(|s| s.blob_digest.clone())
+            .cloned()
             .collect();
 
-        let futures = non_empty_shards.into_iter().map(|digest| {
+        let futures = non_empty_shards.into_iter().map(|descriptor| {
             let oci = oci.clone();
-            async move { oci.indexes().get_shard_data(&digest).await.ok() }
+            async move { oci.indexes().get_shard_data(&descriptor, system).await.ok() }
         });
         let payloads = futures_util::future::join_all(futures).await;
         for payload in payloads.into_iter().flatten() {
@@ -222,7 +222,13 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     info!("Built {} top-level output path(s)", output_paths.len());
 
     // 4. 获取已有远端 hashes
-    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.credentials.clone(), true);
+    let oci = create_tokio_reqwest_client(
+        opts.registry,
+        opts.repo,
+        opts.credentials.clone(),
+        true,
+        Default::default(),
+    );
     let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
     info!(
         "Remote index contains {} previously-cached entries for {}",
@@ -380,7 +386,14 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_remote_arch_hashes_empty() {
         let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", false, transport);
+        let client = OciClient::with_transport(
+            "example.com",
+            "test/repo",
+            "",
+            false,
+            transport,
+            Default::default(),
+        );
         let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
         assert!(hashes.is_empty());
     }
@@ -388,11 +401,24 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_remote_arch_hashes_populated() {
         let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        let client = OciClient::with_transport(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            transport,
+            Default::default(),
+        );
 
         let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let mut payload = ShardDataPayload::new(h1.shard_id());
-        payload.entries.insert(h1.clone(), IndexEntry::default());
+        payload.entries.insert(
+            h1.clone(),
+            IndexEntry {
+                system: Some(SystemArch::X86_64Linux),
+                ..Default::default()
+            },
+        );
 
         let (shard_digest, comp_size, uncomp_size) =
             client.indexes().push_shard_data(&payload).await.unwrap();

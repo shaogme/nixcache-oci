@@ -1,18 +1,16 @@
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt, stream::LocalBoxStream};
 use http::{
     HeaderMap, StatusCode,
     header::{HeaderName, HeaderValue},
 };
-use nixcache_oci::{OciTransport, TransportError, UploadChunkResponse, parse_range_header};
+use nixcache_oci::{
+    OciTransport, TransportError, UploadChunkResponse, check_content_length, parse_range_header,
+};
 use std::{fmt::Display, io::Error as IoError, time::Duration};
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
-#[cfg(not(target_arch = "wasm32"))]
-use futures_util::stream::BoxStream;
-
-#[cfg(target_arch = "wasm32")]
-use futures_util::{StreamExt, stream::LocalBoxStream};
+use nixcache_oci::collect_limited;
 
 #[derive(Clone, Default)]
 pub struct WorkerFetchTransport;
@@ -27,13 +25,14 @@ fn map_worker_error(url: &str, err: impl Display) -> TransportError {
 fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportError> {
     let worker_headers = Headers::new();
     for (key, val) in headers {
-        if let Ok(val_str) = val.to_str() {
-            worker_headers
-                .set(key.as_str(), val_str)
-                .map_err(|_| TransportError::HeaderParse {
-                    header: "worker_header_set",
-                })?;
-        }
+        let val_str = val.to_str().map_err(|_| TransportError::HeaderParse {
+            header: "worker_header_value",
+        })?;
+        worker_headers
+            .set(key.as_str(), val_str)
+            .map_err(|_| TransportError::HeaderParse {
+                header: "worker_header_set",
+            })?;
     }
     Ok(worker_headers)
 }
@@ -41,12 +40,14 @@ fn convert_to_worker_headers(headers: &HeaderMap) -> Result<Headers, TransportEr
 fn convert_from_worker_headers(headers: &Headers) -> Result<HeaderMap, TransportError> {
     let mut http_headers = HeaderMap::new();
     for (key, val) in headers {
-        if let (Ok(k), Ok(v)) = (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(&val),
-        ) {
-            http_headers.insert(k, v);
-        }
+        let k =
+            HeaderName::from_bytes(key.as_bytes()).map_err(|_| TransportError::HeaderParse {
+                header: "worker_header_name",
+            })?;
+        let v = HeaderValue::from_str(&val).map_err(|_| TransportError::HeaderParse {
+            header: "worker_header_value",
+        })?;
+        http_headers.insert(k, v);
     }
     Ok(http_headers)
 }
@@ -70,10 +71,6 @@ fn resolve_redirect_url(base_url: &str, location: &str) -> String {
 }
 
 impl OciTransport for WorkerFetchTransport {
-    #[cfg(not(target_arch = "wasm32"))]
-    type BodyStream = BoxStream<'static, Result<Bytes, TransportError>>;
-
-    #[cfg(target_arch = "wasm32")]
     type BodyStream = LocalBoxStream<'static, Result<Bytes, TransportError>>;
 
     async fn head_with_headers(
@@ -129,6 +126,7 @@ impl OciTransport for WorkerFetchTransport {
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
         let mut current_url = url.to_string();
         let mut current_headers = headers;
@@ -165,21 +163,28 @@ impl OciTransport for WorkerFetchTransport {
                     message: Some(format!("Invalid status code {}", status_code)),
                 })?;
             let resp_headers = convert_from_worker_headers(resp.headers())?;
-            let bytes = Bytes::from(
-                resp.bytes()
-                    .await
-                    .map_err(|e| map_worker_error(&current_url, e))?,
-            );
+            check_content_length(&current_url, &resp_headers, max_bytes)?;
+            let bytes = {
+                let byte_stream = resp
+                    .stream()
+                    .map_err(|e| map_worker_error(&current_url, e))?
+                    .map(|result| {
+                        result
+                            .map(Bytes::from)
+                            .map_err(|e| map_worker_error(&current_url, e))
+                    });
+                collect_limited(&current_url, max_bytes, byte_stream).await?
+            };
 
             return Ok((status, resp_headers, bytes));
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
     async fn stream(
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
         let mut current_url = url.to_string();
         let mut current_headers = headers;
@@ -216,6 +221,7 @@ impl OciTransport for WorkerFetchTransport {
                     message: Some(format!("Invalid status code {}", status_code)),
                 })?;
             let resp_headers = convert_from_worker_headers(resp.headers())?;
+            check_content_length(&current_url, &resp_headers, max_bytes)?;
             let err_url = current_url.clone();
             let byte_stream = resp
                 .stream()
@@ -228,18 +234,6 @@ impl OciTransport for WorkerFetchTransport {
 
             return Ok((status, resp_headers, stream));
         }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn stream(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
-        let (status, resp_headers, bytes) = self.get(url, headers).await?;
-        let stream: Self::BodyStream =
-            Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
-        Ok((status, resp_headers, stream))
     }
 
     async fn post(

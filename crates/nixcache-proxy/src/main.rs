@@ -118,7 +118,13 @@ async fn main() -> Result<(), ProxyError> {
     info!("Index cache directory: {:?}", index_dir);
     info!("Upstream caches: {:?}", upstream_caches);
 
-    let oci = create_tokio_reqwest_client(&registry, &repo, credentials.clone(), false);
+    let oci = create_tokio_reqwest_client(
+        &registry,
+        &repo,
+        credentials.clone(),
+        false,
+        Default::default(),
+    );
 
     let proxy_config = CascadingProxyConfig {
         repo: repo.clone(),

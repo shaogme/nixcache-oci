@@ -14,9 +14,12 @@ pub use manifest::{FetchedOciArtifact, ManifestCasCondition, ManifestClient};
 use crate::{
     auth::RegistryCredentials,
     backend::{OciDriver, RegistryCapabilities, RegistryKind, detect_driver, driver_for_kind},
+    limits::OciReadLimits,
     token::TokenManager,
     transport::OciTransport,
 };
+use std::{convert::TryFrom, sync::Arc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Shared OCI registry context. Domain operations are exposed through the borrowed clients.
 #[derive(Clone)]
@@ -26,6 +29,8 @@ pub struct OciClient<T: OciTransport> {
     driver: OciDriver,
     token_manager: TokenManager,
     transport: T,
+    limits: OciReadLimits,
+    index_read_semaphore: Arc<Semaphore>,
 }
 
 impl<T: OciTransport + Clone> OciClient<T> {
@@ -37,7 +42,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
         write_access: bool,
         driver: impl Into<OciDriver>,
         transport: T,
+        limits: OciReadLimits,
     ) -> Self {
+        limits
+            .validate()
+            .expect("OciReadLimits must be constructed through a checked constructor");
         let driver = driver.into();
         let canonical_registry = driver.canonicalize_endpoint(registry);
         let canonical_repo = driver.canonicalize_repository(repo);
@@ -55,6 +64,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
             driver,
             token_manager,
             transport,
+            index_read_semaphore: Arc::new(Semaphore::new(
+                usize::try_from(limits.max_parallel_index_reads())
+                    .expect("validated parallel read limit must fit usize"),
+            )),
+            limits,
         }
     }
 
@@ -66,6 +80,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         transport: T,
+        limits: OciReadLimits,
     ) -> Self {
         Self::new(
             registry,
@@ -74,6 +89,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             write_access,
             driver_for_kind(kind),
             transport,
+            limits,
         )
     }
 
@@ -84,6 +100,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         transport: T,
+        limits: OciReadLimits,
     ) -> Self {
         Self::new(
             registry,
@@ -92,6 +109,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             write_access,
             detect_driver(registry),
             transport,
+            limits,
         )
     }
 
@@ -117,6 +135,18 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    pub fn limits(&self) -> &OciReadLimits {
+        &self.limits
+    }
+
+    pub(crate) async fn acquire_index_read(&self) -> OwnedSemaphorePermit {
+        self.index_read_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("OCI index read semaphore is never closed")
     }
 
     pub(crate) fn token_manager(&self) -> &TokenManager {

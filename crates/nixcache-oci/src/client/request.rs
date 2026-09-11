@@ -85,16 +85,17 @@ impl<T: OciTransport + Clone> OciClient<T> {
         &self,
         url: &str,
         operation: &'static str,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), OciError> {
         let headers = self.get_auth_headers().await?;
-        let first = self.transport.get(url, headers).await?;
+        let first = self.transport.get(url, headers, max_bytes).await?;
         if first.0 != StatusCode::UNAUTHORIZED {
             return Ok(first);
         }
         let (_, retry_headers) = self
             .request_challenge_for_response(operation, first.0, &first.1)
             .await?;
-        let second = self.transport.get(url, retry_headers).await?;
+        let second = self.transport.get(url, retry_headers, max_bytes).await?;
         if second.0 == StatusCode::UNAUTHORIZED {
             return Err(Self::request_auth_error(
                 operation,
@@ -344,16 +345,17 @@ impl<T: OciTransport + Clone> OciClient<T> {
         &self,
         url: &str,
         operation: &'static str,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, T::BodyStream), OciError> {
         let headers = self.get_auth_headers().await?;
-        let first = self.transport.stream(url, headers).await?;
+        let first = self.transport.stream(url, headers, max_bytes).await?;
         if first.0 != StatusCode::UNAUTHORIZED {
             return Ok(first);
         }
         let (_, retry_headers) = self
             .request_challenge_for_response(operation, first.0, &first.1)
             .await?;
-        let second = self.transport.stream(url, retry_headers).await?;
+        let second = self.transport.stream(url, retry_headers, max_bytes).await?;
         if second.0 == StatusCode::UNAUTHORIZED {
             return Err(Self::request_auth_error(
                 operation,

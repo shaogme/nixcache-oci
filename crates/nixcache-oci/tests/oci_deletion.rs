@@ -45,10 +45,11 @@ async fn test_generic_oci_two_stage_tag_deletion() {
     let transport = MockRouterTransport::default();
     let manifest_body =
         r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+    let manifest_digest = digest(manifest_body);
     let mut get_headers = HeaderMap::new();
     get_headers.insert(
         "Docker-Content-Digest",
-        HeaderValue::from_static("sha256:manifestdigest123"),
+        HeaderValue::from_str(&manifest_digest).unwrap(),
     );
 
     // Stage 1: GET manifest for tag
@@ -65,7 +66,7 @@ async fn test_generic_oci_two_stage_tag_deletion() {
     // Stage 2: DELETE manifest by digest
     transport.add_route(
         "DELETE",
-        "/manifests/sha256:manifestdigest123",
+        &format!("/manifests/{manifest_digest}"),
         MockResponse {
             status: StatusCode::ACCEPTED,
             headers: HeaderMap::new(),
@@ -80,6 +81,7 @@ async fn test_generic_oci_two_stage_tag_deletion() {
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     );
 
     let del_res = client.deletion().delete_tag("run-100").await;
@@ -106,6 +108,7 @@ async fn test_generic_oci_manifest_delete_405_rejected() {
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     );
 
     let err = client
@@ -154,6 +157,7 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     );
 
     let digests = vec![
@@ -189,8 +193,13 @@ async fn test_generic_oci_deletes_complete_tag_reachable_graph() {
     let child_one = store_manifest(&transport, "sha256:child-one", manifest_one);
     let child_two = store_manifest(&transport, "sha256:child-two", manifest_two);
     let index = format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":1}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":1}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":1}}]}}"#,
-        child_one, child_two, child_one
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{}}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{}}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{}}}]}}"#,
+        child_one,
+        manifest_one.len(),
+        child_two,
+        manifest_two.len(),
+        child_one,
+        manifest_one.len()
     );
     let index_digest = store_manifest(&transport, "cache-index", &index);
     let _ = transport.stored_manifests.upsert_sync(
@@ -215,6 +224,7 @@ async fn test_generic_oci_deletes_complete_tag_reachable_graph() {
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     );
     let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 2);
@@ -232,22 +242,28 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0")
             .unwrap();
     let store_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+    let shard_id = store_hash.shard_id();
     let entry = IndexEntry {
+        system: Some(SystemArch::X86_64Linux),
         nar_digest: nar_digest.clone(),
         nar_size: 2048,
         ..Default::default()
     };
-    let shard_payload = ShardDataPayload::with_entries(42, HashMap::from([(store_hash, entry)]));
+    let shard_payload =
+        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)]));
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = digest_bytes(&shard_bytes);
 
-    let mut root =
-        ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "myorg/repo", "registry.local");
-    root.shards[42] = ShardDescriptor::new(
-        42,
+    let mut root = ShardedArchCacheIndexData::new(
+        SystemArch::X86_64Linux,
+        "myorg/repo",
+        "registry.local:5000",
+    );
+    root.shards[shard_id as usize] = ShardDescriptor::new(
+        shard_id,
         &shard_digest,
         shard_bytes.len() as u64,
-        2048,
+        serde_json::to_vec(&shard_payload).unwrap().len() as u64,
         shard_payload.len(),
         shard_payload.compute_merkle_hash(),
     );
@@ -281,6 +297,7 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         true,
         GenericOciDriver,
         transport,
+        Default::default(),
     );
     let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 1);

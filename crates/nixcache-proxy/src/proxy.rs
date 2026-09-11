@@ -301,7 +301,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 
@@ -347,7 +353,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index: index.clone(),
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 
@@ -379,7 +391,13 @@ mod tests {
         let empty_state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
         let empty_app = create_router(empty_state);
@@ -442,7 +460,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 
@@ -535,7 +559,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 
@@ -621,7 +651,7 @@ mod tests {
         );
 
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let digest_str = "0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0";
+        let digest_str = "3733cd977ff8eb18b987357e22ced99f46097f31ecb239e878ae63760e83e4d5";
         let shard_id = calculate_shard_id(&local_hash);
         let mut shard = ShardDataPayload::new(shard_id);
         shard.entries.insert(
@@ -642,7 +672,7 @@ mod tests {
             },
         );
 
-        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", &oci_host);
         index
             .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
@@ -675,7 +705,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client(&oci_host, "test/repo", "", false),
+            oci_client: create_tokio_reqwest_client(
+                &oci_host,
+                "test/repo",
+                "",
+                false,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 
@@ -745,7 +781,13 @@ mod tests {
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
-            oci_client: create_tokio_reqwest_client("ghcr.io", "test/repo", "", true),
+            oci_client: create_tokio_reqwest_client(
+                "ghcr.io",
+                "test/repo",
+                "",
+                true,
+                Default::default(),
+            ),
             http_client: reqwest::Client::new(),
         };
 

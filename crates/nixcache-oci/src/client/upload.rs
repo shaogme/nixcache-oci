@@ -236,7 +236,11 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
     ) -> Result<(StatusCode, http::HeaderMap, Option<(u64, u64)>), OciError> {
         let (status, headers, _) = self
             .client
-            .request_get_with_auth_retry(session_url, "probe upload session")
+            .request_get_with_auth_retry(
+                session_url,
+                "probe upload session",
+                self.client.limits().max_manifest_bytes(),
+            )
             .await?;
         let range = if let Some(value) = headers.get(http::header::RANGE) {
             let text = value

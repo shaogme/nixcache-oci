@@ -5,6 +5,8 @@ use std::{
     str::from_utf8,
     sync::atomic::{AtomicU8, Ordering},
 };
+
+const MAX_GITHUB_API_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 use tracing::{debug, info};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -156,7 +158,10 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
 
             let url = self.format_url(is_org, &url_suffix);
             let headers = self.get_headers();
-            let (status, _resp_headers, body) = self.transport.get(&url, headers).await?;
+            let (status, _resp_headers, body) = self
+                .transport
+                .get(&url, headers, MAX_GITHUB_API_RESPONSE_BYTES)
+                .await?;
 
             if status.is_success() {
                 if cached_type == 0 {
@@ -178,8 +183,10 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
                 );
                 let user_url = self.format_url(false, &url_suffix);
                 let user_headers = self.get_headers();
-                let (user_status, _resp_h, user_body) =
-                    self.transport.get(&user_url, user_headers).await?;
+                let (user_status, _resp_h, user_body) = self
+                    .transport
+                    .get(&user_url, user_headers, MAX_GITHUB_API_RESPONSE_BYTES)
+                    .await?;
 
                 if user_status.is_success() {
                     self.owner_type.store(2, Ordering::Relaxed);

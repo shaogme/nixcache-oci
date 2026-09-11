@@ -9,6 +9,7 @@ async fn package_deletion_reports_unsupported_backends_explicitly() {
         true,
         DockerHubDriver,
         MockRouterTransport::default(),
+        Default::default(),
     );
     let error = client.deletion().delete_entire_package().await.unwrap_err();
     assert!(matches!(
@@ -28,6 +29,7 @@ async fn empty_blob_deletion_batch_is_a_successful_noop() {
         "",
         true,
         MockRouterTransport::default(),
+        Default::default(),
     );
     let summary = client
         .deletion()

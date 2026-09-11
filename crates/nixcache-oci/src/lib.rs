@@ -3,6 +3,8 @@ pub mod backend;
 pub mod client;
 pub mod codec;
 pub mod error;
+pub mod integrity;
+pub mod limits;
 pub mod manifest;
 pub mod mock;
 pub mod token;
@@ -23,8 +25,10 @@ pub use client::{
     BlobClient, DeletionClient, DeletionOutcome, DeletionSummary, FetchedOciArtifact, IndexClient,
     ManifestCasCondition, ManifestClient, OciClient, PackageDeletionSummary,
 };
-pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
+pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, DecodedIndex, IndexCodec};
 pub use error::{OciError, TokenError, TransportError};
+pub use integrity::{ContentDigest, verify_buffered_body, verify_size};
+pub use limits::{OciReadLimits, ReadLimitsError};
 pub use manifest::{
     CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
     OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -48,6 +52,7 @@ pub use nixcache_core::{
 pub use token::TokenManager;
 pub use transport::{
     HashingStream, OciBlobStream, OciTransport, StreamHashState, UploadChunkResponse,
+    VerifiedBlobStream, check_content_length, collect_limited, parse_content_length,
     parse_range_header,
 };
 pub use upload::{BlobPayload, UploadConfig};

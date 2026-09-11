@@ -1,9 +1,9 @@
 use crate::error::ProxyIndexError;
 use arc_swap::ArcSwap;
 use nixcache_core::{
-    IndexEntry, NarDigest, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, SystemArch,
-    build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors, extract_nar_basename,
-    extract_store_hash,
+    IndexEntry, NarDigest, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
+    SystemArch, build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors,
+    extract_nar_basename, extract_store_hash,
 };
 use nixcache_oci::{
     CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient, RegistryCredentials,
@@ -21,6 +21,9 @@ use std::{
 };
 use tokio::fs;
 use tracing::{error, info};
+
+#[cfg(test)]
+use nixcache_oci::ContentDigest;
 
 pub fn detect_current_system() -> SystemArch {
     SystemArch::detect_current()
@@ -86,6 +89,7 @@ pub struct CachedBaselineEntry {
 pub struct ShardCacheEntry {
     pub payload: Arc<ShardDataPayload>,
     pub nar_lookup: Arc<HashMap<String, NarDigest>>,
+    pub blob_digest: String,
     pub expires_at: Instant,
 }
 
@@ -110,8 +114,13 @@ impl CacheIndex {
         config: CascadingProxyConfig,
         credentials: impl Into<RegistryCredentials>,
     ) -> Self {
-        let oci_client =
-            create_tokio_reqwest_client(&config.registry, &config.repo, credentials, false);
+        let oci_client = create_tokio_reqwest_client(
+            &config.registry,
+            &config.repo,
+            credentials,
+            false,
+            Default::default(),
+        );
 
         Self {
             config,
@@ -172,10 +181,12 @@ impl CacheIndex {
     /// 按需拉取或获取单个分片数据 (通过 LRU/SccHashMap 缓存)
     pub async fn get_shard_data(
         &self,
-        shard_id: u16,
-        blob_digest: &str,
+        shard_desc: &ShardDescriptor,
     ) -> Option<Arc<ShardDataPayload>> {
+        let shard_id = shard_desc.shard_id;
+        let blob_digest = &shard_desc.blob_digest;
         if let Some(cached) = self.shard_cache.read_sync(&shard_id, |_, v| v.clone())
+            && cached.blob_digest == blob_digest.as_str()
             && cached.expires_at > Instant::now()
         {
             return Some(cached.payload);
@@ -185,7 +196,12 @@ impl CacheIndex {
             return None;
         }
 
-        match self.oci_client.indexes().get_shard_data(blob_digest).await {
+        match self
+            .oci_client
+            .indexes()
+            .get_shard_data(shard_desc, &self.config.target_system)
+            .await
+        {
             Ok(payload) => {
                 self.set_remote_status(true, None);
                 let nar_map = build_nar_lookup_map(&payload.entries);
@@ -195,6 +211,7 @@ impl CacheIndex {
                     ShardCacheEntry {
                         payload: arc_payload.clone(),
                         nar_lookup: Arc::new(nar_map),
+                        blob_digest: blob_digest.to_string(),
                         expires_at: Instant::now() + self.config.baseline_ttl,
                     },
                 );
@@ -232,9 +249,7 @@ impl CacheIndex {
             return None;
         }
 
-        let shard_payload = self
-            .get_shard_data(shard_id, &shard_desc.blob_digest)
-            .await?;
+        let shard_payload = self.get_shard_data(shard_desc).await?;
         shard_payload.entries.get(&parsed_hash).cloned()
     }
 
@@ -397,15 +412,32 @@ impl CacheIndex {
             if arch_backup.exists() {
                 match fs::read(&arch_backup).await {
                     Ok(bytes) => {
-                        if let Ok(root_data) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
+                        if let Ok(decoded) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
                             &bytes,
                             CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+                            self.oci_client.limits().max_index_uncompressed_bytes(),
                         ) {
-                            info!(
-                                "[nixcache-proxy] Loaded backup sharded root index from {:?}",
-                                arch_backup
-                            );
-                            fetched_baseline = Some(CachedBaseline::new(root_data));
+                            let root_data = decoded.value;
+                            if root_data
+                                .validate_for(
+                                    &system_clone,
+                                    &self.config.repo,
+                                    &self.config.registry,
+                                    self.oci_client.limits(),
+                                )
+                                .is_ok()
+                            {
+                                info!(
+                                    "[nixcache-proxy] Loaded backup sharded root index from {:?}",
+                                    arch_backup
+                                );
+                                fetched_baseline = Some(CachedBaseline::new(root_data));
+                            } else {
+                                error!(
+                                    "[nixcache-proxy] Rejected invalid backup sharded root index from {:?}",
+                                    arch_backup
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -483,14 +515,20 @@ impl CacheIndex {
         );
 
         for shard in &shards {
+            let encoded = IndexCodec::encode_zstd(shard, DEFAULT_ZSTD_COMPRESSION_LEVEL)
+                .expect("test shard encoding should succeed");
+            let uncompressed_size = serde_json::to_vec(shard)
+                .expect("test shard serialization should succeed")
+                .len() as u64;
             let shard_desc = ShardDescriptor::new(
                 shard.shard_id,
-                format!("sha256:mock_shard_{}", shard.shard_id),
-                100,
-                200,
+                ContentDigest::from_bytes(&encoded).to_string(),
+                encoded.len() as u64,
+                uncompressed_size,
                 shard.entries.len(),
                 shard.compute_merkle_hash(),
             );
+            let shard_blob_digest = shard_desc.blob_digest.clone();
             if let Some(d) = root.find_shard_by_id_mut(shard.shard_id) {
                 *d = shard_desc;
             }
@@ -500,12 +538,20 @@ impl CacheIndex {
                 ShardCacheEntry {
                     payload: Arc::new(shard.clone()),
                     nar_lookup: Arc::new(nar_map),
+                    blob_digest: shard_blob_digest,
                     expires_at: Instant::now() + Duration::from_secs(3600),
                 },
             );
         }
 
         root.recalculate_merkle_root();
+        root.validate_for(
+            &self.config.target_system,
+            &self.config.repo,
+            &self.config.registry,
+            self.oci_client.limits(),
+        )
+        .expect("test baseline root should pass validation");
 
         let baseline = Arc::new(CachedBaseline::new(root));
         let _ = self.baseline_cache.upsert_sync(
@@ -675,7 +721,7 @@ mod tests {
         };
 
         let mut root_data =
-            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "127.0.0.1:9");
         root_data.public_key = "backup-pubkey:CCC=".to_string();
 
         // Pre-create cache-index-x86_64-linux.json.zst in the index dir

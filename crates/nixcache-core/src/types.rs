@@ -1,5 +1,5 @@
 use crate::{
-    error::TypeError,
+    error::{CoreError, TypeError},
     sharding::{
         EMPTY_SHARD_MERKLE_HASH, calculate_shard_id, compute_merkle_root,
         compute_shard_merkle_hash, shard_id_to_prefix,
@@ -18,6 +18,50 @@ pub const CACHE_INDEX_VERSION: u32 = 6;
 pub const RUN_SESSION_VERSION: u32 = 6;
 pub const RECEIPT_VERSION: u32 = 6;
 pub const NUM_SHARDS: usize = 1024;
+
+pub trait IndexValidationLimits {
+    fn max_shard_entries(&self) -> u64;
+    fn max_gc_roots(&self) -> u64;
+    fn max_uncompressed_bytes(&self) -> u64;
+    fn max_nar_size(&self) -> u64;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultIndexValidationLimits {
+    pub shard_entries: u64,
+    pub gc_roots: u64,
+    pub uncompressed_bytes: u64,
+    pub nar_size: u64,
+}
+
+impl Default for DefaultIndexValidationLimits {
+    fn default() -> Self {
+        Self {
+            shard_entries: 500_000,
+            gc_roots: 500_000,
+            uncompressed_bytes: 64 * 1024 * 1024,
+            nar_size: 16 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl IndexValidationLimits for DefaultIndexValidationLimits {
+    fn max_shard_entries(&self) -> u64 {
+        self.shard_entries
+    }
+
+    fn max_gc_roots(&self) -> u64 {
+        self.gc_roots
+    }
+
+    fn max_uncompressed_bytes(&self) -> u64 {
+        self.uncompressed_bytes
+    }
+
+    fn max_nar_size(&self) -> u64 {
+        self.nar_size
+    }
+}
 
 /// Nix 32 字符 Base32 散列值 (例如: `s66mzxpvicwk07gjbjfw9izjfa797vsw`)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -723,6 +767,101 @@ impl ShardedArchCacheIndexData {
             None => true,
         }
     }
+
+    pub fn validate_for<L: IndexValidationLimits>(
+        &self,
+        system: &SystemArch,
+        repo: &str,
+        registry: &str,
+        limits: &L,
+    ) -> Result<(), CoreError> {
+        if self.version != SCHEMA_VERSION_V6 {
+            return Err(CoreError::InvalidIndex {
+                details: format!("version must be {SCHEMA_VERSION_V6}"),
+            });
+        }
+        if !self.system.is_known() || self.system != *system {
+            return Err(CoreError::InvalidIndex {
+                details: "root system does not match the requested system".to_string(),
+            });
+        }
+        if self.repo != repo || self.registry != registry {
+            return Err(CoreError::InvalidIndex {
+                details: "root repository or registry does not match the client target".to_string(),
+            });
+        }
+        if self.shards.len() != NUM_SHARDS {
+            return Err(CoreError::InvalidIndex {
+                details: format!("expected exactly {NUM_SHARDS} shard descriptors"),
+            });
+        }
+        for (index, shard) in self.shards.iter().enumerate() {
+            let expected_id = index as u16;
+            if shard.shard_id != expected_id {
+                return Err(CoreError::InvalidIndex {
+                    details: format!("shard descriptor at index {index} has wrong id"),
+                });
+            }
+            if shard.prefix != shard_id_to_prefix(expected_id) {
+                return Err(CoreError::InvalidIndex {
+                    details: format!("shard {expected_id} has an invalid prefix"),
+                });
+            }
+            if shard.is_empty() {
+                if !shard.blob_digest.is_empty()
+                    || shard.compressed_size != 0
+                    || shard.uncompressed_size != 0
+                    || shard.merkle_hash != EMPTY_SHARD_MERKLE_HASH
+                {
+                    return Err(CoreError::InvalidIndex {
+                        details: format!("empty shard {expected_id} has non-empty metadata"),
+                    });
+                }
+            } else {
+                validate_sha256(&shard.blob_digest).map_err(|details| CoreError::InvalidIndex {
+                    details: format!("shard {expected_id} digest: {details}"),
+                })?;
+                if shard.compressed_size == 0 || shard.uncompressed_size == 0 {
+                    return Err(CoreError::InvalidIndex {
+                        details: format!("non-empty shard {expected_id} has zero size"),
+                    });
+                }
+                if shard.uncompressed_size > limits.max_uncompressed_bytes() {
+                    return Err(CoreError::LimitExceeded {
+                        target: "shard uncompressed bytes",
+                        limit: limits.max_uncompressed_bytes(),
+                        actual: shard.uncompressed_size,
+                    });
+                }
+                if shard.entry_count as u64 > limits.max_shard_entries() {
+                    return Err(CoreError::LimitExceeded {
+                        target: "shard entries",
+                        limit: limits.max_shard_entries(),
+                        actual: shard.entry_count as u64,
+                    });
+                }
+                validate_sha256(&shard.merkle_hash).map_err(|details| CoreError::InvalidIndex {
+                    details: format!("shard {expected_id} Merkle hash: {details}"),
+                })?;
+            }
+        }
+        validate_sha256(&self.merkle_root).map_err(|details| CoreError::InvalidIndex {
+            details: format!("root Merkle hash: {details}"),
+        })?;
+        if compute_merkle_root(&self.shards) != self.merkle_root {
+            return Err(CoreError::InvalidIndex {
+                details: "root Merkle hash does not match shard descriptors".to_string(),
+            });
+        }
+        if self.gc_roots.len() as u64 > limits.max_gc_roots() {
+            return Err(CoreError::LimitExceeded {
+                target: "GC roots",
+                limit: limits.max_gc_roots(),
+                actual: self.gc_roots.len() as u64,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// 单个分片内部的实际数据 Payload (独立 Zstd 压缩存储)
@@ -764,6 +903,89 @@ impl ShardDataPayload {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn validate_for<L: IndexValidationLimits>(
+        &self,
+        shard_id: u16,
+        system: &SystemArch,
+        limits: &L,
+    ) -> Result<(), CoreError> {
+        if self.version != SCHEMA_VERSION_V6 {
+            return Err(CoreError::InvalidShard {
+                details: format!("version must be {SCHEMA_VERSION_V6}"),
+            });
+        }
+        if shard_id >= NUM_SHARDS as u16 || self.shard_id != shard_id {
+            return Err(CoreError::InvalidShard {
+                details: "payload shard id is invalid or does not match the descriptor".to_string(),
+            });
+        }
+        if self.prefix != shard_id_to_prefix(shard_id) {
+            return Err(CoreError::InvalidShard {
+                details: "payload prefix does not match shard id".to_string(),
+            });
+        }
+        if self.entries.len() as u64 > limits.max_shard_entries() {
+            return Err(CoreError::LimitExceeded {
+                target: "shard entries",
+                limit: limits.max_shard_entries(),
+                actual: self.entries.len() as u64,
+            });
+        }
+        for (hash, entry) in &self.entries {
+            if hash.shard_id() != shard_id {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} belongs to another shard"),
+                });
+            }
+            if entry.system != Some(*system) {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} has a mismatched or missing system"),
+                });
+            }
+            if !is_sha256(entry.nar_digest.as_str()) {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} has an invalid NAR digest"),
+                });
+            }
+            if entry.nar_size > limits.max_nar_size() {
+                return Err(CoreError::LimitExceeded {
+                    target: "NAR size",
+                    limit: limits.max_nar_size(),
+                    actual: entry.nar_size,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_merkle_hash(&self, expected: &str) -> Result<(), CoreError> {
+        if self.compute_merkle_hash() != expected {
+            return Err(CoreError::InvalidShard {
+                details: "payload Merkle hash does not match root descriptor".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_sha256(value: &str) -> Result<(), String> {
+    if is_sha256(value) {
+        Ok(())
+    } else {
+        Err(
+            "expected canonical sha256: followed by 64 lowercase hexadecimal characters"
+                .to_string(),
+        )
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// 单个构建节点的统计数据

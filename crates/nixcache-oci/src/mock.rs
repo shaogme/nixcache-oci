@@ -1,6 +1,9 @@
 use crate::{
     error::TransportError,
-    transport::{OciTransport, UploadChunkResponse, parse_range_header},
+    transport::{
+        OciTransport, UploadChunkResponse, check_content_length, collect_limited,
+        parse_range_header,
+    },
 };
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
@@ -261,6 +264,7 @@ impl OciTransport for MockRouterTransport {
         &self,
         url: &str,
         _headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
@@ -282,7 +286,19 @@ impl OciTransport for MockRouterTransport {
                 gate.wait_until_released().await;
             }
             if let Some(response) = self.token_responses.pop() {
-                return Ok((response.status, response.headers, response.body));
+                let MockResponse {
+                    status,
+                    headers,
+                    body: response_body,
+                } = response;
+                let body = collect_limited(
+                    url,
+                    max_bytes,
+                    futures_util::stream::once(async move { Ok(response_body) }),
+                )
+                .await?;
+                check_content_length(url, &headers, max_bytes)?;
+                return Ok((status, headers, body));
             }
         }
 
@@ -296,13 +312,28 @@ impl OciTransport for MockRouterTransport {
             }
         });
         if let Some(res) = found {
-            return Ok(res);
+            let (status, headers, body) = res;
+            check_content_length(url, &headers, max_bytes)?;
+            let body = collect_limited(
+                url,
+                max_bytes,
+                futures_util::stream::once(async move { Ok(body) }),
+            )
+            .await?;
+            return Ok((status, headers, body));
         }
 
         if let Some(idx) = path.rfind("/blobs/") {
             let digest = &path[idx + 7..];
             if let Some(entry) = self.stored_blobs.get_sync(digest) {
-                return Ok((StatusCode::OK, HeaderMap::new(), entry.get().clone()));
+                let stored_body = entry.get().clone();
+                let body = collect_limited(
+                    url,
+                    max_bytes,
+                    futures_util::stream::once(async move { Ok(stored_body) }),
+                )
+                .await?;
+                return Ok((StatusCode::OK, HeaderMap::new(), body));
             }
         }
 
@@ -314,7 +345,13 @@ impl OciTransport for MockRouterTransport {
                 if let Ok(val) = HeaderValue::from_str(digest) {
                     headers.insert("Docker-Content-Digest", val);
                 }
-                return Ok((StatusCode::OK, headers, bytes.clone()));
+                let body = collect_limited(
+                    url,
+                    max_bytes,
+                    futures_util::stream::once(async move { Ok(bytes.clone()) }),
+                )
+                .await?;
+                return Ok((StatusCode::OK, headers, body));
             }
         }
 
@@ -333,7 +370,13 @@ impl OciTransport for MockRouterTransport {
                 "tags": tags,
             });
             let bytes = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
-            return Ok((StatusCode::OK, HeaderMap::new(), bytes));
+            let body = collect_limited(
+                url,
+                max_bytes,
+                futures_util::stream::once(async move { Ok(bytes) }),
+            )
+            .await?;
+            return Ok((StatusCode::OK, HeaderMap::new(), body));
         }
 
         Ok((StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new()))
@@ -343,8 +386,9 @@ impl OciTransport for MockRouterTransport {
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
-        let (status, headers, bytes) = self.get(url, headers).await?;
+        let (status, headers, bytes) = self.get(url, headers, max_bytes).await?;
         let stream: Self::BodyStream =
             Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
         Ok((status, headers, stream))

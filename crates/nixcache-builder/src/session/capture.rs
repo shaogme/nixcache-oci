@@ -100,7 +100,13 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         closure_res.active_gc_roots.len()
     );
 
-    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.credentials.clone(), true);
+    let oci = create_tokio_reqwest_client(
+        opts.registry,
+        opts.repo,
+        opts.credentials.clone(),
+        true,
+        Default::default(),
+    );
 
     // 4. 获取远端已缓存 StoreHash 集合 (从生产基线 cache-index)
     let all_known_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;

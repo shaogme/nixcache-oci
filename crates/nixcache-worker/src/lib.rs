@@ -10,7 +10,7 @@ use crate::{
 pub use error::WorkerStoreError;
 use futures_util::TryStreamExt;
 use nixcache_core::SystemArch;
-use nixcache_oci::RegistryCredentials;
+use nixcache_oci::{OciReadLimits, RegistryCredentials};
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 
 pub fn parse_upstream_list(upstream_str: &str) -> Vec<String> {
@@ -94,6 +94,7 @@ fn get_store(env: &Env) -> Result<CacheStore> {
         credentials,
         false,
         WorkerFetchTransport,
+        OciReadLimits::default(),
     );
     Ok(CacheStore::new(oci_client, config))
 }

@@ -3,7 +3,8 @@ use crate::{
     backend::{GitHubPackagesClient, PackageDeletionSupport, RegistryDeletionStrategy},
     client::endpoint,
     error::OciError,
-    transport::OciTransport,
+    integrity::verify_buffered_body,
+    transport::{OciTransport, parse_content_length},
 };
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -27,7 +28,11 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                 );
                 let (status, headers, body) = self
                     .client
-                    .request_get_with_auth_retry(&url, "get tag manifest")
+                    .request_get_with_auth_retry(
+                        &url,
+                        "get tag manifest",
+                        self.client.limits().max_manifest_bytes(),
+                    )
                     .await?;
                 if status == StatusCode::NOT_FOUND {
                     return Ok(());
@@ -46,11 +51,16 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                         details: format!("HTTP {} when retrieving tag manifest {}", status, tag),
                     });
                 }
-                let digest = headers
-                    .get("Docker-Content-Digest")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| endpoint::compute_sha256_digest(&body));
+                let content_length = parse_content_length(&headers).map_err(OciError::Transport)?;
+                let digest = verify_buffered_body(
+                    &url,
+                    None,
+                    headers.get("Docker-Content-Digest"),
+                    None,
+                    content_length,
+                    &body,
+                )?
+                .to_string();
                 self.delete_manifest_strict(&digest).await?;
 
                 let tag_status = self

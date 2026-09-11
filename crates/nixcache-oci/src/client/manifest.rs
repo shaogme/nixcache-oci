@@ -2,8 +2,9 @@ use super::{OciClient, endpoint};
 use crate::{
     backend::ManifestCasSupport,
     error::{OciError, TransportError},
+    integrity::{ContentDigest, verify_buffered_body},
     manifest::{EMPTY_CONFIG_DIGEST, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest},
-    transport::OciTransport,
+    transport::{OciTransport, parse_content_length},
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
@@ -48,6 +49,34 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
     }
 
     pub async fn get_with_digest(&self, tag: &str) -> Result<Option<(String, String)>, OciError> {
+        self.get_with_expected_size(tag, None).await
+    }
+
+    /// descriptor-aware manifest GET，用于校验 image index 中声明的 manifest size。
+    pub async fn get_with_digest_and_size(
+        &self,
+        reference: &str,
+        expected_size: u64,
+    ) -> Result<Option<(String, String)>, OciError> {
+        self.get_with_expected_size(reference, Some(expected_size))
+            .await
+    }
+
+    async fn get_with_expected_size(
+        &self,
+        tag: &str,
+        expected_size: Option<u64>,
+    ) -> Result<Option<(String, String)>, OciError> {
+        if let Some(expected_size) = expected_size
+            && expected_size > self.client.limits().max_manifest_bytes()
+        {
+            return Err(OciError::SizeLimitExceeded {
+                target: tag.to_string(),
+                limit: self.client.limits().max_manifest_bytes(),
+                actual: expected_size,
+            });
+        }
+        let _permit = self.client.acquire_index_read().await;
         let url = endpoint::manifest_url(
             self.client.url_scheme(),
             self.client.registry(),
@@ -56,24 +85,30 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
         );
         let (status, response_headers, bytes) = self
             .client
-            .request_get_with_auth_retry(&url, "get manifest")
+            .request_get_with_auth_retry(
+                &url,
+                "get manifest",
+                self.client.limits().max_manifest_bytes(),
+            )
             .await?;
 
         if status == StatusCode::OK {
-            let digest_header = response_headers
-                .get("Docker-Content-Digest")
-                .map(|value| {
-                    value
-                        .to_str()
-                        .map(str::to_string)
-                        .map_err(|_| TransportError::HeaderParse {
-                            header: "Docker-Content-Digest",
-                        })
-                })
+            let request_digest = tag
+                .starts_with("sha256:")
+                .then(|| ContentDigest::parse(tag))
                 .transpose()?;
+            let content_length =
+                parse_content_length(&response_headers).map_err(OciError::Transport)?;
+            let digest = verify_buffered_body(
+                &url,
+                request_digest.as_ref().map(ContentDigest::as_str),
+                response_headers.get("Docker-Content-Digest"),
+                expected_size,
+                content_length,
+                &bytes,
+            )?;
             let body = from_utf8(&bytes)?;
-            let digest = digest_header.unwrap_or_else(|| endpoint::compute_sha256_digest(&bytes));
-            Ok(Some((body.to_string(), digest)))
+            Ok(Some((body.to_string(), digest.to_string())))
         } else if status == StatusCode::NOT_FOUND {
             Ok(None)
         } else {
@@ -130,9 +165,14 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
                 Some(cursor) => endpoint::with_last_cursor(&base_url, cursor),
                 None => format!("{base_url}?n=100"),
             };
+            let _permit = self.client.acquire_index_read().await;
             let (status, _, body) = self
                 .client
-                .request_get_with_auth_retry(&url, "list tags")
+                .request_get_with_auth_retry(
+                    &url,
+                    "list tags",
+                    self.client.limits().max_manifest_bytes(),
+                )
                 .await?;
             if status == StatusCode::NOT_FOUND {
                 if !all_tags.is_empty() {
@@ -150,7 +190,11 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
                 if last_tag.is_none() {
                     let (plain_status, _, plain_body) = self
                         .client
-                        .request_get_with_auth_retry(&base_url, "list tags fallback")
+                        .request_get_with_auth_retry(
+                            &base_url,
+                            "list tags fallback",
+                            self.client.limits().max_manifest_bytes(),
+                        )
                         .await?;
                     if plain_status.is_success() {
                         let response = serde_json::from_slice::<OciTagsListResponse>(&plain_body)
@@ -198,6 +242,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
             return Ok(None);
         };
         let manifest = serde_json::from_str::<OciArtifactManifest>(&body)?;
+        manifest.validate_for(self.client.limits(), tag_or_digest)?;
         Ok(Some(FetchedOciArtifact { manifest, digest }))
     }
 

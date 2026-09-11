@@ -5,8 +5,8 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    OciClient, OciDriver, OciTransport, RegistryCredentials, RegistryKind, TransportError,
-    UploadChunkResponse, parse_range_header,
+    OciClient, OciDriver, OciReadLimits, OciTransport, RegistryCredentials, RegistryKind,
+    TransportError, UploadChunkResponse, check_content_length, collect_limited, parse_range_header,
 };
 use reqwest::Client;
 use std::{io::Error as IoError, time::Duration};
@@ -90,6 +90,7 @@ impl OciTransport for ReqwestTransport {
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
         let resp = self
             .client
@@ -100,7 +101,11 @@ impl OciTransport for ReqwestTransport {
             .map_err(map_reqwest_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
+        check_content_length(url, &headers, max_bytes)?;
+        let body_stream = resp
+            .bytes_stream()
+            .map(|result| result.map_err(map_reqwest_error));
+        let bytes = collect_limited(url, max_bytes, body_stream).await?;
         Ok((status, headers, bytes))
     }
 
@@ -108,6 +113,7 @@ impl OciTransport for ReqwestTransport {
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError> {
         let resp = self
             .client
@@ -118,6 +124,7 @@ impl OciTransport for ReqwestTransport {
             .map_err(map_reqwest_error)?;
         let status = resp.status();
         let headers = resp.headers().clone();
+        check_content_length(url, &headers, max_bytes)?;
         let stream: BoxStream<'static, Result<Bytes, TransportError>> = Box::pin(
             resp.bytes_stream()
                 .map(|res| res.map_err(map_reqwest_error)),
@@ -456,9 +463,10 @@ pub fn create_tokio_reqwest_client(
     repo: &str,
     credentials: impl Into<RegistryCredentials>,
     write_access: bool,
+    limits: OciReadLimits,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::with_transport(registry, repo, credentials, write_access, transport)
+    OciClient::with_transport(registry, repo, credentials, write_access, transport, limits)
 }
 
 /// 基于指定 Driver 创建 Tokio Reqwest OCI 客户端
@@ -468,9 +476,18 @@ pub fn create_tokio_reqwest_client_with_driver(
     credentials: impl Into<RegistryCredentials>,
     write_access: bool,
     driver: impl Into<OciDriver>,
+    limits: OciReadLimits,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::new(registry, repo, credentials, write_access, driver, transport)
+    OciClient::new(
+        registry,
+        repo,
+        credentials,
+        write_access,
+        driver,
+        transport,
+        limits,
+    )
 }
 
 /// 基于指定 RegistryKind 创建 Tokio Reqwest OCI 客户端
@@ -480,9 +497,18 @@ pub fn create_tokio_reqwest_client_from_kind(
     repo: &str,
     credentials: impl Into<RegistryCredentials>,
     write_access: bool,
+    limits: OciReadLimits,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::from_kind(kind, registry, repo, credentials, write_access, transport)
+    OciClient::from_kind(
+        kind,
+        registry,
+        repo,
+        credentials,
+        write_access,
+        transport,
+        limits,
+    )
 }
 
 #[cfg(test)]
@@ -549,7 +575,13 @@ mod tests {
             .await;
 
         let credentials = nixcache_oci::RegistryCredentials::with_username("custom", "secret");
-        let client = super::create_tokio_reqwest_client(&host, "test/repo", credentials, false);
+        let client = super::create_tokio_reqwest_client(
+            &host,
+            "test/repo",
+            credentials,
+            false,
+            Default::default(),
+        );
         let artifact = client.manifests().get("cache-index").await.unwrap();
         assert!(artifact.is_some());
     }
@@ -572,7 +604,8 @@ mod tests {
             .await;
 
         let credentials = RegistryCredentials::with_username("custom", "secret-gh-token");
-        let client = create_tokio_reqwest_client(&host, "test/repo", credentials, true);
+        let client =
+            create_tokio_reqwest_client(&host, "test/repo", credentials, true, Default::default());
         let challenge = BearerChallenge::new(
             format!("http://{host}/token"),
             Some(host.clone()),
@@ -633,7 +666,15 @@ mod tests {
             .await;
 
         let transport = super::ReqwestTransport::default();
-        let client = OciClient::new(&host, "test/repo", "", true, GenericOciDriver, transport);
+        let client = OciClient::new(
+            &host,
+            "test/repo",
+            "",
+            true,
+            GenericOciDriver,
+            transport,
+            Default::default(),
+        );
         let result = client
             .blobs()
             .push_resumable(
@@ -690,7 +731,15 @@ mod tests {
             .build()
             .unwrap();
         let transport = super::ReqwestTransport::new(http_client);
-        let client = OciClient::new(&host, "test/repo", "", true, GenericOciDriver, transport);
+        let client = OciClient::new(
+            &host,
+            "test/repo",
+            "",
+            true,
+            GenericOciDriver,
+            transport,
+            Default::default(),
+        );
         let result = client
             .blobs()
             .push_resumable(

@@ -63,4 +63,17 @@ pub enum CoreError {
 
     #[error("Serialization / Deserialization error: {0}")]
     Json(String),
+
+    #[error("Invalid Schema v6 root index: {details}")]
+    InvalidIndex { details: String },
+
+    #[error("Invalid Schema v6 shard payload: {details}")]
+    InvalidShard { details: String },
+
+    #[error("Schema v6 {target} exceeds limit {limit} (actual {actual})")]
+    LimitExceeded {
+        target: &'static str,
+        limit: u64,
+        actual: u64,
+    },
 }

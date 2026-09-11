@@ -1,7 +1,10 @@
-use crate::error::TransportError;
+use crate::{
+    error::{OciError, TransportError},
+    integrity::{ContentDigest, verify_size, verify_stream_digest},
+};
 use bytes::Bytes;
-use futures_util::{Stream, ready};
-use http::{HeaderMap, StatusCode};
+use futures_util::{Stream, StreamExt, ready};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
@@ -44,6 +47,69 @@ impl<S> OciBlobStream<S> {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
     }
+}
+
+/// 解析并验证响应的 Content-Length。无效 header 必须失败，不能降级为 chunked。
+pub fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, TransportError> {
+    let Some(value) = headers.get(http::header::CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+    let text = value.to_str().map_err(|_| TransportError::HeaderParse {
+        header: "Content-Length",
+    })?;
+    let length = text
+        .parse::<u64>()
+        .map_err(|_| TransportError::HeaderParse {
+            header: "Content-Length",
+        })?;
+    Ok(Some(length))
+}
+
+pub fn check_content_length(
+    url: &str,
+    headers: &HeaderMap,
+    max_bytes: u64,
+) -> Result<Option<u64>, TransportError> {
+    let length = parse_content_length(headers)?;
+    if let Some(length) = length
+        && length > max_bytes
+    {
+        return Err(TransportError::ResponseTooLarge {
+            url: url.to_string(),
+            limit: max_bytes,
+            actual: length,
+        });
+    }
+    Ok(length)
+}
+
+/// 在 transport 层收集有限 body；检查发生在追加 chunk 之前。
+pub async fn collect_limited<S>(
+    url: &str,
+    max_bytes: u64,
+    stream: S,
+) -> Result<Bytes, TransportError>
+where
+    S: Stream<Item = Result<Bytes, TransportError>>,
+{
+    let capacity = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut body = Vec::with_capacity(capacity.min(1024 * 1024));
+    let mut stream = Box::pin(stream);
+    while let Some(chunk) = stream.as_mut().next().await {
+        let chunk = chunk?;
+        let current = body.len() as u64;
+        let chunk_len = chunk.len() as u64;
+        let total = current.saturating_add(chunk_len);
+        if total > max_bytes {
+            return Err(TransportError::ResponseTooLarge {
+                url: url.to_string(),
+                limit: max_bytes,
+                actual: total,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +164,109 @@ pub struct HashingStream<S> {
     inner: S,
     hasher: Sha256,
     state: StreamHashState,
+}
+
+/// NAR 等大 blob 的零拷贝完整性验证包装器。
+pub struct VerifiedBlobStream<S> {
+    inner: S,
+    target: String,
+    expected_digest: String,
+    header_digest: Option<HeaderValue>,
+    content_length: Option<u64>,
+    max_bytes: u64,
+    bytes_seen: u64,
+    hasher: Sha256,
+    finished: bool,
+}
+
+impl<S> VerifiedBlobStream<S> {
+    pub fn new(
+        inner: S,
+        target: impl Into<String>,
+        expected_digest: impl Into<String>,
+        headers: &HeaderMap,
+        max_bytes: u64,
+    ) -> Result<Self, OciError> {
+        let target = target.into();
+        let expected_digest = expected_digest.into();
+        ContentDigest::parse(&expected_digest)?;
+        let content_length = parse_content_length(headers).map_err(OciError::Transport)?;
+        if let Some(content_length) = content_length
+            && content_length > max_bytes
+        {
+            return Err(OciError::SizeLimitExceeded {
+                target: target.clone(),
+                limit: max_bytes,
+                actual: content_length,
+            });
+        }
+        Ok(Self {
+            inner,
+            target,
+            expected_digest,
+            header_digest: headers.get("Docker-Content-Digest").cloned(),
+            content_length,
+            max_bytes,
+            bytes_seen: 0,
+            hasher: Sha256::new(),
+            finished: false,
+        })
+    }
+}
+
+impl<S> Stream for VerifiedBlobStream<S>
+where
+    S: Stream<Item = Result<Bytes, TransportError>> + Unpin,
+{
+    type Item = Result<Bytes, OciError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
+            Some(Err(error)) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(OciError::Transport(error))))
+            }
+            Some(Ok(bytes)) => {
+                let chunk_len = bytes.len() as u64;
+                let total = this.bytes_seen.saturating_add(chunk_len);
+                if total > this.max_bytes {
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(OciError::SizeLimitExceeded {
+                        target: this.target.clone(),
+                        limit: this.max_bytes,
+                        actual: total,
+                    })));
+                }
+                this.bytes_seen = total;
+                this.hasher.update(&bytes);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            None => {
+                this.finished = true;
+                let actual = ContentDigest::from_hasher(std::mem::take(&mut this.hasher));
+                let result = this
+                    .content_length
+                    .map(|length| verify_size(&this.target, length, this.bytes_seen))
+                    .unwrap_or(Ok(()))
+                    .and_then(|_| {
+                        verify_stream_digest(
+                            &this.target,
+                            &this.expected_digest,
+                            this.header_digest.as_ref(),
+                            &actual,
+                        )
+                    });
+                match result {
+                    Ok(()) => Poll::Ready(None),
+                    Err(error) => Poll::Ready(Some(Err(error))),
+                }
+            }
+        }
+    }
 }
 
 impl<S> HashingStream<S> {
@@ -190,12 +359,14 @@ pub trait OciTransport: 'static {
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError>;
 
     async fn stream(
         &self,
         url: &str,
         headers: HeaderMap,
+        max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Self::BodyStream), TransportError>;
 
     async fn post(
@@ -313,4 +484,136 @@ pub trait OciTransport: 'static {
     }
 
     async fn sleep(&self, duration: Duration);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerifiedBlobStream, check_content_length, collect_limited, parse_content_length};
+    use crate::{ContentDigest, OciError, TransportError};
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use http::{HeaderMap, HeaderValue};
+
+    #[tokio::test]
+    async fn collect_limited_rejects_chunked_body_before_append() {
+        let chunks = stream::iter(vec![
+            Ok(Bytes::from_static(b"123")),
+            Ok(Bytes::from_static(b"45")),
+        ]);
+        let error = collect_limited("blob", 4, chunks)
+            .await
+            .expect_err("the second chunk must exceed the limit");
+        assert!(matches!(
+            error,
+            TransportError::ResponseTooLarge {
+                limit: 4,
+                actual: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn content_length_is_parsed_and_checked_before_body_reads() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Length", HeaderValue::from_static("9"));
+        assert_eq!(parse_content_length(&headers).unwrap(), Some(9));
+        assert!(matches!(
+            check_content_length("blob", &headers, 8),
+            Err(TransportError::ResponseTooLarge {
+                limit: 8,
+                actual: 9,
+                ..
+            })
+        ));
+
+        headers.insert("Content-Length", HeaderValue::from_static("invalid"));
+        assert!(matches!(
+            parse_content_length(&headers),
+            Err(TransportError::HeaderParse {
+                header: "Content-Length"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_stream_only_finishes_successfully_after_eof_digest_check() {
+        let body = Bytes::from_static(b"stream body");
+        let digest = ContentDigest::from_bytes(&body).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&body.len().to_string()).unwrap(),
+        );
+        headers.insert(
+            "Docker-Content-Digest",
+            HeaderValue::from_str(&digest).unwrap(),
+        );
+        let mut verified = VerifiedBlobStream::new(
+            stream::iter(vec![Ok::<Bytes, TransportError>(body.clone())]),
+            "blob",
+            &digest,
+            &headers,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(verified.next().await.unwrap().unwrap(), body);
+        assert!(verified.next().await.is_none());
+
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let mut wrong = VerifiedBlobStream::new(
+            stream::iter(vec![Ok::<Bytes, TransportError>(Bytes::from_static(
+                b"stream body",
+            ))]),
+            "blob",
+            wrong_digest,
+            &HeaderMap::new(),
+            1024,
+        )
+        .unwrap();
+        assert!(wrong.next().await.unwrap().is_ok());
+        assert!(matches!(
+            wrong.next().await,
+            Some(Err(OciError::DigestMismatch { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_stream_rejects_size_mismatch_and_cumulative_overflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Length", HeaderValue::from_static("10"));
+        let digest = ContentDigest::from_bytes(b"12345").to_string();
+        let mut short = VerifiedBlobStream::new(
+            stream::iter(vec![Ok::<Bytes, TransportError>(Bytes::from_static(
+                b"12345",
+            ))]),
+            "blob",
+            digest,
+            &headers,
+            100,
+        )
+        .unwrap();
+        assert!(short.next().await.unwrap().is_ok());
+        assert!(matches!(
+            short.next().await,
+            Some(Err(OciError::SizeMismatch { .. }))
+        ));
+
+        let digest = ContentDigest::from_bytes(b"1234").to_string();
+        let mut oversized = VerifiedBlobStream::new(
+            stream::iter(vec![Ok::<Bytes, TransportError>(Bytes::from_static(
+                b"1234",
+            ))]),
+            "blob",
+            digest,
+            &HeaderMap::new(),
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            oversized.next().await,
+            Some(Err(OciError::SizeLimitExceeded { .. }))
+        ));
+    }
 }

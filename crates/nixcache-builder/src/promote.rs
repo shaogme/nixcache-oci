@@ -65,7 +65,7 @@ pub async fn run_promote(
         target_tag, registry, repo
     );
 
-    let oci = create_tokio_reqwest_client(registry, repo, credentials, true);
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default());
 
     // 1. 准备待合并的数据集 (按系统架构分桶)
     let mut incoming_entries_by_sys: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =
@@ -195,9 +195,7 @@ pub async fn run_promote(
                     let existing_desc = &root_index.shards[shard_id as usize];
                     let mut shard_payload =
                         if existing_desc.entry_count > 0 && !existing_desc.blob_digest.is_empty() {
-                            oci.indexes()
-                                .get_shard_data(&existing_desc.blob_digest)
-                                .await?
+                            oci.indexes().get_shard_data(existing_desc, &sys).await?
                         } else {
                             ShardDataPayload::new(shard_id)
                         };

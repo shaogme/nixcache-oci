@@ -18,6 +18,8 @@ use std::{sync::Arc, time::Duration};
 use sync::{ChallengeKey, FlightOutcome, FlightRegistry, Leader, Waiter};
 use web_time::Instant;
 
+const MAX_TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Deserialize)]
 struct TokenResponse {
     token: Option<String>,
@@ -242,7 +244,7 @@ impl TokenManager {
         }
 
         let (status, _response_headers, bytes) = transport
-            .get(&token_url, headers)
+            .get(&token_url, headers, MAX_TOKEN_RESPONSE_BYTES)
             .await
             .map_err(OciError::Transport)?;
         if !status.is_success() {
