@@ -322,7 +322,7 @@ fn fmix64(mut k: u64) -> u64 {
 pub struct FastBlockedBloomFilter {
     /// 512 位块的连续位图，每块占 8 个 u64 (64 字节)
     bits: Vec<u64>,
-    /// 块总数 (num_blocks >= 1，u32 保证跨平台确定性，支持最大 ~256 GB 位图)
+    /// 块总数 (num_blocks >= 1，u32 保证跨平台确定性，位图上限为 64 MiB)
     num_blocks: u32,
     /// 记录的条目总数 (u64 确保序列化字段在 32/64 位平台完全一致)
     num_entries: u64,
@@ -332,11 +332,44 @@ pub struct FastBlockedBloomFilter {
 
 pub type BloomFilter = FastBlockedBloomFilter;
 
+fn checked_div_ceil(value: u64, divisor: u64) -> Result<u64, BloomError> {
+    debug_assert!(divisor > 0);
+    if divisor == 0 {
+        return Err(BloomError::ArithmeticOverflow {
+            operation: "division by zero",
+        });
+    }
+    if value == 0 {
+        return Ok(0);
+    }
+    value
+        .checked_add(divisor - 1)
+        .map(|adjusted| adjusted / divisor)
+        .ok_or(BloomError::ArithmeticOverflow {
+            operation: "rounded block count",
+        })
+}
+
+fn allocate_zeroed_words(word_len: usize) -> Result<Vec<u64>, BloomError> {
+    let mut bits = Vec::new();
+    bits.try_reserve_exact(word_len)
+        .map_err(|error| BloomError::AllocationFailed {
+            requested: word_len,
+            details: error.to_string(),
+        })?;
+    bits.resize(word_len, 0);
+    Ok(bits)
+}
+
 impl FastBlockedBloomFilter {
     /// 默认假阳性率 p = 0.01 (1%)，单条目占用 10 bits，num_hashes = 7
     pub const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
     pub const DEFAULT_BITS_PER_ENTRY: f64 = 10.0;
     pub const DEFAULT_NUM_HASHES: u8 = 7;
+    pub const MIN_FALSE_POSITIVE_RATE: f64 = 0.00001;
+    pub const MAX_FALSE_POSITIVE_RATE: f64 = 0.5;
+    pub const MAX_BLOCKS: u32 = 1_048_576;
+    pub const MAX_HASHES: u8 = 30;
     pub const BLOCK_BITS: usize = 512;
     pub const WORDS_PER_BLOCK: usize = 8; // 512 / 64 = 8
 
@@ -344,42 +377,80 @@ impl FastBlockedBloomFilter {
     ///
     /// 强制在 `u64` 算术精度下完成块定位运算，防止 wasm32 下 `usize` 截断高 32 位。
     #[inline(always)]
-    fn calculate_block_offset(h1: u64, num_blocks: u32) -> usize {
-        let block_idx = (h1 % (num_blocks as u64)) as usize;
-        block_idx * Self::WORDS_PER_BLOCK
+    fn calculate_block_offset(h1: u64, num_blocks: u32) -> Option<usize> {
+        if num_blocks == 0 {
+            return None;
+        }
+
+        let block_idx = usize::try_from(h1 % u64::from(num_blocks)).ok()?;
+        block_idx.checked_mul(Self::WORDS_PER_BLOCK)
     }
 
     /// 根据预期条目数与假阳性率构建布隆过滤器
-    pub fn new(expected_entries: usize, false_positive_rate: f64) -> Self {
-        let p = false_positive_rate.clamp(0.00001, 0.5);
-        let bits_per_entry = -(p.ln() / (2.0f64.ln().powi(2))) * 1.15;
-        let num_hashes = ((bits_per_entry * 2.0f64.ln()).round() as u8).clamp(1, 30);
+    pub fn new(expected_entries: usize, false_positive_rate: f64) -> Result<Self, BloomError> {
+        if !false_positive_rate.is_finite()
+            || !(Self::MIN_FALSE_POSITIVE_RATE..=Self::MAX_FALSE_POSITIVE_RATE)
+                .contains(&false_positive_rate)
+        {
+            return Err(BloomError::InvalidFalsePositiveRate {
+                actual: format!("{false_positive_rate:?}"),
+                min: "0.00001",
+                max: "0.5",
+            });
+        }
 
-        let total_bits =
-            ((expected_entries as u64) * bits_per_entry as u64).max(Self::BLOCK_BITS as u64);
-        let num_blocks = (total_bits.div_ceil(Self::BLOCK_BITS as u64)) as u32;
+        let bits_per_entry = -(false_positive_rate.ln() / (2.0f64.ln().powi(2))) * 1.15;
+        if !bits_per_entry.is_finite() || bits_per_entry <= 0.0 {
+            return Err(BloomError::ArithmeticOverflow {
+                operation: "bits per entry",
+            });
+        }
+        let bits_per_entry = bits_per_entry.ceil();
+        if bits_per_entry > u64::MAX as f64 {
+            return Err(BloomError::ArithmeticOverflow {
+                operation: "bits per entry conversion",
+            });
+        }
+        let bits_per_entry = bits_per_entry as u64;
+        let expected_entries =
+            u64::try_from(expected_entries).map_err(|_| BloomError::ArithmeticOverflow {
+                operation: "expected entry count conversion",
+            })?;
+        let total_bits = expected_entries
+            .checked_mul(bits_per_entry)
+            .ok_or(BloomError::ArithmeticOverflow {
+                operation: "total bit count",
+            })?
+            .max(Self::BLOCK_BITS as u64);
+        let num_blocks = checked_div_ceil(total_bits, Self::BLOCK_BITS as u64)?;
+        let (num_blocks, word_len) = Self::validated_word_len(num_blocks)?;
+        let bits = allocate_zeroed_words(word_len)?;
+        let num_hashes =
+            ((bits_per_entry as f64 * 2.0f64.ln()).round() as u8).clamp(1, Self::MAX_HASHES);
 
-        Self {
-            bits: vec![0u64; num_blocks as usize * Self::WORDS_PER_BLOCK],
+        Ok(Self {
+            bits,
             num_blocks,
             num_entries: 0,
             num_hashes,
-        }
+        })
     }
 
     /// 使用默认参数 (1% 假阳性率) 创建
-    pub fn new_with_defaults(expected_entries: usize) -> Self {
+    pub fn new_with_defaults(expected_entries: usize) -> Result<Self, BloomError> {
         Self::new(expected_entries, Self::DEFAULT_FALSE_POSITIVE_RATE)
     }
 
     /// 从可迭代集合批量构建布隆过滤器
-    pub fn from_entries<'a>(entries: impl IntoIterator<Item = &'a StoreHash>) -> Self {
+    pub fn from_entries<'a>(
+        entries: impl IntoIterator<Item = &'a StoreHash>,
+    ) -> Result<Self, BloomError> {
         let items: Vec<&'a StoreHash> = entries.into_iter().collect();
-        let mut filter = Self::new_with_defaults(items.len());
+        let mut filter = Self::new_with_defaults(items.len())?;
         for hash in items {
-            filter.insert(hash);
+            filter.insert(hash)?;
         }
-        filter
+        Ok(filter)
     }
 
     /// 从原始字节流与元数据还原布隆过滤器
@@ -388,8 +459,12 @@ impl FastBlockedBloomFilter {
     /// - `bytes` 必须为 64 字节对齐（严格 512 位块边界）
     /// - `bytes.len() / 64` 必须不超过 `u32::MAX`
     pub fn from_bytes(bytes: &[u8], num_entries: u64, num_hashes: u8) -> Result<Self, BloomError> {
-        if num_hashes == 0 {
-            return Err(BloomError::ZeroHashCount(0));
+        if !(1..=Self::MAX_HASHES).contains(&num_hashes) {
+            return Err(BloomError::InvalidHashCount {
+                actual: num_hashes,
+                min: 1,
+                max: Self::MAX_HASHES,
+            });
         }
         if bytes.is_empty() || !bytes.len().is_multiple_of(64) {
             return Err(BloomError::InvalidByteLength {
@@ -398,12 +473,30 @@ impl FastBlockedBloomFilter {
         }
 
         let num_blocks_raw = bytes.len() / 64;
-        let num_blocks = num_blocks_raw as u32;
-        let mut bits = Vec::with_capacity(num_blocks_raw * Self::WORDS_PER_BLOCK);
+        let (num_blocks, word_len) =
+            Self::validated_word_len(u64::try_from(num_blocks_raw).map_err(|_| {
+                BloomError::ArithmeticOverflow {
+                    operation: "serialized block count conversion",
+                }
+            })?)?;
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(word_len)
+            .map_err(|error| BloomError::AllocationFailed {
+                requested: word_len,
+                details: error.to_string(),
+            })?;
 
         let (chunks, _) = bytes.as_chunks::<8>();
         for chunk in chunks {
             bits.push(u64::from_le_bytes(*chunk));
+        }
+
+        if bits.len() != word_len {
+            return Err(BloomError::InvalidStructure {
+                num_blocks,
+                expected_words: word_len,
+                actual_words: bits.len(),
+            });
         }
 
         Ok(Self {
@@ -412,6 +505,51 @@ impl FastBlockedBloomFilter {
             num_entries,
             num_hashes,
         })
+    }
+
+    fn validated_word_len(num_blocks: u64) -> Result<(u32, usize), BloomError> {
+        let num_blocks = u32::try_from(num_blocks).map_err(|_| BloomError::BlockCountOverflow {
+            actual: num_blocks,
+            max: u32::MAX,
+        })?;
+        if num_blocks == 0 {
+            return Err(BloomError::InvalidBlockCount { actual: 0 });
+        }
+        if num_blocks > Self::MAX_BLOCKS {
+            return Err(BloomError::BlockLimitExceeded {
+                actual: u64::from(num_blocks),
+                limit: Self::MAX_BLOCKS,
+            });
+        }
+        let blocks = usize::try_from(num_blocks).map_err(|_| BloomError::ArithmeticOverflow {
+            operation: "block count conversion to usize",
+        })?;
+        let word_len =
+            blocks
+                .checked_mul(Self::WORDS_PER_BLOCK)
+                .ok_or(BloomError::ArithmeticOverflow {
+                    operation: "bitmap word count",
+                })?;
+        Ok((num_blocks, word_len))
+    }
+
+    fn validate_internal(&self) -> Result<(), BloomError> {
+        let (_, expected_words) = Self::validated_word_len(u64::from(self.num_blocks))?;
+        if self.bits.len() != expected_words {
+            return Err(BloomError::InvalidStructure {
+                num_blocks: self.num_blocks,
+                expected_words,
+                actual_words: self.bits.len(),
+            });
+        }
+        if !(1..=Self::MAX_HASHES).contains(&self.num_hashes) {
+            return Err(BloomError::InvalidHashCount {
+                actual: self.num_hashes,
+                min: 1,
+                max: Self::MAX_HASHES,
+            });
+        }
+        Ok(())
     }
 
     /// 导出为紧凑二进制字节流 (小端对齐，多架构字节序严格一致)
@@ -424,16 +562,27 @@ impl FastBlockedBloomFilter {
     }
 
     /// 向布隆过滤器插入 StoreHash
-    pub fn insert(&mut self, hash: &StoreHash) {
-        self.insert_bytes(hash.as_bytes());
+    pub fn insert(&mut self, hash: &StoreHash) -> Result<(), BloomError> {
+        self.insert_bytes(hash.as_bytes())
     }
 
     /// 向布隆过滤器插入原始字节切片
     ///
     /// 使用 `u64` 精度取模（`h1 % num_blocks as u64`），跨平台确定性核心路径。
-    pub fn insert_bytes(&mut self, key: &[u8]) {
+    pub fn insert_bytes(&mut self, key: &[u8]) -> Result<(), BloomError> {
+        self.validate_internal()?;
+        let next_entries =
+            self.num_entries
+                .checked_add(1)
+                .ok_or(BloomError::EntryCountOverflow {
+                    actual: self.num_entries,
+                })?;
         let (h1, h2) = murmur3_x64_128(key, 0);
-        let block_offset = Self::calculate_block_offset(h1, self.num_blocks);
+        let block_offset = Self::calculate_block_offset(h1, self.num_blocks).ok_or(
+            BloomError::InvalidBlockCount {
+                actual: self.num_blocks,
+            },
+        )?;
 
         let base = (h1 >> 32) ^ (h1 & 0xFFFF_FFFF);
         let step = h2 | 1;
@@ -446,7 +595,8 @@ impl FastBlockedBloomFilter {
             self.bits[block_offset + word_idx] |= 1u64 << bit_idx;
         }
 
-        self.num_entries += 1;
+        self.num_entries = next_entries;
+        Ok(())
     }
 
     /// 探测 StoreHash 是否可能存在 (False Positive Rate ~ 1%，绝对无 False Negative)
@@ -463,7 +613,9 @@ impl FastBlockedBloomFilter {
         }
 
         let (h1, h2) = murmur3_x64_128(key, 0);
-        let block_offset = Self::calculate_block_offset(h1, self.num_blocks);
+        let Some(block_offset) = Self::calculate_block_offset(h1, self.num_blocks) else {
+            return false;
+        };
 
         let base = (h1 >> 32) ^ (h1 & 0xFFFF_FFFF);
         let step = h2 | 1;
@@ -510,6 +662,7 @@ impl FastBlockedBloomFilter {
 #[cfg(test)]
 mod tests {
     use super::{FastBlockedBloomFilter, murmur3_x64_128};
+    use crate::error::BloomError;
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -551,14 +704,16 @@ mod tests {
         }
 
         // 构建 num_blocks=3 的过滤器，插入 hash1，确认 contains 返回 true（零假阴性）
-        let mut filter = FastBlockedBloomFilter::new(10, 0.01);
+        let mut filter = FastBlockedBloomFilter::new(10, 0.01).expect("valid Bloom parameters");
         // 通过公开接口间接验证：把 filter 构建为 3 块
         let filter3 = FastBlockedBloomFilter::from_bytes(&[0u8; 192], 0, 7).unwrap();
         // 重新用 from_bytes 构建正确块数的过滤器并手动插入
         drop(filter3);
 
         // 直接构建并插入，验证包含
-        filter.insert_bytes(hash1.as_bytes());
+        filter
+            .insert_bytes(hash1.as_bytes())
+            .expect("valid Bloom insertion");
         assert!(
             filter.contains_bytes(hash1.as_bytes()),
             "向量1 插入后 contains 应为 true"
@@ -573,8 +728,10 @@ mod tests {
         let block_idx_v2 = (h1_v2 % 3u64) as usize;
         assert_eq!(block_idx_v2, 0, "向量2 block_idx 应为 0");
 
-        let mut filter2 = FastBlockedBloomFilter::new(10, 0.01);
-        filter2.insert_bytes(hash2.as_bytes());
+        let mut filter2 = FastBlockedBloomFilter::new(10, 0.01).expect("valid Bloom parameters");
+        filter2
+            .insert_bytes(hash2.as_bytes())
+            .expect("valid Bloom insertion");
         assert!(
             filter2.contains_bytes(hash2.as_bytes()),
             "向量2 插入后 contains 应为 true"
@@ -599,9 +756,12 @@ mod tests {
         ];
 
         // 步骤1：构建并插入
-        let mut original = FastBlockedBloomFilter::new(test_hashes.len(), 0.01);
+        let mut original =
+            FastBlockedBloomFilter::new(test_hashes.len(), 0.01).expect("valid Bloom parameters");
         for h in &test_hashes {
-            original.insert_bytes(h.as_bytes());
+            original
+                .insert_bytes(h.as_bytes())
+                .expect("valid Bloom insertion");
         }
         let bytes_original = original.to_bytes();
 
@@ -633,8 +793,6 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[test]
     fn test_from_bytes_validation() {
-        use crate::error::BloomError;
-
         // 空字节
         assert!(matches!(
             FastBlockedBloomFilter::from_bytes(&[], 0, 7),
@@ -650,7 +808,11 @@ mod tests {
         // num_hashes = 0
         assert!(matches!(
             FastBlockedBloomFilter::from_bytes(&[0u8; 64], 0, 0),
-            Err(BloomError::ZeroHashCount(0))
+            Err(BloomError::InvalidHashCount {
+                actual: 0,
+                min: 1,
+                max: FastBlockedBloomFilter::MAX_HASHES,
+            })
         ));
 
         // 合法：64 字节 (1 块)
@@ -659,5 +821,115 @@ mod tests {
         let f = result.unwrap();
         assert_eq!(f.num_blocks(), 1);
         assert_eq!(f.num_entries(), 42);
+    }
+
+    #[test]
+    fn test_construction_rejects_unrepresentable_or_oversized_parameters() {
+        assert!(matches!(
+            FastBlockedBloomFilter::new(usize::MAX, 0.01),
+            Err(BloomError::ArithmeticOverflow { .. }) | Err(BloomError::BlockLimitExceeded { .. })
+        ));
+
+        let entries_over_limit =
+            (FastBlockedBloomFilter::MAX_BLOCKS as usize * FastBlockedBloomFilter::BLOCK_BITS) / 10
+                + 1;
+        assert!(matches!(
+            FastBlockedBloomFilter::new(entries_over_limit, 0.01),
+            Err(BloomError::BlockLimitExceeded { .. })
+        ));
+
+        assert!(matches!(
+            super::checked_div_ceil(u64::MAX, 2),
+            Err(BloomError::ArithmeticOverflow { .. })
+        ));
+        assert!(matches!(
+            FastBlockedBloomFilter::validated_word_len(u64::from(u32::MAX) + 1),
+            Err(BloomError::BlockCountOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_false_positive_rate_must_be_finite_and_supported() {
+        for rate in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.1,
+            0.500_001,
+            1.0,
+        ] {
+            assert!(matches!(
+                FastBlockedBloomFilter::new(10, rate),
+                Err(BloomError::InvalidFalsePositiveRate { .. })
+            ));
+        }
+        assert!(
+            FastBlockedBloomFilter::new(10, FastBlockedBloomFilter::MIN_FALSE_POSITIVE_RATE)
+                .is_ok()
+        );
+        assert!(
+            FastBlockedBloomFilter::new(10, FastBlockedBloomFilter::MAX_FALSE_POSITIVE_RATE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_from_bytes_rejects_invalid_hash_count_and_block_limits() {
+        assert!(matches!(
+            FastBlockedBloomFilter::from_bytes(
+                &[0u8; 64],
+                0,
+                FastBlockedBloomFilter::MAX_HASHES + 1
+            ),
+            Err(BloomError::InvalidHashCount { .. })
+        ));
+        assert!(matches!(
+            FastBlockedBloomFilter::validated_word_len(
+                u64::from(FastBlockedBloomFilter::MAX_BLOCKS) + 1
+            ),
+            Err(BloomError::BlockLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_one_block_insert_and_entry_count_overflow_are_safe() {
+        let mut one_block = FastBlockedBloomFilter::from_bytes(&[0u8; 64], 0, 7)
+            .expect("one block should be valid");
+        one_block
+            .insert_bytes(b"one-block-key")
+            .expect("one block insertion should be valid");
+        assert!(one_block.contains_bytes(b"one-block-key"));
+
+        let mut full_count = FastBlockedBloomFilter::from_bytes(&[0u8; 64], u64::MAX, 7)
+            .expect("metadata count is representable");
+        let before = full_count.to_bytes();
+        assert!(matches!(
+            full_count.insert_bytes(b"overflow"),
+            Err(BloomError::EntryCountOverflow { actual: u64::MAX })
+        ));
+        assert_eq!(full_count.to_bytes(), before);
+    }
+
+    #[test]
+    fn test_valid_filter_round_trips_without_false_negatives() {
+        let keys = [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ];
+        let mut filter =
+            FastBlockedBloomFilter::new(keys.len(), 0.01).expect("valid Bloom parameters");
+        for key in keys {
+            filter.insert_bytes(key).expect("valid Bloom insertion");
+        }
+        let bytes = filter.to_bytes();
+        let restored =
+            FastBlockedBloomFilter::from_bytes(&bytes, filter.num_entries(), filter.num_hashes())
+                .expect("valid Bloom bytes");
+        for key in keys {
+            assert!(restored.contains_bytes(key));
+        }
+        assert_eq!(restored.to_bytes(), bytes);
     }
 }

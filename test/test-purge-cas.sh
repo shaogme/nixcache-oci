@@ -89,9 +89,13 @@ touch /tmp/nixcache-test-registry-purge/blobs/sha256_2d1b50428e2194f481ad1cf387f
 
 cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
 {
-  "version": 6,
+  "version": 7,
   "system": "x86_64-linux",
   "repo": "testorg/testrepo",
+  "origin": {
+    "run_id": 100,
+    "job_id": "x86"
+  },
   "timestamp": "2026-08-29T10:00:00Z",
   "new_entries": {
     "0000000000000000000000000000app1": {
@@ -100,15 +104,20 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
       "narinfo_meta": {
         "store_path": "/nix/store/0000000000000000000000000000app1-my-app-1.0",
         "nar_basename": "app1.nar.xz",
+        "compression": "xz",
+        "file_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "file_size": 500,
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 500,
         "references": ["0000000000000000000000000000lib1-my-lib-1.0"],
-        "signatures": []
+        "deriver": null,
+        "signatures": [],
+        "ca": null
       },
       "nar_digest": "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 500,
       "added": "2026-08-29T10:00:00Z",
-      "origin_job": "run:100:job:x86"
+      "origin": {"run_id": 100, "job_id": "x86"}
     },
     "0000000000000000000000000000lib1": {
       "name": "my-lib-1.0",
@@ -116,15 +125,20 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
       "narinfo_meta": {
         "store_path": "/nix/store/0000000000000000000000000000lib1-my-lib-1.0",
         "nar_basename": "lib1.nar.xz",
+        "compression": "xz",
+        "file_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "file_size": 300,
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 300,
         "references": ["0000000000000000000000000000car1-glibc-2.38"],
-        "signatures": []
+        "deriver": null,
+        "signatures": [],
+        "ca": null
       },
       "nar_digest": "sha256:1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 300,
       "added": "2026-08-29T10:00:00Z",
-      "origin_job": "run:100:job:x86"
+      "origin": {"run_id": 100, "job_id": "x86"}
     },
     "0000000000000000000000000000car1": {
       "name": "glibc-2.38",
@@ -132,15 +146,20 @@ cat << 'RECEIPT_JSON' > "$RECEIPT_DIR/receipt-x86.json"
       "narinfo_meta": {
         "store_path": "/nix/store/0000000000000000000000000000car1-glibc-2.38",
         "nar_basename": "car1.nar.xz",
+        "compression": "xz",
+        "file_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "file_size": 200,
         "nar_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "nar_size": 200,
         "references": [],
-        "signatures": []
+        "deriver": null,
+        "signatures": [],
+        "ca": null
       },
       "nar_digest": "sha256:2d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0",
       "nar_size": 200,
       "added": "2026-08-29T10:00:00Z",
-      "origin_job": "run:100:job:x86"
+      "origin": {"run_id": 100, "job_id": "x86"}
     }
   },
   "active_gc_roots": [

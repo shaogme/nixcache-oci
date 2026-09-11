@@ -1,8 +1,9 @@
 use nixcache_oci::{
-    CacheLayerMediaType, DockerHubDriver, GenericOciDriver, IndexEntry, MockRouterTransport,
-    NarInfoMeta, OciClient, OciDescriptor, OciImageIndex, OciPlatform, OciReadLimits,
-    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, ShardedArchIndexManifestParams,
-    StoreHash, SystemArch, build_image_index, build_sharded_arch_index_manifest,
+    CacheLayerMediaType, CacheLayerMediaTypeV7, DockerHubDriver, GenericOciDriver, IndexEntry,
+    MockRouterTransport, NarInfoMeta, OciClient, OciDescriptor, OciImageIndex, OciPlatform,
+    OciReadLimits, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData,
+    ShardedArchIndexManifestParams, StoreHash, SystemArch, build_image_index,
+    build_sharded_arch_index_manifest,
 };
 
 #[tokio::test]
@@ -222,14 +223,18 @@ fn index_data_types_remain_public() {
     let index = OciImageIndex::new();
     assert!(index.media_type.is_empty() || index.media_type.contains("oci"));
     assert_eq!(
-        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
-        "application/vnd.nix.cache.root.v7+zstd"
+        CacheLayerMediaType::ROOT_INDEX_V8_ZSTD,
+        "application/vnd.nix.cache.root.v8+zstd"
+    );
+    assert_eq!(
+        CacheLayerMediaType::parse(CacheLayerMediaTypeV7::ROOT_INDEX_V7_ZSTD),
+        None
     );
     let _ = GenericOciDriver;
 }
 
 #[test]
-fn schema_v6_root_annotation_is_rejected_by_v7_validator() {
+fn schema_v7_root_annotation_is_rejected_by_v8_validator() {
     let system = SystemArch::X86_64Linux;
     let mut manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -246,7 +251,7 @@ fn schema_v6_root_annotation_is_rejected_by_v7_validator() {
         .insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
 
     let error = manifest
-        .validate_schema_v7_root(
+        .validate_schema_v8_root(
             &system,
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             &OciReadLimits::default(),

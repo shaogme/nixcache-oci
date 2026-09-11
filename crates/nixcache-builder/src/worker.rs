@@ -6,7 +6,7 @@ use crate::{
     summary::write_worker_step_summary,
 };
 use chrono::Utc;
-use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
+use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, OriginMetadata, StoreHash, SystemArch};
 use nixcache_oci::{OciClient, OciTransport, RegistryCredentials};
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
@@ -201,6 +201,18 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         "Starting worker build for system: {} | Repo: {}/{}",
         system, opts.registry, opts.repo
     );
+    let origin = {
+        let run_id = env::var("GITHUB_RUN_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let job_id = env::var("GITHUB_JOB")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        match (run_id, job_id) {
+            (None, None) => None,
+            (run_id, job_id) => Some(OriginMetadata { run_id, job_id }),
+        }
+    };
 
     // 1. 启动自替代代理并注入 NIX_CONFIG
     let mut proxy_guard = setup_self_substituter(
@@ -257,7 +269,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
             strict: opts.strict,
             upload_config: nixcache_oci::UploadConfig::default(),
             system,
-            origin_job: env::var("GITHUB_JOB").ok().map(|j| format!("job:{}", j)),
+            origin: origin.clone(),
         };
 
         let report =
@@ -334,11 +346,6 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         substituted_paths: 0,
     };
 
-    let run_id = env::var("GITHUB_RUN_ID")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    let job_id = env::var("GITHUB_JOB").ok();
-
     let receipt = BuildReceipt::new(
         system,
         opts.repo.to_string(),
@@ -347,8 +354,8 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         new_entries,
         active_gc_roots,
         stats,
-    )
-    .with_run_info(run_id, job_id);
+        origin,
+    )?;
 
     if let Some(parent) = opts.output_receipt_path.parent()
         && !parent.as_os_str().is_empty()

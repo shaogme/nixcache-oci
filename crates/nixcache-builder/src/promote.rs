@@ -2,7 +2,7 @@ use crate::{error::BuilderError, summary::write_promote_step_summary};
 use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_core::{
-    BuildReceipt, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
+    BuildReceipt, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch, partition_entries_by_shard,
 };
 use nixcache_oci::{
@@ -223,7 +223,7 @@ pub async fn run_promote(
             root_index.gc_roots.dedup();
             root_index.recalculate_merkle_root()?;
 
-            root_index.version = SCHEMA_VERSION_V7;
+            root_index.version = SCHEMA_VERSION_V8;
             root_index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             root_index.last_promoted_run =
                 env::var("GITHUB_RUN_ID").ok().and_then(|v| v.parse().ok());
@@ -332,7 +332,9 @@ mod tests {
             HashMap::new(),
             vec![root1],
             BuildStats::default(),
-        );
+            None,
+        )
+        .expect("test receipt should be constructible");
 
         let receipt2 = BuildReceipt::new(
             SystemArch::Aarch64Linux,
@@ -342,7 +344,9 @@ mod tests {
             HashMap::new(),
             vec![root2],
             BuildStats::default(),
-        );
+            None,
+        )
+        .expect("test receipt should be constructible");
 
         let r1_json = serde_json::to_string(&receipt1).unwrap();
         let r2_json = serde_json::to_string(&receipt2).unwrap();

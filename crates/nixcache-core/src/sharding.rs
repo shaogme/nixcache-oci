@@ -8,13 +8,13 @@ use std::collections::HashMap;
 /// Nix RFC 4648 变体 Base32 编码字符集 (长度 32)
 pub const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-const ENTRY_LEAF_DOMAIN: &str = "nixcache/merkle/v7/entry-leaf";
-const SHARD_NODE_DOMAIN: &str = "nixcache/merkle/v7/shard-node";
-const SHARD_ROOT_DOMAIN: &str = "nixcache/merkle/v7/shard-root";
-const DESCRIPTOR_LEAF_DOMAIN: &str = "nixcache/merkle/v7/descriptor-leaf";
-const ROOT_NODE_DOMAIN: &str = "nixcache/merkle/v7/root-node";
-const ROOT_ROOT_DOMAIN: &str = "nixcache/merkle/v7/root-root";
-const EMPTY_SUBTREE_DOMAIN: &str = "nixcache/merkle/v7/empty-subtree";
+const ENTRY_LEAF_DOMAIN: &str = "nixcache/merkle/v8/entry-leaf";
+const SHARD_NODE_DOMAIN: &str = "nixcache/merkle/v8/shard-node";
+const SHARD_ROOT_DOMAIN: &str = "nixcache/merkle/v8/shard-root";
+const DESCRIPTOR_LEAF_DOMAIN: &str = "nixcache/merkle/v8/descriptor-leaf";
+const ROOT_NODE_DOMAIN: &str = "nixcache/merkle/v8/root-node";
+const ROOT_ROOT_DOMAIN: &str = "nixcache/merkle/v8/root-root";
+const EMPTY_SUBTREE_DOMAIN: &str = "nixcache/merkle/v8/empty-subtree";
 
 type DigestBytes = [u8; 32];
 
@@ -105,7 +105,7 @@ pub fn partition_hashes_by_shard(hashes: &[StoreHash]) -> HashMap<u16, Vec<Store
     partitioned
 }
 
-/// 计算单个分片内部所有条目的 v7 分层 Merkle 散列值。
+/// 计算单个分片内部所有条目的 v8 分层 Merkle 散列值。
 ///
 /// 条目按 StoreHash 的 canonical 字典序排序。每个条目先生成叶子，之后
 /// 使用带层级和基数标记的二叉树归并；最终再将 shard 身份包进 shard root。
@@ -163,11 +163,18 @@ fn entry_leaf_hash(hash: &StoreHash, entry: &IndexEntry) -> Result<DigestBytes, 
         encoder.digest(nar_digest);
         encoder.u64(entry.nar_size);
         encoder.string(&entry.added);
-        encoder.option_string(entry.origin_job.as_deref());
+        match &entry.origin {
+            Some(origin) => {
+                encoder.u8(1);
+                encoder.option_u64(origin.run_id);
+                encoder.option_string(origin.job_id.as_deref());
+            }
+            None => encoder.u8(0),
+        }
     }))
 }
 
-/// 计算 1024 个分片的 v7 全局 Merkle Root Hash。
+/// 计算 1024 个分片的 v8 全局 Merkle Root Hash。
 ///
 /// 输入必须恰好包含 ID 为 `0..1023` 的唯一描述符集合；输入顺序不参与结果。
 pub fn compute_merkle_root(shards: &[ShardDescriptor]) -> Result<String, CoreError> {
@@ -460,7 +467,7 @@ mod tests {
         layered_root,
     };
     use crate::{
-        IndexEntry, NarDigest, NarInfoMeta, ShardDataPayload, ShardDescriptor,
+        IndexEntry, NarDigest, NarInfoMeta, OriginMetadata, ShardDataPayload, ShardDescriptor,
         ShardedArchCacheIndexData, StoreHash, SystemArch, compute_merkle_root,
         compute_shard_merkle_hash, diff_shard_descriptors,
     };
@@ -504,13 +511,13 @@ mod tests {
     #[test]
     fn layered_tree_uses_unary_nodes_for_odd_levels() {
         let leaves = [[1_u8; 32], [2_u8; 32], [3_u8; 32]];
-        let domain = "nixcache/merkle/v7/test-node";
+        let domain = "nixcache/merkle/v8/test-node";
         let root = layered_root(&leaves, domain);
         let reordered = [leaves[0], leaves[2], leaves[1]];
 
         assert_eq!(
             format_digest(layered_root(&[], domain)),
-            "sha256:f9293ba1d29efd64af7c0ce424280445f304973a7bf16ac966b9ed176dc24b73"
+            "sha256:a29cb2cea7dffa50c8a1ce50831bb44a8902fc40dcf4dfab2727b9db2326af86"
         );
         assert_eq!(
             format_digest(layered_root(&leaves[..1], domain)),
@@ -518,11 +525,11 @@ mod tests {
         );
         assert_eq!(
             format_digest(layered_root(&leaves[..2], domain)),
-            "sha256:d110298a12f0b046459648953b1c45a8ea4d4f2e36749a7ffdf5d64e4f17e213"
+            "sha256:23e2c55626733d650f9277ea075ab71b68b1183f4f40f92603388c0294286bb5"
         );
         assert_eq!(
             format_digest(root),
-            "sha256:2f2e862014e28dcd0019e0ab844f731c981f756216415976282841e021ef6350"
+            "sha256:d5fddcc9925acb83f9b4cb4c64dbcad2aa4f668bfa7db7b9e713d3cf2233688f"
         );
 
         assert_ne!(root, layered_root(&reordered, domain));
@@ -548,7 +555,7 @@ mod tests {
             nar_digest: test_digest(),
             nar_size: 100,
             added: "2026-08-29T00:00:00Z".to_string(),
-            origin_job: None,
+            origin: None,
         }
     }
 
@@ -626,8 +633,23 @@ mod tests {
         assert_changes_hash!("added", |entry: &mut IndexEntry| {
             entry.added = "2026-08-30T00:00:00Z".to_string()
         });
-        assert_changes_hash!("origin_job", |entry: &mut IndexEntry| {
-            entry.origin_job = Some("job-2".to_string())
+        assert_changes_hash!("origin", |entry: &mut IndexEntry| {
+            entry.origin = Some(OriginMetadata {
+                run_id: Some(2),
+                job_id: Some("job-2".to_string()),
+            })
+        });
+        assert_changes_hash!("origin_run", |entry: &mut IndexEntry| {
+            entry.origin = Some(OriginMetadata {
+                run_id: Some(3),
+                job_id: Some("job-2".to_string()),
+            })
+        });
+        assert_changes_hash!("origin_job_id", |entry: &mut IndexEntry| {
+            entry.origin = Some(OriginMetadata {
+                run_id: Some(2),
+                job_id: Some("job-3".to_string()),
+            })
         });
 
         let other_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsa").unwrap();

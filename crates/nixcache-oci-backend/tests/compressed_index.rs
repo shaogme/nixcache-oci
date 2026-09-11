@@ -1,6 +1,6 @@
 use nixcache_core::{
-    IndexEntry, NUM_SHARDS, NarDigest, NarInfoMeta, ShardDataPayload, ShardedArchCacheIndexData,
-    StoreHash, SystemArch,
+    IndexEntry, NUM_SHARDS, NarDigest, NarInfoMeta, OriginMetadata, ShardDataPayload,
+    ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 use nixcache_oci::{
     CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, GcpArtifactRegistryDriver,
@@ -56,7 +56,10 @@ fn sample_sharded_arch_index_data(
             .unwrap(),
             nar_size: 2048,
             added: "2026-08-29T12:00:00Z".to_string(),
-            origin_job: Some("job:ci-build".to_string()),
+            origin: Some(OriginMetadata {
+                run_id: Some(42),
+                job_id: Some("ci-build".to_string()),
+            }),
         },
     );
 
@@ -69,7 +72,7 @@ fn sample_sharded_arch_index_data(
 }
 
 #[test]
-fn test_manifest_builder_generates_v7_zstd_descriptors() {
+fn test_manifest_builder_generates_v8_zstd_descriptors() {
     let system = SystemArch::X86_64Linux;
     let index_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: "sha256:rootblob123",
@@ -87,7 +90,7 @@ fn test_manifest_builder_generates_v7_zstd_descriptors() {
     let root_layer = &index_manifest.layers[0];
     assert_eq!(
         root_layer.media_type,
-        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD
+        CacheLayerMediaType::ROOT_INDEX_V8_ZSTD
     );
     assert_eq!(root_layer.digest, "sha256:rootblob123");
     assert_eq!(root_layer.size, 500);
@@ -97,7 +100,7 @@ fn test_manifest_builder_generates_v7_zstd_descriptors() {
         annotations
             .get("org.nixos.nixcache.schema")
             .map(|s| s.as_str()),
-        Some("7")
+        Some("8")
     );
     assert_eq!(
         annotations
@@ -441,7 +444,7 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
                 "org.nixos.nixcache.system".to_string(),
                 "x86_64-linux".to_string(),
             ),
-            ("org.nixos.nixcache.schema".to_string(), "7".to_string()),
+            ("org.nixos.nixcache.schema".to_string(), "8".to_string()),
             (
                 "org.nixos.nixcache.merkle_root".to_string(),
                 legacy_root.merkle_root,

@@ -49,7 +49,7 @@ pub async fn run_full_scale_simulation(
     system: SystemArch,
 ) -> Result<FullScaleReport, String> {
     info!(
-        "=== 启动 Schema v7 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
+        "=== 启动 Schema v8 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
         entries_count
     );
 
@@ -101,7 +101,10 @@ pub async fn run_full_scale_simulation(
         ">>> 步骤 5/5: 执行 {} 并发 Worker 只读查询压测与 Partial Compaction 性能仿真...",
         concurrency
     );
-    let bf_arc = Arc::new(FastBlockedBloomFilter::from_entries(&hashes));
+    let bf_arc = Arc::new(
+        FastBlockedBloomFilter::from_entries(&hashes)
+            .map_err(|error| format!("Bloom filter construction failed: {error}"))?,
+    );
     let sm_arc = Arc::new(SccHashMap::new());
 
     // 预热分片表

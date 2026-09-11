@@ -193,7 +193,7 @@ pub enum OciError {
     #[error("Manifest missing target layer with root index / delta patch media type")]
     LayerDescriptorMissing,
 
-    #[error("Unsupported layer media type: '{0}' (only Schema v7 Zstd media types supported)")]
+    #[error("Unsupported layer media type: '{0}' (only Schema v8 Zstd media types supported)")]
     UnsupportedMediaType(String),
 
     #[error("Manifest JSON contains invalid UTF-8 bytes: {0}")]

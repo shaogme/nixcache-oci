@@ -8,7 +8,7 @@ use crate::{
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::Utc;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, StoreHash, SystemArch};
+use nixcache_core::{IndexEntry, NarDigest, NarInfoMeta, OriginMetadata, StoreHash, SystemArch};
 use nixcache_oci::{OciClient, TransportError, UploadConfig};
 use nixcache_oci_backend::ReqwestTransport;
 use std::{
@@ -63,8 +63,8 @@ pub struct ParallelExportConfig {
     pub upload_config: UploadConfig,
     /// 目标平台系统架构
     pub system: SystemArch,
-    /// 来源 Job 标识符
-    pub origin_job: Option<String>,
+    /// 构建来源元数据
+    pub origin: Option<OriginMetadata>,
 }
 
 impl ParallelExportConfig {
@@ -84,7 +84,7 @@ impl ParallelExportConfig {
             strict: false,
             upload_config: UploadConfig::default(),
             system: SystemArch::detect_current(),
-            origin_job: None,
+            origin: None,
         }
     }
 }
@@ -168,7 +168,7 @@ impl ParallelExporter {
             let oci_client = oci_client.clone();
             let upload_config = config.upload_config.clone();
             let system = config.system;
-            let origin_job = config.origin_job.clone();
+            let origin = config.origin.clone();
 
             async move {
                 let res = Self::export_single_item_stream(
@@ -176,7 +176,7 @@ impl ParallelExporter {
                     &oci_client,
                     &upload_config,
                     system,
-                    origin_job.as_deref(),
+                    origin,
                 )
                 .await;
                 (item.path.clone(), res)
@@ -265,7 +265,7 @@ impl ParallelExporter {
         oci_client: &OciClient<ReqwestTransport>,
         upload_config: &UploadConfig,
         system: SystemArch,
-        origin_job: Option<&str>,
+        origin: Option<OriginMetadata>,
     ) -> Result<ExportedStorePath, BuilderError> {
         let store_path = &item.path;
         let file_name = Path::new(store_path)
@@ -381,7 +381,7 @@ impl ParallelExporter {
             nar_digest: nar_digest_obj,
             nar_size: nar_size.max(item.nar_size),
             added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            origin_job: origin_job.map(|s| s.to_string()),
+            origin,
         };
         index_entry.validate_structure()?;
 
@@ -541,7 +541,7 @@ mod tests {
             nar_digest: nar_digest.clone(),
             nar_size: 200,
             added: "2026-08-29T00:00:00Z".to_string(),
-            origin_job: None,
+            origin: None,
         };
 
         let exported = ExportedStorePath {
@@ -720,7 +720,10 @@ mod tests {
             strict: true,
             upload_config: nixcache_oci::UploadConfig::default(),
             system: nixcache_core::SystemArch::from("x86_64-linux"),
-            origin_job: Some("job:test".to_string()),
+            origin: Some(nixcache_core::OriginMetadata {
+                run_id: Some(42),
+                job_id: Some("test".to_string()),
+            }),
         };
 
         let report = ParallelExporter::export_and_upload_paths(&paths, &oci, &config)
@@ -808,7 +811,10 @@ mod tests {
             strict: true,
             upload_config: nixcache_oci::UploadConfig::default(),
             system: nixcache_core::SystemArch::from("x86_64-linux"),
-            origin_job: Some("job:test".to_string()),
+            origin: Some(nixcache_core::OriginMetadata {
+                run_id: Some(42),
+                job_id: Some("test".to_string()),
+            }),
         };
 
         let report = ParallelExporter::export_and_upload_paths(&paths, &oci, &config)

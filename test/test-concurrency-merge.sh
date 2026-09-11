@@ -122,7 +122,10 @@ def make_entry(h, name, size):
         'nar_digest': 'sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0',
         'nar_size': size,
         'added': '2026-08-28T00:00:00Z',
-        'origin_job': None
+        'origin': {
+            'run_id': 987654,
+            'job_id': f'worker-{worker_id}'
+        }
     }
 
 entries = {
@@ -138,9 +141,13 @@ active_roots = [
 ]
 
 receipt = {
-    'version': 6,
+    'version': 7,
     'system': sys_name,
     'repo': 'concurrency-test/cache',
+    'origin': {
+        'run_id': 987654,
+        'job_id': f'worker-{worker_id}'
+    },
     'timestamp': '2026-08-28T00:00:00Z',
     'public_key': 'test-concurrency-key:AAAA=',
     'new_entries': entries,
@@ -203,7 +210,7 @@ for m in manifests:
     # Decompress zstd blob (ShardedArchCacheIndexData)
     decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
     arch_data = json.loads(decompressed)
-    assert arch_data['version'] == 7, f'Expected version 7, got {arch_data["version"]}'
+    assert arch_data['version'] == 8, f'Expected version 8, got {arch_data["version"]}'
     
     sys_name = arch_data['system']
     gc_roots[sys_name] = arch_data['gc_roots']

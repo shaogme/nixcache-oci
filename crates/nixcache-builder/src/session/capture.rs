@@ -11,7 +11,7 @@ use crate::{
     worker,
 };
 use chrono::Utc;
-use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
+use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, OriginMetadata, StoreHash, SystemArch};
 use nixcache_oci::{RegistryCredentials, UploadConfig};
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{collections::HashMap, path::Path, time::Duration};
@@ -149,6 +149,10 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
     let mut new_entries: HashMap<StoreHash, IndexEntry> = HashMap::new();
     let mut uploaded_count = 0;
     let mut total_bytes_uploaded = 0u64;
+    let origin = Some(OriginMetadata {
+        run_id: Some(opts.run_id),
+        job_id: Some(opts.job_id.to_string()),
+    });
 
     if !decision_report.to_export.is_empty() {
         info!(
@@ -163,7 +167,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
             strict: false,
             upload_config: UploadConfig::default(),
             system,
-            origin_job: Some(format!("job:{}", opts.job_id)),
+            origin: origin.clone(),
         };
 
         let report = ParallelExporter::export_and_upload_paths_with_preinfo(
@@ -235,8 +239,8 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         new_entries,
         closure_res.active_gc_roots,
         stats,
-    )
-    .with_run_info(Some(opts.run_id), Some(opts.job_id.to_string()));
+        origin,
+    )?;
 
     if let Some(parent) = receipt_path.parent()
         && !parent.as_os_str().is_empty()

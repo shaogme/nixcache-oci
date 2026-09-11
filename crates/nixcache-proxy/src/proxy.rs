@@ -454,7 +454,7 @@ mod tests {
                 .unwrap(),
                 nar_size: 100,
                 added: "2026-08-28T00:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -535,7 +535,7 @@ mod tests {
             .unwrap(),
             nar_size: 1024,
             added: "2026-08-28T00:00:00Z".to_string(),
-            origin_job: None,
+            origin: None,
         };
         let local_rendered = entry.to_narinfo_string();
         let shard_id = calculate_shard_id(&local_hash);
@@ -678,7 +678,7 @@ mod tests {
                 nar_digest: NarDigest::new_sha256(digest_str).unwrap(),
                 nar_size: 5,
                 added: "2026-08-28T00:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -824,7 +824,7 @@ mod tests {
             .unwrap(),
             nar_size: 42,
             added: "2026-08-29T10:00:00Z".to_string(),
-            origin_job: None,
+            origin: None,
         };
 
         let mut payload_map = HashMap::new();

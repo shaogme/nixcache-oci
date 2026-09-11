@@ -9,7 +9,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 
-echo "=== Starting NixCache Schema v7 Sharding Scale & Concurrency Stress Test Suite ==="
+echo "=== Starting NixCache Schema v8 Sharding Scale & Concurrency Stress Test Suite ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-scale-test-XXXXXX)
 export GITHUB_ENV="$TMP_DIR/github_env"
@@ -184,14 +184,21 @@ for batch_id in range(5):
             'nar_digest': 'sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0',
             'nar_size': 4096,
             'added': '2026-08-30T00:00:00Z',
-            'origin_job': f'batch-{batch_id}'
+            'origin': {
+                'run_id': 987654,
+                'job_id': f'batch-{batch_id}'
+            }
         }
         roots.append(h)
 
     receipt = {
-        'version': 5,
+        'version': 7,
         'system': 'x86_64-linux',
         'repo': 'scale-test/cache',
+        'origin': {
+            'run_id': 987654,
+            'job_id': f'batch-{batch_id}'
+        },
         'timestamp': '2026-08-30T00:00:00Z',
         'public_key': 'test-scale-key:AAAA=',
         'new_entries': entries,
@@ -216,8 +223,8 @@ export GITHUB_TOKEN="dummy-token"
 echo ">>> Executing nixcache-builder promote across 5,000 entries..."
 "$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR" --target-tag "cache-index"
 
-# 7. 校验 OCI 中的 Sharded Root Index (Schema v7 分层 Merkle 架构)
-echo ">>> Verifying OCI Sharded Root Index Layer (Schema v7)..."
+# 7. 校验 OCI 中的 Sharded Root Index (Schema v8 分层 Merkle 架构)
+echo ">>> Verifying OCI Sharded Root Index Layer (Schema v8)..."
 MANIFEST_INDEX_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/scale-test/cache/nix-cache/manifests/cache-index")
 
 python3 -c "
@@ -236,7 +243,7 @@ sub_manifest = json.loads(sub_raw)
 assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V7), got {len(sub_manifest["layers"])}'
 root_layer = sub_manifest['layers'][0]
 
-assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v7+zstd'
+assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v8+zstd'
 
 # Decompress and verify Root Index
 blob_digest = root_layer['digest']
@@ -247,7 +254,7 @@ blob_bytes = subprocess.check_output([
 decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 root_data = json.loads(decompressed)
 
-assert root_data['version'] == 7
+assert root_data['version'] == 8
 assert len(root_data['shards']) == 1024
 total_entries = sum(s['entry_count'] for s in root_data['shards'])
 assert total_entries == 5000, f'Expected 5000 entries across shards, got {total_entries}'

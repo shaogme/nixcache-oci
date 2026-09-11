@@ -1,6 +1,6 @@
 use nixcache_core::{
-    BuildReceipt, BuildStats, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, ShardDataPayload,
-    StoreHash, SystemArch, calculate_shard_id, compute_shard_merkle_hash,
+    BuildReceipt, BuildStats, FastBlockedBloomFilter, IndexEntry, NUM_SHARDS, OriginMetadata,
+    ShardDataPayload, StoreHash, SystemArch, calculate_shard_id, compute_shard_merkle_hash,
     partition_entries_by_shard,
 };
 use scc::HashMap as SccHashMap;
@@ -198,6 +198,14 @@ pub async fn simulate_concurrent_delta_and_compaction(
             let new_sub_entries =
                 generate_index_entries(entries_per_builder, (builder_id as u64 + 1) * 9999, system);
             let active_roots: Vec<StoreHash> = new_sub_entries.keys().cloned().collect();
+            let origin = Some(OriginMetadata {
+                run_id: Some(1001),
+                job_id: Some(format!("job-runner-{builder_id}")),
+            });
+            let mut new_sub_entries = new_sub_entries;
+            for entry in new_sub_entries.values_mut() {
+                entry.origin = origin.clone();
+            }
             BuildReceipt::new(
                 system,
                 "owner/repo".to_string(),
@@ -206,14 +214,16 @@ pub async fn simulate_concurrent_delta_and_compaction(
                 new_sub_entries,
                 active_roots,
                 BuildStats::default(),
+                origin,
             )
-            .with_run_info(Some(1001), Some(format!("job-runner-{}", builder_id)))
         });
     }
 
     let mut receipts = Vec::with_capacity(concurrent_builders);
     while let Some(res) = join_set.join_next().await {
-        let receipt = res.map_err(|e| format!("Builder receipt generation failed: {}", e))?;
+        let receipt = res
+            .map_err(|e| format!("Builder receipt generation failed: {e}"))?
+            .map_err(|e| format!("Builder receipt validation failed: {e}"))?;
         receipts.push(receipt);
     }
     let wal_generation_duration_ms = wal_start.elapsed().as_secs_f64() * 1000.0;
@@ -291,7 +301,10 @@ mod tests {
         let pos_hashes = generate_store_hashes(5000, 111);
         let neg_hashes = generate_non_existent_hashes(5000, 111);
 
-        let bf = Arc::new(FastBlockedBloomFilter::from_entries(&pos_hashes));
+        let bf = Arc::new(
+            FastBlockedBloomFilter::from_entries(&pos_hashes)
+                .expect("Bloom filter construction should succeed"),
+        );
         let sm = Arc::new(SccHashMap::new());
 
         let report = simulate_concurrent_read_queries(bf, sm, &pos_hashes, &neg_hashes, 8, 500)

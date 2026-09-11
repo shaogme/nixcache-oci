@@ -60,7 +60,7 @@ mod tests {
             .unwrap(),
             nar_size: 100,
             added: sixty_days_ago.clone(),
-            origin_job: None,
+            origin: None,
         };
         let entry_arm_live = IndexEntry {
             name: "pkg-arm".to_string(),
@@ -78,7 +78,7 @@ mod tests {
             .unwrap(),
             nar_size: 100,
             added: sixty_days_ago.clone(),
-            origin_job: None,
+            origin: None,
         };
         let entry_dead_old = IndexEntry {
             name: "pkg-dead-old".to_string(),
@@ -96,7 +96,7 @@ mod tests {
             .unwrap(),
             nar_size: 100,
             added: sixty_days_ago.clone(),
-            origin_job: None,
+            origin: None,
         };
         let entry_dead_recent = IndexEntry {
             name: "pkg-dead-recent".to_string(),
@@ -114,7 +114,7 @@ mod tests {
             .unwrap(),
             nar_size: 100,
             added: five_days_ago.clone(),
-            origin_job: None,
+            origin: None,
         };
 
         let mut entries = HashMap::new();
@@ -198,7 +198,7 @@ mod tests {
                     nar_digest: NarDigest::new_sha256("0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0").unwrap(),
                     nar_size: 100,
                     added,
-                    origin_job: None,
+                origin: None,
                 },
             );
         }

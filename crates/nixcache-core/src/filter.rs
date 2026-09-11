@@ -160,15 +160,18 @@ impl FilterPredicates {
             }
         }
 
-        // 6. CI Job / Run ID 匹配
-        if let Some(ref job) = entry.origin_job {
-            if !self.origin_jobs.is_empty() && self.origin_jobs.contains(job) {
+        // 6. CI Job / Run ID 精确匹配
+        if let Some(origin) = &entry.origin {
+            if !self.origin_jobs.is_empty()
+                && origin
+                    .job_id
+                    .as_ref()
+                    .is_some_and(|job_id| self.origin_jobs.contains(job_id))
+            {
                 reasons.push("Origin Job Match");
             }
             for run_id in &self.origin_runs {
-                let run_prefix = format!("run:{}", run_id);
-                let run_str = format!("{}", run_id);
-                if job.contains(&run_prefix) || job.contains(&run_str) {
+                if origin.run_id == Some(*run_id) {
                     reasons.push("Origin Run Match");
                     break;
                 }

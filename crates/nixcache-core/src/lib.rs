@@ -31,8 +31,8 @@ pub use sharding::{
 };
 pub use types::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DefaultIndexValidationLimits, IndexEntry,
-    IndexValidationLimits, JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION,
-    RUN_SESSION_VERSION, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
+    IndexValidationLimits, JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, OriginMetadata,
+    RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 
@@ -43,14 +43,14 @@ mod tests {
         CacheSelector, CascadeMode, CoreError, DefaultIndexValidationLimits,
         FastBlockedBloomFilter, FilterPredicates, IndexEntry, JobSummaryMetadata,
         NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, NarInfoParseError,
-        RECEIPT_VERSION, SCHEMA_VERSION_V7, SelectionScope, ShardDataPayload, ShardDescriptor,
-        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
-        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
-        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
-        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
-        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
-        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
-        shard_id_to_prefix,
+        OriginMetadata, RECEIPT_VERSION, SCHEMA_VERSION_V8, SelectionScope, ShardDataPayload,
+        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
+        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
+        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
+        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
+        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
+        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
+        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use sha2::{Digest, Sha256};
@@ -149,57 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_v7_root_and_shard_validators_reject_structural_tampering() {
-        let system = SystemArch::X86_64Linux;
-        let limits = DefaultIndexValidationLimits::default();
-        let mut root = ShardedArchCacheIndexData::new(system, "repo", "registry");
-        root.validate_for(&system, "repo", "registry", &limits)
-            .expect("fresh root should be valid");
-
-        root.shards.pop();
-        assert!(matches!(
-            root.validate_for(&system, "repo", "registry", &limits),
-            Err(CoreError::InvalidIndex { .. })
-        ));
-
-        let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let shard_id = hash.shard_id();
-        let payload = ShardDataPayload::with_entries(
-            shard_id,
-            HashMap::from([(
-                hash,
-                IndexEntry {
-                    name: "pkg".to_string(),
-                    system: Some(system),
-                    narinfo_meta: NarInfoMeta {
-                        store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-pkg"
-                            .to_string(),
-                        nar_basename: "pkg.nar.xz".to_string(),
-                        nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
-                            .to_string(),
-                        ..Default::default()
-                    },
-                    nar_digest: test_digest("payload-validation"),
-                    nar_size: 100,
-                    added: "2026-08-29T00:00:00Z".to_string(),
-                    origin_job: None,
-                },
-            )]),
-        )
-        .expect("test payload shard id and entries are valid");
-        payload
-            .validate_for(shard_id, &system, &limits)
-            .expect("matching shard payload should be valid");
-
-        let mut wrong_system = payload.clone();
-        wrong_system.entries.values_mut().next().unwrap().system = None;
-        assert!(matches!(
-            wrong_system.validate_for(shard_id, &system, &limits),
-            Err(CoreError::InvalidShard { .. })
-        ));
-    }
-
-    #[test]
     fn test_narinfo_parse_and_serialize() {
         let content = r#"StorePath: /nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1
 URL: nar/14j8s5vg8w80z5k86k6r00000000000000000000000.nar.xz
@@ -290,7 +239,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob1"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -306,7 +255,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob2"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -371,7 +320,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_fast_blocked_bloom_filter() {
-        let mut filter = FastBlockedBloomFilter::new_with_defaults(100);
+        let mut filter =
+            FastBlockedBloomFilter::new_with_defaults(100).expect("valid Bloom parameters");
         assert!(filter.is_empty());
         assert_eq!(filter.num_entries(), 0);
 
@@ -380,9 +330,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let h3 = StoreHash::parse("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").unwrap();
         let non_existent = StoreHash::parse("ffffffffffffffffffffffffffffffff").unwrap();
 
-        filter.insert(&h1);
-        filter.insert(&h2);
-        filter.insert(&h3);
+        filter.insert(&h1).expect("valid Bloom insertion");
+        filter.insert(&h2).expect("valid Bloom insertion");
+        filter.insert(&h3).expect("valid Bloom insertion");
 
         assert_eq!(filter.num_entries(), 3);
         assert!(!filter.is_empty());
@@ -408,12 +358,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert!(!restored.contains(&non_existent));
 
         // Large scale false positive rate test
-        let mut large_filter = FastBlockedBloomFilter::new_with_defaults(2000);
+        let mut large_filter =
+            FastBlockedBloomFilter::new_with_defaults(2000).expect("valid Bloom parameters");
         let mut inserted_set = HashSet::new();
 
         for i in 0..2000 {
             let hash = StoreHash::parse(&format!("a{:031}", i)).unwrap();
-            large_filter.insert(&hash);
+            large_filter.insert(&hash).expect("valid Bloom insertion");
             inserted_set.insert(hash);
         }
 
@@ -423,8 +374,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         }
 
         // BloomFilter type alias test
-        let mut alias_filter: BloomFilter = BloomFilter::new_with_defaults(10);
-        alias_filter.insert(&h1);
+        let mut alias_filter: BloomFilter =
+            BloomFilter::new_with_defaults(10).expect("valid Bloom parameters");
+        alias_filter.insert(&h1).expect("valid Bloom insertion");
         assert!(alias_filter.contains(&h1));
 
         // Test false positive rate on 5000 distinct items
@@ -519,10 +471,10 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
-    fn test_schema_v7_structures_and_serialization() {
+    fn test_schema_v8_structures_and_serialization() {
         let mut root_index =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "owner/repo", "ghcr.io");
-        assert_eq!(root_index.version, SCHEMA_VERSION_V7);
+        assert_eq!(root_index.version, SCHEMA_VERSION_V8);
         assert_eq!(root_index.shards.len(), NUM_SHARDS);
         assert_eq!(root_index.total_entries(), 0);
 
@@ -543,7 +495,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let deserialized: ShardedArchCacheIndexData =
             serde_json::from_str(&json).expect("Deserialize root index");
 
-        assert_eq!(deserialized.version, SCHEMA_VERSION_V7);
+        assert_eq!(deserialized.version, SCHEMA_VERSION_V8);
         assert_eq!(deserialized.system, SystemArch::X86_64Linux);
         assert_eq!(deserialized.total_entries(), 1);
         assert_eq!(deserialized.shards.len(), NUM_SHARDS);
@@ -571,12 +523,12 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("payload"),
                 nar_size: 100,
                 added: "2026-08-29T00:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         let payload_json = serde_json::to_string(&payload).unwrap();
         let loaded_payload: ShardDataPayload = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V7);
+        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V8);
         assert_eq!(loaded_payload.shard_id, 838);
         assert_eq!(loaded_payload.len(), 1);
 
@@ -595,7 +547,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 uploaded_blobs: 1,
                 total_bytes_uploaded: 500,
             },
-        );
+            None,
+        )
+        .expect("test receipt should be constructible");
 
         let h2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
         let receipt2 = BuildReceipt::new(
@@ -612,9 +566,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 uploaded_blobs: 2,
                 total_bytes_uploaded: 1000,
             },
-        );
+            None,
+        )
+        .expect("test receipt should be constructible");
 
-        receipt1.merge_with(receipt2);
+        receipt1
+            .merge_with(receipt2)
+            .expect("matching test receipts should merge");
         assert_eq!(receipt1.new_entries.len(), 2);
         assert_eq!(receipt1.active_gc_roots.len(), 2);
         assert_eq!(receipt1.stats.discovered_outputs, 3);
@@ -651,10 +609,14 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 uploaded_blobs: 1,
                 total_bytes_uploaded: 500,
             },
+            Some(OriginMetadata {
+                run_id: Some(12345),
+                job_id: Some("job1".to_string()),
+            }),
         )
-        .with_run_info(Some(12345), Some("job1".to_string()));
+        .expect("test receipt should be constructible");
         assert_eq!(receipt.version, RECEIPT_VERSION);
-        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V7);
+        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V8);
     }
 
     #[test]
@@ -684,7 +646,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("root-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -702,7 +664,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("dep-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -720,7 +682,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("sub-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -738,7 +700,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("old-blob"),
                 nar_size: 100,
                 added: sixty_days_ago,
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -756,7 +718,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("new-blob"),
                 nar_size: 100,
                 added: five_days_ago,
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -812,7 +774,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-rust"),
                 nar_size: 1000,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -828,7 +790,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-llvm"),
                 nar_size: 2000,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -868,7 +830,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob1"),
                 nar_size: 1000,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -884,7 +846,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob2"),
                 nar_size: 2000,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -932,7 +894,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -950,7 +912,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -968,7 +930,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1015,7 +977,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1033,7 +995,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1051,7 +1013,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1094,7 +1056,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -1111,7 +1073,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -1128,7 +1090,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1182,7 +1144,10 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-chromium"),
                 nar_size: 500_000_000,
                 added: "2026-08-25T10:00:00Z".to_string(),
-                origin_job: Some("run:1001:job:build-x86".to_string()),
+                origin: Some(OriginMetadata {
+                    run_id: Some(1001),
+                    job_id: Some("build-x86".to_string()),
+                }),
             },
         );
 
@@ -1199,7 +1164,10 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-small"),
                 nar_size: 1_000,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: Some("run:1002:job:build-x86".to_string()),
+                origin: Some(OriginMetadata {
+                    run_id: Some(1002),
+                    job_id: Some("build-x86".to_string()),
+                }),
             },
         );
 
@@ -1216,7 +1184,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-old"),
                 nar_size: 2_000,
                 added: "2026-07-01T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1289,7 +1257,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-root-x86"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1307,7 +1275,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-dep-x86"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1325,7 +1293,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("blob-root-arm"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1374,7 +1342,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("root-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1392,7 +1360,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("dep-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1410,7 +1378,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 nar_digest: test_digest("old-blob"),
                 nar_size: 100,
                 added: sixty_days_ago,
-                origin_job: None,
+                origin: None,
             },
         );
 
@@ -1486,6 +1454,125 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     }
 
     #[test]
+    fn structured_origin_filters_are_exact_and_round_trip() {
+        let origin = OriginMetadata {
+            run_id: Some(12),
+            job_id: Some("job-a".to_string()),
+        };
+        let json = serde_json::to_string(&origin).expect("origin should serialize");
+        assert_eq!(
+            serde_json::from_str::<OriginMetadata>(&json).expect("origin should deserialize"),
+            origin
+        );
+        assert!(
+            serde_json::from_str::<OriginMetadata>(r#"{"run_id":null,"job_id":null}"#).is_err()
+        );
+        assert!(
+            OriginMetadata {
+                run_id: None,
+                job_id: None,
+            }
+            .validate_structure()
+            .is_err()
+        );
+        assert!(
+            OriginMetadata {
+                run_id: None,
+                job_id: Some(String::new()),
+            }
+            .validate_structure()
+            .is_err()
+        );
+
+        let hash_12 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let hash_112 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsa").unwrap();
+        let make_entry = |hash: &StoreHash, origin: Option<OriginMetadata>| IndexEntry {
+            name: "pkg".to_string(),
+            system: Some(SystemArch::X86_64Linux),
+            narinfo_meta: NarInfoMeta {
+                store_path: format!("/nix/store/{hash}-pkg"),
+                nar_basename: "pkg.nar.xz".to_string(),
+                nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                    .to_string(),
+                ..Default::default()
+            },
+            nar_digest: test_digest("origin-filter"),
+            nar_size: 100,
+            added: "2026-09-11T00:00:00Z".to_string(),
+            origin,
+        };
+        let entry_12 = make_entry(&hash_12, Some(origin.clone()));
+        let entry_112 = make_entry(
+            &hash_112,
+            Some(OriginMetadata {
+                run_id: Some(112),
+                job_id: Some("job-a-extra".to_string()),
+            }),
+        );
+
+        let run_filter = FilterPredicates {
+            origin_runs: HashSet::from([12]),
+            ..Default::default()
+        };
+        assert!(run_filter.evaluate_entry(&hash_12, &entry_12).is_some());
+        assert!(run_filter.evaluate_entry(&hash_112, &entry_112).is_none());
+
+        let job_filter = FilterPredicates {
+            origin_jobs: HashSet::from(["job-a".to_string()]),
+            ..Default::default()
+        };
+        assert!(job_filter.evaluate_entry(&hash_12, &entry_12).is_some());
+        assert!(job_filter.evaluate_entry(&hash_112, &entry_112).is_none());
+
+        let mut entry_without_origin = serde_json::to_value(&entry_12).unwrap();
+        assert!(
+            entry_without_origin
+                .as_object_mut()
+                .expect("entry serializes as an object")
+                .remove("origin")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<IndexEntry>(entry_without_origin).is_err());
+
+        let mismatch = BuildReceipt::new(
+            SystemArch::X86_64Linux,
+            "owner/repo".to_string(),
+            "2026-09-11T00:00:00Z".to_string(),
+            None,
+            HashMap::from([(hash_12.clone(), IndexEntry::default())]),
+            Vec::new(),
+            BuildStats::default(),
+            Some(origin),
+        );
+        assert!(matches!(
+            mismatch,
+            Err(CoreError::ReceiptOriginMismatch { .. })
+        ));
+
+        let receipt = BuildReceipt::new(
+            SystemArch::X86_64Linux,
+            "owner/repo".to_string(),
+            "2026-09-11T00:00:00Z".to_string(),
+            None,
+            HashMap::new(),
+            Vec::new(),
+            BuildStats::default(),
+            None,
+        )
+        .expect("empty receipt should be constructible");
+        let mut old_receipt = serde_json::to_value(&receipt).expect("receipt should serialize");
+        old_receipt["version"] = serde_json::Value::from(RECEIPT_VERSION - 1);
+        assert!(serde_json::from_value::<BuildReceipt>(old_receipt).is_err());
+
+        let mut receipt_without_origin = serde_json::to_value(&receipt).unwrap();
+        receipt_without_origin
+            .as_object_mut()
+            .expect("receipt serializes as an object")
+            .remove("origin");
+        assert!(serde_json::from_value::<BuildReceipt>(receipt_without_origin).is_err());
+    }
+
+    #[test]
     fn test_core_error_conversions() {
         let type_err = TypeError::UnknownSystemArch {
             raw: "invalid".to_string(),
@@ -1493,7 +1580,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let core_type: CoreError = type_err.into();
         assert!(matches!(core_type, CoreError::Type(_)));
 
-        let bloom_err = BloomError::ZeroHashCount(0);
+        let bloom_err = BloomError::InvalidHashCount {
+            actual: 0,
+            min: 1,
+            max: FastBlockedBloomFilter::MAX_HASHES,
+        };
         let core_bloom: CoreError = bloom_err.into();
         assert!(matches!(core_bloom, CoreError::Bloom(_)));
 

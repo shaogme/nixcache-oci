@@ -35,7 +35,7 @@ fn entry(hash: &StoreHash, name: &str) -> IndexEntry {
         nar_digest: NarDigest::new_sha256(OCI_HEX).unwrap(),
         nar_size: 20,
         added: "2026-09-11T00:00:00Z".to_string(),
-        origin_job: None,
+        origin: None,
     }
 }
 

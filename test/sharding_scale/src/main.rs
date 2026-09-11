@@ -7,7 +7,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Parser, Debug)]
 #[command(
     name = "sharding-scale-sim",
-    about = "Schema v7 Sharded Merkle-Radix Index Scale & Concurrency Stress Test Suite",
+    about = "Schema v8 Sharded Merkle-Radix Index Scale & Concurrency Stress Test Suite",
     version = "0.1.0"
 )]
 struct Args {
@@ -73,7 +73,7 @@ fn print_human_report(r: &FullScaleReport) {
         "=========================================================================================="
     );
     println!(
-        "        NixCache Schema v7 Sharded Index Scale & Concurrency Verification Report           "
+        "        NixCache Schema v8 Sharded Index Scale & Concurrency Verification Report           "
     );
     println!(
         "=========================================================================================="

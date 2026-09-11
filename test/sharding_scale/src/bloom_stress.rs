@@ -34,9 +34,12 @@ pub fn verify_bloom_filter_scale(
 
     // 1. 测量构建与插入性能
     let insert_start = Instant::now();
-    let mut filter = FastBlockedBloomFilter::new_with_defaults(total_inserted);
+    let mut filter = FastBlockedBloomFilter::new_with_defaults(total_inserted)
+        .map_err(|error| format!("Bloom filter construction failed: {error}"))?;
     for hash in inserted_hashes {
-        filter.insert(hash);
+        filter
+            .insert(hash)
+            .map_err(|error| format!("Bloom filter insertion failed: {error}"))?;
     }
     let insert_elapsed = insert_start.elapsed();
     let insert_duration_ms = insert_elapsed.as_secs_f64() * 1000.0;

@@ -6,7 +6,7 @@ use crate::{
     codec::IndexCodec,
     error::{OciError, TransportError},
     manifest::{
-        CacheLayerMediaTypeV7, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        CacheLayerMediaTypeV8, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
         OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest,
         ShardedArchIndexManifestParams, build_sharded_arch_index_manifest,
     },
@@ -137,10 +137,10 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
             .and_then(|annotations| annotations.get("org.nixos.nixcache.merkle_root"))
             .ok_or_else(|| OciError::InvalidDescriptor {
                 target: target.to_string(),
-                details: "Schema v7 root manifest merkle_root annotation is missing".to_string(),
+                details: "Schema v8 root manifest merkle_root annotation is missing".to_string(),
             })?;
         let layer =
-            manifest.validate_schema_v7_root(system, merkle_root, self.client.limits(), target)?;
+            manifest.validate_schema_v8_root(system, merkle_root, self.client.limits(), target)?;
         let blob_bytes = self.client.blobs().get_descriptor(layer).await?;
         let decoded = IndexCodec::decode_zstd(
             &blob_bytes,
@@ -249,7 +249,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
             return Ok(ShardDataPayload::new(descriptor.shard_id)?);
         }
         let blob_descriptor = OciDescriptor {
-            media_type: CacheLayerMediaTypeV7::SHARD_DATA_V7_ZSTD.to_string(),
+            media_type: CacheLayerMediaTypeV8::SHARD_DATA_V8_ZSTD.to_string(),
             digest: descriptor.blob_digest.clone(),
             size: descriptor.compressed_size,
             platform: None,
@@ -258,7 +258,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         let blob_bytes = self.client.blobs().get_descriptor(&blob_descriptor).await?;
         let decoded = IndexCodec::decode_zstd(
             &blob_bytes,
-            CacheLayerMediaTypeV7::SHARD_DATA_V7_ZSTD,
+            CacheLayerMediaTypeV8::SHARD_DATA_V8_ZSTD,
             self.client.limits().max_index_uncompressed_bytes(),
         )?;
         if decoded.uncompressed_size != descriptor.uncompressed_size {

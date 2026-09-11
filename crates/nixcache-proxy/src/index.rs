@@ -325,7 +325,7 @@ impl CacheIndex {
         }
     }
 
-    /// 获取生产基线全局分片索引 (Schema v7 Root)
+    /// 获取生产基线全局分片索引 (Schema v8 Root)
     pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
         let system = &self.config.target_system;
@@ -362,7 +362,7 @@ impl CacheIndex {
                         diff_shard_descriptors(&old_entry.baseline.root.shards, &root_data.shards)
                             .unwrap_or_else(|error| {
                                 error!(
-                                    "[nixcache-proxy] Failed to diff v7 shard descriptors: {error}"
+                                    "[nixcache-proxy] Failed to diff v8 shard descriptors: {error}"
                                 );
                                 Vec::new()
                             });
@@ -372,7 +372,7 @@ impl CacheIndex {
                 }
 
                 // 保存本地单架构根索引备份
-                let file_name = format!("cache-index-v7-{}.json.zst", system_clone.as_str());
+                let file_name = format!("cache-index-v8-{}.json.zst", system_clone.as_str());
                 let file_path = self.config.index_dir.join(&file_name);
                 if let Some(parent) = file_path.parent() {
                     let _ = fs::create_dir_all(parent).await;
@@ -413,14 +413,14 @@ impl CacheIndex {
             let arch_backup = self
                 .config
                 .index_dir
-                .join(format!("cache-index-v7-{}.json.zst", system_clone.as_str()));
+                .join(format!("cache-index-v8-{}.json.zst", system_clone.as_str()));
 
             if arch_backup.exists() {
                 match fs::read(&arch_backup).await {
                     Ok(bytes) => {
                         if let Ok(decoded) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
                             &bytes,
-                            CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
+                            CacheLayerMediaType::ROOT_INDEX_V8_ZSTD,
                             self.oci_client.limits().max_index_uncompressed_bytes(),
                         ) {
                             let root_data = decoded.value;
@@ -626,7 +626,7 @@ mod tests {
             .unwrap(),
             nar_size: 100,
             added: "2026-08-29T00:00:00Z".to_string(),
-            origin_job: None,
+            origin: None,
         };
         let mut base_root =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
@@ -658,7 +658,10 @@ mod tests {
             .unwrap(),
             nar_size: 300,
             added: "2026-08-29T10:05:00Z".to_string(),
-            origin_job: Some("job:matrix-x86".to_string()),
+            origin: Some(nixcache_core::OriginMetadata {
+                run_id: Some(42),
+                job_id: Some("matrix-x86".to_string()),
+            }),
         };
         let mut hot_map = HashMap::new();
         hot_map.insert(hash_hot.clone(), hot_entry);
@@ -734,8 +737,8 @@ mod tests {
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "127.0.0.1:9");
         root_data.public_key = "backup-pubkey:CCC=".to_string();
 
-        // Pre-create cache-index-v7-x86_64-linux.json.zst in the index dir
-        let backup_file = temp_dir.path().join("cache-index-v7-x86_64-linux.json.zst");
+        // Pre-create cache-index-v8-x86_64-linux.json.zst in the index dir
+        let backup_file = temp_dir.path().join("cache-index-v8-x86_64-linux.json.zst");
         let compressed = IndexCodec::encode_zstd(&root_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
             .expect("Compression should succeed");
         tokio::fs::write(&backup_file, &compressed).await.unwrap();

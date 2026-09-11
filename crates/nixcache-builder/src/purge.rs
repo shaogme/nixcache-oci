@@ -7,7 +7,7 @@ use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_cli::PurgeArgs;
 use nixcache_core::{
-    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
+    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
     partition_entries_by_shard,
 };
@@ -19,7 +19,7 @@ use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-/// 执行缓存主动清理与失效工作流 (Schema v7 分层 Merkle 索引)
+/// 执行缓存主动清理与失效工作流 (Schema v8 分层 Merkle 索引)
 pub async fn run_purge(
     args: &PurgeArgs,
     repo: &str,
@@ -279,7 +279,7 @@ pub async fn run_purge(
                 root_index.gc_roots = updated_roots;
                 root_index.recalculate_merkle_root()?;
 
-                root_index.version = SCHEMA_VERSION_V7;
+                root_index.version = SCHEMA_VERSION_V8;
                 root_index.generated =
                     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -429,7 +429,7 @@ mod tests {
                 .unwrap(),
                 nar_size: 1024,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
         entries.insert(
@@ -448,7 +448,7 @@ mod tests {
                 .unwrap(),
                 nar_size: 2048,
                 added: "2026-08-29T10:00:00Z".to_string(),
-                origin_job: None,
+                origin: None,
             },
         );
 

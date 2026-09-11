@@ -1,5 +1,5 @@
 use nixcache_core::{
-    IndexEntry, NIX_BASE32_ALPHABET, NarDigest, NarInfoMeta, StoreHash, SystemArch,
+    IndexEntry, NIX_BASE32_ALPHABET, NarDigest, NarInfoMeta, OriginMetadata, StoreHash, SystemArch,
 };
 use std::{collections::HashMap, str};
 
@@ -103,7 +103,10 @@ pub fn generate_index_entries(
             nar_digest: NarDigest::parse(base_digest).expect("generated digest must be valid"),
             nar_size,
             added: "2026-08-30T00:00:00Z".to_string(),
-            origin_job: Some(format!("job-{}", (i % 128))),
+            origin: Some(OriginMetadata {
+                run_id: Some(seed),
+                job_id: Some(format!("job-{}", (i % 128))),
+            }),
         };
 
         entries.insert(hash, entry);

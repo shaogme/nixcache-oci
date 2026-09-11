@@ -4,16 +4,20 @@ use crate::{
         calculate_shard_id, compute_merkle_root, compute_shard_merkle_hash, shard_id_to_prefix,
     },
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, MapAccess, Visitor, value::MapAccessDeserializer},
+};
 use std::{
-    borrow::Borrow, collections::HashMap, convert::Infallible, env, fmt, ops::Deref, str::FromStr,
+    borrow::Borrow, collections::HashMap, convert::Infallible, env, fmt, marker::PhantomData,
+    ops::Deref, str::FromStr,
 };
 use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
-pub const SCHEMA_VERSION_V7: u32 = 7;
-pub const CACHE_INDEX_VERSION: u32 = SCHEMA_VERSION_V7;
+pub const SCHEMA_VERSION_V8: u32 = 8;
+pub const CACHE_INDEX_VERSION: u32 = SCHEMA_VERSION_V8;
 pub const RUN_SESSION_VERSION: u32 = 6;
-pub const RECEIPT_VERSION: u32 = 6;
+pub const RECEIPT_VERSION: u32 = 7;
 pub const NUM_SHARDS: usize = 1024;
 
 pub trait IndexValidationLimits {
@@ -787,6 +791,108 @@ impl<'de> Deserialize<'de> for NarInfoMeta {
     }
 }
 
+/// 构建产物的结构化来源元数据。
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OriginMetadata {
+    pub run_id: Option<u64>,
+    pub job_id: Option<String>,
+}
+
+impl OriginMetadata {
+    pub fn validate_structure(&self) -> Result<(), TypeError> {
+        if self.run_id.is_none() && self.job_id.is_none() {
+            return Err(TypeError::OriginMissingFields);
+        }
+        if self
+            .job_id
+            .as_deref()
+            .is_some_and(|job_id| job_id.trim().is_empty())
+        {
+            return Err(TypeError::EmptyOriginJobId);
+        }
+        Ok(())
+    }
+}
+
+struct RequiredOption<T>(Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredOption<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RequiredOptionVisitor<T>(PhantomData<T>);
+
+        impl<'de, T> Visitor<'de> for RequiredOptionVisitor<T>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = RequiredOption<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("null or a value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(RequiredOption(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                Ok(RequiredOption(None))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                T::deserialize(deserializer).map(|value| RequiredOption(Some(value)))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                T::deserialize(MapAccessDeserializer::new(map))
+                    .map(|value| RequiredOption(Some(value)))
+            }
+        }
+
+        deserializer.deserialize_any(RequiredOptionVisitor(PhantomData))
+    }
+}
+
+#[derive(Deserialize)]
+struct OriginMetadataWire {
+    run_id: Option<u64>,
+    job_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for OriginMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OriginMetadataWire::deserialize(deserializer)?;
+        let origin = Self {
+            run_id: wire.run_id,
+            job_id: wire.job_id,
+        };
+        origin
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(origin)
+    }
+}
+
 /// 强类型 IndexEntry，定义单个 Nix Store 产物及其 NAR 存储元数据
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -797,7 +903,7 @@ pub struct IndexEntry {
     pub nar_digest: NarDigest,
     pub nar_size: u64,
     pub added: String,
-    pub origin_job: Option<String>,
+    pub origin: Option<OriginMetadata>,
 }
 
 impl IndexEntry {
@@ -830,6 +936,9 @@ impl IndexEntry {
                 details: "added must be a valid RFC3339 timestamp".to_string(),
             });
         }
+        if let Some(origin) = &self.origin {
+            origin.validate_structure()?;
+        }
         Ok(())
     }
 
@@ -857,7 +966,7 @@ struct IndexEntryWire {
     nar_digest: NarDigest,
     nar_size: u64,
     added: String,
-    origin_job: Option<String>,
+    origin: RequiredOption<OriginMetadata>,
 }
 
 impl<'de> Deserialize<'de> for IndexEntry {
@@ -873,7 +982,7 @@ impl<'de> Deserialize<'de> for IndexEntry {
             nar_digest: wire.nar_digest,
             nar_size: wire.nar_size,
             added: wire.added,
-            origin_job: wire.origin_job,
+            origin: wire.origin.0,
         };
         value
             .validate_structure()
@@ -892,7 +1001,7 @@ pub struct JobSummaryMetadata {
     pub timestamp: String,
 }
 
-/// 单个分片描述符 (Schema v7 Merkle Tree 叶子节点)
+/// 单个分片描述符 (Schema v8 Merkle Tree 叶子节点)
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// 分片前缀编号 (0..1023)
@@ -1029,7 +1138,7 @@ impl<'de> Deserialize<'de> for ShardDescriptor {
     }
 }
 
-/// 单架构全局分片索引根目录 (Schema v7 Root)
+/// 单架构全局分片索引根目录 (Schema v8 Root)
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardedArchCacheIndexData {
     pub version: u32,
@@ -1048,20 +1157,20 @@ pub struct ShardedArchCacheIndexData {
 }
 
 impl ShardedArchCacheIndexData {
-    /// 创建一个全新的 Schema v7 单架构分片索引根目录 (包含 1024 个空分片描述符)
+    /// 创建一个全新的 Schema v8 单架构分片索引根目录 (包含 1024 个空分片描述符)
     pub fn new(system: SystemArch, repo: impl Into<String>, registry: impl Into<String>) -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for id in 0..NUM_SHARDS {
             shards.push(
                 ShardDescriptor::empty(id as u16)
-                    .expect("the fixed v7 shard range must always be valid"),
+                    .expect("the fixed v8 shard range must always be valid"),
             );
         }
         let merkle_root = compute_merkle_root(&shards)
             .expect("a freshly created complete shard set must have a valid Merkle root");
 
         Self {
-            version: SCHEMA_VERSION_V7,
+            version: SCHEMA_VERSION_V8,
             system,
             repo: repo.into(),
             registry: registry.into(),
@@ -1116,9 +1225,9 @@ impl ShardedArchCacheIndexData {
     }
 
     pub fn validate_structure(&self) -> Result<(), CoreError> {
-        if self.version != SCHEMA_VERSION_V7 {
+        if self.version != SCHEMA_VERSION_V8 {
             return Err(CoreError::InvalidIndex {
-                details: format!("version must be {SCHEMA_VERSION_V7}"),
+                details: format!("version must be {SCHEMA_VERSION_V8}"),
             });
         }
         if !self.system.is_known() {
@@ -1266,7 +1375,7 @@ impl ShardDataPayload {
             });
         }
         Ok(Self {
-            version: SCHEMA_VERSION_V7,
+            version: SCHEMA_VERSION_V8,
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             entries: HashMap::new(),
@@ -1295,9 +1404,9 @@ impl ShardDataPayload {
     }
 
     pub fn validate_structure(&self) -> Result<(), CoreError> {
-        if self.version != SCHEMA_VERSION_V7 {
+        if self.version != SCHEMA_VERSION_V8 {
             return Err(CoreError::InvalidShard {
-                details: format!("version must be {SCHEMA_VERSION_V7}"),
+                details: format!("version must be {SCHEMA_VERSION_V8}"),
             });
         }
         if self.shard_id >= NUM_SHARDS as u16 {
@@ -1443,13 +1552,12 @@ pub struct BuildStats {
 }
 
 /// 节点构建回执 (BuildReceipt)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct BuildReceipt {
     pub version: u32,
     pub system: SystemArch,
     pub repo: String,
-    pub run_id: Option<u64>,
-    pub job_id: Option<String>,
+    pub origin: Option<OriginMetadata>,
     pub timestamp: String,
     pub public_key: Option<String>,
     pub new_entries: HashMap<StoreHash, IndexEntry>,
@@ -1458,6 +1566,7 @@ pub struct BuildReceipt {
 }
 
 impl BuildReceipt {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         system: SystemArch,
         repo: String,
@@ -1466,33 +1575,94 @@ impl BuildReceipt {
         new_entries: HashMap<StoreHash, IndexEntry>,
         active_gc_roots: Vec<StoreHash>,
         stats: BuildStats,
-    ) -> Self {
-        Self {
+        origin: Option<OriginMetadata>,
+    ) -> Result<Self, CoreError> {
+        let receipt = Self {
             version: RECEIPT_VERSION,
             system,
             repo,
-            run_id: None,
-            job_id: None,
+            origin,
             timestamp,
             public_key,
             new_entries,
             active_gc_roots,
             stats,
-        }
+        };
+        receipt.validate_origin_consistency()?;
+        Ok(receipt)
     }
 
-    pub fn with_run_info(mut self, run_id: Option<u64>, job_id: Option<String>) -> Self {
-        self.run_id = run_id;
-        self.job_id = job_id;
-        self
+    fn validate_origin_consistency(&self) -> Result<(), CoreError> {
+        if let Some(origin) = &self.origin {
+            origin.validate_structure()?;
+        }
+        for (hash, entry) in &self.new_entries {
+            if let Some(origin) = &entry.origin {
+                origin
+                    .validate_structure()
+                    .map_err(|error| CoreError::InvalidReceipt {
+                        details: format!("entry {hash} origin: {error}"),
+                    })?;
+            }
+            if entry.origin != self.origin {
+                return Err(CoreError::ReceiptOriginMismatch {
+                    hash: hash.to_string(),
+                    expected: format!("{:?}", self.origin),
+                    actual: format!("{:?}", entry.origin),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.version != RECEIPT_VERSION {
+            return Err(CoreError::InvalidReceipt {
+                details: format!("version must be {RECEIPT_VERSION}"),
+            });
+        }
+        if !self.system.is_known() {
+            return Err(CoreError::InvalidReceipt {
+                details: "receipt system must be known".to_string(),
+            });
+        }
+        if self.repo.trim().is_empty() {
+            return Err(CoreError::InvalidReceipt {
+                details: "receipt repository must not be empty".to_string(),
+            });
+        }
+        if self.timestamp.trim().is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&self.timestamp).is_err()
+        {
+            return Err(CoreError::InvalidReceipt {
+                details: "receipt timestamp must be a valid RFC3339 timestamp".to_string(),
+            });
+        }
+        self.validate_origin_consistency()?;
+        for (hash, entry) in &self.new_entries {
+            entry
+                .validate_structure()
+                .map_err(|error| CoreError::InvalidReceipt {
+                    details: format!("entry {hash}: {error}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// 执行两个相同架构回执的无损合并
-    pub fn merge_with(&mut self, other: BuildReceipt) {
-        debug_assert_eq!(
-            self.system, other.system,
-            "Cannot merge receipts of different architectures"
-        );
+    pub fn merge_with(&mut self, other: BuildReceipt) -> Result<(), CoreError> {
+        self.validate_origin_consistency()?;
+        other.validate_origin_consistency()?;
+        if self.system != other.system {
+            return Err(CoreError::InvalidReceipt {
+                details: "cannot merge receipts of different architectures".to_string(),
+            });
+        }
+        if self.origin != other.origin {
+            return Err(CoreError::InvalidReceipt {
+                details: "cannot merge receipts with different origins".to_string(),
+            });
+        }
         self.new_entries.extend(other.new_entries);
         self.active_gc_roots.extend(other.active_gc_roots);
         self.active_gc_roots.sort_unstable();
@@ -1505,5 +1675,43 @@ impl BuildReceipt {
         if self.public_key.is_none() {
             self.public_key = other.public_key;
         }
+        self.validate_origin_consistency()
+    }
+}
+
+#[derive(Deserialize)]
+struct BuildReceiptWire {
+    version: u32,
+    system: SystemArch,
+    repo: String,
+    origin: RequiredOption<OriginMetadata>,
+    timestamp: String,
+    public_key: Option<String>,
+    new_entries: HashMap<StoreHash, IndexEntry>,
+    active_gc_roots: Vec<StoreHash>,
+    stats: BuildStats,
+}
+
+impl<'de> Deserialize<'de> for BuildReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BuildReceiptWire::deserialize(deserializer)?;
+        let receipt = Self {
+            version: wire.version,
+            system: wire.system,
+            repo: wire.repo,
+            origin: wire.origin.0,
+            timestamp: wire.timestamp,
+            public_key: wire.public_key,
+            new_entries: wire.new_entries,
+            active_gc_roots: wire.active_gc_roots,
+            stats: wire.stats,
+        };
+        receipt
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(receipt)
     }
 }

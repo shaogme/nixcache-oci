@@ -289,7 +289,7 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
     let root_digest = digest_bytes(&root_bytes);
     let manifest_body = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}},"layers":[{{"mediaType":"{}","digest":"{}","size":{}}}]}}"#,
-        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
+        CacheLayerMediaType::ROOT_INDEX_V8_ZSTD,
         root_digest,
         root_bytes.len()
     );
@@ -357,7 +357,7 @@ async fn test_generic_oci_deletes_direct_shard_with_manifest_system_context() {
     let manifest_body = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":2}},"layers":[{{"mediaType":"{}","digest":"{}","size":{}}}],"annotations":{{"org.nixos.nixcache.system":"x86_64-linux"}}}}"#,
         config_digest,
-        CacheLayerMediaType::SHARD_DATA_V7_ZSTD,
+        CacheLayerMediaType::SHARD_DATA_V8_ZSTD,
         shard_digest,
         shard_bytes.len()
     );
