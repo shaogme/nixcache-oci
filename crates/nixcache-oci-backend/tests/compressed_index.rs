@@ -195,7 +195,8 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
         .await;
 
     let client =
-        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default())
+            .unwrap();
 
     // Push blob
     let (pushed_digest, comp_size, uncomp_size) =
@@ -384,7 +385,8 @@ async fn test_get_multi_arch_sharded_index_routing() {
         .await;
 
     let client =
-        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default())
+            .unwrap();
 
     let (fetched_x86, digest) = client
         .indexes()
@@ -462,7 +464,8 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
         .await;
 
     let client =
-        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default())
+            .unwrap();
     let err = client
         .indexes()
         .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
@@ -507,7 +510,8 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
         .await;
 
     let client =
-        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default())
+            .unwrap();
     let err = client
         .indexes()
         .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
@@ -549,7 +553,8 @@ async fn test_get_shard_data_roundtrip() {
         .await;
 
     let client =
-        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default());
+        create_tokio_reqwest_client(&host, "test/repo", "token123", true, Default::default())
+            .unwrap();
 
     let (pushed_digest, comp_size, uncomp_size) = client
         .indexes()
@@ -628,7 +633,8 @@ async fn test_update_sharded_arch_index_cas_flow() {
         true,
         GcpArtifactRegistryDriver,
         Default::default(),
-    );
+    )
+    .unwrap();
 
     let updated_digest = client
         .indexes()

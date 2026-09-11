@@ -124,7 +124,7 @@ async fn main() -> Result<(), ProxyError> {
         credentials.clone(),
         false,
         Default::default(),
-    );
+    )?;
 
     let proxy_config = CascadingProxyConfig {
         repo: repo.clone(),
@@ -136,7 +136,7 @@ async fn main() -> Result<(), ProxyError> {
         target_system,
     };
 
-    let cache_index = CacheIndex::with_config(proxy_config, credentials);
+    let cache_index = CacheIndex::with_config(proxy_config, credentials)?;
 
     let state = AppState {
         repo,

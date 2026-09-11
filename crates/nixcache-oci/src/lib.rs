@@ -19,7 +19,8 @@ pub use backend::{
     GenericOciDriver, GhcrDriver, GitHubContainerMetadata, GitHubPackageVersion,
     GitHubPackageVersionMetadata, GitHubPackagesClient, ManifestCasSupport, OciBackendDriver,
     OciDriver, PackageDeletionSupport, RegistryCapabilities, RegistryDeletionStrategy,
-    RegistryKind, detect_driver, driver_for_kind,
+    RegistryEndpoint, RegistryEndpointError, RegistryKind, RegistryScheme, detect_driver,
+    driver_for_kind,
 };
 pub use client::{
     BlobClient, DeletionClient, DeletionOutcome, DeletionSummary, FetchedOciArtifact, IndexClient,

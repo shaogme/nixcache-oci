@@ -20,12 +20,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
             RegistryDeletionStrategy::StandardOciDelete
             | RegistryDeletionStrategy::DockerHubRestApi
             | RegistryDeletionStrategy::AwsEcrApi => {
-                let url = endpoint::manifest_url(
-                    self.client.url_scheme(),
-                    self.client.registry(),
-                    self.client.repo(),
-                    tag,
-                );
+                let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
                 let (status, headers, body) = self
                     .client
                     .request_get_with_auth_retry(
@@ -94,12 +89,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
         &self,
         digest: &str,
     ) -> Result<DeletionOutcome, OciError> {
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), digest);
         let status = self
             .client
             .request_delete_with_auth_retry(&url, "delete manifest")
@@ -151,12 +141,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                 ),
             });
         }
-        let url = endpoint::blob_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::blob_url(self.client.endpoint(), self.client.repo(), digest);
         let status = self
             .client
             .request_delete_with_auth_retry(&url, "delete blob")
@@ -306,12 +291,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
     }
 
     async fn verify_manifest_absent(&self, digest: &str) -> Result<(), OciError> {
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), digest);
         let (status, _) = self
             .client
             .request_head_with_auth_retry(&url, "verify manifest deletion")

@@ -82,7 +82,8 @@ async fn test_generic_oci_two_stage_tag_deletion() {
         GenericOciDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
 
     let del_res = client.deletion().delete_tag("run-100").await;
     assert!(del_res.is_ok());
@@ -109,7 +110,8 @@ async fn test_generic_oci_manifest_delete_405_rejected() {
         GenericOciDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
 
     let err = client
         .deletion()
@@ -158,7 +160,8 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
         GenericOciDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
 
     let digests = vec![
         NarDigest::new_unchecked("sha256:b1"),
@@ -225,7 +228,8 @@ async fn test_generic_oci_deletes_complete_tag_reachable_graph() {
         GenericOciDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 2);
     assert_eq!(summary.manifests_discovered, 3);
@@ -298,7 +302,8 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         GenericOciDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 1);
     assert_eq!(summary.manifests_discovered, 1);

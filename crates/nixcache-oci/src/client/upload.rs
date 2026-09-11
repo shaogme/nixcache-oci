@@ -39,11 +39,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
     }
 
     async fn execute_two_step_put(&self, digest: &str, bytes: Bytes) -> Result<String, OciError> {
-        let upload_init_url = endpoint::upload_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-        );
+        let upload_init_url = endpoint::upload_url(self.client.endpoint(), self.client.repo());
         let (status, response_headers) = self
             .client
             .request_post_with_auth_retry(&upload_init_url, "initialize blob upload")
@@ -56,8 +52,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             .get(LOCATION)
             .and_then(|value| value.to_str().ok())
             .ok_or(OciError::UploadLocationMissing)?;
-        let session_url =
-            endpoint::resolved_location(self.client.url_scheme(), self.client.registry(), location);
+        let session_url = endpoint::resolved_location(self.client.endpoint(), location)?;
         let put_url = endpoint::with_digest(&session_url, digest);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
@@ -103,11 +98,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             BlobUploadStrategy::PreferMonolithicPost
             | BlobUploadStrategy::ResumableChunkedPatch => {
                 let monolithic_url = endpoint::with_digest(
-                    &endpoint::upload_url(
-                        self.client.url_scheme(),
-                        self.client.registry(),
-                        self.client.repo(),
-                    ),
+                    &endpoint::upload_url(self.client.endpoint(), self.client.repo()),
                     digest,
                 );
                 let mut headers = self.client.get_auth_headers().await?;
@@ -176,11 +167,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             return Ok(digest.to_string());
         }
 
-        let upload_init_url = endpoint::upload_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-        );
+        let upload_init_url = endpoint::upload_url(self.client.endpoint(), self.client.repo());
         let (status, response_headers) = self
             .client
             .request_post_with_auth_retry(&upload_init_url, "initialize blob stream upload")
@@ -192,8 +179,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             .get(LOCATION)
             .and_then(|value| value.to_str().ok())
             .ok_or(OciError::UploadLocationMissing)?;
-        let session_url =
-            endpoint::resolved_location(self.client.url_scheme(), self.client.registry(), location);
+        let session_url = endpoint::resolved_location(self.client.endpoint(), location)?;
         let put_url = endpoint::with_digest(&session_url, digest);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
@@ -305,17 +291,13 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             {
                 Ok(response) => {
                     endpoint::update_location(
-                        self.client.url_scheme(),
-                        self.client.registry(),
+                        self.client.endpoint(),
                         session_url,
                         &response.headers,
-                    );
+                    )?;
                     if let Some(location) = response.location.as_deref() {
-                        *session_url = endpoint::resolved_location(
-                            self.client.url_scheme(),
-                            self.client.registry(),
-                            location,
-                        );
+                        *session_url =
+                            endpoint::resolved_location(self.client.endpoint(), location)?;
                     }
 
                     if response.status.is_success() {
@@ -368,12 +350,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                     attempts: patch_attempts,
                     source: Box::new(probe_error),
                 })?;
-            endpoint::update_location(
-                self.client.url_scheme(),
-                self.client.registry(),
-                session_url,
-                &probe_headers,
-            );
+            endpoint::update_location(self.client.endpoint(), session_url, &probe_headers)?;
             if !probe_status.is_success() {
                 if probed_416 {
                     return Err(last_error);
@@ -461,11 +438,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         }
 
         info!("Executing standard chunked resumable upload for large stream");
-        let upload_init_url = endpoint::upload_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-        );
+        let upload_init_url = endpoint::upload_url(self.client.endpoint(), self.client.repo());
         let (status, response_headers) = self
             .client
             .request_post_with_auth_retry(&upload_init_url, "initialize chunked upload")
@@ -477,8 +450,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             .get(LOCATION)
             .and_then(|value| value.to_str().ok())
             .ok_or(OciError::UploadLocationMissing)?;
-        let mut session_url =
-            endpoint::resolved_location(self.client.url_scheme(), self.client.registry(), location);
+        let mut session_url = endpoint::resolved_location(self.client.endpoint(), location)?;
         let mut current_offset = 0u64;
         let mut chunk_buf = buffer;
         let mut stream_ended = false;

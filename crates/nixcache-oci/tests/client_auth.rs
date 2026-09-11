@@ -3,7 +3,7 @@ use http::{HeaderMap, StatusCode};
 use nixcache_oci::{
     AwsEcrDriver, BearerChallenge, BlobUploadStrategy, DockerHubDriver, GenericOciDriver,
     GhcrDriver, MockResponse, MockRouterTransport, OciClient, OciError, RegistryDeletionStrategy,
-    RegistryKind,
+    RegistryEndpoint, RegistryKind,
 };
 
 #[test]
@@ -19,7 +19,12 @@ fn driver_capabilities_and_canonicalization() {
         ghcr.capabilities().deletion_strategy,
         RegistryDeletionStrategy::GitHubPackagesRestApi
     );
-    assert_eq!(ghcr.canonicalize_endpoint("  GHCR.IO "), "ghcr.io");
+    assert_eq!(
+        ghcr.canonicalize_endpoint("  GHCR.IO ")
+            .unwrap()
+            .to_string(),
+        "https://ghcr.io"
+    );
     assert_eq!(ghcr.canonicalize_repository("/Owner/Repo/"), "owner/repo");
 
     let docker = DockerHubDriver;
@@ -30,8 +35,11 @@ fn driver_capabilities_and_canonicalization() {
         BlobUploadStrategy::PreferMonolithicPost
     );
     assert_eq!(
-        docker.canonicalize_endpoint("docker.io"),
-        "registry-1.docker.io"
+        docker
+            .canonicalize_endpoint("docker.io")
+            .unwrap()
+            .to_string(),
+        "https://registry-1.docker.io"
     );
     assert_eq!(docker.canonicalize_repository("ubuntu"), "library/ubuntu");
 
@@ -67,7 +75,8 @@ async fn token_exchange_failure_is_visible() {
         true,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let challenge = BearerChallenge::new(
         "https://auth.example.test/token",
         Some("example.com".to_string()),
@@ -95,5 +104,73 @@ fn oci_error_display_includes_status_and_target() {
             }
         ),
         "Target blob 'sha256:123' not found on registry"
+    );
+}
+
+#[tokio::test]
+async fn endpoint_generates_complete_base_path_request_urls() {
+    let transport = MockRouterTransport::default();
+    transport.add_route(
+        "GET",
+        "/Harbor/v2/team/repo/nix-cache/manifests/latest",
+        MockResponse {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        },
+    );
+    let client = OciClient::new(
+        " HTTPS://REGISTRY.example/Harbor/ ",
+        "team/repo",
+        "",
+        false,
+        GenericOciDriver,
+        transport.clone(),
+        Default::default(),
+    )
+    .unwrap();
+
+    assert_eq!(client.manifests().get("latest").await.unwrap(), None);
+    assert_eq!(
+        transport.request_urls.pop().unwrap(),
+        (
+            "GET".to_string(),
+            "https://registry.example/Harbor/v2/team/repo/nix-cache/manifests/latest".to_string()
+        )
+    );
+}
+
+#[test]
+fn endpoint_rejects_invalid_input_during_client_construction() {
+    let error = match OciClient::new(
+        "ftp://registry.example",
+        "team/repo",
+        "",
+        false,
+        GenericOciDriver,
+        MockRouterTransport::default(),
+        Default::default(),
+    ) {
+        Ok(_) => panic!("invalid endpoint must fail before a request"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, OciError::InvalidEndpoint(_)));
+}
+
+#[test]
+fn docker_alias_only_rewrites_the_authority_host() {
+    let endpoint = DockerHubDriver
+        .canonicalize_endpoint("HTTP://DOCKER.IO:5000/Team/Prefix/")
+        .unwrap();
+    assert_eq!(endpoint.scheme().as_str(), "http");
+    assert_eq!(endpoint.authority(), "registry-1.docker.io:5000");
+    assert_eq!(endpoint.base_path(), "/Team/Prefix");
+    assert_eq!(endpoint.service_name(), "registry-1.docker.io:5000");
+    assert_eq!(
+        RegistryEndpoint::parse("127.0.0.1:5000")
+            .unwrap()
+            .scheme()
+            .as_str(),
+        "http"
     );
 }

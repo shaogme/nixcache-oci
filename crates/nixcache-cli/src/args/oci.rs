@@ -113,6 +113,15 @@ mod tests {
             RegistryKind::DockerHub
         );
 
+        let endpoint_args = OciTargetArgs {
+            registry: Some(" HTTPS://GHCR.IO/Harbor/ ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            endpoint_args.resolve_kind(DEFAULT_NIXCACHE_REGISTRY),
+            RegistryKind::Ghcr
+        );
+
         let custom_kind_args = OciTargetArgs {
             repo: Some("custom/repo".to_string()),
             registry: Some("registry.internal.corp".to_string()),

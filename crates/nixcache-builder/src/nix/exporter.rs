@@ -632,7 +632,8 @@ mod tests {
             "",
             true,
             Default::default(),
-        );
+        )
+        .unwrap();
         let config = super::ParallelExportConfig::default();
         let report = ParallelExporter::export_and_upload_paths(&[], &oci, &config)
             .await
@@ -703,7 +704,8 @@ mod tests {
             "",
             true,
             Default::default(),
-        );
+        )
+        .unwrap();
         let config = super::ParallelExportConfig {
             concurrency: 4,
             signing_key_file: None,
@@ -790,7 +792,8 @@ mod tests {
             true,
             nixcache_oci::GhcrDriver,
             Default::default(),
-        );
+        )
+        .unwrap();
         let config = super::ParallelExportConfig {
             concurrency: 2,
             signing_key_file: None,

@@ -1,4 +1,4 @@
-use crate::backend::RegistryKind;
+use crate::backend::{RegistryEndpointError, RegistryKind};
 use http::StatusCode;
 use nixcache_core::CoreError;
 use nixcache_utils::CompressionError;
@@ -61,6 +61,9 @@ pub enum TokenError {
 
 #[derive(Error, Debug)]
 pub enum OciError {
+    #[error(transparent)]
+    InvalidEndpoint(#[from] RegistryEndpointError),
+
     #[error("Digest mismatch for '{target}': expected {expected}, got {actual}")]
     DigestMismatch {
         target: String,

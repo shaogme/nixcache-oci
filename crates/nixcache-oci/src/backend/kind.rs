@@ -1,3 +1,4 @@
+use super::endpoint::RegistryEndpoint;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
@@ -57,13 +58,10 @@ impl FromStr for RegistryKind {
 impl RegistryKind {
     /// 基于注册表域名或端点字符串自动探测推导后端种类
     pub fn detect(registry: &str) -> Self {
-        let clean = registry.trim().to_lowercase();
-        let host = clean
-            .strip_prefix("https://")
-            .or_else(|| clean.strip_prefix("http://"))
-            .unwrap_or(&clean);
-        let host = host.split('/').next().unwrap_or(host);
-        let host = host.split(':').next().unwrap_or(host);
+        let Ok(endpoint) = RegistryEndpoint::parse(registry) else {
+            return Self::GenericOci;
+        };
+        let host = endpoint.host();
 
         if host == "ghcr.io" {
             Self::Ghcr

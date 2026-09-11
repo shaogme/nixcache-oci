@@ -219,7 +219,8 @@ async fn test_ghcr_client_integration_via_oci_client() {
         GhcrDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
 
     // delete_tag_strict should route to GitHubPackagesClient and succeed
     assert!(oci.deletion().delete_tag("run-99").await.is_ok());

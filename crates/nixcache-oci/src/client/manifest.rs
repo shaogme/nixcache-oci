@@ -77,12 +77,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
             });
         }
         let _permit = self.client.acquire_index_read().await;
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let (status, response_headers, bytes) = self
             .client
             .request_get_with_auth_retry(
@@ -123,12 +118,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
     }
 
     pub async fn head(&self, tag: &str) -> Result<Option<String>, OciError> {
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let (status, response_headers) = self
             .client
             .request_head_with_auth_retry(&url, "head manifest")
@@ -156,11 +146,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
         let mut all_tags = Vec::new();
         let mut last_tag: Option<String> = None;
         loop {
-            let base_url = endpoint::tags_url(
-                self.client.url_scheme(),
-                self.client.registry(),
-                self.client.repo(),
-            );
+            let base_url = endpoint::tags_url(self.client.endpoint(), self.client.repo());
             let url = match last_tag.as_deref() {
                 Some(cursor) => endpoint::with_last_cursor(&base_url, cursor),
                 None => format!("{base_url}?n=100"),
@@ -250,12 +236,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
         if manifest.contains(EMPTY_CONFIG_DIGEST) {
             self.client.blobs().ensure_empty_config().await?;
         }
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
             "Content-Type",
@@ -291,12 +272,7 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
         if manifest.contains(EMPTY_CONFIG_DIGEST) {
             self.client.blobs().ensure_empty_config().await?;
         }
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
             "Content-Type",

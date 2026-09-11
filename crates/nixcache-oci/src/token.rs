@@ -6,7 +6,7 @@ mod sync;
 
 use crate::{
     auth::{BearerChallenge, RegistryCredentials},
-    backend::driver::OciDriver,
+    backend::{RegistryEndpoint, driver::OciDriver},
     error::{OciError, TokenError},
     transport::OciTransport,
 };
@@ -45,7 +45,7 @@ impl Clock for SystemClock {
 /// OCI 注册表鉴权令牌管理器。
 #[derive(Clone)]
 pub struct TokenManager {
-    registry: String,
+    endpoint: RegistryEndpoint,
     repo: String,
     credentials: RegistryCredentials,
     write_access: bool,
@@ -56,14 +56,14 @@ pub struct TokenManager {
 
 impl TokenManager {
     pub fn new(
-        registry: &str,
+        endpoint: &RegistryEndpoint,
         repo: &str,
         credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         driver: impl Into<OciDriver>,
     ) -> Self {
         Self::new_with_clock(
-            registry,
+            endpoint,
             repo,
             credentials,
             write_access,
@@ -73,7 +73,7 @@ impl TokenManager {
     }
 
     fn new_with_clock(
-        registry: &str,
+        endpoint: &RegistryEndpoint,
         repo: &str,
         credentials: impl Into<RegistryCredentials>,
         write_access: bool,
@@ -81,10 +81,9 @@ impl TokenManager {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let driver = driver.into();
-        let clean_registry = driver.canonicalize_endpoint(registry);
         let clean_repo = driver.canonicalize_repository(repo);
         Self {
-            registry: clean_registry,
+            endpoint: endpoint.clone(),
             repo: clean_repo,
             credentials: credentials.into(),
             write_access,
@@ -103,7 +102,7 @@ impl TokenManager {
     }
 
     pub(crate) fn default_service(&self) -> &str {
-        &self.registry
+        self.endpoint.service_name()
     }
 
     pub(crate) async fn cached_token(&self) -> Option<Arc<str>> {
@@ -295,6 +294,7 @@ mod tests {
     use super::TokenManager;
     use crate::{
         auth::BearerChallenge,
+        backend::RegistryEndpoint,
         backend::driver::{GhcrDriver, detect_driver},
         mock::{MockResponse, MockRouterTransport, MockTokenGate},
     };
@@ -359,12 +359,16 @@ mod tests {
         transport
     }
 
+    fn test_endpoint() -> RegistryEndpoint {
+        RegistryEndpoint::parse("test.registry.io").unwrap()
+    }
+
     #[tokio::test]
     async fn test_token_manager_singleflight_concurrent_storm() {
         let transport = Arc::new(make_test_transport());
         let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -401,7 +405,7 @@ mod tests {
         let transport = make_test_transport();
         let driver = detect_driver("test.registry.io");
         let token_mgr =
-            TokenManager::new("test.registry.io", "test/repo", "secret_tok", true, driver);
+            TokenManager::new(&test_endpoint(), "test/repo", "secret_tok", true, driver);
 
         // 第一次调用：执行网络 Fetch
         let t1 = token_mgr
@@ -435,7 +439,7 @@ mod tests {
 
         let driver = detect_driver("test.registry.io");
         let token_mgr = TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "fallback_token",
             false,
@@ -486,7 +490,7 @@ mod tests {
         transport.set_token_gate(gate.clone());
         let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -529,7 +533,7 @@ mod tests {
         transport.set_token_gate(gate.clone());
         let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -567,7 +571,7 @@ mod tests {
         transport.set_panic_on_token(true);
         let driver = detect_driver("test.registry.io");
         let token_mgr =
-            TokenManager::new("test.registry.io", "test/repo", "secret_tok", false, driver);
+            TokenManager::new(&test_endpoint(), "test/repo", "secret_tok", false, driver);
 
         let task = {
             let mgr = token_mgr.clone();
@@ -594,7 +598,7 @@ mod tests {
         transport.set_token_gate(gate.clone());
         let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -647,7 +651,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let driver = detect_driver("test.registry.io");
         let token_mgr = TokenManager::new_with_clock(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -692,7 +696,7 @@ mod tests {
         transport.set_token_gate(gate.clone());
         let driver = detect_driver("test.registry.io");
         let token_mgr = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &test_endpoint(),
             "test/repo",
             "secret_tok",
             false,
@@ -729,8 +733,9 @@ mod tests {
     async fn test_token_manager_scope_and_write_access() {
         let transport = make_test_transport();
         let driver = GhcrDriver;
-        let write_mgr = TokenManager::new("ghcr.io", "org/repo", "token", true, driver);
-        let read_mgr = TokenManager::new("ghcr.io", "org/repo", "token", false, driver);
+        let ghcr_endpoint = RegistryEndpoint::parse("ghcr.io").unwrap();
+        let write_mgr = TokenManager::new(&ghcr_endpoint, "org/repo", "token", true, driver);
+        let read_mgr = TokenManager::new(&ghcr_endpoint, "org/repo", "token", false, driver);
 
         let t_write = write_mgr
             .get_token(&transport, &test_challenge())
@@ -743,5 +748,12 @@ mod tests {
 
         assert_eq!(t_write.as_ref(), "singleflight-jwt-token");
         assert_eq!(t_read.as_ref(), "singleflight-jwt-token");
+    }
+
+    #[test]
+    fn default_service_is_endpoint_authority_only() {
+        let endpoint = RegistryEndpoint::parse("http://127.0.0.1:5000/registry").unwrap();
+        let manager = TokenManager::new(&endpoint, "team/repo", "", false, detect_driver(""));
+        assert_eq!(manager.default_service(), "127.0.0.1:5000");
     }
 }

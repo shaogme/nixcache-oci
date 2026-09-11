@@ -1,22 +1,26 @@
 //! Registry endpoint construction shared by all domain clients.
 
+use crate::{
+    backend::RegistryEndpoint,
+    error::{OciError, TransportError},
+};
 use http::HeaderMap;
 use http::header::LOCATION;
 
-pub(super) fn manifest_url(scheme: &str, registry: &str, repo: &str, reference: &str) -> String {
-    format!("{scheme}://{registry}/v2/{repo}/nix-cache/manifests/{reference}")
+pub(super) fn manifest_url(endpoint: &RegistryEndpoint, repo: &str, reference: &str) -> String {
+    endpoint.api_url(&format!("/v2/{repo}/nix-cache/manifests/{reference}"))
 }
 
-pub(super) fn blob_url(scheme: &str, registry: &str, repo: &str, digest: &str) -> String {
-    format!("{scheme}://{registry}/v2/{repo}/nix-cache/blobs/{digest}")
+pub(super) fn blob_url(endpoint: &RegistryEndpoint, repo: &str, digest: &str) -> String {
+    endpoint.api_url(&format!("/v2/{repo}/nix-cache/blobs/{digest}"))
 }
 
-pub(super) fn upload_url(scheme: &str, registry: &str, repo: &str) -> String {
-    format!("{scheme}://{registry}/v2/{repo}/nix-cache/blobs/uploads/")
+pub(super) fn upload_url(endpoint: &RegistryEndpoint, repo: &str) -> String {
+    endpoint.api_url(&format!("/v2/{repo}/nix-cache/blobs/uploads/"))
 }
 
-pub(super) fn tags_url(scheme: &str, registry: &str, repo: &str) -> String {
-    format!("{scheme}://{registry}/v2/{repo}/nix-cache/tags/list")
+pub(super) fn tags_url(endpoint: &RegistryEndpoint, repo: &str) -> String {
+    endpoint.api_url(&format!("/v2/{repo}/nix-cache/tags/list"))
 }
 
 pub(super) fn with_digest(url: &str, digest: &str) -> String {
@@ -49,23 +53,25 @@ fn hex_digit(value: u8) -> char {
     }
 }
 
-pub(super) fn resolved_location(scheme: &str, registry: &str, location: &str) -> String {
-    if location.starts_with('/') {
-        format!("{scheme}://{registry}{location}")
-    } else {
-        location.to_string()
-    }
+pub(super) fn resolved_location(
+    endpoint: &RegistryEndpoint,
+    location: &str,
+) -> Result<String, OciError> {
+    endpoint.resolve_location(location).map_err(OciError::from)
 }
 
 pub(super) fn update_location(
-    scheme: &str,
-    registry: &str,
+    endpoint: &RegistryEndpoint,
     session_url: &mut String,
     headers: &HeaderMap,
-) {
-    if let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) {
-        *session_url = resolved_location(scheme, registry, location);
+) -> Result<(), OciError> {
+    if let Some(location) = headers.get(LOCATION) {
+        let location = location
+            .to_str()
+            .map_err(|_| OciError::Transport(TransportError::HeaderParse { header: "Location" }))?;
+        *session_url = resolved_location(endpoint, location)?;
     }
+    Ok(())
 }
 
 pub(super) fn compute_sha256_digest(bytes: &[u8]) -> String {

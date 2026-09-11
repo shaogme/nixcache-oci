@@ -18,12 +18,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
     }
 
     pub async fn head(&self, digest: &str) -> Result<bool, OciError> {
-        let url = endpoint::blob_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::blob_url(self.client.endpoint(), self.client.repo(), digest);
         let (status, _) = self
             .client
             .request_head_with_auth_retry(&url, "head blob")
@@ -63,12 +58,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
     ) -> Result<Bytes, OciError> {
         let _permit = self.client.acquire_index_read().await;
         ContentDigest::parse(digest)?;
-        let url = endpoint::blob_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::blob_url(self.client.endpoint(), self.client.repo(), digest);
         let (status, response_headers, bytes) = self
             .client
             .request_get_with_auth_retry(
@@ -104,12 +94,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         digest: &str,
     ) -> Result<OciBlobStream<VerifiedBlobStream<T::BodyStream>>, OciError> {
         ContentDigest::parse(digest)?;
-        let url = endpoint::blob_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            digest,
-        );
+        let url = endpoint::blob_url(self.client.endpoint(), self.client.repo(), digest);
         let (status, headers, stream) = self
             .client
             .request_stream_with_auth_retry(

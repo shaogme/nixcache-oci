@@ -95,7 +95,8 @@ fn get_store(env: &Env) -> Result<CacheStore> {
         false,
         WorkerFetchTransport,
         OciReadLimits::default(),
-    );
+    )
+    .map_err(WorkerStoreError::from)?;
     Ok(CacheStore::new(oci_client, config))
 }
 

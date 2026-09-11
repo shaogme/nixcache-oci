@@ -27,7 +27,8 @@ async fn monolithic_post_upload_is_available() {
         DockerHubDriver,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     assert_eq!(
         client
@@ -59,7 +60,8 @@ async fn ghcr_resumable_upload_uses_fixed_two_step_strategy() {
         GhcrDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let data = Bytes::from_static(b"streamed nar xz chunk data for test");
     let stream = Box::pin(futures_util::stream::iter(vec![
         Ok::<Bytes, TransportError>(data.clone()),
@@ -109,6 +111,7 @@ fn chunked_client(transport: MockRouterTransport) -> OciClient<MockRouterTranspo
         transport,
         Default::default(),
     )
+    .unwrap()
 }
 
 fn drain_patch_requests(transport: &MockRouterTransport) -> Vec<MockPatchRequest> {
@@ -164,7 +167,8 @@ async fn buffered_and_streamed_blob_reads_reject_digest_tampering() {
         false,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     assert!(matches!(
         client.blobs().get(&body_digest).await,
         Err(OciError::HeaderDigestMismatch { .. })
@@ -187,7 +191,8 @@ async fn buffered_and_streamed_blob_reads_reject_digest_tampering() {
         false,
         stream_transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let blob_stream = stream_client.blobs().stream(wrong_digest).await.unwrap();
     let mut body_stream = blob_stream.stream;
     assert!(body_stream.next().await.unwrap().is_ok());
@@ -213,7 +218,8 @@ async fn buffered_blob_reads_use_configured_limits() {
         },
     );
     let client =
-        OciClient::with_transport("example.com", "test/repo", "", false, transport, limits);
+        OciClient::with_transport("example.com", "test/repo", "", false, transport, limits)
+            .unwrap();
     assert!(matches!(
         client
             .blobs()

@@ -5,7 +5,7 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    OciClient, OciDriver, OciReadLimits, OciTransport, RegistryCredentials, RegistryKind,
+    OciClient, OciDriver, OciError, OciReadLimits, OciTransport, RegistryCredentials, RegistryKind,
     TransportError, UploadChunkResponse, check_content_length, collect_limited, parse_range_header,
 };
 use reqwest::Client;
@@ -464,7 +464,7 @@ pub fn create_tokio_reqwest_client(
     credentials: impl Into<RegistryCredentials>,
     write_access: bool,
     limits: OciReadLimits,
-) -> OciClient<ReqwestTransport> {
+) -> Result<OciClient<ReqwestTransport>, OciError> {
     let transport = ReqwestTransport::default();
     OciClient::with_transport(registry, repo, credentials, write_access, transport, limits)
 }
@@ -477,7 +477,7 @@ pub fn create_tokio_reqwest_client_with_driver(
     write_access: bool,
     driver: impl Into<OciDriver>,
     limits: OciReadLimits,
-) -> OciClient<ReqwestTransport> {
+) -> Result<OciClient<ReqwestTransport>, OciError> {
     let transport = ReqwestTransport::default();
     OciClient::new(
         registry,
@@ -498,7 +498,7 @@ pub fn create_tokio_reqwest_client_from_kind(
     credentials: impl Into<RegistryCredentials>,
     write_access: bool,
     limits: OciReadLimits,
-) -> OciClient<ReqwestTransport> {
+) -> Result<OciClient<ReqwestTransport>, OciError> {
     let transport = ReqwestTransport::default();
     OciClient::from_kind(
         kind,
@@ -581,7 +581,8 @@ mod tests {
             credentials,
             false,
             Default::default(),
-        );
+        )
+        .unwrap();
         let artifact = client.manifests().get("cache-index").await.unwrap();
         assert!(artifact.is_some());
     }
@@ -605,7 +606,8 @@ mod tests {
 
         let credentials = RegistryCredentials::with_username("custom", "secret-gh-token");
         let client =
-            create_tokio_reqwest_client(&host, "test/repo", credentials, true, Default::default());
+            create_tokio_reqwest_client(&host, "test/repo", credentials, true, Default::default())
+                .unwrap();
         let challenge = BearerChallenge::new(
             format!("http://{host}/token"),
             Some(host.clone()),
@@ -674,7 +676,8 @@ mod tests {
             GenericOciDriver,
             transport,
             Default::default(),
-        );
+        )
+        .unwrap();
         let result = client
             .blobs()
             .push_resumable(
@@ -739,7 +742,8 @@ mod tests {
             GenericOciDriver,
             transport,
             Default::default(),
-        );
+        )
+        .unwrap();
         let result = client
             .blobs()
             .push_resumable(

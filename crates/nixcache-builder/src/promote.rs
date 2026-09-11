@@ -65,7 +65,7 @@ pub async fn run_promote(
         target_tag, registry, repo
     );
 
-    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default());
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default())?;
 
     // 1. 准备待合并的数据集 (按系统架构分桶)
     let mut incoming_entries_by_sys: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =

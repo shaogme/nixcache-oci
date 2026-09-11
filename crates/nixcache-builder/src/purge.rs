@@ -36,7 +36,7 @@ pub async fn run_purge(
         registry, repo, dry_run, delete_blobs, strict_mode, is_all
     );
 
-    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default());
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default())?;
 
     // 1. --all 必须显式遵守后端能够证明的删除范围。
     if is_all {

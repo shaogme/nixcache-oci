@@ -151,7 +151,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         root_data.validate_for(
             system,
             self.client.repo(),
-            self.client.registry(),
+            self.client.endpoint().authority(),
             self.client.limits(),
         )?;
         for shard in &root_data.shards {
@@ -286,12 +286,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
     }
 
     pub async fn put(&self, tag: &str, index: &OciImageIndex) -> Result<(), OciError> {
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
             "Content-Type",
@@ -330,12 +325,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
                 backend: self.client.kind(),
             });
         }
-        let url = endpoint::manifest_url(
-            self.client.url_scheme(),
-            self.client.registry(),
-            self.client.repo(),
-            tag,
-        );
+        let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), tag);
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
             "Content-Type",

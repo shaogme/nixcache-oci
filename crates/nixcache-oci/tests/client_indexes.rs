@@ -13,7 +13,8 @@ async fn sharded_root_and_shard_data_round_trip() {
         true,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
     let shard_id = hash.shard_id();
     let mut shard = ShardDataPayload::new(shard_id);
@@ -81,7 +82,8 @@ async fn image_index_routes_to_the_requested_architecture() {
         true,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     let root_x86 =
         ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
     let root_arm =
@@ -172,7 +174,8 @@ async fn sharded_root_cas_update_is_exposed_by_index_client() {
         DockerHubDriver,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     client
         .indexes()
         .update_sharded_cas("cache-index", &SystemArch::X86_64Linux, 3, |existing| {

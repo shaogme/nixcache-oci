@@ -228,7 +228,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         opts.credentials.clone(),
         true,
         Default::default(),
-    );
+    )?;
     let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
     info!(
         "Remote index contains {} previously-cached entries for {}",
@@ -393,7 +393,8 @@ mod tests {
             false,
             transport,
             Default::default(),
-        );
+        )
+        .unwrap();
         let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
         assert!(hashes.is_empty());
     }
@@ -408,7 +409,8 @@ mod tests {
             true,
             transport,
             Default::default(),
-        );
+        )
+        .unwrap();
 
         let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let mut payload = ShardDataPayload::new(h1.shard_id());

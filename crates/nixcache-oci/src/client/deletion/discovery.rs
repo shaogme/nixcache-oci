@@ -175,7 +175,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                             root.validate_for(
                                 &root.system,
                                 self.client.repo(),
-                                self.client.registry(),
+                                self.client.endpoint().authority(),
                                 self.client.limits(),
                             )
                             .map_err(|error| {

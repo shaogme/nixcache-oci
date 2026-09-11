@@ -1,3 +1,4 @@
+use super::{RegistryEndpoint, RegistryEndpointError};
 use crate::backend::kind::{
     BlobUploadStrategy, ManifestCasSupport, PackageDeletionSupport, RegistryCapabilities,
     RegistryDeletionStrategy, RegistryKind,
@@ -13,7 +14,10 @@ pub trait OciBackendDriver: Send + Sync + Debug + 'static {
     fn capabilities(&self) -> &'static RegistryCapabilities;
 
     /// 规范化 Registry 主机域名与端点 (例如将 docker.io 转换为 registry-1.docker.io)
-    fn canonicalize_endpoint(&self, registry: &str) -> String;
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError>;
 
     /// 规范化存储库路径 (例如为 Docker Hub 补充 library/ 前缀)
     fn canonicalize_repository(&self, repo: &str) -> String;
@@ -54,13 +58,16 @@ impl GhcrDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        let clean = registry.trim().to_lowercase();
-        if clean.is_empty() {
-            "ghcr.io".to_string()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        let registry = if registry.trim().is_empty() {
+            "ghcr.io"
         } else {
-            clean
-        }
+            registry
+        };
+        RegistryEndpoint::parse(registry)
     }
 
     #[inline(always)]
@@ -90,7 +97,10 @@ impl OciBackendDriver for GhcrDriver {
         GhcrDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         GhcrDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -134,12 +144,20 @@ impl DockerHubDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        let clean = registry.trim().to_lowercase();
-        if clean == "docker.io" || clean == "index.docker.io" || clean.is_empty() {
-            "registry-1.docker.io".to_string()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        let registry = if registry.trim().is_empty() {
+            "registry-1.docker.io"
         } else {
-            clean
+            registry
+        };
+        let endpoint = RegistryEndpoint::parse(registry)?;
+        if matches!(endpoint.host(), "docker.io" | "index.docker.io") {
+            Ok(endpoint.replace_host("registry-1.docker.io"))
+        } else {
+            Ok(endpoint)
         }
     }
 
@@ -175,7 +193,10 @@ impl OciBackendDriver for DockerHubDriver {
         DockerHubDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         DockerHubDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -215,8 +236,11 @@ impl AwsEcrDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        registry.trim().to_lowercase()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        RegistryEndpoint::parse(registry)
     }
 
     #[inline(always)]
@@ -246,7 +270,10 @@ impl OciBackendDriver for AwsEcrDriver {
         AwsEcrDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         AwsEcrDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -290,8 +317,11 @@ impl GcpArtifactRegistryDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        registry.trim().to_lowercase()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        RegistryEndpoint::parse(registry)
     }
 
     #[inline(always)]
@@ -321,7 +351,10 @@ impl OciBackendDriver for GcpArtifactRegistryDriver {
         GcpArtifactRegistryDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         GcpArtifactRegistryDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -361,8 +394,11 @@ impl AzureAcrDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        registry.trim().to_lowercase()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        RegistryEndpoint::parse(registry)
     }
 
     #[inline(always)]
@@ -392,7 +428,10 @@ impl OciBackendDriver for AzureAcrDriver {
         AzureAcrDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         AzureAcrDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -432,8 +471,11 @@ impl GenericOciDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
-        registry.trim().to_lowercase()
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
+        RegistryEndpoint::parse(registry)
     }
 
     #[inline(always)]
@@ -463,7 +505,10 @@ impl OciBackendDriver for GenericOciDriver {
         GenericOciDriver::capabilities(self)
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         GenericOciDriver::canonicalize_endpoint(self, registry)
     }
 
@@ -595,7 +640,10 @@ impl OciDriver {
     }
 
     #[inline(always)]
-    pub fn canonicalize_endpoint(&self, registry: &str) -> String {
+    pub fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         match self {
             Self::Ghcr(d) => d.canonicalize_endpoint(registry),
             Self::DockerHub(d) => d.canonicalize_endpoint(registry),
@@ -640,7 +688,10 @@ impl OciBackendDriver for OciDriver {
         self.capabilities()
     }
 
-    fn canonicalize_endpoint(&self, registry: &str) -> String {
+    fn canonicalize_endpoint(
+        &self,
+        registry: &str,
+    ) -> Result<RegistryEndpoint, RegistryEndpointError> {
         self.canonicalize_endpoint(registry)
     }
 

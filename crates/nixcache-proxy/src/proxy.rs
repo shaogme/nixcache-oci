@@ -292,7 +292,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
         let mut root =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
@@ -307,7 +308,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 
@@ -344,7 +346,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
         let mut root =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
@@ -359,7 +362,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 
@@ -397,7 +401,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
         let empty_app = create_router(empty_state);
@@ -425,7 +430,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
         let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let shard_id = calculate_shard_id(&hash1);
         let mut shard = ShardDataPayload::new(shard_id);
@@ -466,7 +472,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 
@@ -508,7 +515,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
 
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let entry = IndexEntry {
@@ -565,7 +573,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 
@@ -648,7 +657,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
 
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let digest_str = "3733cd977ff8eb18b987357e22ced99f46097f31ecb239e878ae63760e83e4d5";
@@ -711,7 +721,8 @@ mod tests {
                 "",
                 false,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 
@@ -777,7 +788,8 @@ mod tests {
                 ..Default::default()
             },
             "",
-        );
+        )
+        .unwrap();
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
@@ -787,7 +799,8 @@ mod tests {
                 "",
                 true,
                 Default::default(),
-            ),
+            )
+            .unwrap(),
             http_client: reqwest::Client::new(),
         };
 

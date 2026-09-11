@@ -126,6 +126,7 @@ pub struct MockPutRequest {
 #[derive(Clone, Default)]
 pub struct MockRouterTransport {
     pub call_count: Arc<AtomicUsize>,
+    pub request_urls: Arc<SegQueue<(String, String)>>,
     pub responses: Arc<SccHashMap<(String, String), MockResponse>>,
     pub posted_bodies: Arc<SegQueue<(String, Bytes)>>,
     pub patch_requests: Arc<SegQueue<MockPatchRequest>>,
@@ -170,6 +171,11 @@ impl MockRouterTransport {
 
     pub fn set_panic_on_token(&self, panic: bool) {
         self.panic_on_token.store(panic, Ordering::Release);
+    }
+
+    fn record_request(&self, method: &str, url: &str) {
+        self.request_urls
+            .push((method.to_string(), url.to_string()));
     }
 
     fn mock_patch_response(
@@ -224,6 +230,7 @@ impl OciTransport for MockRouterTransport {
         _headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("HEAD", url);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
@@ -267,6 +274,7 @@ impl OciTransport for MockRouterTransport {
         max_bytes: u64,
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("GET", url);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
 
         if path.ends_with("/token") {
@@ -400,6 +408,7 @@ impl OciTransport for MockRouterTransport {
         _headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("POST", url);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
@@ -429,6 +438,7 @@ impl OciTransport for MockRouterTransport {
         body: Bytes,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("POST", url);
         self.posted_bodies.push((url.to_string(), body.clone()));
 
         if let Some(digest) = extract_digest_param(url) {
@@ -466,6 +476,7 @@ impl OciTransport for MockRouterTransport {
         byte_range: (u64, u64),
     ) -> Result<UploadChunkResponse, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("PATCH", url);
         headers.insert(CONTENT_LENGTH, HeaderValue::from(chunk.len() as u64));
         headers.insert(
             CONTENT_RANGE,
@@ -553,6 +564,7 @@ impl OciTransport for MockRouterTransport {
         last_chunk: Option<(Bytes, (u64, u64))>,
     ) -> Result<StatusCode, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("PUT", url);
         let body = last_chunk
             .as_ref()
             .map(|(bytes, _)| bytes.clone())
@@ -593,6 +605,7 @@ impl OciTransport for MockRouterTransport {
         body: Bytes,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("PUT", url);
         self.put_requests.push(MockPutRequest {
             url: url.to_string(),
             headers: headers.clone(),
@@ -678,6 +691,7 @@ impl OciTransport for MockRouterTransport {
         _headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.record_request("DELETE", url);
         self.delete_requests.push(url.to_string());
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
 

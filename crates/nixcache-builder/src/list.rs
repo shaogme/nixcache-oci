@@ -229,7 +229,7 @@ pub async fn run_list(
     let limit = args.resolve_limit();
     let details = args.resolve_details();
 
-    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default());
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true, Default::default())?;
 
     // 1. 探查多架构并获取所有架构的 ShardedArchCacheIndexData
     let mut target_systems: HashSet<SystemArch> = HashSet::new();

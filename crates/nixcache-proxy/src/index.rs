@@ -113,16 +113,16 @@ impl CacheIndex {
     pub fn with_config(
         config: CascadingProxyConfig,
         credentials: impl Into<RegistryCredentials>,
-    ) -> Self {
+    ) -> Result<Self, ProxyIndexError> {
         let oci_client = create_tokio_reqwest_client(
             &config.registry,
             &config.repo,
             credentials,
             false,
             Default::default(),
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             config,
             oci_client,
             hot_entries: Arc::new(SccHashMap::new()),
@@ -131,7 +131,7 @@ impl CacheIndex {
             baseline_cache: Arc::new(SccHashMap::new()),
             shard_cache: Arc::new(SccHashMap::new()),
             remote_status: Arc::new(ArcSwap::from_pointee(RemoteStatus::default())),
-        }
+        })
     }
 
     pub fn config(&self) -> &CascadingProxyConfig {
@@ -594,7 +594,7 @@ mod tests {
             target_system: SystemArch::X86_64Linux,
         };
 
-        let index = CacheIndex::with_config(config, "");
+        let index = CacheIndex::with_config(config, "").unwrap();
 
         let hash_base = StoreHash::parse("00000000000000000000000000000001").unwrap();
         let hash_hot = StoreHash::parse("00000000000000000000000000000003").unwrap();
@@ -730,7 +730,7 @@ mod tests {
             .expect("Compression should succeed");
         tokio::fs::write(&backup_file, &compressed).await.unwrap();
 
-        let index = CacheIndex::with_config(config, "");
+        let index = CacheIndex::with_config(config, "").unwrap();
         let baseline = index.get_baseline_data().await;
 
         assert_eq!(baseline.root.public_key, "backup-pubkey:CCC=");

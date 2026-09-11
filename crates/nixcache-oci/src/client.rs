@@ -13,7 +13,11 @@ pub use manifest::{FetchedOciArtifact, ManifestCasCondition, ManifestClient};
 
 use crate::{
     auth::RegistryCredentials,
-    backend::{OciDriver, RegistryCapabilities, RegistryKind, detect_driver, driver_for_kind},
+    backend::{
+        OciDriver, RegistryCapabilities, RegistryEndpoint, RegistryKind, detect_driver,
+        driver_for_kind,
+    },
+    error::OciError,
     limits::OciReadLimits,
     token::TokenManager,
     transport::OciTransport,
@@ -24,7 +28,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Shared OCI registry context. Domain operations are exposed through the borrowed clients.
 #[derive(Clone)]
 pub struct OciClient<T: OciTransport> {
-    registry: String,
+    endpoint: RegistryEndpoint,
     repo: String,
     driver: OciDriver,
     token_manager: TokenManager,
@@ -43,23 +47,23 @@ impl<T: OciTransport + Clone> OciClient<T> {
         driver: impl Into<OciDriver>,
         transport: T,
         limits: OciReadLimits,
-    ) -> Self {
+    ) -> Result<Self, OciError> {
         limits
             .validate()
             .expect("OciReadLimits must be constructed through a checked constructor");
         let driver = driver.into();
-        let canonical_registry = driver.canonicalize_endpoint(registry);
+        let endpoint = driver.canonicalize_endpoint(registry)?;
         let canonical_repo = driver.canonicalize_repository(repo);
         let token_manager = TokenManager::new(
-            &canonical_registry,
+            &endpoint,
             &canonical_repo,
             credentials,
             write_access,
             driver,
         );
 
-        Self {
-            registry: canonical_registry,
+        Ok(Self {
+            endpoint,
             repo: canonical_repo,
             driver,
             token_manager,
@@ -69,7 +73,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     .expect("validated parallel read limit must fit usize"),
             )),
             limits,
-        }
+        })
     }
 
     /// 基于指定的 RegistryKind 构造 OCI 客户端。
@@ -81,7 +85,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         write_access: bool,
         transport: T,
         limits: OciReadLimits,
-    ) -> Self {
+    ) -> Result<Self, OciError> {
         Self::new(
             registry,
             repo,
@@ -101,7 +105,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         write_access: bool,
         transport: T,
         limits: OciReadLimits,
-    ) -> Self {
+    ) -> Result<Self, OciError> {
         Self::new(
             registry,
             repo,
@@ -125,8 +129,12 @@ impl<T: OciTransport + Clone> OciClient<T> {
         self.driver.capabilities()
     }
 
-    pub fn registry(&self) -> &str {
-        &self.registry
+    pub fn endpoint(&self) -> &RegistryEndpoint {
+        &self.endpoint
+    }
+
+    pub fn authority(&self) -> &str {
+        self.endpoint.authority()
     }
 
     pub fn repo(&self) -> &str {
@@ -151,18 +159,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
     pub(crate) fn token_manager(&self) -> &TokenManager {
         &self.token_manager
-    }
-
-    pub fn url_scheme(&self) -> &str {
-        if self.registry.starts_with("localhost:")
-            || self.registry.starts_with("127.0.0.1:")
-            || self.registry == "localhost"
-            || self.registry == "127.0.0.1"
-        {
-            "http"
-        } else {
-            "https"
-        }
     }
 
     pub fn blobs(&self) -> BlobClient<'_, T> {

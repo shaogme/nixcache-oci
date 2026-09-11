@@ -38,7 +38,8 @@ async fn get_and_put_manifest_use_manifest_client() {
         true,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         client.manifests().get("cache-index").await.unwrap(),
         Some(manifest_content.to_string())
@@ -97,7 +98,8 @@ async fn put_manifest_ensures_empty_config_blob() {
         true,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     assert!(
         client
             .manifests()
@@ -127,7 +129,8 @@ async fn manifest_cas_sets_the_expected_condition_header() {
         DockerHubDriver,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     let error = client
         .manifests()
         .put_cas(
@@ -159,7 +162,8 @@ async fn create_only_manifest_cas_uses_if_none_match() {
         DockerHubDriver,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     client
         .manifests()
         .put_cas("new-tag", "{}", ManifestCasCondition::CreateOnly)
@@ -186,7 +190,8 @@ async fn stale_manifest_cas_writer_cannot_overwrite() {
         DockerHubDriver,
         MockRouterTransport::default(),
         Default::default(),
-    );
+    )
+    .unwrap();
     client
         .manifests()
         .put("shared", "{\"version\":0}")
@@ -260,7 +265,8 @@ async fn get_manifest_with_digest_rejects_invalid_utf8() {
         false,
         transport,
         Default::default(),
-    );
+    )
+    .unwrap();
     assert!(
         client
             .manifests()
