@@ -1,316 +1,499 @@
-//! TokenManager 并发与同步原语抽象层
+//! Token single-flight 的代际状态机和同步适配器。
+//!
+//! 该模块只传播 flight 的完成状态。token 永远只从带有当前 generation
+//! 且未过期的 cache 读取，通知本身不保存也不携带 token。
+
+use std::{collections::HashMap, sync::Arc as TokenArc};
+
+#[cfg(loom)]
+use loom::sync::{Arc as SharedArc, Condvar, Mutex as StateMutex, MutexGuard};
 
 #[cfg(not(loom))]
-mod imp {
-    use crate::error::{OciError, TokenError};
-    use arc_swap::ArcSwapOption;
-    use std::{
-        fmt,
-        sync::{
-            Arc,
-            atomic::{AtomicU8, Ordering},
-        },
-        time::Duration,
-    };
-    use tokio::sync::watch;
-    use web_time::Instant;
+use std::sync::{Arc as SharedArc, Mutex as StateMutex, MutexGuard};
 
-    const STATE_IDLE: u8 = 0;
-    const STATE_FETCHING: u8 = 1;
+#[cfg(not(loom))]
+use tokio::sync::Notify;
 
-    #[derive(Clone)]
-    pub struct InFlightState {
-        inner: Arc<AtomicU8>,
-    }
+use web_time::Instant;
 
-    impl fmt::Debug for InFlightState {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("InFlightState").finish_non_exhaustive()
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ChallengeKey {
+    pub(super) realm: String,
+    pub(super) service: String,
+    pub(super) scope: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlightOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CachedToken {
+    pub(super) token: TokenArc<str>,
+    pub(super) generation: u64,
+    pub(super) expires_at: Instant,
+}
+
+pub(super) enum Acquire {
+    Leader(LeaderGuard),
+    Waiter(FlightWaiter),
+}
+
+struct FlightState {
+    outcome: Option<FlightOutcome>,
+}
+
+#[cfg(not(loom))]
+struct Flight {
+    state: StateMutex<FlightState>,
+    notify: Notify,
+}
+
+#[cfg(loom)]
+struct Flight {
+    channel: SharedArc<(StateMutex<FlightState>, Condvar)>,
+}
+
+impl Flight {
+    #[cfg(not(loom))]
+    fn new() -> Self {
+        Self {
+            state: StateMutex::new(FlightState { outcome: None }),
+            notify: Notify::new(),
         }
     }
 
-    impl Default for InFlightState {
-        fn default() -> Self {
-            Self::new()
+    #[cfg(loom)]
+    fn new() -> Self {
+        Self {
+            channel: SharedArc::new((
+                StateMutex::new(FlightState { outcome: None }),
+                Condvar::new(),
+            )),
         }
     }
 
-    impl InFlightState {
-        pub fn new() -> Self {
-            Self {
-                inner: Arc::new(AtomicU8::new(STATE_IDLE)),
+    #[cfg(not(loom))]
+    fn state(&self) -> MutexGuard<'_, FlightState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(loom)]
+    fn state(&self) -> MutexGuard<'_, FlightState> {
+        self.channel.0.lock().unwrap()
+    }
+
+    fn outcome(&self) -> Option<FlightOutcome> {
+        self.state().outcome
+    }
+
+    fn complete(&self, outcome: FlightOutcome) {
+        #[cfg(not(loom))]
+        {
+            let changed = {
+                let mut state = self.state();
+                if state.outcome.is_none() {
+                    state.outcome = Some(outcome);
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                self.notify.notify_waiters();
             }
         }
 
-        pub fn try_acquire_leader(&self) -> bool {
-            self.inner
-                .compare_exchange(
-                    STATE_IDLE,
-                    STATE_FETCHING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        }
-
-        pub fn release_leader(&self) {
-            self.inner.store(STATE_IDLE, Ordering::Release);
-        }
-    }
-
-    #[derive(Clone)]
-    struct CachedToken {
-        token: Arc<str>,
-        created_at: Instant,
-    }
-
-    #[derive(Clone)]
-    pub struct TokenStorage {
-        inner: Arc<ArcSwapOption<CachedToken>>,
-    }
-
-    impl fmt::Debug for TokenStorage {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TokenStorage").finish_non_exhaustive()
-        }
-    }
-
-    impl Default for TokenStorage {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl TokenStorage {
-        pub fn new() -> Self {
-            Self {
-                inner: Arc::new(ArcSwapOption::from(None)),
+        #[cfg(loom)]
+        {
+            let mut state = self.state();
+            if state.outcome.is_none() {
+                state.outcome = Some(outcome);
+                self.channel.1.notify_all();
             }
         }
+    }
 
-        pub fn load(&self) -> Option<Arc<str>> {
-            self.inner
-                .load_full()
-                .filter(|c| c.created_at.elapsed() < Duration::from_secs(240))
-                .map(|c| Arc::clone(&c.token))
+    #[cfg(not(loom))]
+    async fn wait(&self) -> FlightOutcome {
+        let notified = self.notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(outcome) = self.outcome() {
+            return outcome;
         }
+        notified.await;
+        self.outcome().unwrap_or(FlightOutcome::Cancelled)
+    }
 
-        pub fn store(&self, token: impl Into<Arc<str>>) {
-            self.inner.store(Some(Arc::new(CachedToken {
-                token: token.into(),
-                created_at: Instant::now(),
-            })));
+    #[cfg(loom)]
+    async fn wait(&self) -> FlightOutcome {
+        let mut state = self.state();
+        while state.outcome.is_none() {
+            state = self.channel.1.wait(state).unwrap();
+        }
+        state.outcome.unwrap_or(FlightOutcome::Cancelled)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct FlightRegistry {
+    inner: SharedArc<StateMutex<RegistryState>>,
+}
+
+struct RegistryState {
+    cache: HashMap<ChallengeKey, CachedToken>,
+    flights: HashMap<ChallengeKey, SharedArc<Flight>>,
+    generations: HashMap<ChallengeKey, u64>,
+    last_key: Option<ChallengeKey>,
+}
+
+impl FlightRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: SharedArc::new(StateMutex::new(RegistryState {
+                cache: HashMap::new(),
+                flights: HashMap::new(),
+                generations: HashMap::new(),
+                last_key: None,
+            })),
         }
     }
 
-    #[derive(Clone)]
-    pub struct TokenBroadcaster {
-        tx: Arc<watch::Sender<Option<Arc<str>>>>,
-        rx: watch::Receiver<Option<Arc<str>>>,
+    #[cfg(not(loom))]
+    fn state(&self) -> MutexGuard<'_, RegistryState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    impl fmt::Debug for TokenBroadcaster {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TokenBroadcaster").finish_non_exhaustive()
+    #[cfg(loom)]
+    fn state(&self) -> MutexGuard<'_, RegistryState> {
+        self.inner.lock().unwrap()
+    }
+
+    pub(super) fn load(&self, key: &ChallengeKey, now: Instant) -> Option<TokenArc<str>> {
+        let mut state = self.state();
+        let generation = state.generations.get(key).copied().unwrap_or_default();
+        let valid = state
+            .cache
+            .get(key)
+            .is_some_and(|entry| entry.generation == generation && entry.expires_at > now);
+        if valid {
+            return state
+                .cache
+                .get(key)
+                .map(|entry| TokenArc::clone(&entry.token));
+        }
+        state.cache.remove(key);
+        None
+    }
+
+    pub(super) fn load_last(&self, now: Instant) -> Option<TokenArc<str>> {
+        let mut state = self.state();
+        let key = state.last_key.clone()?;
+        let generation = state.generations.get(&key).copied().unwrap_or_default();
+        let valid = state
+            .cache
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation && entry.expires_at > now);
+        if valid {
+            return state
+                .cache
+                .get(&key)
+                .map(|entry| TokenArc::clone(&entry.token));
+        }
+        state.cache.remove(&key);
+        None
+    }
+
+    pub(super) fn acquire(&self, key: ChallengeKey) -> Acquire {
+        let mut state = self.state();
+        let generation = *state.generations.entry(key.clone()).or_default();
+        if let Some(flight) = state.flights.get(&key) {
+            return Acquire::Waiter(FlightWaiter {
+                flight: SharedArc::clone(flight),
+            });
+        }
+
+        let flight = SharedArc::new(Flight::new());
+        state.flights.insert(key.clone(), SharedArc::clone(&flight));
+        Acquire::Leader(LeaderGuard {
+            registry: self.clone(),
+            key: Some(key),
+            generation,
+            flight,
+        })
+    }
+
+    pub(super) fn store_if_current(
+        &self,
+        key: ChallengeKey,
+        generation: u64,
+        token: TokenArc<str>,
+        expires_at: Instant,
+    ) -> bool {
+        let mut state = self.state();
+        let current_generation = state.generations.get(&key).copied().unwrap_or_default();
+        if current_generation != generation {
+            return false;
+        }
+        state.cache.insert(
+            key.clone(),
+            CachedToken {
+                token,
+                generation,
+                expires_at,
+            },
+        );
+        state.last_key = Some(key);
+        true
+    }
+
+    pub(super) fn invalidate(&self, key: ChallengeKey) {
+        let flight = {
+            let mut state = self.state();
+            let generation = state.generations.entry(key.clone()).or_default();
+            *generation = generation.saturating_add(1);
+            state.cache.remove(&key);
+            state.flights.remove(&key)
+        };
+        if let Some(flight) = flight {
+            flight.complete(FlightOutcome::Cancelled);
         }
     }
 
-    impl Default for TokenBroadcaster {
-        fn default() -> Self {
-            Self::new()
+    fn finish(
+        &self,
+        key: ChallengeKey,
+        generation: u64,
+        flight: &SharedArc<Flight>,
+        outcome: FlightOutcome,
+    ) {
+        let remove = {
+            let mut state = self.state();
+            let same_flight = state
+                .flights
+                .get(&key)
+                .is_some_and(|current| SharedArc::ptr_eq(current, flight));
+            let same_generation =
+                state.generations.get(&key).copied().unwrap_or_default() == generation;
+            same_flight && same_generation && state.flights.remove(&key).is_some()
+        };
+        if remove || flight.outcome().is_none() {
+            flight.complete(outcome);
+        }
+    }
+}
+
+pub(super) struct FlightWaiter {
+    flight: SharedArc<Flight>,
+}
+
+impl FlightWaiter {
+    pub(super) async fn wait(self) -> FlightOutcome {
+        self.flight.wait().await
+    }
+}
+
+pub(super) struct LeaderGuard {
+    registry: FlightRegistry,
+    key: Option<ChallengeKey>,
+    generation: u64,
+    flight: SharedArc<Flight>,
+}
+
+impl LeaderGuard {
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn finish(mut self, outcome: FlightOutcome) {
+        self.finish_inner(outcome);
+    }
+
+    fn finish_inner(&mut self, outcome: FlightOutcome) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        self.registry
+            .finish(key, self.generation, &self.flight, outcome);
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        self.finish_inner(FlightOutcome::Cancelled);
+    }
+}
+
+pub(super) use Acquire::{Leader, Waiter};
+
+#[cfg(loom)]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct LoomTestRegistry {
+    registry: FlightRegistry,
+    key: ChallengeKey,
+    base: Instant,
+    tick: SharedArc<StateMutex<u64>>,
+}
+
+#[cfg(loom)]
+impl LoomTestRegistry {
+    pub fn new() -> Self {
+        Self {
+            registry: FlightRegistry::new(),
+            key: ChallengeKey {
+                realm: "https://auth.example.test/token".to_string(),
+                service: "registry.example.test".to_string(),
+                scope: "repository:test/repo:pull".to_string(),
+            },
+            base: Instant::now(),
+            tick: SharedArc::new(StateMutex::new(0)),
         }
     }
 
-    impl TokenBroadcaster {
-        pub fn new() -> Self {
-            let (tx, rx) = watch::channel(None);
-            Self {
-                tx: Arc::new(tx),
-                rx,
-            }
+    pub fn acquire(&self) -> LoomTestAcquire {
+        match self.registry.acquire(self.key.clone()) {
+            Acquire::Leader(leader) => LoomTestAcquire::Leader(LoomTestLeader { leader }),
+            Acquire::Waiter(_) => LoomTestAcquire::Waiter,
         }
+    }
 
-        pub fn broadcast(&self, token: impl Into<Arc<str>>) {
-            let _ = self.tx.send(Some(token.into()));
-        }
+    pub fn invalidate(&self) {
+        self.registry.invalidate(self.key.clone());
+    }
 
-        pub async fn wait(&self) -> Result<Arc<str>, OciError> {
-            let mut rx = self.rx.clone();
-            if let Some(ref token) = *rx.borrow() {
-                return Ok(Arc::clone(token));
-            }
-            if rx.changed().await.is_err() {
-                return Err(OciError::Token(TokenError::TokenMissingInBody));
-            }
-            rx.borrow()
-                .as_ref()
-                .cloned()
-                .ok_or(OciError::Token(TokenError::TokenMissingInBody))
-        }
+    pub fn advance(&self, ticks: u64) {
+        let mut tick = self.tick.lock().unwrap();
+        *tick += ticks;
+    }
+
+    pub fn load(&self) -> Option<String> {
+        self.registry
+            .load(&self.key, self.now())
+            .map(|token| token.to_string())
+    }
+
+    fn now(&self) -> Instant {
+        let tick = *self.tick.lock().unwrap();
+        self.base + std::time::Duration::from_millis(tick)
+    }
+
+    fn store(&self, generation: u64, token: &str, ttl_ticks: u64) -> bool {
+        self.registry.store_if_current(
+            self.key.clone(),
+            generation,
+            TokenArc::from(token),
+            self.now() + std::time::Duration::from_millis(ttl_ticks),
+        )
     }
 }
 
 #[cfg(loom)]
-mod imp {
-    use crate::error::{OciError, TokenError};
-    use loom::sync::{
-        Arc as LoomArc, Condvar, Mutex,
-        atomic::{AtomicU8, Ordering},
-    };
-    use std::{fmt, sync::Arc};
+#[doc(hidden)]
+pub enum LoomTestAcquire {
+    Leader(LoomTestLeader),
+    Waiter,
+}
 
-    const STATE_IDLE: u8 = 0;
-    const STATE_FETCHING: u8 = 1;
+#[cfg(loom)]
+#[doc(hidden)]
+pub struct LoomTestLeader {
+    leader: LeaderGuard,
+}
 
-    #[derive(Clone)]
-    pub struct InFlightState {
-        inner: LoomArc<AtomicU8>,
+#[cfg(loom)]
+impl LoomTestLeader {
+    pub fn generation(&self) -> u64 {
+        self.leader.generation
     }
 
-    impl fmt::Debug for InFlightState {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("InFlightState").finish_non_exhaustive()
-        }
+    pub fn store(&self, registry: &LoomTestRegistry, token: &str, ttl_ticks: u64) -> bool {
+        registry.store(self.generation(), token, ttl_ticks)
     }
 
-    impl Default for InFlightState {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl InFlightState {
-        pub fn new() -> Self {
-            Self {
-                inner: LoomArc::new(AtomicU8::new(STATE_IDLE)),
-            }
-        }
-
-        pub fn try_acquire_leader(&self) -> bool {
-            self.inner
-                .compare_exchange(
-                    STATE_IDLE,
-                    STATE_FETCHING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        }
-
-        pub fn release_leader(&self) {
-            self.inner.store(STATE_IDLE, Ordering::Release);
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct TokenStorage {
-        inner: LoomArc<Mutex<Option<Arc<str>>>>,
-    }
-
-    impl fmt::Debug for TokenStorage {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TokenStorage").finish_non_exhaustive()
-        }
-    }
-
-    impl Default for TokenStorage {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl TokenStorage {
-        pub fn new() -> Self {
-            Self {
-                inner: LoomArc::new(Mutex::new(None)),
-            }
-        }
-
-        pub fn load(&self) -> Option<Arc<str>> {
-            let guard = self.inner.lock().unwrap();
-            guard.clone()
-        }
-
-        pub fn store(&self, token: impl Into<Arc<str>>) {
-            let mut guard = self.inner.lock().unwrap();
-            *guard = Some(token.into());
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct TokenBroadcaster {
-        channel: LoomArc<(Mutex<BroadcastState>, Condvar)>,
-    }
-
-    struct BroadcastState {
-        token: Option<Arc<str>>,
-        failed: bool,
-    }
-
-    impl fmt::Debug for TokenBroadcaster {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("TokenBroadcaster").finish_non_exhaustive()
-        }
-    }
-
-    impl Default for TokenBroadcaster {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl TokenBroadcaster {
-        pub fn new() -> Self {
-            Self {
-                channel: LoomArc::new((
-                    Mutex::new(BroadcastState {
-                        token: None,
-                        failed: false,
-                    }),
-                    Condvar::new(),
-                )),
-            }
-        }
-
-        pub fn broadcast(&self, token: impl Into<Arc<str>>) {
-            let (lock, cvar) = &*self.channel;
-            let mut state = lock.lock().unwrap();
-            state.token = Some(token.into());
-            state.failed = false;
-            cvar.notify_all();
-        }
-
-        pub fn broadcast_error(&self) {
-            let (lock, cvar) = &*self.channel;
-            let mut state = lock.lock().unwrap();
-            state.token = None;
-            state.failed = true;
-            cvar.notify_all();
-        }
-
-        pub fn load(&self) -> Option<Arc<str>> {
-            self.channel.0.lock().unwrap().token.clone()
-        }
-
-        pub async fn wait(&self) -> Result<Arc<str>, OciError> {
-            let (lock, cvar) = &*self.channel;
-            let mut state = lock.lock().unwrap();
-            if let Some(ref val) = state.token {
-                return Ok(Arc::clone(val));
-            }
-            if state.failed {
-                return Err(OciError::Token(TokenError::TokenMissingInBody));
-            }
-            state = cvar.wait(state).unwrap();
-            if state.failed {
-                return Err(OciError::Token(TokenError::TokenMissingInBody));
-            }
-            state
-                .token
-                .clone()
-                .ok_or(OciError::Token(TokenError::TokenMissingInBody))
-        }
+    pub fn finish(self) {
+        self.leader.finish(FlightOutcome::Succeeded);
     }
 }
 
-pub use imp::*;
+#[cfg(test)]
+mod tests {
+    use super::{Acquire, CachedToken, ChallengeKey, FlightOutcome, FlightRegistry};
+    use std::{sync::Arc, time::Duration};
+    use web_time::Instant;
+
+    fn key(scope: &str) -> ChallengeKey {
+        ChallengeKey {
+            realm: "https://auth.example.test/token".to_string(),
+            service: "registry.example.test".to_string(),
+            scope: scope.to_string(),
+        }
+    }
+
+    #[test]
+    fn stale_generation_cannot_overwrite_current_cache() {
+        let registry = FlightRegistry::new();
+        let key = key("pull");
+        let now = Instant::now();
+        let leader = match registry.acquire(key.clone()) {
+            Acquire::Leader(leader) => leader,
+            Acquire::Waiter(_) => panic!("first caller must be leader"),
+        };
+        registry.invalidate(key.clone());
+        assert!(!registry.store_if_current(
+            key,
+            leader.generation,
+            Arc::from("old"),
+            now + Duration::from_secs(300),
+        ));
+        leader.finish(FlightOutcome::Succeeded);
+    }
+
+    #[test]
+    fn expired_cache_is_a_miss() {
+        let registry = FlightRegistry::new();
+        let key = key("pull");
+        let now = Instant::now();
+        assert!(registry.store_if_current(key.clone(), 0, Arc::from("expired"), now,));
+        assert!(registry.load(&key, now).is_none());
+        let state = registry.state();
+        assert!(state.cache.is_empty());
+    }
+
+    #[test]
+    fn guard_drop_does_not_remove_new_flight() {
+        let registry = FlightRegistry::new();
+        let key = key("pull");
+        let old = match registry.acquire(key.clone()) {
+            Acquire::Leader(leader) => leader,
+            Acquire::Waiter(_) => panic!("first caller must be leader"),
+        };
+        registry.invalidate(key.clone());
+        let new = match registry.acquire(key.clone()) {
+            Acquire::Leader(leader) => leader,
+            Acquire::Waiter(_) => panic!("invalidated caller must be leader"),
+        };
+        drop(old);
+        assert!(matches!(registry.acquire(key), Acquire::Waiter(_)));
+        drop(new);
+    }
+
+    #[test]
+    fn cache_entry_carries_generation_and_expiry() {
+        let entry = CachedToken {
+            token: Arc::from("token"),
+            generation: 3,
+            expires_at: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(entry.generation, 3);
+        assert!(entry.expires_at > Instant::now());
+    }
+}

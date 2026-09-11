@@ -308,10 +308,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 "registry returned 401 without a Bearer challenge",
             )
         })?;
-        self.token_manager.invalidate_challenge(&challenge).await;
         let token = self
             .token_manager
-            .get_token_for_challenge(&self.transport, &challenge, true)
+            .refresh_token(&self.transport, &challenge)
             .await?;
         let request_headers = Self::with_bearer(self.get_auth_headers().await?, &token);
         Ok((challenge, request_headers))

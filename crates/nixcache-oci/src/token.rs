@@ -1,22 +1,22 @@
+#[cfg(loom)]
 pub mod sync;
 
-#[cfg(loom)]
-use crate::token::sync::{InFlightState, TokenBroadcaster, TokenStorage};
+#[cfg(not(loom))]
+mod sync;
+
 use crate::{
     auth::{BearerChallenge, RegistryCredentials},
     backend::driver::OciDriver,
-    error::OciError,
+    error::{OciError, TokenError},
     transport::OciTransport,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
-#[cfg(not(loom))]
-use std::collections::HashMap;
-#[cfg(not(loom))]
-use std::time::Instant;
 use std::{sync::Arc, time::Duration};
+use sync::{ChallengeKey, FlightOutcome, FlightRegistry, Leader, Waiter};
+use web_time::Instant;
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -28,37 +28,15 @@ struct TokenResponse {
 
 pub(crate) use crate::auth::SecretToken;
 
-#[cfg(not(loom))]
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ChallengeKey {
-    realm: String,
-    service: String,
-    scope: String,
+trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
 }
 
-#[cfg(not(loom))]
-struct CachedChallengeToken {
-    token: Arc<str>,
-    expires_at: Instant,
-}
+struct SystemClock;
 
-#[cfg(not(loom))]
-struct ChallengeState {
-    cache: tokio::sync::Mutex<HashMap<ChallengeKey, CachedChallengeToken>>,
-    leaders: std::sync::Mutex<std::collections::HashSet<ChallengeKey>>,
-    wake: tokio::sync::Notify,
-    last_key: tokio::sync::Mutex<Option<ChallengeKey>>,
-}
-
-#[cfg(not(loom))]
-impl ChallengeState {
-    fn new() -> Self {
-        Self {
-            cache: tokio::sync::Mutex::new(HashMap::new()),
-            leaders: std::sync::Mutex::new(std::collections::HashSet::new()),
-            wake: tokio::sync::Notify::new(),
-            last_key: tokio::sync::Mutex::new(None),
-        }
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 }
 
@@ -70,14 +48,8 @@ pub struct TokenManager {
     credentials: RegistryCredentials,
     write_access: bool,
     driver: OciDriver,
-    #[cfg(loom)]
-    storage: TokenStorage,
-    #[cfg(loom)]
-    in_flight: InFlightState,
-    #[cfg(loom)]
-    broadcaster: TokenBroadcaster,
-    #[cfg(not(loom))]
-    challenge_state: Arc<ChallengeState>,
+    flights: FlightRegistry,
+    clock: Arc<dyn Clock>,
 }
 
 impl TokenManager {
@@ -88,6 +60,24 @@ impl TokenManager {
         write_access: bool,
         driver: impl Into<OciDriver>,
     ) -> Self {
+        Self::new_with_clock(
+            registry,
+            repo,
+            credentials,
+            write_access,
+            driver,
+            Arc::new(SystemClock),
+        )
+    }
+
+    fn new_with_clock(
+        registry: &str,
+        repo: &str,
+        credentials: impl Into<RegistryCredentials>,
+        write_access: bool,
+        driver: impl Into<OciDriver>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let driver = driver.into();
         let clean_registry = driver.canonicalize_endpoint(registry);
         let clean_repo = driver.canonicalize_repository(repo);
@@ -97,14 +87,8 @@ impl TokenManager {
             credentials: credentials.into(),
             write_access,
             driver,
-            #[cfg(loom)]
-            storage: TokenStorage::new(),
-            #[cfg(loom)]
-            in_flight: InFlightState::new(),
-            #[cfg(loom)]
-            broadcaster: TokenBroadcaster::new(),
-            #[cfg(not(loom))]
-            challenge_state: Arc::new(ChallengeState::new()),
+            flights: FlightRegistry::new(),
+            clock,
         }
     }
 
@@ -121,19 +105,7 @@ impl TokenManager {
     }
 
     pub(crate) async fn cached_token(&self) -> Option<Arc<str>> {
-        #[cfg(not(loom))]
-        {
-            let key = self.challenge_state.last_key.lock().await.clone()?;
-            let cache = self.challenge_state.cache.lock().await;
-            cache
-                .get(&key)
-                .filter(|entry| entry.expires_at > Instant::now())
-                .map(|entry| Arc::clone(&entry.token))
-        }
-        #[cfg(loom)]
-        {
-            None
-        }
+        self.flights.load_last(self.clock.now())
     }
 
     /// 按 Registry 返回的 challenge 获取 token，并以 realm/service/scope 隔离缓存。
@@ -141,8 +113,30 @@ impl TokenManager {
         &self,
         transport: &T,
         challenge: &BearerChallenge,
-        force_refresh: bool,
     ) -> Result<Arc<str>, OciError> {
+        self.validate_challenge(challenge)?;
+        let key = self.challenge_key(challenge);
+        self.get_token_for_key(transport, challenge, key).await
+    }
+
+    /// 使当前 challenge 的 token 失效，并只获取递增 generation 的 token。
+    pub async fn refresh_token<T: OciTransport>(
+        &self,
+        transport: &T,
+        challenge: &BearerChallenge,
+    ) -> Result<Arc<str>, OciError> {
+        self.validate_challenge(challenge)?;
+        let key = self.challenge_key(challenge);
+        self.invalidate_challenge(challenge);
+        self.get_token_for_key(transport, challenge, key).await
+    }
+
+    pub(crate) fn invalidate_challenge(&self, challenge: &BearerChallenge) {
+        let key = self.challenge_key(challenge);
+        self.flights.invalidate(key);
+    }
+
+    fn validate_challenge(&self, challenge: &BearerChallenge) -> Result<(), OciError> {
         challenge.validate()?;
         if challenge.is_insecure_non_localhost() && self.credentials.has_secret() {
             return Err(OciError::AuthChallengeInvalid {
@@ -150,110 +144,9 @@ impl TokenManager {
                     .to_string(),
             });
         }
-
-        #[cfg(loom)]
-        {
-            if !force_refresh && let Some(cached) = self.storage.load() {
-                return Ok(cached);
-            }
-            if !force_refresh && let Some(cached) = self.broadcaster.load() {
-                self.storage.store(Arc::clone(&cached));
-                return Ok(cached);
-            }
-            let leader = self.in_flight.try_acquire_leader();
-            if leader {
-                if !force_refresh {
-                    if let Some(cached) = self.storage.load() {
-                        self.in_flight.release_leader();
-                        return Ok(cached);
-                    }
-                    if let Some(cached) = self.broadcaster.load() {
-                        self.storage.store(Arc::clone(&cached));
-                        self.in_flight.release_leader();
-                        return Ok(cached);
-                    }
-                }
-                let result = self.fetch_token_network(transport, challenge).await;
-                match result {
-                    Ok((token, _)) => {
-                        self.storage.store(Arc::clone(&token));
-                        self.broadcaster.broadcast(Arc::clone(&token));
-                        self.in_flight.release_leader();
-                        return Ok(token);
-                    }
-                    Err(error) => {
-                        self.broadcaster.broadcast_error();
-                        self.in_flight.release_leader();
-                        return Err(error);
-                    }
-                }
-            }
-            return self.broadcaster.wait().await;
-        }
-
-        #[cfg(not(loom))]
-        {
-            let key = self.challenge_key(challenge);
-            let mut force_refresh = force_refresh;
-            loop {
-                if !force_refresh && let Some(token) = self.load_challenge_token(&key).await {
-                    return Ok(token);
-                }
-
-                let notified = self.challenge_state.wake.notified();
-                let mut notified = std::pin::pin!(notified);
-                notified.as_mut().enable();
-                let leader = {
-                    let mut leaders = self
-                        .challenge_state
-                        .leaders
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    leaders.insert(key.clone())
-                };
-                if !leader {
-                    notified.await;
-                    force_refresh = false;
-                    continue;
-                }
-
-                if !force_refresh && let Some(token) = self.load_challenge_token(&key).await {
-                    self.challenge_state
-                        .leaders
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&key);
-                    self.challenge_state.wake.notify_waiters();
-                    return Ok(token);
-                }
-
-                let guard = LeaderGuard::new(Arc::clone(&self.challenge_state), key.clone());
-                let result = self.fetch_token_network(transport, challenge).await;
-                match result {
-                    Ok((token, ttl)) => {
-                        self.store_challenge_token(&key, Arc::clone(&token), ttl)
-                            .await;
-                        guard.finish();
-                        return Ok(token);
-                    }
-                    Err(error) => {
-                        guard.finish();
-                        return Err(error);
-                    }
-                }
-            }
-        }
+        Ok(())
     }
 
-    pub(crate) async fn invalidate_challenge(&self, _challenge: &BearerChallenge) {
-        #[cfg(not(loom))]
-        {
-            let key = self.challenge_key(_challenge);
-            self.challenge_state.cache.lock().await.remove(&key);
-        }
-    }
-
-    #[cfg(not(loom))]
     fn challenge_key(&self, challenge: &BearerChallenge) -> ChallengeKey {
         let default_scope = self.default_scope();
         let (realm, service, scope) = challenge.cache_key(self.default_service(), &default_scope);
@@ -264,27 +157,56 @@ impl TokenManager {
         }
     }
 
-    #[cfg(not(loom))]
-    async fn load_challenge_token(&self, key: &ChallengeKey) -> Option<Arc<str>> {
-        let mut cache = self.challenge_state.cache.lock().await;
-        let entry = cache.get(key)?;
-        if entry.expires_at <= Instant::now() {
-            cache.remove(key);
-            return None;
-        }
-        Some(Arc::clone(&entry.token))
-    }
+    async fn get_token_for_key<T: OciTransport>(
+        &self,
+        transport: &T,
+        challenge: &BearerChallenge,
+        key: ChallengeKey,
+    ) -> Result<Arc<str>, OciError> {
+        loop {
+            if let Some(token) = self.flights.load(&key, self.clock.now()) {
+                return Ok(token);
+            }
 
-    #[cfg(not(loom))]
-    async fn store_challenge_token(&self, key: &ChallengeKey, token: Arc<str>, ttl: Duration) {
-        self.challenge_state.cache.lock().await.insert(
-            key.clone(),
-            CachedChallengeToken {
-                token,
-                expires_at: Instant::now() + ttl,
-            },
-        );
-        *self.challenge_state.last_key.lock().await = Some(key.clone());
+            match self.flights.acquire(key.clone()) {
+                Leader(leader) => {
+                    // acquire 已经在同一个同步临界区内创建了 Guard；这里之后的每个 await
+                    // 都受 Guard 保护，包括这个必要的二次缓存检查。
+                    if let Some(token) = self.flights.load(&key, self.clock.now()) {
+                        leader.finish(FlightOutcome::Succeeded);
+                        return Ok(token);
+                    }
+
+                    match self.fetch_token_network(transport, challenge).await {
+                        Ok((token, ttl)) => {
+                            let expires_at = self.clock.now() + ttl;
+                            if self.flights.store_if_current(
+                                key.clone(),
+                                leader.generation(),
+                                Arc::clone(&token),
+                                expires_at,
+                            ) {
+                                leader.finish(FlightOutcome::Succeeded);
+                                return Ok(token);
+                            }
+                            // invalidate/refresh 已经推进了 generation；旧结果不能回填或
+                            // 满足当前请求，丢弃后重新读取当前状态。
+                            leader.finish(FlightOutcome::Cancelled);
+                        }
+                        Err(error) => {
+                            leader.finish(FlightOutcome::Failed);
+                            return Err(error);
+                        }
+                    }
+                }
+                Waiter(waiter) => match waiter.wait().await {
+                    FlightOutcome::Succeeded | FlightOutcome::Cancelled => continue,
+                    FlightOutcome::Failed => {
+                        return Err(OciError::Token(TokenError::FlightFailed));
+                    }
+                },
+            }
+        }
     }
 
     /// 基于调用方已获得的 Bearer challenge 获取 token。
@@ -293,8 +215,7 @@ impl TokenManager {
         transport: &T,
         challenge: &BearerChallenge,
     ) -> Result<Arc<str>, OciError> {
-        self.get_token_for_challenge(transport, challenge, false)
-            .await
+        self.get_token_for_challenge(transport, challenge).await
     }
 
     async fn fetch_token_network<T: OciTransport>(
@@ -325,14 +246,14 @@ impl TokenManager {
             .await
             .map_err(OciError::Transport)?;
         if !status.is_success() {
-            return Err(OciError::Token(crate::error::TokenError::ExchangeFailed {
+            return Err(OciError::Token(TokenError::ExchangeFailed {
                 realm: challenge.realm.clone(),
                 status,
             }));
         }
 
         let response: TokenResponse = serde_json::from_slice(&bytes).map_err(|_| {
-            OciError::Token(crate::error::TokenError::InvalidResponse {
+            OciError::Token(TokenError::InvalidResponse {
                 realm: challenge.realm.clone(),
                 details: "invalid JSON token response",
             })
@@ -342,7 +263,7 @@ impl TokenManager {
             .or(response.access_token)
             .filter(|token| !token.is_empty())
             .ok_or_else(|| {
-                OciError::Token(crate::error::TokenError::InvalidResponse {
+                OciError::Token(TokenError::InvalidResponse {
                     realm: challenge.realm.clone(),
                     details: "response does not contain token or access_token",
                 })
@@ -367,59 +288,51 @@ impl TokenManager {
     }
 }
 
-#[cfg(not(loom))]
-struct LeaderGuard {
-    state: Arc<ChallengeState>,
-    key: Option<ChallengeKey>,
-}
-
-#[cfg(not(loom))]
-impl LeaderGuard {
-    fn new(state: Arc<ChallengeState>, key: ChallengeKey) -> Self {
-        Self {
-            state,
-            key: Some(key),
-        }
-    }
-
-    fn finish(mut self) {
-        if let Some(key) = self.key.take() {
-            self.state
-                .leaders
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&key);
-            self.state.wake.notify_waiters();
-        }
-    }
-}
-
-#[cfg(not(loom))]
-impl Drop for LeaderGuard {
-    fn drop(&mut self) {
-        let Some(key) = self.key.take() else {
-            return;
-        };
-        self.state
-            .leaders
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
-        self.state.wake.notify_waiters();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::TokenManager;
     use crate::{
         auth::BearerChallenge,
         backend::driver::{GhcrDriver, detect_driver},
-        mock::{MockResponse, MockRouterTransport},
+        mock::{MockResponse, MockRouterTransport, MockTokenGate},
     };
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
-    use std::sync::{Arc, atomic::Ordering};
+    use std::{
+        sync::{Arc, Mutex, atomic::Ordering},
+        time::Duration,
+    };
+    use web_time::Instant;
+
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self
+                .now
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *now += duration;
+        }
+    }
+
+    impl super::Clock for FakeClock {
+        fn now(&self) -> Instant {
+            *self
+                .now
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
 
     fn test_challenge() -> BearerChallenge {
         BearerChallenge::new(
@@ -552,6 +465,262 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t2.as_ref(), "recovered-token");
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_error_wakes_waiter_and_allows_retry() {
+        let transport = Arc::new(MockRouterTransport::default());
+        transport.add_token_response(MockResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        transport.add_token_response(MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(r#"{"token":"recovered-after-error","expires_in":300}"#),
+        });
+        let gate = MockTokenGate::new();
+        transport.set_token_gate(gate.clone());
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = Arc::new(TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+            driver,
+        ));
+
+        let leader = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        gate.wait_until_entered().await;
+        let waiter = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        tokio::task::yield_now().await;
+        gate.release();
+
+        assert!(leader.await.expect("leader task must not panic").is_err());
+        let waiter_result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must be woken by failed flight")
+            .expect("waiter task must not panic");
+        assert!(waiter_result.is_err());
+
+        let recovered = token_mgr
+            .get_token(&*transport, &test_challenge())
+            .await
+            .expect("next request must be able to create a new flight");
+        assert_eq!(recovered.as_ref(), "recovered-after-error");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_leader_abort_releases_waiters() {
+        let transport = Arc::new(make_test_transport());
+        let gate = MockTokenGate::new();
+        transport.set_token_gate(gate.clone());
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = Arc::new(TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+            driver,
+        ));
+
+        let leader = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        gate.wait_until_entered().await;
+
+        let waiter = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        tokio::task::yield_now().await;
+        leader.abort();
+        gate.release();
+        assert!(leader.await.is_err());
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must not remain blocked")
+            .expect("waiter task must not panic")
+            .expect("waiter must recover after leader cancellation");
+        assert_eq!(result.as_ref(), "singleflight-jwt-token");
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_leader_panic_releases_flight() {
+        let transport = make_test_transport();
+        transport.set_panic_on_token(true);
+        let driver = detect_driver("test.registry.io");
+        let token_mgr =
+            TokenManager::new("test.registry.io", "test/repo", "secret_tok", false, driver);
+
+        let task = {
+            let mgr = token_mgr.clone();
+            let tr = transport.clone();
+            tokio::spawn(async move { mgr.get_token(&tr, &test_challenge()).await })
+        };
+        assert!(task.await.is_err(), "panic must be isolated to leader task");
+
+        transport.set_panic_on_token(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            token_mgr.get_token(&transport, &test_challenge()),
+        )
+        .await
+        .expect("post-panic request must not remain blocked")
+        .expect("post-panic request must recover");
+        assert_eq!(result.as_ref(), "singleflight-jwt-token");
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_waiter_abort_does_not_release_leader() {
+        let transport = Arc::new(make_test_transport());
+        let gate = MockTokenGate::new();
+        transport.set_token_gate(gate.clone());
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = Arc::new(TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+            driver,
+        ));
+
+        let leader = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        gate.wait_until_entered().await;
+
+        let waiter = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        let mut waiter = waiter;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        waiter.abort();
+
+        gate.release();
+        let result = tokio::time::timeout(Duration::from_secs(2), leader)
+            .await
+            .expect("leader must finish")
+            .expect("leader task must not panic")
+            .expect("leader must retain ownership after waiter cancellation");
+        assert_eq!(result.as_ref(), "singleflight-jwt-token");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_token_manager_ttl_expires_with_fake_clock() {
+        let transport = MockRouterTransport::default();
+        transport.add_token_response(MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(r#"{"token":"before-expiry","expires_in":300}"#),
+        });
+        transport.add_token_response(MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(r#"{"token":"after-expiry","expires_in":300}"#),
+        });
+        let clock = Arc::new(FakeClock::new());
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = TokenManager::new_with_clock(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+            driver,
+            clock.clone(),
+        );
+
+        let first = token_mgr
+            .get_token(&transport, &test_challenge())
+            .await
+            .unwrap();
+        assert_eq!(first.as_ref(), "before-expiry");
+        assert_eq!(
+            token_mgr.cached_token().await.as_deref(),
+            Some("before-expiry")
+        );
+
+        // expires_in=300 减去 30 秒提前失效窗口后，TTL 为 270 秒。
+        clock.advance(Duration::from_secs(270));
+        let second = token_mgr
+            .get_token(&transport, &test_challenge())
+            .await
+            .unwrap();
+        assert_eq!(second.as_ref(), "after-expiry");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_does_not_return_old_generation() {
+        let transport = Arc::new(MockRouterTransport::default());
+        transport.add_token_response(MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(r#"{"token":"old-generation","expires_in":300}"#),
+        });
+        transport.add_token_response(MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(r#"{"token":"new-generation","expires_in":300}"#),
+        });
+        let gate = MockTokenGate::new();
+        transport.set_token_gate(gate.clone());
+        let driver = detect_driver("test.registry.io");
+        let token_mgr = Arc::new(TokenManager::new(
+            "test.registry.io",
+            "test/repo",
+            "secret_tok",
+            false,
+            driver,
+        ));
+
+        let initial = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.get_token(&*tr, &test_challenge()).await })
+        };
+        gate.wait_until_entered().await;
+
+        let refresh = {
+            let mgr = Arc::clone(&token_mgr);
+            let tr = Arc::clone(&transport);
+            tokio::spawn(async move { mgr.refresh_token(&*tr, &test_challenge()).await })
+        };
+        tokio::task::yield_now().await;
+        gate.release();
+
+        let refreshed = tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh must not remain blocked")
+            .expect("refresh task must not panic")
+            .expect("refresh must succeed");
+        assert_eq!(refreshed.as_ref(), "new-generation");
+        let initial = initial.await.expect("initial task must not panic").unwrap();
+        assert_eq!(initial.as_ref(), "new-generation");
+        assert_eq!(transport.call_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
