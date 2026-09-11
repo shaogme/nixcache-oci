@@ -273,7 +273,7 @@ mod tests {
     use http_body_util::BodyExt;
     use nixcache_core::{
         IndexEntry, NarDigest, NarInfoMeta, ShardDataPayload, ShardedArchCacheIndexData, StoreHash,
-        SystemArch, calculate_shard_id,
+        calculate_shard_id,
     };
     use nixcache_oci_backend::create_tokio_reqwest_client;
     use std::{collections::HashMap, time::Duration};
@@ -295,7 +295,7 @@ mod tests {
         )
         .unwrap();
         let mut root =
-            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+            ShardedArchCacheIndexData::new(index.config().target_system, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
         index.update_sharded_baseline_in_memory(root, vec![]).await;
 
@@ -349,7 +349,7 @@ mod tests {
         )
         .unwrap();
         let mut root =
-            ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+            ShardedArchCacheIndexData::new(index.config().target_system, "test/repo", "ghcr.io");
         root.public_key = "test-key-1:abcd".to_string();
         index.update_sharded_baseline_in_memory(root, vec![]).await;
 
@@ -388,7 +388,11 @@ mod tests {
         // Missing key returns 404
         index
             .update_sharded_baseline_in_memory(
-                ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io"),
+                ShardedArchCacheIndexData::new(
+                    index.config().target_system,
+                    "test/repo",
+                    "ghcr.io",
+                ),
                 vec![],
             )
             .await;
@@ -439,7 +443,7 @@ mod tests {
             hash1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
-                system: Some(SystemArch::X86_64Linux),
+                system: Some(index.config().target_system),
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg1", hash1),
                     nar_basename: "pkg1.nar.xz".to_string(),
@@ -458,7 +462,8 @@ mod tests {
             },
         );
 
-        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        let root =
+            ShardedArchCacheIndexData::new(index.config().target_system, "test/repo", "ghcr.io");
         index
             .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
@@ -521,7 +526,7 @@ mod tests {
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let entry = IndexEntry {
             name: "local-pkg".to_string(),
-            system: Some(SystemArch::X86_64Linux),
+            system: Some(index.config().target_system),
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", local_hash),
                 nar_basename: "local.nar.xz".to_string(),
@@ -542,7 +547,8 @@ mod tests {
         let mut shard = ShardDataPayload::new(shard_id).unwrap();
         shard.entries.insert(local_hash.clone(), entry);
 
-        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
+        let root =
+            ShardedArchCacheIndexData::new(index.config().target_system, "test/repo", "ghcr.io");
         index
             .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
@@ -668,7 +674,7 @@ mod tests {
             local_hash.clone(),
             IndexEntry {
                 name: "local-pkg".to_string(),
-                system: Some(SystemArch::X86_64Linux),
+                system: Some(index.config().target_system),
                 narinfo_meta: NarInfoMeta {
                     store_path: format!("/nix/store/{}-pkg", local_hash),
                     nar_basename: format!("{}-local.nar.xz", local_hash),
@@ -682,7 +688,8 @@ mod tests {
             },
         );
 
-        let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", &oci_host);
+        let root =
+            ShardedArchCacheIndexData::new(index.config().target_system, "test/repo", &oci_host);
         index
             .update_sharded_baseline_in_memory(root, vec![shard])
             .await;
@@ -790,6 +797,7 @@ mod tests {
             "",
         )
         .unwrap();
+        let target_system = index.config().target_system;
         let state = AppState {
             repo: "test/repo".to_string(),
             index,
@@ -810,7 +818,7 @@ mod tests {
         let hash1 = StoreHash::parse(hash1_str).unwrap();
         let entry = IndexEntry {
             name: "hot-pkg".to_string(),
-            system: Some(SystemArch::X86_64Linux),
+            system: Some(target_system),
             narinfo_meta: NarInfoMeta {
                 store_path: format!("/nix/store/{}-pkg", hash1_str),
                 nar_basename: "hot.nar.xz".to_string(),
