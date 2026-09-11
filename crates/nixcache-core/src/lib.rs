@@ -30,9 +30,9 @@ pub use sharding::{
     shard_id_to_prefix_bytes,
 };
 pub use types::{
-    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DefaultIndexValidationLimits, IndexEntry,
-    IndexValidationLimits, JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, OriginMetadata,
-    RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
+    BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, IndexValidationLimits,
+    JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, OriginMetadata, RECEIPT_VERSION,
+    RUN_SESSION_VERSION, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 
@@ -40,17 +40,16 @@ pub use types::{
 mod tests {
     use super::{
         BloomError, BloomFilter, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheQueryResult,
-        CacheSelector, CascadeMode, CoreError, DefaultIndexValidationLimits,
-        FastBlockedBloomFilter, FilterPredicates, IndexEntry, JobSummaryMetadata,
-        NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, NarInfoParseError,
-        OriginMetadata, RECEIPT_VERSION, SCHEMA_VERSION_V8, SelectionScope, ShardDataPayload,
-        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
-        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
-        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
-        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
-        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
-        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
-        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
+        CacheSelector, CascadeMode, CoreError, FastBlockedBloomFilter, FilterPredicates,
+        IndexEntry, JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo,
+        NarInfoMeta, NarInfoParseError, OriginMetadata, RECEIPT_VERSION, SCHEMA_VERSION_V8,
+        SelectionScope, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, SizeFilter,
+        StoreHash, SystemArch, TimeFilter, TypeError, build_nar_lookup_map, calculate_shard_id,
+        calculate_shard_id_from_str, compute_merkle_root, compute_shard_merkle_hash,
+        diff_shard_descriptors, evaluate_arch_cache_purge, evaluate_arch_cache_query,
+        evaluate_cache_purge, evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc,
+        extract_nar_basename, extract_store_hash, extract_store_hash_str, matches_pattern,
+        nix_base32_char, nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use sha2::{Digest, Sha256};

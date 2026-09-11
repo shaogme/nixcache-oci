@@ -27,43 +27,6 @@ pub trait IndexValidationLimits {
     fn max_nar_size(&self) -> u64;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DefaultIndexValidationLimits {
-    pub shard_entries: u64,
-    pub gc_roots: u64,
-    pub uncompressed_bytes: u64,
-    pub nar_size: u64,
-}
-
-impl Default for DefaultIndexValidationLimits {
-    fn default() -> Self {
-        Self {
-            shard_entries: 500_000,
-            gc_roots: 500_000,
-            uncompressed_bytes: 64 * 1024 * 1024,
-            nar_size: 16 * 1024 * 1024 * 1024,
-        }
-    }
-}
-
-impl IndexValidationLimits for DefaultIndexValidationLimits {
-    fn max_shard_entries(&self) -> u64 {
-        self.shard_entries
-    }
-
-    fn max_gc_roots(&self) -> u64 {
-        self.gc_roots
-    }
-
-    fn max_uncompressed_bytes(&self) -> u64 {
-        self.uncompressed_bytes
-    }
-
-    fn max_nar_size(&self) -> u64 {
-        self.nar_size
-    }
-}
-
 /// Nix 32 字符 Base32 散列值 (例如: `s66mzxpvicwk07gjbjfw9izjfa797vsw`)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StoreHash(String);
