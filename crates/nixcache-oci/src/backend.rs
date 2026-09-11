@@ -11,6 +11,6 @@ pub use ghcr::{
     GitHubPackagesClient,
 };
 pub use kind::{
-    BlobUploadStrategy, ManifestCasSupport, RegistryCapabilities, RegistryDeletionStrategy,
-    RegistryKind,
+    BlobUploadStrategy, ManifestCasSupport, PackageDeletionSupport, RegistryCapabilities,
+    RegistryDeletionStrategy, RegistryKind,
 };

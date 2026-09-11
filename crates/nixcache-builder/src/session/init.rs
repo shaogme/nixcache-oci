@@ -158,7 +158,7 @@ pub async fn record_store_snapshot_from_dir(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionInitOptions<'a> {
     pub repo: &'a str,
     pub registry: &'a str,
@@ -168,6 +168,7 @@ pub struct SessionInitOptions<'a> {
     pub baseline_ttl: u64,
     pub baseline_tag: &'a str,
     pub github_token: &'a str,
+    pub registry_username: Option<&'a str>,
     pub signing_key_file: Option<&'a str>,
     pub snapshot_path: Option<&'a Path>,
 }
@@ -194,6 +195,9 @@ pub async fn run_session_init(opts: &SessionInitOptions<'_>) -> Result<(), Build
         .env("GITHUB_TOKEN", opts.github_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(username) = opts.registry_username {
+        proxy_cmd.env("REGISTRY_USERNAME", username);
+    }
 
     let mut child = proxy_cmd.spawn()?;
 

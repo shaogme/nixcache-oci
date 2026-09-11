@@ -3,6 +3,7 @@ pub use nixcache_oci::backend::{
     GenericOciDriver, GhcrDriver, OciBackendDriver, OciDriver, RegistryCapabilities, RegistryKind,
     detect_driver, driver_for_kind,
 };
+pub use nixcache_oci::{BearerChallenge, PackageDeletionSupport, RegistryCredentials};
 
 #[cfg(feature = "tokio-reqwest")]
 #[path = "tokio-reqwest.rs"]

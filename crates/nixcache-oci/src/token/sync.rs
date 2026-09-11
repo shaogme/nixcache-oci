@@ -239,7 +239,12 @@ mod imp {
 
     #[derive(Clone)]
     pub struct TokenBroadcaster {
-        channel: LoomArc<(Mutex<Option<Arc<str>>>, Condvar)>,
+        channel: LoomArc<(Mutex<BroadcastState>, Condvar)>,
+    }
+
+    struct BroadcastState {
+        token: Option<Arc<str>>,
+        failed: bool,
     }
 
     impl fmt::Debug for TokenBroadcaster {
@@ -257,25 +262,51 @@ mod imp {
     impl TokenBroadcaster {
         pub fn new() -> Self {
             Self {
-                channel: LoomArc::new((Mutex::new(None), Condvar::new())),
+                channel: LoomArc::new((
+                    Mutex::new(BroadcastState {
+                        token: None,
+                        failed: false,
+                    }),
+                    Condvar::new(),
+                )),
             }
         }
 
         pub fn broadcast(&self, token: impl Into<Arc<str>>) {
             let (lock, cvar) = &*self.channel;
-            let mut broadcast = lock.lock().unwrap();
-            *broadcast = Some(token.into());
+            let mut state = lock.lock().unwrap();
+            state.token = Some(token.into());
+            state.failed = false;
             cvar.notify_all();
+        }
+
+        pub fn broadcast_error(&self) {
+            let (lock, cvar) = &*self.channel;
+            let mut state = lock.lock().unwrap();
+            state.token = None;
+            state.failed = true;
+            cvar.notify_all();
+        }
+
+        pub fn load(&self) -> Option<Arc<str>> {
+            self.channel.0.lock().unwrap().token.clone()
         }
 
         pub async fn wait(&self) -> Result<Arc<str>, OciError> {
             let (lock, cvar) = &*self.channel;
-            let mut broadcast = lock.lock().unwrap();
-            if let Some(ref val) = *broadcast {
+            let mut state = lock.lock().unwrap();
+            if let Some(ref val) = state.token {
                 return Ok(Arc::clone(val));
             }
-            broadcast = cvar.wait(broadcast).unwrap();
-            broadcast
+            if state.failed {
+                return Err(OciError::Token(TokenError::TokenMissingInBody));
+            }
+            state = cvar.wait(state).unwrap();
+            if state.failed {
+                return Err(OciError::Token(TokenError::TokenMissingInBody));
+            }
+            state
+                .token
                 .clone()
                 .ok_or(OciError::Token(TokenError::TokenMissingInBody))
         }

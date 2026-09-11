@@ -7,7 +7,7 @@ use nixcache_core::{
 };
 use nixcache_oci::{
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciPlatform,
-    build_image_index,
+    RegistryCredentials, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
@@ -58,14 +58,14 @@ pub async fn run_promote(
     repo: &str,
     registry: &str,
     target_tag: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
 ) -> Result<(), BuilderError> {
     info!(
         "Promoting multi-arch cache to tag '{}' for repo: {}/{}",
         target_tag, registry, repo
     );
 
-    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true);
 
     // 1. 准备待合并的数据集 (按系统架构分桶)
     let mut incoming_entries_by_sys: HashMap<SystemArch, HashMap<StoreHash, IndexEntry>> =

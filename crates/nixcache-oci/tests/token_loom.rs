@@ -13,7 +13,7 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use loom::{model::Builder, sync::atomic::Ordering, thread};
 use nixcache_oci::{
-    GenericOciDriver, MockResponse, MockRouterTransport, TokenManager,
+    BearerChallenge, GenericOciDriver, MockResponse, MockRouterTransport, TokenManager,
     token::sync::{InFlightState, TokenBroadcaster, TokenStorage},
 };
 use std::{
@@ -23,6 +23,15 @@ use std::{
     sync::Arc,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+
+fn challenge() -> BearerChallenge {
+    BearerChallenge::new(
+        "https://auth.example.test/token",
+        Some("test.registry.io".to_string()),
+        Some("repository:test/repo/nix-cache:pull,push".to_string()),
+    )
+    .unwrap()
+}
 
 /// 轻量级 Loom 兼容的 Future 轮询驱动器
 fn loom_block_on<F: Future>(fut: F) -> F::Output {
@@ -91,7 +100,7 @@ fn loom_verify_token_manager_singleflight_invariant() {
             .map(|_| {
                 let mgr = token_mgr.clone();
                 let tr = transport.clone();
-                thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+                thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
             })
             .collect();
 
@@ -125,7 +134,7 @@ fn loom_verify_token_manager_three_threads_storm() {
             .map(|_| {
                 let mgr = token_mgr.clone();
                 let tr = transport.clone();
-                thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+                thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
             })
             .collect();
 
@@ -155,7 +164,7 @@ fn loom_verify_token_manager_fast_path_cached() {
         ));
 
         // 预热：首次调用填充缓存
-        let initial_tok = loom_block_on(token_mgr.get_token(&*transport)).unwrap();
+        let initial_tok = loom_block_on(token_mgr.get_token(&*transport, &challenge())).unwrap();
         assert_eq!(initial_tok.as_ref(), "fast-path-token");
         assert_eq!(transport.call_count.load(Ordering::SeqCst), 1);
 
@@ -164,7 +173,7 @@ fn loom_verify_token_manager_fast_path_cached() {
             .map(|_| {
                 let mgr = token_mgr.clone();
                 let tr = transport.clone();
-                thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+                thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
             })
             .collect();
 
@@ -177,9 +186,9 @@ fn loom_verify_token_manager_fast_path_cached() {
     });
 }
 
-/// 场景 4: 网络故障与回退广播（Fallback Token 同步与状态机复位）
+/// 场景 4: 网络故障与错误广播（错误同步与状态机复位）
 #[test]
-fn loom_verify_token_manager_fallback_on_network_failure() {
+fn loom_verify_token_manager_error_broadcast_on_network_failure() {
     loom::model(|| {
         let transport = make_error_transport();
         let token_mgr = Arc::new(TokenManager::new(
@@ -194,19 +203,18 @@ fn loom_verify_token_manager_fallback_on_network_failure() {
             .map(|_| {
                 let mgr = token_mgr.clone();
                 let tr = transport.clone();
-                thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+                thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).is_ok())
             })
             .collect();
 
-        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<bool> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
         // 验证 1: 发生 1 次或 2 次网络请求失败（并发单飞为 1 次，串行重试为 2 次）
         let calls = transport.call_count.load(Ordering::SeqCst);
         assert!(calls == 1 || calls == 2);
 
-        // 验证 2: 所有线程安全回退到 fallback token，无死锁
-        assert_eq!(results[0].as_ref(), "github_fallback_key");
-        assert_eq!(results[1].as_ref(), "github_fallback_key");
+        // 验证 2: 所有线程都观察到错误，且无死锁。
+        assert_eq!(results, vec![false, false]);
     });
 }
 
@@ -227,12 +235,12 @@ fn loom_verify_token_manager_multi_generation_sequential() {
         let t1 = {
             let mgr = token_mgr.clone();
             let tr = transport.clone();
-            thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+            thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
         };
         let t2 = {
             let mgr = token_mgr.clone();
             let tr = transport.clone();
-            thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+            thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
         };
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
@@ -243,7 +251,7 @@ fn loom_verify_token_manager_multi_generation_sequential() {
         let t3 = {
             let mgr = token_mgr.clone();
             let tr = transport.clone();
-            thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+            thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).unwrap())
         };
         let r3 = t3.join().unwrap();
         assert_eq!(r3.as_ref(), "multi-gen-token");
@@ -253,9 +261,9 @@ fn loom_verify_token_manager_multi_generation_sequential() {
     });
 }
 
-/// 场景 6: 空回退令牌在网络故障下的并发处理
+/// 场景 6: 空凭据在网络故障下的并发处理
 #[test]
-fn loom_verify_token_manager_empty_github_token_fallback() {
+fn loom_verify_token_manager_empty_credentials_on_network_failure() {
     loom::model(|| {
         let transport = make_error_transport();
         let token_mgr = Arc::new(TokenManager::new(
@@ -270,15 +278,14 @@ fn loom_verify_token_manager_empty_github_token_fallback() {
             .map(|_| {
                 let mgr = token_mgr.clone();
                 let tr = transport.clone();
-                thread::spawn(move || loom_block_on(mgr.get_token(&*tr)).unwrap())
+                thread::spawn(move || loom_block_on(mgr.get_token(&*tr, &challenge())).is_ok())
             })
             .collect();
 
-        let results: Vec<Arc<str>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let results: Vec<bool> = threads.into_iter().map(|t| t.join().unwrap()).collect();
 
-        // 验证: 即使无 token 且网络失败，所有线程均获得空字符串，不产生 panic 或死锁
-        assert_eq!(results[0].as_ref(), "");
-        assert_eq!(results[1].as_ref(), "");
+        // 验证: 即使无凭据且网络失败，所有线程均收到错误，不产生死锁。
+        assert_eq!(results, vec![false, false]);
     });
 }
 

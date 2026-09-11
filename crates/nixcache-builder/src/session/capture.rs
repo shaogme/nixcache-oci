@@ -12,7 +12,7 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
-use nixcache_oci::UploadConfig;
+use nixcache_oci::{RegistryCredentials, UploadConfig};
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::fs;
@@ -26,7 +26,7 @@ pub struct SessionCaptureOptions<'a> {
     pub job_id: &'a str,
     pub system_opt: Option<&'a str>,
     pub signing_key_file: Option<&'a str>,
-    pub github_token: &'a str,
+    pub credentials: RegistryCredentials,
     pub output_receipt_path: Option<&'a Path>,
     pub proxy_url: Option<&'a str>,
     pub snapshot_before: Option<&'a Path>,
@@ -100,7 +100,7 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         closure_res.active_gc_roots.len()
     );
 
-    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
+    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.credentials.clone(), true);
 
     // 4. 获取远端已缓存 StoreHash 集合 (从生产基线 cache-index)
     let all_known_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;

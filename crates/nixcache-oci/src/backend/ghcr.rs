@@ -191,8 +191,15 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
                     }
                     page += 1;
                 } else if user_status == StatusCode::NOT_FOUND {
-                    // 两边都是 404，说明包或用户不存在，返回空列表
-                    return Ok(Vec::new());
+                    if all_versions.is_empty() {
+                        // 两边都是 404，说明包或用户不存在，返回空列表。
+                        return Ok(Vec::new());
+                    }
+                    return Err(OciError::DeletionDiscoveryFailed {
+                        stage: "ghcr_versions",
+                        target: self.package_name.clone(),
+                        details: "GHCR returned 404 after a partial version listing".to_string(),
+                    });
                 } else {
                     return Err(self.handle_status_error(
                         "list package versions",
@@ -201,8 +208,15 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
                     ));
                 }
             } else if status == StatusCode::NOT_FOUND {
-                // 已经确定类型或者是 user 路由返回 404，视为包不存在
-                return Ok(Vec::new());
+                if all_versions.is_empty() {
+                    // 已经确定类型或者是 user 路由首页返回 404，视为包不存在。
+                    return Ok(Vec::new());
+                }
+                return Err(OciError::DeletionDiscoveryFailed {
+                    stage: "ghcr_versions",
+                    target: self.package_name.clone(),
+                    details: "GHCR returned 404 after a partial version listing".to_string(),
+                });
             } else {
                 return Err(self.handle_status_error("list package versions", status, &body));
             }

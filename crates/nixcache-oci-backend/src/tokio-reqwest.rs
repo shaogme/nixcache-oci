@@ -5,8 +5,9 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
 };
 use nixcache_oci::{
-    BlobUploadStrategy, OciClient, OciDriver, OciError, OciTransport, RegistryKind, TransportError,
-    UploadChunkResponse, UploadConfig, parse_range_header,
+    BlobUploadStrategy, OciClient, OciDriver, OciError, OciTransport, RegistryCredentials,
+    RegistryKind, TransportError, UploadChunkResponse, UploadConfig, parse_range_header,
+    parse_www_authenticate,
 };
 use reqwest::Client;
 use std::{
@@ -71,6 +72,123 @@ impl ReqwestTransport {
     pub fn client(&self) -> &Client {
         &self.client
     }
+}
+
+async fn challenge_retry_headers<T: OciTransport + Clone>(
+    client: &OciClient<T>,
+    operation: &'static str,
+    response_headers: &HeaderMap,
+) -> Result<HeaderMap, OciError> {
+    let challenge = parse_www_authenticate(response_headers)?.ok_or_else(|| {
+        OciError::AuthenticationFailed {
+            operation,
+            status: StatusCode::UNAUTHORIZED,
+            details: "registry returned 401 without a Bearer challenge".to_string(),
+        }
+    })?;
+    let token = client
+        .token_manager()
+        .get_token_for_challenge(client.transport(), &challenge, true)
+        .await?;
+    let mut headers = client.get_auth_headers().await?;
+    let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        OciError::AuthChallengeInvalid {
+            details: "invalid Bearer authentication header".to_string(),
+        }
+    })?;
+    headers.insert("Authorization", value);
+    Ok(headers)
+}
+
+fn merge_request_headers(base: &mut HeaderMap, original: &HeaderMap) {
+    for (name, value) in original {
+        if name.as_str() != "authorization" {
+            base.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+async fn post_empty_with_auth_retry<T: OciTransport + Clone>(
+    client: &OciClient<T>,
+    url: &str,
+    headers: HeaderMap,
+    operation: &'static str,
+) -> Result<(StatusCode, HeaderMap), OciError> {
+    let first = client.transport().post(url, headers.clone()).await?;
+    if first.0 != StatusCode::UNAUTHORIZED {
+        return Ok(first);
+    }
+    let mut retry_headers = challenge_retry_headers(client, operation, &first.1).await?;
+    merge_request_headers(&mut retry_headers, &headers);
+    let second = client.transport().post(url, retry_headers).await?;
+    if second.0 == StatusCode::UNAUTHORIZED {
+        return Err(OciError::AuthenticationFailed {
+            operation,
+            status: second.0,
+            details: "Bearer challenge retry was rejected".to_string(),
+        });
+    }
+    Ok(second)
+}
+
+async fn patch_chunk_with_auth_retry<T: OciTransport + Clone>(
+    client: &OciClient<T>,
+    url: &str,
+    headers: HeaderMap,
+    chunk: Bytes,
+    byte_range: (u64, u64),
+    operation: &'static str,
+) -> Result<UploadChunkResponse, OciError> {
+    let first = client
+        .transport()
+        .patch_chunk(url, headers.clone(), chunk.clone(), byte_range)
+        .await?;
+    if first.status != StatusCode::UNAUTHORIZED {
+        return Ok(first);
+    }
+    let mut retry_headers = challenge_retry_headers(client, operation, &first.headers).await?;
+    merge_request_headers(&mut retry_headers, &headers);
+    let second = client
+        .transport()
+        .patch_chunk(url, retry_headers, chunk, byte_range)
+        .await?;
+    if second.status == StatusCode::UNAUTHORIZED {
+        return Err(OciError::AuthenticationFailed {
+            operation,
+            status: second.status,
+            details: "Bearer challenge retry was rejected".to_string(),
+        });
+    }
+    Ok(second)
+}
+
+async fn finish_chunk_with_auth_retry<T: OciTransport + Clone>(
+    client: &OciClient<T>,
+    url: &str,
+    headers: HeaderMap,
+    operation: &'static str,
+) -> Result<StatusCode, OciError> {
+    let first = client
+        .transport()
+        .put_chunk_finish_with_headers(url, headers.clone(), None)
+        .await?;
+    if first.0 != StatusCode::UNAUTHORIZED {
+        return Ok(first.0);
+    }
+    let mut retry_headers = challenge_retry_headers(client, operation, &first.1).await?;
+    merge_request_headers(&mut retry_headers, &headers);
+    let second = client
+        .transport()
+        .put_chunk_finish_with_headers(url, retry_headers, None)
+        .await?;
+    if second.0 == StatusCode::UNAUTHORIZED {
+        return Err(OciError::AuthenticationFailed {
+            operation,
+            status: second.0,
+            details: "Bearer challenge retry was rejected".to_string(),
+        });
+    }
+    Ok(second.0)
 }
 
 impl OciTransport for ReqwestTransport {
@@ -320,9 +438,20 @@ impl OciTransport for ReqwestTransport {
     async fn put_chunk_finish(
         &self,
         url: &str,
-        mut headers: HeaderMap,
+        headers: HeaderMap,
         final_chunk: Option<(Bytes, (u64, u64))>,
     ) -> Result<StatusCode, TransportError> {
+        self.put_chunk_finish_with_headers(url, headers, final_chunk)
+            .await
+            .map(|(status, _)| status)
+    }
+
+    async fn put_chunk_finish_with_headers(
+        &self,
+        url: &str,
+        mut headers: HeaderMap,
+        final_chunk: Option<(Bytes, (u64, u64))>,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         if let Some((bytes, byte_range)) = final_chunk {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len() as u64));
             let range_str = format!("{}-{}", byte_range.0, byte_range.1);
@@ -343,7 +472,7 @@ impl OciTransport for ReqwestTransport {
                 .send()
                 .await
                 .map_err(map_reqwest_error)?;
-            Ok(resp.status())
+            Ok((resp.status(), resp.headers().clone()))
         } else {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(0u64));
             let resp = self
@@ -353,7 +482,7 @@ impl OciTransport for ReqwestTransport {
                 .send()
                 .await
                 .map_err(map_reqwest_error)?;
-            Ok(resp.status())
+            Ok((resp.status(), resp.headers().clone()))
         }
     }
 
@@ -374,13 +503,42 @@ impl OciTransport for ReqwestTransport {
         Ok(resp.status())
     }
 
+    async fn put_bytes_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        let resp = self
+            .client
+            .put(url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        Ok((resp.status(), resp.headers().clone()))
+    }
+
     async fn put_stream(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        content_len: u64,
+    ) -> Result<StatusCode, TransportError> {
+        self.put_stream_with_headers(url, headers, stream, content_len)
+            .await
+            .map(|(status, _)| status)
+    }
+
+    async fn put_stream_with_headers(
         &self,
         url: &str,
         mut headers: HeaderMap,
         stream: Self::BodyStream,
         content_len: u64,
-    ) -> Result<StatusCode, TransportError> {
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         headers.insert(CONTENT_LENGTH, HeaderValue::from(content_len));
         let body = reqwest::Body::wrap_stream(stream);
         let resp = self
@@ -391,7 +549,7 @@ impl OciTransport for ReqwestTransport {
             .send()
             .await
             .map_err(map_reqwest_error)?;
-        Ok(resp.status())
+        Ok((resp.status(), resp.headers().clone()))
     }
 
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
@@ -403,6 +561,21 @@ impl OciTransport for ReqwestTransport {
             .await
             .map_err(map_reqwest_error)?;
         Ok(resp.status())
+    }
+
+    async fn delete_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        let resp = self
+            .client
+            .delete(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        Ok((resp.status(), resp.headers().clone()))
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -485,7 +658,9 @@ impl OciClientExt for OciClient<ReqwestTransport> {
         );
 
         let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport().post(&upload_init_url, headers).await?;
+        let (status, resp_headers) =
+            post_empty_with_auth_retry(self, &upload_init_url, headers, "initialize file upload")
+                .await?;
         if !status.is_success() {
             return Err(OciError::BlobUploadFailed(status));
         }
@@ -532,15 +707,15 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                     }
                 };
 
-                match self
-                    .transport()
-                    .patch_chunk(
-                        &session_url,
-                        headers,
-                        Bytes::from(buf),
-                        (current_offset, end_offset),
-                    )
-                    .await
+                match patch_chunk_with_auth_retry(
+                    self,
+                    &session_url,
+                    headers,
+                    Bytes::from(buf),
+                    (current_offset, end_offset),
+                    "upload file chunk",
+                )
+                .await
                 {
                     Ok(resp)
                         if resp.status == StatusCode::ACCEPTED
@@ -562,7 +737,7 @@ impl OciClientExt for OciClient<ReqwestTransport> {
                         last_err = Some(OciError::BlobUploadFailed(resp.status));
                     }
                     Err(e) => {
-                        last_err = Some(OciError::Transport(e));
+                        last_err = Some(e);
                     }
                 }
 
@@ -609,10 +784,8 @@ impl OciClientExt for OciClient<ReqwestTransport> {
         let separator = if session_url.contains('?') { "&" } else { "?" };
         let finish_url = format!("{}{}digest={}", session_url, separator, digest);
         let headers = self.get_auth_headers().await?;
-        let finish_status = self
-            .transport()
-            .put_chunk_finish(&finish_url, headers, None)
-            .await?;
+        let finish_status =
+            finish_chunk_with_auth_retry(self, &finish_url, headers, "finish file upload").await?;
 
         if finish_status == StatusCode::CREATED
             || finish_status == StatusCode::OK
@@ -633,30 +806,23 @@ impl OciClientExt for OciClient<ReqwestTransport> {
 pub fn create_tokio_reqwest_client(
     registry: &str,
     repo: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
     write_access: bool,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::with_transport(registry, repo, github_token, write_access, transport)
+    OciClient::with_transport(registry, repo, credentials, write_access, transport)
 }
 
 /// 基于指定 Driver 创建 Tokio Reqwest OCI 客户端
 pub fn create_tokio_reqwest_client_with_driver(
     registry: &str,
     repo: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
     write_access: bool,
     driver: impl Into<OciDriver>,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::new(
-        registry,
-        repo,
-        github_token,
-        write_access,
-        driver,
-        transport,
-    )
+    OciClient::new(registry, repo, credentials, write_access, driver, transport)
 }
 
 /// 基于指定 RegistryKind 创建 Tokio Reqwest OCI 客户端
@@ -664,11 +830,11 @@ pub fn create_tokio_reqwest_client_from_kind(
     kind: RegistryKind,
     registry: &str,
     repo: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
     write_access: bool,
 ) -> OciClient<ReqwestTransport> {
     let transport = ReqwestTransport::default();
-    OciClient::from_kind(kind, registry, repo, github_token, write_access, transport)
+    OciClient::from_kind(kind, registry, repo, credentials, write_access, transport)
 }
 
 #[cfg(test)]
@@ -676,14 +842,57 @@ mod tests {
     use super::{
         OciClientExt, create_tokio_reqwest_client, create_tokio_reqwest_client_with_driver,
     };
-    use nixcache_oci::{GenericOciDriver, GhcrDriver, UploadConfig};
+    use nixcache_oci::{
+        BearerChallenge, GenericOciDriver, GhcrDriver, RegistryCredentials, UploadConfig,
+    };
     use serde_json::json;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        matchers::{header, method, path, query_param},
     };
+
+    #[tokio::test]
+    async fn test_bearer_challenge_uses_registry_realm_and_replays_request() {
+        let server = MockServer::start().await;
+        let host = server.address().to_string();
+        let realm = format!("http://{host}/auth/exchange?existing=1");
+        let challenge = format!(
+            "Bearer realm=\"{realm}\", service=\"{host}\", scope=\"repository:test/repo/nix-cache:pull\""
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/v2/test/repo/nix-cache/manifests/cache-index"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/auth/exchange"))
+            .and(query_param("existing", "1"))
+            .and(query_param("service", &host))
+            .and(query_param("scope", "repository:test/repo/nix-cache:pull"))
+            .and(header("Authorization", "Basic Y3VzdG9tOnNlY3JldA=="))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "realm-token", "expires_in": 120})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/test/repo/nix-cache/manifests/cache-index"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let credentials = nixcache_oci::RegistryCredentials::with_username("custom", "secret");
+        let client = super::create_tokio_reqwest_client(&host, "test/repo", credentials, false);
+        let artifact = client.get_manifest("cache-index").await.unwrap();
+        assert!(artifact.is_some());
+    }
 
     #[tokio::test]
     async fn test_reqwest_transport_token_exchange_mock() {
@@ -702,12 +911,22 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = create_tokio_reqwest_client(&host, "test/repo", "secret-gh-token", true);
-        let token = client.get_token().await.expect("Failed to fetch token");
+        let credentials = RegistryCredentials::with_username("custom", "secret-gh-token");
+        let client = create_tokio_reqwest_client(&host, "test/repo", credentials, true);
+        let challenge = BearerChallenge::new(
+            format!("http://{host}/token"),
+            Some(host.clone()),
+            Some("repository:test/repo/nix-cache:pull,push".to_string()),
+        )
+        .unwrap();
+        let token = client
+            .get_token(&challenge)
+            .await
+            .expect("Failed to fetch token");
         assert_eq!(token.as_ref(), "mocked-jwt-token");
 
         let cached_token = client
-            .get_token()
+            .get_token(&challenge)
             .await
             .expect("Failed to get cached token");
         assert_eq!(cached_token.as_ref(), "mocked-jwt-token");

@@ -1,6 +1,6 @@
 use crate::backend::kind::{
-    BlobUploadStrategy, ManifestCasSupport, RegistryCapabilities, RegistryDeletionStrategy,
-    RegistryKind,
+    BlobUploadStrategy, ManifestCasSupport, PackageDeletionSupport, RegistryCapabilities,
+    RegistryDeletionStrategy, RegistryKind,
 };
 use std::{fmt::Debug, sync::Arc};
 
@@ -21,8 +21,10 @@ pub trait OciBackendDriver: Send + Sync + Debug + 'static {
     /// 构造特定后端的 Scope 字符串
     fn format_auth_scope(&self, repo: &str, write: bool) -> String;
 
-    /// 获取 Token 认证端点 URL
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String;
+    /// token exchange 使用的默认 Basic 用户名。Generic OCI 不猜测用户名。
+    fn default_basic_username(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 pub static GHCR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
@@ -31,10 +33,9 @@ pub static GHCR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::FixedTwoStepPut,
-    custom_auth_endpoint: Some("https://ghcr.io/token"),
     deletion_strategy: RegistryDeletionStrategy::GitHubPackagesRestApi,
     supports_blob_physical_deletion: false,
-    supports_package_deletion: true,
+    package_deletion_support: PackageDeletionSupport::NativeComplete,
 };
 
 /// GitHub Container Registry 专属驱动 (ghcr.io)
@@ -78,12 +79,6 @@ impl GhcrDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, _registry: &str, repo: &str, write: bool) -> String {
-        let scope = self.format_auth_scope(repo, write);
-        format!("https://ghcr.io/token?service=ghcr.io&scope={}", scope)
-    }
 }
 
 impl OciBackendDriver for GhcrDriver {
@@ -107,8 +102,8 @@ impl OciBackendDriver for GhcrDriver {
         GhcrDriver::format_auth_scope(self, repo, write)
     }
 
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        GhcrDriver::resolve_token_endpoint(self, registry, repo, write)
+    fn default_basic_username(&self) -> Option<&'static str> {
+        Some("token")
     }
 }
 
@@ -118,10 +113,9 @@ pub static DOCKER_HUB_CAPABILITIES: RegistryCapabilities = RegistryCapabilities 
     manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: true,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
-    custom_auth_endpoint: Some("https://auth.docker.io/token"),
     deletion_strategy: RegistryDeletionStrategy::DockerHubRestApi,
     supports_blob_physical_deletion: false,
-    supports_package_deletion: false,
+    package_deletion_support: PackageDeletionSupport::Unsupported,
 };
 
 /// Docker Hub 专属驱动 (docker.io / registry-1.docker.io)
@@ -170,15 +164,6 @@ impl DockerHubDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, _registry: &str, repo: &str, write: bool) -> String {
-        let scope = self.format_auth_scope(repo, write);
-        format!(
-            "https://auth.docker.io/token?service=registry.docker.io&scope={}",
-            scope
-        )
-    }
 }
 
 impl OciBackendDriver for DockerHubDriver {
@@ -201,10 +186,6 @@ impl OciBackendDriver for DockerHubDriver {
     fn format_auth_scope(&self, repo: &str, write: bool) -> String {
         DockerHubDriver::format_auth_scope(self, repo, write)
     }
-
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        DockerHubDriver::resolve_token_endpoint(self, registry, repo, write)
-    }
 }
 
 pub static AWS_ECR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
@@ -213,10 +194,9 @@ pub static AWS_ECR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
-    custom_auth_endpoint: None,
     deletion_strategy: RegistryDeletionStrategy::AwsEcrApi,
     supports_blob_physical_deletion: false,
-    supports_package_deletion: false,
+    package_deletion_support: PackageDeletionSupport::Unsupported,
 };
 
 /// AWS ECR 驱动 (*.dkr.ecr.*.amazonaws.com)
@@ -255,16 +235,6 @@ impl AwsEcrDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        let clean_reg = self.canonicalize_endpoint(registry);
-        let scope = self.format_auth_scope(repo, write);
-        format!(
-            "https://{}/v2/token?service={}&scope={}",
-            clean_reg, clean_reg, scope
-        )
-    }
 }
 
 impl OciBackendDriver for AwsEcrDriver {
@@ -288,8 +258,8 @@ impl OciBackendDriver for AwsEcrDriver {
         AwsEcrDriver::format_auth_scope(self, repo, write)
     }
 
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        AwsEcrDriver::resolve_token_endpoint(self, registry, repo, write)
+    fn default_basic_username(&self) -> Option<&'static str> {
+        Some("AWS")
     }
 }
 
@@ -299,10 +269,9 @@ pub static GCP_GAR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
-    custom_auth_endpoint: None,
     deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
     supports_blob_physical_deletion: true,
-    supports_package_deletion: false,
+    package_deletion_support: PackageDeletionSupport::TaggedGraphOnly,
 };
 
 /// Google Cloud Artifact Registry 驱动 (*-docker.pkg.dev)
@@ -341,16 +310,6 @@ impl GcpArtifactRegistryDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        let clean_reg = self.canonicalize_endpoint(registry);
-        let scope = self.format_auth_scope(repo, write);
-        format!(
-            "https://{}/v2/token?service={}&scope={}",
-            clean_reg, clean_reg, scope
-        )
-    }
 }
 
 impl OciBackendDriver for GcpArtifactRegistryDriver {
@@ -373,10 +332,6 @@ impl OciBackendDriver for GcpArtifactRegistryDriver {
     fn format_auth_scope(&self, repo: &str, write: bool) -> String {
         GcpArtifactRegistryDriver::format_auth_scope(self, repo, write)
     }
-
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        GcpArtifactRegistryDriver::resolve_token_endpoint(self, registry, repo, write)
-    }
 }
 
 pub static AZURE_ACR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
@@ -385,10 +340,9 @@ pub static AZURE_ACR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
-    custom_auth_endpoint: None,
     deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
     supports_blob_physical_deletion: true,
-    supports_package_deletion: false,
+    package_deletion_support: PackageDeletionSupport::TaggedGraphOnly,
 };
 
 /// Azure Container Registry 驱动 (*.azurecr.io)
@@ -427,16 +381,6 @@ impl AzureAcrDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        let clean_reg = self.canonicalize_endpoint(registry);
-        let scope = self.format_auth_scope(repo, write);
-        format!(
-            "https://{}/oauth2/token?service={}&scope={}",
-            clean_reg, clean_reg, scope
-        )
-    }
 }
 
 impl OciBackendDriver for AzureAcrDriver {
@@ -459,10 +403,6 @@ impl OciBackendDriver for AzureAcrDriver {
     fn format_auth_scope(&self, repo: &str, write: bool) -> String {
         AzureAcrDriver::format_auth_scope(self, repo, write)
     }
-
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        AzureAcrDriver::resolve_token_endpoint(self, registry, repo, write)
-    }
 }
 
 pub static GENERIC_OCI_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
@@ -471,10 +411,9 @@ pub static GENERIC_OCI_CAPABILITIES: RegistryCapabilities = RegistryCapabilities
     manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
-    custom_auth_endpoint: None,
     deletion_strategy: RegistryDeletionStrategy::StandardOciDelete,
     supports_blob_physical_deletion: true,
-    supports_package_deletion: false,
+    package_deletion_support: PackageDeletionSupport::TaggedGraphOnly,
 };
 
 /// 通用符合 OCI 标准的驱动 (Harbor, Zot, Distribution, Quay 等)
@@ -513,21 +452,6 @@ impl GenericOciDriver {
         let action = if write { "pull,push" } else { "pull" };
         format!("repository:{}:{}", target_repo, action)
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        let clean_reg = self.canonicalize_endpoint(registry);
-        let scope = self.format_auth_scope(repo, write);
-        let scheme = if clean_reg.starts_with("localhost") || clean_reg.starts_with("127.0.0.1") {
-            "http"
-        } else {
-            "https"
-        };
-        format!(
-            "{}://{}/token?service={}&scope={}",
-            scheme, clean_reg, clean_reg, scope
-        )
-    }
 }
 
 impl OciBackendDriver for GenericOciDriver {
@@ -549,10 +473,6 @@ impl OciBackendDriver for GenericOciDriver {
 
     fn format_auth_scope(&self, repo: &str, write: bool) -> String {
         GenericOciDriver::format_auth_scope(self, repo, write)
-    }
-
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        GenericOciDriver::resolve_token_endpoint(self, registry, repo, write)
     }
 }
 
@@ -651,6 +571,18 @@ impl OciDriver {
     }
 
     #[inline(always)]
+    pub fn default_basic_username(&self) -> Option<&'static str> {
+        match self {
+            Self::Ghcr(d) => d.default_basic_username(),
+            Self::DockerHub(d) => d.default_basic_username(),
+            Self::AwsEcr(d) => d.default_basic_username(),
+            Self::Gcp(d) => d.default_basic_username(),
+            Self::Azure(d) => d.default_basic_username(),
+            Self::Generic(d) => d.default_basic_username(),
+        }
+    }
+
+    #[inline(always)]
     pub fn capabilities(&self) -> &'static RegistryCapabilities {
         match self {
             Self::Ghcr(_) => &GHCR_CAPABILITIES,
@@ -697,18 +629,6 @@ impl OciDriver {
             Self::Generic(d) => d.format_auth_scope(repo, write),
         }
     }
-
-    #[inline(always)]
-    pub fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        match self {
-            Self::Ghcr(d) => d.resolve_token_endpoint(registry, repo, write),
-            Self::DockerHub(d) => d.resolve_token_endpoint(registry, repo, write),
-            Self::AwsEcr(d) => d.resolve_token_endpoint(registry, repo, write),
-            Self::Gcp(d) => d.resolve_token_endpoint(registry, repo, write),
-            Self::Azure(d) => d.resolve_token_endpoint(registry, repo, write),
-            Self::Generic(d) => d.resolve_token_endpoint(registry, repo, write),
-        }
-    }
 }
 
 impl OciBackendDriver for OciDriver {
@@ -732,8 +652,8 @@ impl OciBackendDriver for OciDriver {
         self.format_auth_scope(repo, write)
     }
 
-    fn resolve_token_endpoint(&self, registry: &str, repo: &str, write: bool) -> String {
-        self.resolve_token_endpoint(registry, repo, write)
+    fn default_basic_username(&self) -> Option<&'static str> {
+        self.default_basic_username()
     }
 }
 

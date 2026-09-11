@@ -8,12 +8,12 @@
 
 | 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | Manifest 更新保证 | 删除与清理机制 (`DeletionStrategy`) | 特性说明 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **不支持 CAS；单写者发布** | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 严禁 PATCH，无 416 风险；原生支持 Tag 与 Package 物理删除 |
-| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **Hub 专有 REST API** (`DockerHubRestApi`) | 自动规范化域名为 `registry-1.docker.io` |
-| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **不支持 CAS；单写者发布** | **AWS ECR API** (`AwsEcrApi`) | 原生适配 AWS ECR 端点与 BatchDeleteImage |
-| **GCP GAR** (`gcp_artifact_registry`) | `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
-| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Azure 容器注册表 |
-| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | **不支持 CAS；单写者发布** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 严格遵循 OCI Distribution Spec，支持 Manifest 与 Blob 物理删除 |
+| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | Registry Bearer challenge；GHCR REST 使用 PAT | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **不支持 CAS；单写者发布** | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 原生完整 Package 删除；token exchange 默认 Basic 用户名 `token` |
+| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | Registry Bearer challenge 指定 realm | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **完整 Package 删除不支持** | 自动规范化域名为 `registry-1.docker.io` |
+| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | Registry Bearer challenge；默认 Basic 用户名 `AWS` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **不支持 CAS；单写者发布** | **完整 Package 删除不支持** | 用户名可由 `--registry-username` 覆盖 |
+| **GCP GAR** (`gcp_artifact_registry`) | `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | Registry Bearer challenge 指定 realm | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **Tag-reachable 图删除** (`StandardOciDelete`) | 标准 API 无法发现 untagged 历史对象 |
+| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | Registry Bearer challenge 指定 realm | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **Tag-reachable 图删除** (`StandardOciDelete`) | 完整 package 删除需后端专用 API |
+| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | Registry 返回的 `WWW-Authenticate: Bearer` challenge | **完整分块断点续传** (`ResumableChunkedPatch`) | **不支持 CAS；单写者发布** | **Tag-reachable 图删除** (`StandardOciDelete`) | 不依赖固定 `/token`；无法宣称回收 untagged 历史 Blob |
 
 Manifest CAS 仅由显式 `*_cas` API 使用；不支持条件发布的后端会返回 `CasUnsupported`，不会静默退化为无条件覆盖。`promote` 使用单写者 API，必须由 CI concurrency 或外部锁保证同一目标索引不会并发发布。
 
@@ -243,7 +243,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-- **全量清空与彻底重置 (`--all`)**：若指定 `--all`，GHCR 后端将通过 GitHub Packages REST API 直接彻底物理删除远程 Package 容器包及其所有历史版本；Generic OCI 后端将清空索引并物理回收 Blobs。
+- **全量清空与彻底重置 (`--all`)**：GHCR 通过 GitHub Packages REST API 删除完整 Package；GCP、Azure 和 Generic OCI 只删除当前 `tags/list` 可达的 manifest/config/layer/NAR Blob 图，并执行最终验证。标准 OCI API 无法发现 untagged 历史对象，不能把该范围称为完整 Package 清空；Docker Hub 与 ECR 当前明确报告不支持。
 - **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收。
 - **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
 
@@ -506,7 +506,7 @@ npins update
 现在 `nixcache-proxy` 和 `nixcache-builder` 均同时支持命令行参数与环境变量配置（命令行参数优先级更高）。
 
 > [!TIP]
-> **凭据自动探测机制**：`--github-token`（或 `GITHUB_TOKEN` / `GH_TOKEN`）在未显式提供时，程序会自动回退尝试调用本地已登录的 GitHub CLI (`gh auth token`) 探测认证凭据，极大简化了开发者在本地环境下的调试流程。
+> **凭据自动探测机制**：`--github-token`（或 `GITHUB_TOKEN` / `GH_TOKEN`）在未显式提供时，程序会自动回退尝试调用本地已登录的 GitHub CLI (`gh auth token`) 探测认证凭据。`--registry-username`（或 `REGISTRY_USERNAME` / `OCI_USERNAME`）用于 Bearer token exchange 的 Basic 用户名；Registry 返回的 challenge realm、service 和 scope 始终优先。
 
 ### 代理服务 (nixcache-proxy) 配置
 
@@ -690,7 +690,7 @@ nixcache-builder purge \
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
 | --- | --- | --- | --- |
-| `--all` | `NIXCACHE_PURGE_ALL` | `false` | **彻底清空/重置**：GHCR 下通过 REST API 直接删除整个 Package；Generic OCI 下重置生产基线索引 |
+| `--all` | `NIXCACHE_PURGE_ALL` | `false` | 按后端能力删除：GHCR 走原生完整 Package API；GCP/Azure/Generic OCI 删除当前 tag-reachable 对象图并验证；Docker Hub/ECR 明确不支持 |
 | `--hashes <HASHES>` | `NIXCACHE_PURGE_HASHES` | （无） | 指定要清理的 Store Hash（逗号或空格分隔） |
 | `--patterns <PATTERN...>` | `NIXCACHE_PURGE_PATTERNS` | （无） | 包名或 Store 路径匹配模式（支持通配符 `*`、`?`） |
 | `--system <SYSTEM...>` | `NIXCACHE_SYSTEM` | （全部） | 限制目标架构（如 `x86_64-linux`） |

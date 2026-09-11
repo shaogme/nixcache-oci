@@ -5,7 +5,9 @@ use nixcache_core::{
     build_nar_lookup_map, calculate_shard_id, diff_shard_descriptors, extract_nar_basename,
     extract_store_hash,
 };
-use nixcache_oci::{CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient};
+use nixcache_oci::{
+    CacheLayerMediaType, DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec, OciClient, RegistryCredentials,
+};
 use nixcache_oci_backend::{ReqwestTransport, create_tokio_reqwest_client};
 use scc::HashMap as SccHashMap;
 use std::{
@@ -104,9 +106,12 @@ pub struct CacheIndex {
 }
 
 impl CacheIndex {
-    pub fn with_config(config: CascadingProxyConfig, github_token: &str) -> Self {
+    pub fn with_config(
+        config: CascadingProxyConfig,
+        credentials: impl Into<RegistryCredentials>,
+    ) -> Self {
         let oci_client =
-            create_tokio_reqwest_client(&config.registry, &config.repo, github_token, false);
+            create_tokio_reqwest_client(&config.registry, &config.repo, credentials, false);
 
         Self {
             config,

@@ -7,6 +7,7 @@ use nixcache_core::{
     CacheQueryResult, IndexEntry, SortBy, SortOrder, StoreHash, SystemArch, evaluate_cache_query,
 };
 use nixcache_oci::OciArtifactManifest;
+use nixcache_oci::RegistryCredentials;
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -219,7 +220,7 @@ pub async fn run_list(
     args: &ListArgs,
     repo: &str,
     registry: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
 ) -> Result<(), BuilderError> {
     let target_tag = args.resolve_target_tag();
     let format = args.resolve_format();
@@ -228,7 +229,7 @@ pub async fn run_list(
     let limit = args.resolve_limit();
     let details = args.resolve_details();
 
-    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true);
 
     // 1. 探查多架构并获取所有架构的 ShardedArchCacheIndexData
     let mut target_systems: HashSet<SystemArch> = HashSet::new();

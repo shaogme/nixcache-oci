@@ -1,4 +1,5 @@
 use crate::{cli::GcArgs, error::BuilderError, purge::run_purge};
+use nixcache_oci::RegistryCredentials;
 use tracing::info;
 
 /// 阶段 3: 跨平台垃圾回收阶段 (统一复用 purge 执行引擎)
@@ -6,7 +7,7 @@ pub async fn run_gc(
     args: &GcArgs,
     repo: &str,
     registry: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
 ) -> Result<(), BuilderError> {
     let purge_args = args.to_purge_args();
     info!(
@@ -18,7 +19,7 @@ pub async fn run_gc(
         purge_args.delete_blobs
     );
 
-    run_purge(&purge_args, repo, registry, github_token).await
+    run_purge(&purge_args, repo, registry, credentials).await
 }
 
 #[cfg(test)]
