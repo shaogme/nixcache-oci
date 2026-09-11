@@ -312,6 +312,7 @@ impl ParallelExporter {
         let reader_stream = ReaderStream::new(reader);
         let oci_stream = Box::pin(reader_stream.map_err(TransportError::Io));
 
+        // 核心流式入口按每个逻辑分块使用 upload_config.max_retry_attempts 重试。
         let (nar_digest, nar_size) = oci_client
             .push_blob_streaming_resumable(oci_stream, upload_config)
             .await?;

@@ -30,7 +30,9 @@ pub use manifest::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mock::MockTokenGate;
-pub use mock::{MockPutRequest, MockResponse, MockRouterTransport};
+pub use mock::{
+    MockPatchOutcome, MockPatchRequest, MockPutRequest, MockResponse, MockRouterTransport,
+};
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
     NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
@@ -43,7 +45,7 @@ pub use nixcache_core::{
 pub use token::TokenManager;
 pub use transport::{
     HashingStream, OciBlobStream, OciTransport, StreamHashState, UploadChunkResponse,
-    UploadSessionInfo, parse_range_header,
+    parse_range_header,
 };
 pub use upload::{BlobPayload, UploadConfig};
 
@@ -51,20 +53,20 @@ pub use upload::{BlobPayload, UploadConfig};
 mod tests {
     use super::{
         AwsEcrDriver, BearerChallenge, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST,
-        GenericOciDriver, GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport,
-        NarDigest, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
-        RegistryDeletionStrategy, RegistryKind, ShardDataPayload, ShardedArchCacheIndexData,
-        StoreHash, StreamHashState, SystemArch, TransportError, UploadConfig, build_image_index,
-        parse_range_header,
+        GenericOciDriver, GhcrDriver, HashingStream, IndexEntry, MockPatchOutcome, MockResponse,
+        MockRouterTransport, NarDigest, OciClient, OciDescriptor, OciError, OciImageIndex,
+        OciPlatform, RegistryDeletionStrategy, RegistryKind, ShardDataPayload,
+        ShardedArchCacheIndexData, StoreHash, StreamHashState, SystemArch, TransportError,
+        UploadConfig, build_image_index, parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
     use http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{IF_MATCH, IF_NONE_MATCH},
     };
     use sha2::{Digest, Sha256};
-    use std::{collections::HashMap, sync::atomic::Ordering};
+    use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 
     #[test]
     fn test_driver_capabilities_and_canonicalization() {
@@ -842,6 +844,452 @@ mod tests {
 
         assert_eq!(total_size, 3 * 1024 * 1024);
         assert!(pushed_digest.starts_with("sha256:"));
+    }
+
+    fn chunked_config(max_retry_attempts: usize) -> UploadConfig {
+        UploadConfig {
+            chunk_size_bytes: 1024 * 1024,
+            chunk_threshold_bytes: 1024 * 1024,
+            max_retry_attempts,
+        }
+    }
+
+    fn chunked_client(transport: MockRouterTransport) -> OciClient<MockRouterTransport> {
+        OciClient::new(
+            "generic.registry",
+            "test/repo",
+            "token",
+            true,
+            GenericOciDriver,
+            transport,
+        )
+    }
+
+    fn drain_patch_requests(transport: &MockRouterTransport) -> Vec<super::MockPatchRequest> {
+        let mut requests = Vec::new();
+        while let Some(request) = transport.patch_requests.pop() {
+            requests.push(request);
+        }
+        requests
+    }
+
+    fn response(status: StatusCode) -> MockResponse {
+        MockResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
+
+    fn range_response(status: StatusCode, range: &str) -> MockResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert("Range", HeaderValue::from_str(range).unwrap());
+        MockResponse {
+            status,
+            headers,
+            body: Bytes::new(),
+        }
+    }
+
+    fn stream_for(
+        data: Bytes,
+    ) -> futures_util::stream::BoxStream<'static, Result<Bytes, TransportError>> {
+        Box::pin(futures_util::stream::iter(vec![
+            Ok::<Bytes, TransportError>(data),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_retries_temporary_http_failure_and_replays_body() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(StatusCode::ACCEPTED)));
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            response(StatusCode::NO_CONTENT),
+        );
+        let client = chunked_client(transport.clone());
+        let data = Bytes::from(vec![0x5a; 1024 * 1024]);
+
+        let result = client
+            .push_blob_streaming_resumable(stream_for(data.clone()), &chunked_config(1))
+            .await
+            .unwrap();
+
+        let requests = drain_patch_requests(&transport);
+        assert_eq!(result.1, data.len() as u64);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, data);
+        assert_eq!(requests[1].body, requests[0].body);
+        assert_eq!(requests[0].byte_range, (0, 1024 * 1024 - 1));
+        assert_eq!(requests[1].byte_range, requests[0].byte_range);
+        assert_eq!(
+            transport.sleep_durations.pop(),
+            Some(Duration::from_millis(100))
+        );
+        assert!(transport.delete_requests.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_retries_transport_failures_with_exponential_backoff() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Timeout);
+        transport.add_patch_outcome(MockPatchOutcome::ConnectionFailed);
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(StatusCode::NO_CONTENT)));
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            response(StatusCode::NO_CONTENT),
+        );
+        let client = chunked_client(transport.clone());
+
+        client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x11; 1024 * 1024])),
+                &chunked_config(2),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(drain_patch_requests(&transport).len(), 3);
+        assert_eq!(
+            transport.sleep_durations.pop(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            transport.sleep_durations.pop(),
+            Some(Duration::from_millis(200))
+        );
+        assert!(transport.sleep_durations.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_retry_budget_zero_aborts_without_sleep_or_retry() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        let client = chunked_client(transport.clone());
+
+        let error = client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x22; 1024 * 1024])),
+                &chunked_config(0),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OciError::ResumableUploadFailed { attempts: 1, .. }
+        ));
+        assert_eq!(drain_patch_requests(&transport).len(), 1);
+        assert!(transport.sleep_durations.pop().is_none());
+        assert_eq!(
+            transport.delete_requests.pop().unwrap(),
+            "https://generic.registry/v2/test/repo/nix-cache/blobs/uploads/session-mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_retry_exhaustion_reports_attempts_and_aborts() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            response(StatusCode::NO_CONTENT),
+        );
+        let client = chunked_client(transport.clone());
+
+        let error = client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x33; 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OciError::ResumableUploadFailed {
+                attempts: 2,
+                source,
+            } if matches!(*source, OciError::BlobUploadFailed(StatusCode::SERVICE_UNAVAILABLE))
+        ));
+        assert_eq!(drain_patch_requests(&transport).len(), 2);
+        assert!(transport.delete_requests.pop().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_probe_skips_patch_when_remote_already_completed() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            range_response(StatusCode::NO_CONTENT, "0-1048575"),
+        );
+        let client = chunked_client(transport.clone());
+
+        client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x44; 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(drain_patch_requests(&transport).len(), 1);
+        assert!(transport.sleep_durations.pop().is_none());
+        assert!(transport.delete_requests.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_probe_resends_only_uncommitted_suffix() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Timeout);
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(StatusCode::NO_CONTENT)));
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            range_response(StatusCode::NO_CONTENT, "0-0"),
+        );
+        let client = chunked_client(transport.clone());
+        let data = Bytes::from(vec![0x55; 1024 * 1024]);
+
+        let (digest, size) = client
+            .push_blob_streaming_resumable(stream_for(data.clone()), &chunked_config(1))
+            .await
+            .unwrap();
+
+        let requests = drain_patch_requests(&transport);
+        assert_eq!(size, data.len() as u64);
+        let expected_digest = format!(
+            "sha256:{}",
+            Sha256::digest(&data)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(digest, expected_digest);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, data);
+        assert_eq!(requests[1].body, data.slice(1..));
+        assert_eq!(requests[1].byte_range, (1, data.len() as u64 - 1));
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("Content-Range")
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("1-{}", data.len() - 1).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_retry_budget_is_reset_for_each_chunk() {
+        let transport = MockRouterTransport::default();
+        for _ in 0..2 {
+            transport.add_patch_outcome(MockPatchOutcome::Response(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+            )));
+            transport
+                .add_patch_outcome(MockPatchOutcome::Response(response(StatusCode::NO_CONTENT)));
+        }
+        transport.add_route(
+            "GET",
+            "/uploads/session-mock",
+            response(StatusCode::NO_CONTENT),
+        );
+        let client = chunked_client(transport.clone());
+
+        client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0xbb; 2 * 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(drain_patch_requests(&transport).len(), 4);
+        assert_eq!(
+            transport.sleep_durations.pop(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            transport.sleep_durations.pop(),
+            Some(Duration::from_millis(100))
+        );
+        assert!(transport.sleep_durations.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_416_is_probed_once_then_fails_without_blind_retry() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        )));
+        let client = chunked_client(transport.clone());
+
+        let error = client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0xcc; 1024 * 1024])),
+                &chunked_config(5),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OciError::BlobUploadFailed(StatusCode::RANGE_NOT_SATISFIABLE)
+        ));
+        assert_eq!(drain_patch_requests(&transport).len(), 1);
+        assert!(transport.sleep_durations.pop().is_none());
+        assert!(transport.delete_requests.pop().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_non_retryable_status_aborts_immediately() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            let transport = MockRouterTransport::default();
+            transport.add_patch_outcome(MockPatchOutcome::Response(response(status)));
+            let client = chunked_client(transport.clone());
+
+            let error = client
+                .push_blob_streaming_resumable(
+                    stream_for(Bytes::from(vec![0x66; 1024 * 1024])),
+                    &chunked_config(5),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, OciError::AuthenticationFailed { .. })
+                    || matches!(
+                        error,
+                        OciError::BlobUploadFailed(actual) if actual == status
+                    )
+            );
+            assert_eq!(drain_patch_requests(&transport).len(), 1);
+            assert!(transport.sleep_durations.pop().is_none());
+            assert!(transport.delete_requests.pop().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_rejects_range_beyond_current_chunk() {
+        let transport = MockRouterTransport::default();
+        transport.add_patch_outcome(MockPatchOutcome::Response(range_response(
+            StatusCode::NO_CONTENT,
+            "0-1048576",
+        )));
+        let client = chunked_client(transport.clone());
+
+        let error = client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x77; 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OciError::UploadRangeInvalid { .. }));
+        assert_eq!(drain_patch_requests(&transport).len(), 1);
+        assert!(transport.delete_requests.pop().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_finish_failure_and_stream_read_failure_abort() {
+        let finish_transport = MockRouterTransport::default();
+        finish_transport.add_route(
+            "PUT",
+            "/uploads/session-mock",
+            response(StatusCode::INTERNAL_SERVER_ERROR),
+        );
+        let finish_client = chunked_client(finish_transport.clone());
+        let finish_error = finish_client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0x88; 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            finish_error,
+            OciError::BlobUploadFailed(StatusCode::INTERNAL_SERVER_ERROR)
+        ));
+        assert!(finish_transport.delete_requests.pop().is_some());
+
+        let stream_transport = MockRouterTransport::default();
+        let stream_client = chunked_client(stream_transport.clone());
+        let stream = Box::pin(futures_util::stream::iter(vec![
+            Ok::<Bytes, TransportError>(Bytes::from(vec![0x99; 1024 * 1024])),
+            Err(TransportError::Io(std::io::Error::other("upstream failed"))),
+        ]));
+        let stream_error = stream_client
+            .push_blob_streaming_resumable(stream, &chunked_config(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(stream_error, OciError::Transport(_)));
+        assert!(stream_transport.delete_requests.pop().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chunk_location_update_is_used_for_retry_finish_and_abort() {
+        let transport = MockRouterTransport::default();
+        let mut patch_headers = HeaderMap::new();
+        patch_headers.insert(
+            "Location",
+            HeaderValue::from_static("/v2/test/repo/nix-cache/blobs/uploads/session-new"),
+        );
+        transport.add_patch_outcome(MockPatchOutcome::Response(MockResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: patch_headers,
+            body: Bytes::new(),
+        }));
+        transport.add_patch_outcome(MockPatchOutcome::Response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        )));
+        transport.add_route(
+            "GET",
+            "/uploads/session-new",
+            response(StatusCode::NO_CONTENT),
+        );
+        let client = chunked_client(transport.clone());
+
+        let error = client
+            .push_blob_streaming_resumable(
+                stream_for(Bytes::from(vec![0xaa; 1024 * 1024])),
+                &chunked_config(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OciError::ResumableUploadFailed { attempts: 2, .. }
+        ));
+        let requests = drain_patch_requests(&transport);
+        assert_eq!(
+            requests[1].url,
+            "https://generic.registry/v2/test/repo/nix-cache/blobs/uploads/session-new"
+        );
+        assert_eq!(transport.delete_requests.pop().unwrap(), requests[1].url);
     }
 
     #[tokio::test]

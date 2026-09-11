@@ -54,12 +54,6 @@ pub struct UploadChunkResponse {
     pub range: Option<(u64, u64)>,
 }
 
-#[derive(Debug, Clone)]
-pub struct UploadSessionInfo {
-    pub location: String,
-    pub last_range_end: Option<u64>,
-}
-
 #[derive(Debug, Default)]
 struct StreamHashInner {
     bytes_streamed: AtomicU64,
@@ -244,13 +238,6 @@ pub trait OciTransport: 'static {
         stream: Self::BodyStream,
         byte_range: (u64, u64),
     ) -> Result<UploadChunkResponse, TransportError>;
-
-    /// 探测当前断点会话状态 (GET session url 获取已接收的 Range 终止偏移量)
-    async fn probe_upload_session(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<Option<u64>, TransportError>;
 
     /// 完成分块上传 (PUT finish，可带尾部数据或为空 Body)
     async fn put_chunk_finish(

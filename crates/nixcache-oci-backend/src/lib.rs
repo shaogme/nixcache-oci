@@ -11,6 +11,6 @@ pub mod tokio_reqwest;
 
 #[cfg(feature = "tokio-reqwest")]
 pub use tokio_reqwest::{
-    OciClientExt, ReqwestTransport, create_tokio_reqwest_client,
-    create_tokio_reqwest_client_from_kind, create_tokio_reqwest_client_with_driver,
+    ReqwestTransport, create_tokio_reqwest_client, create_tokio_reqwest_client_from_kind,
+    create_tokio_reqwest_client_with_driver,
 };

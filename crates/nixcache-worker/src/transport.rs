@@ -343,10 +343,18 @@ impl OciTransport for WorkerFetchTransport {
             .get("Location")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let range = resp_headers
-            .get("Range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_range_header);
+        let range = match resp_headers.get("Range") {
+            Some(value) => {
+                let text = value
+                    .to_str()
+                    .map_err(|_| TransportError::HeaderParse { header: "Range" })?;
+                Some(
+                    parse_range_header(text)
+                        .ok_or(TransportError::HeaderParse { header: "Range" })?,
+                )
+            }
+            None => None,
+        };
 
         Ok(UploadChunkResponse {
             status,
@@ -371,21 +379,6 @@ impl OciTransport for WorkerFetchTransport {
             .collect::<Vec<u8>>();
         self.patch_chunk(url, headers, Bytes::from(bytes), byte_range)
             .await
-    }
-
-    async fn probe_upload_session(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Result<Option<u64>, TransportError> {
-        let (status, resp_headers, _) = self.get(url, headers).await?;
-        if status.is_success()
-            && let Some(range_val) = resp_headers.get("Range").and_then(|v| v.to_str().ok())
-            && let Some((_start, end)) = parse_range_header(range_val)
-        {
-            return Ok(Some(end));
-        }
-        Ok(None)
     }
 
     async fn put_chunk_finish(

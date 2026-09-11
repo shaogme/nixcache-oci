@@ -136,6 +136,9 @@ pub enum OciError {
     #[error("Upload session location missing in 202 Accepted response")]
     UploadLocationMissing,
 
+    #[error("Invalid upload session range: {details}")]
+    UploadRangeInvalid { details: String },
+
     #[error("Resumable chunked upload failed after {attempts} attempts: {source}")]
     ResumableUploadFailed {
         attempts: usize,

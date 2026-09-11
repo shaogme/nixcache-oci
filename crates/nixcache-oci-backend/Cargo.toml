@@ -25,20 +25,13 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 
-# Observability
-tracing = { workspace = true }
-
-# Utilities & Error handling
-sha2 = { workspace = true }
-thiserror = { workspace = true }
-
 # Optional dependencies (feature-gated)
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+sha2 = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 wiremock = { workspace = true }

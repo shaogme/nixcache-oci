@@ -1,12 +1,12 @@
 use crate::{
     error::TransportError,
-    transport::{OciTransport, UploadChunkResponse},
+    transport::{OciTransport, UploadChunkResponse, parse_range_header},
 };
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use http::{
     HeaderMap, HeaderValue, StatusCode,
-    header::{IF_MATCH, IF_NONE_MATCH},
+    header::{CONTENT_LENGTH, CONTENT_RANGE, IF_MATCH, IF_NONE_MATCH, LOCATION, RANGE},
 };
 use scc::HashMap as SccHashMap;
 use sha2::{Digest, Sha256};
@@ -50,11 +50,27 @@ fn extract_digest_param(url: &str) -> Option<String> {
     })
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MockResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MockPatchRequest {
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub byte_range: (u64, u64),
+}
+
+#[derive(Clone, Debug)]
+pub enum MockPatchOutcome {
+    Response(MockResponse),
+    Io,
+    ConnectionFailed,
+    Timeout,
 }
 
 /// 可控的 token GET 闸门，供并发取消和代际交错测试使用。
@@ -109,7 +125,11 @@ pub struct MockRouterTransport {
     pub call_count: Arc<AtomicUsize>,
     pub responses: Arc<SccHashMap<(String, String), MockResponse>>,
     pub posted_bodies: Arc<SegQueue<(String, Bytes)>>,
+    pub patch_requests: Arc<SegQueue<MockPatchRequest>>,
+    pub patch_outcomes: Arc<SegQueue<MockPatchOutcome>>,
     pub put_requests: Arc<SegQueue<MockPutRequest>>,
+    pub delete_requests: Arc<SegQueue<String>>,
+    pub sleep_durations: Arc<SegQueue<Duration>>,
     pub stored_blobs: Arc<SccHashMap<String, Bytes>>,
     pub stored_manifests: Arc<SccHashMap<String, (Bytes, String)>>,
     token_responses: Arc<SegQueue<MockResponse>>,
@@ -133,6 +153,10 @@ impl MockRouterTransport {
         self.token_responses.push(response);
     }
 
+    pub fn add_patch_outcome(&self, outcome: MockPatchOutcome) {
+        self.patch_outcomes.push(outcome);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_token_gate(&self, gate: MockTokenGate) {
         *self
@@ -143,6 +167,40 @@ impl MockRouterTransport {
 
     pub fn set_panic_on_token(&self, panic: bool) {
         self.panic_on_token.store(panic, Ordering::Release);
+    }
+
+    fn mock_patch_response(
+        &self,
+        response: MockResponse,
+        byte_range: (u64, u64),
+    ) -> Result<UploadChunkResponse, TransportError> {
+        let location = response
+            .headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let range = response
+            .headers
+            .get(RANGE)
+            .map(|value| {
+                let text = value
+                    .to_str()
+                    .map_err(|_| TransportError::HeaderParse { header: "Range" })?;
+                parse_range_header(text).ok_or(TransportError::HeaderParse { header: "Range" })
+            })
+            .transpose()?;
+        Ok(UploadChunkResponse {
+            status: response.status,
+            headers: response.headers,
+            location,
+            range: range.or_else(|| {
+                if response.status.is_success() {
+                    Some(byte_range)
+                } else {
+                    None
+                }
+            }),
+        })
     }
 }
 
@@ -359,11 +417,51 @@ impl OciTransport for MockRouterTransport {
     async fn patch_chunk(
         &self,
         url: &str,
-        _headers: HeaderMap,
-        _chunk: Bytes,
+        mut headers: HeaderMap,
+        chunk: Bytes,
         byte_range: (u64, u64),
     ) -> Result<UploadChunkResponse, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(chunk.len() as u64));
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!("{}-{}", byte_range.0, byte_range.1)).map_err(|_| {
+                TransportError::HeaderParse {
+                    header: "Content-Range",
+                }
+            })?,
+        );
+        self.patch_requests.push(MockPatchRequest {
+            url: url.to_string(),
+            headers,
+            body: chunk,
+            byte_range,
+        });
+
+        if let Some(outcome) = self.patch_outcomes.pop() {
+            match outcome {
+                MockPatchOutcome::Response(response) => {
+                    return self.mock_patch_response(response, byte_range);
+                }
+                MockPatchOutcome::Io => {
+                    return Err(TransportError::Io(std::io::Error::other(
+                        "mock patch I/O failure",
+                    )));
+                }
+                MockPatchOutcome::ConnectionFailed => {
+                    return Err(TransportError::ConnectionFailed {
+                        endpoint: url.to_string(),
+                        source: std::io::Error::other("mock patch connection failure"),
+                    });
+                }
+                MockPatchOutcome::Timeout => {
+                    return Err(TransportError::Timeout {
+                        duration: Duration::from_secs(1),
+                    });
+                }
+            }
+        }
+
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
@@ -375,12 +473,14 @@ impl OciTransport for MockRouterTransport {
             }
         });
         if let Some((status, headers)) = found {
-            Ok(UploadChunkResponse {
-                status,
-                headers,
-                location: None,
-                range: Some(byte_range),
-            })
+            self.mock_patch_response(
+                MockResponse {
+                    status,
+                    headers,
+                    body: Bytes::new(),
+                },
+                byte_range,
+            )
         } else {
             Ok(UploadChunkResponse {
                 status: StatusCode::ACCEPTED,
@@ -402,23 +502,33 @@ impl OciTransport for MockRouterTransport {
             .await
     }
 
-    async fn probe_upload_session(
-        &self,
-        _url: &str,
-        _headers: HeaderMap,
-    ) -> Result<Option<u64>, TransportError> {
-        self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
-    }
-
     async fn put_chunk_finish(
         &self,
-        _url: &str,
-        _headers: HeaderMap,
-        _last_chunk: Option<(Bytes, (u64, u64))>,
+        url: &str,
+        headers: HeaderMap,
+        last_chunk: Option<(Bytes, (u64, u64))>,
     ) -> Result<StatusCode, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(StatusCode::CREATED)
+        let body = last_chunk
+            .as_ref()
+            .map(|(bytes, _)| bytes.clone())
+            .unwrap_or_default();
+        self.put_requests.push(MockPutRequest {
+            url: url.to_string(),
+            headers: headers.clone(),
+            body,
+        });
+        let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+        let mut found = None;
+        self.responses.iter_sync(|(method, suffix), response| {
+            if method == "PUT" && path.ends_with(suffix) {
+                found = Some(response.status);
+                false
+            } else {
+                true
+            }
+        });
+        Ok(found.unwrap_or(StatusCode::CREATED))
     }
 
     async fn put_bytes(
@@ -524,6 +634,7 @@ impl OciTransport for MockRouterTransport {
         _headers: HeaderMap,
     ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.delete_requests.push(url.to_string());
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
 
         let mut found = None;
@@ -563,5 +674,7 @@ impl OciTransport for MockRouterTransport {
         Ok((status, response_headers))
     }
 
-    async fn sleep(&self, _duration: Duration) {}
+    async fn sleep(&self, duration: Duration) {
+        self.sleep_durations.push(duration);
+    }
 }

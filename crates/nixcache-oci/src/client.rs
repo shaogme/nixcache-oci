@@ -14,12 +14,17 @@ use crate::{
         build_sharded_arch_index_manifest,
     },
     token::TokenManager,
-    transport::{HashingStream, OciBlobStream, OciTransport, UploadChunkResponse},
+    transport::{
+        HashingStream, OciBlobStream, OciTransport, UploadChunkResponse, parse_range_header,
+    },
     upload::UploadConfig,
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
+use http::{
+    HeaderMap, HeaderValue, StatusCode,
+    header::{IF_MATCH, LOCATION, RANGE},
+};
 use nixcache_core::{NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
 use nixcache_utils::get_process_id;
 use serde::{Deserialize, Serialize, de::Deserializer};
@@ -494,6 +499,288 @@ impl<T: OciTransport + Clone> OciClient<T> {
         Ok(second)
     }
 
+    fn resolved_upload_location(&self, location: &str) -> String {
+        if location.starts_with('/') {
+            format!("{}://{}{}", self.url_scheme(), self.registry, location)
+        } else {
+            location.to_string()
+        }
+    }
+
+    fn update_upload_location(&self, session_url: &mut String, headers: &HeaderMap) {
+        if let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) {
+            *session_url = self.resolved_upload_location(location);
+        }
+    }
+
+    fn retryable_status(status: StatusCode) -> bool {
+        matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        ) || status.is_server_error()
+    }
+
+    fn retryable_error(error: &OciError) -> bool {
+        match error {
+            OciError::BlobUploadFailed(status) => Self::retryable_status(*status),
+            OciError::Transport(TransportError::Io(_))
+            | OciError::Transport(TransportError::ConnectionFailed { .. })
+            | OciError::Transport(TransportError::Timeout { .. }) => true,
+            OciError::Transport(TransportError::HttpStatus { status, .. }) => {
+                Self::retryable_status(*status)
+            }
+            _ => false,
+        }
+    }
+
+    fn invalid_upload_range(details: impl Into<String>) -> OciError {
+        OciError::UploadRangeInvalid {
+            details: details.into(),
+        }
+    }
+
+    fn response_next_offset(
+        range: Option<(u64, u64)>,
+        chunk_start: u64,
+        request_start: u64,
+        chunk_end: u64,
+    ) -> Result<u64, OciError> {
+        let Some((start, end)) = range else {
+            return chunk_end
+                .checked_add(1)
+                .ok_or_else(|| Self::invalid_upload_range("chunk end offset overflowed"));
+        };
+
+        if start != 0 && start != chunk_start && start != request_start {
+            return Err(Self::invalid_upload_range(format!(
+                "range starts at {start}, expected 0, chunk start {chunk_start}, or request start {request_start}"
+            )));
+        }
+        if end < request_start {
+            return Err(Self::invalid_upload_range(format!(
+                "range ends at {end}, before requested offset {request_start}"
+            )));
+        }
+        if end > chunk_end {
+            return Err(Self::invalid_upload_range(format!(
+                "range ends at {end}, beyond chunk end {chunk_end}"
+            )));
+        }
+
+        end.checked_add(1)
+            .ok_or_else(|| Self::invalid_upload_range("range end offset overflowed"))
+    }
+
+    fn probe_next_offset(
+        range: Option<(u64, u64)>,
+        chunk_start: u64,
+        current_offset: u64,
+        chunk_end: u64,
+    ) -> Result<Option<u64>, OciError> {
+        let Some((start, end)) = range else {
+            return Ok(None);
+        };
+        if start != 0 && start != chunk_start {
+            return Err(Self::invalid_upload_range(format!(
+                "probe range starts at {start}, expected 0 or chunk start {chunk_start}"
+            )));
+        }
+        if end > chunk_end {
+            return Err(Self::invalid_upload_range(format!(
+                "probe range ends at {end}, beyond chunk end {chunk_end}"
+            )));
+        }
+        let next = end
+            .checked_add(1)
+            .ok_or_else(|| Self::invalid_upload_range("probe range end offset overflowed"))?;
+        if next < current_offset {
+            return Err(Self::invalid_upload_range(format!(
+                "probe moved remote offset backwards from {current_offset} to {next}"
+            )));
+        }
+        Ok(Some(next))
+    }
+
+    async fn probe_upload_session_with_auth_retry(
+        &self,
+        session_url: &str,
+    ) -> Result<(StatusCode, HeaderMap, Option<(u64, u64)>), OciError> {
+        let (status, headers, _) = self
+            .get_with_auth_retry(session_url, "probe upload session")
+            .await?;
+        let range = if let Some(value) = headers.get(RANGE) {
+            let text = value
+                .to_str()
+                .map_err(|_| TransportError::HeaderParse { header: "Range" })?;
+            Some(parse_range_header(text).ok_or_else(|| {
+                Self::invalid_upload_range(format!("cannot parse Range header '{text}'"))
+            })?)
+        } else {
+            None
+        };
+        Ok((status, headers, range))
+    }
+
+    async fn abort_upload_session(&self, session_url: &str) {
+        match self
+            .delete_with_auth_retry(session_url, "abort upload session")
+            .await
+        {
+            Ok(status) if status.is_success() || status == StatusCode::NOT_FOUND => {}
+            Ok(status) => warn!(
+                "Best-effort upload session abort returned unexpected status {}",
+                status
+            ),
+            Err(error) => warn!("Best-effort upload session abort failed: {error}"),
+        }
+    }
+
+    async fn upload_chunk_with_retry(
+        &self,
+        session_url: &mut String,
+        chunk: &Bytes,
+        chunk_start: u64,
+        config: &UploadConfig,
+    ) -> Result<(), OciError> {
+        let chunk_end = chunk_start
+            .checked_add(chunk.len() as u64)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| Self::invalid_upload_range("chunk end offset overflowed"))?;
+        let mut remote_next = chunk_start;
+        let mut retry_count = 0usize;
+        let mut patch_attempts = 0usize;
+        let mut last_error: OciError;
+        let mut probed_416 = false;
+        let max_patch_attempts = config.max_retry_attempts.saturating_add(1);
+
+        loop {
+            if remote_next > chunk_end {
+                return Ok(());
+            }
+            if patch_attempts >= max_patch_attempts {
+                return Err(OciError::ResumableUploadFailed {
+                    attempts: patch_attempts,
+                    source: Box::new(Self::invalid_upload_range(
+                        "retry budget exhausted before the logical chunk completed",
+                    )),
+                });
+            }
+
+            let relative_start = (remote_next - chunk_start) as usize;
+            let body = chunk.slice(relative_start..);
+            let byte_range = (remote_next, chunk_end);
+            let headers = self.get_auth_headers().await?;
+            patch_attempts += 1;
+            let mut is_416_failure = false;
+
+            let patch_result = self
+                .patch_chunk_with_auth_retry(
+                    session_url,
+                    headers,
+                    body,
+                    byte_range,
+                    "upload blob chunk",
+                )
+                .await;
+
+            match patch_result {
+                Ok(response) => {
+                    self.update_upload_location(session_url, &response.headers);
+                    if let Some(location) = response.location.as_deref() {
+                        *session_url = self.resolved_upload_location(location);
+                    }
+
+                    if response.status.is_success() {
+                        remote_next = Self::response_next_offset(
+                            response.range,
+                            chunk_start,
+                            byte_range.0,
+                            chunk_end,
+                        )?;
+                        continue;
+                    }
+
+                    let status_error = OciError::BlobUploadFailed(response.status);
+                    let is_416 = response.status == StatusCode::RANGE_NOT_SATISFIABLE;
+                    is_416_failure = is_416;
+                    if !is_416 && !Self::retryable_error(&status_error) {
+                        return Err(status_error);
+                    }
+                    last_error = status_error;
+
+                    if is_416 {
+                        if probed_416 {
+                            return Err(last_error);
+                        }
+                        probed_416 = true;
+                    } else if retry_count >= config.max_retry_attempts {
+                        return Err(OciError::ResumableUploadFailed {
+                            attempts: patch_attempts,
+                            source: Box::new(last_error),
+                        });
+                    }
+                }
+                Err(error) => {
+                    if !Self::retryable_error(&error) {
+                        return Err(error);
+                    }
+                    last_error = error;
+                    if retry_count >= config.max_retry_attempts {
+                        return Err(OciError::ResumableUploadFailed {
+                            attempts: patch_attempts,
+                            source: Box::new(last_error),
+                        });
+                    }
+                }
+            }
+
+            let (probe_status, probe_headers, probe_range) = self
+                .probe_upload_session_with_auth_retry(session_url)
+                .await
+                .map_err(|probe_error| OciError::ResumableUploadFailed {
+                    attempts: patch_attempts,
+                    source: Box::new(probe_error),
+                })?;
+            self.update_upload_location(session_url, &probe_headers);
+            if !probe_status.is_success() {
+                if is_416_failure {
+                    return Err(last_error);
+                }
+                return Err(OciError::ResumableUploadFailed {
+                    attempts: patch_attempts,
+                    source: Box::new(OciError::BlobUploadFailed(probe_status)),
+                });
+            }
+
+            if is_416_failure && probe_range.is_none() {
+                return Err(last_error);
+            }
+
+            if let Some(next) =
+                Self::probe_next_offset(probe_range, chunk_start, remote_next, chunk_end)?
+            {
+                remote_next = next;
+                if remote_next > chunk_end {
+                    return Ok(());
+                }
+            }
+
+            if retry_count >= config.max_retry_attempts {
+                return Err(OciError::ResumableUploadFailed {
+                    attempts: patch_attempts,
+                    source: Box::new(last_error),
+                });
+            }
+
+            retry_count += 1;
+            let backoff_exponent = retry_count.saturating_sub(1).min(5) as u32;
+            let backoff_ms = 100u64.saturating_mul(1u64 << backoff_exponent);
+            self.transport()
+                .sleep(Duration::from_millis(backoff_ms))
+                .await;
+        }
+    }
+
     async fn put_chunk_finish_with_auth_retry(
         &self,
         url: &str,
@@ -868,89 +1155,71 @@ impl<T: OciTransport + Clone> OciClient<T> {
             .and_then(|v| v.to_str().ok())
             .ok_or(OciError::UploadLocationMissing)?;
 
-        let mut session_url = if location.starts_with('/') {
-            format!("{}://{}{}", self.url_scheme(), self.registry, location)
-        } else {
-            location.to_string()
-        };
-
+        let mut session_url = self.resolved_upload_location(location);
         let mut current_offset = 0u64;
         let mut chunk_buf = buffer;
         let mut stream_ended = false;
 
-        while !stream_ended {
-            while chunk_buf.len() < chunk_limit {
-                if let Some(item) = pinned_stream.next().await {
-                    let bytes: Bytes = item?;
-                    chunk_buf.extend_from_slice(&bytes);
-                } else {
-                    stream_ended = true;
+        let upload_result = async {
+            while !stream_ended {
+                while chunk_buf.len() < chunk_limit {
+                    if let Some(item) = pinned_stream.next().await {
+                        let bytes: Bytes = item?;
+                        chunk_buf.extend_from_slice(&bytes);
+                    } else {
+                        stream_ended = true;
+                        break;
+                    }
+                }
+
+                if chunk_buf.is_empty() {
                     break;
                 }
-            }
 
-            if chunk_buf.is_empty() {
-                break;
-            }
-
-            let send_len = if stream_ended {
-                chunk_buf.len()
-            } else {
-                chunk_limit.min(chunk_buf.len())
-            };
-
-            let send_bytes = chunk_buf.split_to(send_len).freeze();
-            let end_offset = current_offset + send_bytes.len() as u64 - 1;
-            let headers = self.get_auth_headers().await?;
-            let resp = self
-                .patch_chunk_with_auth_retry(
-                    &session_url,
-                    headers,
-                    send_bytes,
-                    (current_offset, end_offset),
-                    "upload blob chunk",
+                let send_len = if stream_ended {
+                    chunk_buf.len()
+                } else {
+                    chunk_limit.min(chunk_buf.len())
+                };
+                let chunk_bytes = chunk_buf.split_to(send_len).freeze();
+                self.upload_chunk_with_retry(
+                    &mut session_url,
+                    &chunk_bytes,
+                    current_offset,
+                    config,
                 )
                 .await?;
+                current_offset += chunk_bytes.len() as u64;
+            }
 
-            if !resp.status.is_success()
-                && resp.status != StatusCode::ACCEPTED
-                && resp.status != StatusCode::NO_CONTENT
+            let final_digest = hash_state.force_finalize();
+            let total_size = hash_state.bytes_streamed();
+            let separator = if session_url.contains('?') { "&" } else { "?" };
+            let finish_url = format!("{}{}digest={}", session_url, separator, final_digest);
+            let headers = self.get_auth_headers().await?;
+            let finish_status = self
+                .put_chunk_finish_with_auth_retry(&finish_url, headers, None, "finish blob upload")
+                .await?;
+
+            if finish_status == StatusCode::CREATED
+                || finish_status == StatusCode::OK
+                || finish_status == StatusCode::ACCEPTED
             {
-                return Err(OciError::BlobUploadFailed(resp.status));
+                info!(
+                    "Successfully committed streaming blob {} ({} bytes)",
+                    final_digest, total_size
+                );
+                Ok((final_digest, total_size))
+            } else {
+                Err(OciError::BlobUploadFailed(finish_status))
             }
-
-            if let Some(new_loc) = resp.location {
-                session_url = if new_loc.starts_with('/') {
-                    format!("{}://{}{}", self.url_scheme(), self.registry, new_loc)
-                } else {
-                    new_loc
-                };
-            }
-            current_offset = end_offset + 1;
         }
+        .await;
 
-        let final_digest = hash_state.force_finalize();
-        let total_size = hash_state.bytes_streamed();
-
-        let separator = if session_url.contains('?') { "&" } else { "?" };
-        let finish_url = format!("{}{}digest={}", session_url, separator, final_digest);
-        let headers = self.get_auth_headers().await?;
-        let finish_status = self
-            .put_chunk_finish_with_auth_retry(&finish_url, headers, None, "finish blob upload")
-            .await?;
-
-        if finish_status == StatusCode::CREATED
-            || finish_status == StatusCode::OK
-            || finish_status == StatusCode::ACCEPTED
-        {
-            info!(
-                "Successfully committed streaming blob {} ({} bytes)",
-                final_digest, total_size
-            );
-            Ok((final_digest, total_size))
-        } else {
-            Err(OciError::BlobUploadFailed(finish_status))
+        if upload_result.is_err() {
+            self.abort_upload_session(&session_url).await;
         }
+        upload_result
     }
 
     /// 将数据紧凑序列化并经过 Zstd 压缩后推送至 Registry Blob

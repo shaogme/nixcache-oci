@@ -23,7 +23,7 @@ pub struct UploadConfig {
     pub chunk_threshold_bytes: u64,
     /// 单个分块大小（默认 32MB，最小 1MB）
     pub chunk_size_bytes: usize,
-    /// 最大网络中断重试次数（默认 5 次）
+    /// 首次 PATCH 之外允许的网络中断重试次数（默认 5 次）
     pub max_retry_attempts: usize,
 }
 
