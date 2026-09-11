@@ -198,8 +198,8 @@ pub async fn run_purge(
         extra_hashes.extend(flake_hashes);
     }
 
-    let selector = args.to_purge_filter(&extra_hashes);
-    let purge_result = evaluate_cache_purge(&all_entries, &all_gc_roots, &selector);
+    let selector = args.to_purge_filter(&extra_hashes)?;
+    let purge_result = evaluate_cache_purge(&all_entries, &all_gc_roots, &selector)?;
 
     info!(
         "Purge Evaluation: Total Before: {}, Purged: {}, Kept: {}, Estimated Space Freed: {} bytes",
@@ -409,8 +409,8 @@ mod tests {
 
     #[test]
     fn test_purge_filter_integration_with_builder() {
-        let hash1 = StoreHash::new_unchecked("0000000000000000000000000000pkg1");
-        let hash2 = StoreHash::new_unchecked("0000000000000000000000000000pkg2");
+        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
+        let hash2 = StoreHash::parse("00000000000000000000000000000002").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -423,7 +423,10 @@ mod tests {
                     nar_basename: "pkg-x86.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob1"),
+                nar_digest: NarDigest::new_sha256(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                )
+                .unwrap(),
                 nar_size: 1024,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -439,7 +442,10 @@ mod tests {
                     nar_basename: "pkg-arm.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob2"),
+                nar_digest: NarDigest::new_sha256(
+                    "0000000000000000000000000000000000000000000000000000000000000002",
+                )
+                .unwrap(),
                 nar_size: 2048,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -458,8 +464,8 @@ mod tests {
             ..Default::default()
         };
 
-        let selector = args.to_purge_filter(&[]);
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let selector = args.to_purge_filter(&[]).unwrap();
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         assert_eq!(result.purged_hashes, vec![hash1]);
         assert_eq!(result.kept_entries.len(), 1);
         assert!(result.kept_entries.contains_key(&hash2));

@@ -1,4 +1,5 @@
 use crate::{
+    error::CoreError,
     filter::{CacheQueryResult, CacheSelector, evaluate_cache_query},
     types::{IndexEntry, NarDigest, StoreHash, SystemArch},
 };
@@ -20,14 +21,11 @@ pub fn prune_broken_gc_roots(
     entries: &HashMap<StoreHash, IndexEntry>,
     gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     purged_hashes: &HashSet<StoreHash>,
-) -> HashMap<SystemArch, Vec<StoreHash>> {
+) -> Result<HashMap<SystemArch, Vec<StoreHash>>, CoreError> {
     let mut forward_graph: HashMap<StoreHash, Vec<StoreHash>> = HashMap::new();
     for (hash, entry) in entries {
         if !purged_hashes.contains(hash) {
-            forward_graph.insert(
-                hash.clone(),
-                entry.narinfo_meta.reference_hashes().collect(),
-            );
+            forward_graph.insert(hash.clone(), entry.narinfo_meta.reference_hashes()?);
         }
     }
 
@@ -75,7 +73,7 @@ pub fn prune_broken_gc_roots(
         }
     }
 
-    updated_gc_roots
+    Ok(updated_gc_roots)
 }
 
 /// 单架构缓存清理与失效评估计算
@@ -84,7 +82,7 @@ pub fn evaluate_arch_cache_purge(
     gc_roots: &[StoreHash],
     system: SystemArch,
     selector: &CacheSelector,
-) -> PurgeEvaluationResult {
+) -> Result<PurgeEvaluationResult, CoreError> {
     let mut roots_map = HashMap::new();
     if !gc_roots.is_empty() {
         roots_map.insert(system, gc_roots.to_vec());
@@ -97,18 +95,18 @@ pub fn evaluate_cache_purge(
     entries: &HashMap<StoreHash, IndexEntry>,
     gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     selector: &CacheSelector,
-) -> PurgeEvaluationResult {
-    let query_res: CacheQueryResult = evaluate_cache_query(entries, gc_roots, selector);
+) -> Result<PurgeEvaluationResult, CoreError> {
+    let query_res: CacheQueryResult = evaluate_cache_query(entries, gc_roots, selector)?;
 
     let purged_hashes_set: HashSet<StoreHash> = query_res.matched_entries.keys().cloned().collect();
-    let updated_gc_roots = prune_broken_gc_roots(entries, gc_roots, &purged_hashes_set);
+    let updated_gc_roots = prune_broken_gc_roots(entries, gc_roots, &purged_hashes_set)?;
     let purged_nar_digests: Vec<NarDigest> = query_res
         .matched_entries
         .values()
         .map(|e| e.nar_digest.clone())
         .collect();
 
-    PurgeEvaluationResult {
+    Ok(PurgeEvaluationResult {
         kept_entries: query_res.unmatched_entries,
         purged_entries: query_res.matched_entries,
         purged_hashes: query_res.final_matched_hashes,
@@ -116,5 +114,5 @@ pub fn evaluate_cache_purge(
         updated_gc_roots,
         estimated_freed_bytes: query_res.matched_bytes,
         reason_map: query_res.reason_map,
-    }
+    })
 }

@@ -53,7 +53,14 @@ mod tests {
         nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
+    use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet};
+
+    fn test_digest(label: &str) -> NarDigest {
+        let digest = Sha256::digest(label.as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        NarDigest::new_sha256(&hex).expect("test digest must be valid")
+    }
 
     #[test]
     fn test_strong_types_validation() {
@@ -162,8 +169,20 @@ mod tests {
             HashMap::from([(
                 hash,
                 IndexEntry {
+                    name: "pkg".to_string(),
                     system: Some(system),
-                    ..Default::default()
+                    narinfo_meta: NarInfoMeta {
+                        store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-pkg"
+                            .to_string(),
+                        nar_basename: "pkg.nar.xz".to_string(),
+                        nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
+                        ..Default::default()
+                    },
+                    nar_digest: test_digest("payload-validation"),
+                    nar_size: 100,
+                    added: "2026-08-29T00:00:00Z".to_string(),
+                    origin_job: None,
                 },
             )]),
         );
@@ -253,8 +272,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
         assert_eq!(extract_nar_basename("nar/test.nar.xz"), "test.nar.xz");
 
-        let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
-        let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
+        let hash1 = StoreHash::parse("blamgln5vwadzwndb4a5g4nmvcaxzcnx").unwrap();
+        let hash2 = StoreHash::parse("g8f1kharg0fr38s1gqfik0a9ghf93qsi").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -267,7 +286,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "pkg1.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob1"),
+                nar_digest: test_digest("blob1"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -283,7 +302,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "pkg2.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob2"),
+                nar_digest: test_digest("blob2"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -291,14 +310,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
 
         let lookup = build_nar_lookup_map(&entries);
-        assert_eq!(
-            lookup.get("pkg1.nar.xz"),
-            Some(&NarDigest::new_unchecked("sha256:blob1"))
-        );
-        assert_eq!(
-            lookup.get("pkg2.nar.xz"),
-            Some(&NarDigest::new_unchecked("sha256:blob2"))
-        );
+        assert_eq!(lookup.get("pkg1.nar.xz"), Some(&test_digest("blob1")));
+        assert_eq!(lookup.get("pkg2.nar.xz"), Some(&test_digest("blob2")));
         assert_eq!(lookup.get("nonexistent.nar.xz"), None);
     }
 
@@ -398,7 +411,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut inserted_set = HashSet::new();
 
         for i in 0..2000 {
-            let hash = StoreHash::new_unchecked(format!("a{:031}", i));
+            let hash = StoreHash::parse(&format!("a{:031}", i)).unwrap();
             large_filter.insert(&hash);
             inserted_set.insert(hash);
         }
@@ -417,7 +430,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let mut false_positives = 0;
         let test_count = 5000;
         for i in 0..test_count {
-            let probe_hash = StoreHash::new_unchecked(format!("z{:031}", i));
+            let probe_hash = StoreHash::parse(&format!("z{:031}", i)).unwrap();
             if !inserted_set.contains(&probe_hash) && large_filter.contains(&probe_hash) {
                 false_positives += 1;
             }
@@ -442,7 +455,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             IndexEntry {
                 name: "pkg1".to_string(),
                 nar_size: 500,
-                nar_digest: NarDigest::new_unchecked("sha256:digest1"),
+                nar_digest: test_digest("digest1"),
                 ..Default::default()
             },
         );
@@ -493,10 +506,12 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
         let target_shard = root_index.find_shard_mut(&h1).expect("Shard exists");
         target_shard.entry_count = 1;
-        target_shard.blob_digest = "sha256:shard_blob_digest".to_string();
+        target_shard.blob_digest =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string();
         target_shard.compressed_size = 1024;
         target_shard.uncompressed_size = 4096;
-        target_shard.merkle_hash = "sha256:new_merkle".to_string();
+        target_shard.merkle_hash =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
         root_index.recalculate_merkle_root();
 
         let json = serde_json::to_string(&root_index).expect("Serialize root index");
@@ -519,8 +534,19 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             h1.clone(),
             IndexEntry {
                 name: "pkg1".to_string(),
+                system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", h1),
+                    nar_basename: "pkg1.nar.xz".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
+                    ..Default::default()
+                },
+                nar_digest: test_digest("payload"),
                 nar_size: 100,
-                ..Default::default()
+                added: "2026-08-29T00:00:00Z".to_string(),
+                origin_job: None,
             },
         );
         let payload_json = serde_json::to_string(&payload).unwrap();
@@ -608,11 +634,11 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_gc_evaluation() {
-        let root_app = StoreHash::new_unchecked("hash0000000000000000000000000app");
-        let shared_dep = StoreHash::new_unchecked("hash0000000000000000000000000dep");
-        let sub_dep = StoreHash::new_unchecked("hash0000000000000000000000000sub");
-        let orphan_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
-        let orphan_new = StoreHash::new_unchecked("hash0000000000000000000000000new");
+        let root_app = StoreHash::parse("sp3sj3kyaz322v3ns73ajkkfag3j2b36").unwrap();
+        let shared_dep = StoreHash::parse("cmx4c1d0l5m4li5hc5xlcidhlmmll150").unwrap();
+        let sub_dep = StoreHash::parse("xjwp9207mj47128pdjcpr2h75jl7i2qp").unwrap();
+        let orphan_old = StoreHash::parse("0rihhxi48r908drl09i0hdil899h8xr4").unwrap();
+        let orphan_new = StoreHash::parse("ryqbmnw31f0vxn439y8b5nc3ifhvdnl3").unwrap();
 
         let mut entries = HashMap::new();
         let now = Utc::now();
@@ -630,7 +656,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-shared-dep", shared_dep)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:root-blob"),
+                nar_digest: test_digest("root-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
                 origin_job: None,
@@ -648,7 +674,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-sub-dep", sub_dep)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:dep-blob"),
+                nar_digest: test_digest("dep-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
                 origin_job: None,
@@ -666,7 +692,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:sub-blob"),
+                nar_digest: test_digest("sub-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
                 origin_job: None,
@@ -684,7 +710,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:old-blob"),
+                nar_digest: test_digest("old-blob"),
                 nar_size: 100,
                 added: sixty_days_ago,
                 origin_job: None,
@@ -702,7 +728,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:new-blob"),
+                nar_digest: test_digest("new-blob"),
                 nar_size: 100,
                 added: five_days_ago,
                 origin_job: None,
@@ -712,7 +738,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         let gc_roots = vec![root_app.clone()];
         let cutoff = now - Duration::days(30);
 
-        let result = evaluate_gc(&entries, &gc_roots, &cutoff);
+        let result = evaluate_gc(&entries, &gc_roots, &cutoff).unwrap();
         assert_eq!(result.deleted_hashes, vec![orphan_old]);
         assert_eq!(result.kept_entries.len(), 4);
         assert!(result.kept_entries.contains_key(&root_app));
@@ -723,7 +749,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
         let mut multi_roots = HashMap::new();
         multi_roots.insert(SystemArch::X86_64Linux, vec![root_app.clone()]);
-        let multi_result = evaluate_multi_arch_gc(&entries, &multi_roots, &cutoff);
+        let multi_result = evaluate_multi_arch_gc(&entries, &multi_roots, &cutoff).unwrap();
         assert_eq!(multi_result.deleted_hashes, result.deleted_hashes);
     }
 
@@ -744,8 +770,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_evaluate_cache_query_and_selector() {
-        let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
-        let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
+        let hash1 = StoreHash::parse("blamgln5vwadzwndb4a5g4nmvcaxzcnx").unwrap();
+        let hash2 = StoreHash::parse("g8f1kharg0fr38s1gqfik0a9ghf93qsi").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -758,7 +784,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "rust-1.80.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-rust"),
+                nar_digest: test_digest("blob-rust"),
                 nar_size: 1000,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -774,7 +800,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "llvm-18.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-llvm"),
+                nar_digest: test_digest("blob-llvm"),
                 nar_size: 2000,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -786,7 +812,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         });
         let query_res: CacheQueryResult =
-            evaluate_cache_query(&entries, &HashMap::new(), &selector);
+            evaluate_cache_query(&entries, &HashMap::new(), &selector).unwrap();
         assert_eq!(query_res.matched_entries.len(), 1);
         assert_eq!(query_res.unmatched_entries.len(), 1);
         assert_eq!(query_res.matched_bytes, 1000);
@@ -794,14 +820,14 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert_eq!(query_res.final_matched_hashes, vec![hash1.clone()]);
 
         let arch_query_res =
-            evaluate_arch_cache_query(&entries, &[], SystemArch::X86_64Linux, &selector);
+            evaluate_arch_cache_query(&entries, &[], SystemArch::X86_64Linux, &selector).unwrap();
         assert_eq!(arch_query_res.matched_entries.len(), 1);
     }
 
     #[test]
     fn test_purge_all_clears_everything() {
-        let hash1 = StoreHash::new_unchecked("hash1111111111111111111111111111");
-        let hash2 = StoreHash::new_unchecked("hash2222222222222222222222222222");
+        let hash1 = StoreHash::parse("blamgln5vwadzwndb4a5g4nmvcaxzcnx").unwrap();
+        let hash2 = StoreHash::parse("g8f1kharg0fr38s1gqfik0a9ghf93qsi").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -814,7 +840,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "pkg1.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob1"),
+                nar_digest: test_digest("blob1"),
                 nar_size: 1000,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -830,7 +856,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "pkg2.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob2"),
+                nar_digest: test_digest("blob2"),
                 nar_size: 2000,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -843,7 +869,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
         let selector = CacheSelector::all(HashSet::new());
 
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         assert!(result.kept_entries.is_empty());
         assert_eq!(result.purged_entries.len(), 2);
         assert_eq!(result.purged_hashes.len(), 2);
@@ -852,15 +878,16 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert!(result.updated_gc_roots.is_empty());
 
         let arch_result =
-            evaluate_arch_cache_purge(&entries, &[hash1], SystemArch::X86_64Linux, &selector);
+            evaluate_arch_cache_purge(&entries, &[hash1], SystemArch::X86_64Linux, &selector)
+                .unwrap();
         assert_eq!(arch_result.purged_entries.len(), 2);
     }
 
     #[test]
     fn test_purge_exact_preserves_dependents() {
-        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
-        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
-        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+        let app = StoreHash::parse("sp3sj3kyaz322v3ns73ajkkfag3j2b36").unwrap();
+        let lib_a = StoreHash::parse("inh3dflbrnq3mywv1n03xf4b9n835ycv").unwrap();
+        let core = StoreHash::parse("fvpnng72fkpynppsfbp6nz7jf3pfn7pa").unwrap();
 
         let mut entries = HashMap::new();
         let mut gc_roots = HashMap::new();
@@ -877,7 +904,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-liba", lib_a)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -895,7 +922,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-core", core)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -913,7 +940,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -929,7 +956,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         })
         .with_cascade(CascadeMode::Exact);
 
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         assert_eq!(result.purged_hashes, vec![lib_a.clone()]);
         assert_eq!(result.estimated_freed_bytes, 300);
         assert!(result.kept_entries.contains_key(&app));
@@ -941,9 +968,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_purge_cascade_dependents_invalidates_closure() {
-        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
-        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
-        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+        let app = StoreHash::parse("sp3sj3kyaz322v3ns73ajkkfag3j2b36").unwrap();
+        let lib_a = StoreHash::parse("inh3dflbrnq3mywv1n03xf4b9n835ycv").unwrap();
+        let core = StoreHash::parse("fvpnng72fkpynppsfbp6nz7jf3pfn7pa").unwrap();
 
         let mut entries = HashMap::new();
         let mut gc_roots = HashMap::new();
@@ -960,7 +987,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-liba", lib_a)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -978,7 +1005,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-core", core)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -996,7 +1023,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1012,7 +1039,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         })
         .with_cascade(CascadeMode::Dependents);
 
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         assert_eq!(result.purged_entries.len(), 2);
         assert!(result.purged_entries.contains_key(&lib_a));
         assert!(result.purged_entries.contains_key(&app));
@@ -1023,9 +1050,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_purge_cascade_transitive_and_full_tree() {
-        let app = StoreHash::new_unchecked("hash0000000000000000000000000app");
-        let lib_a = StoreHash::new_unchecked("hash000000000000000000000000liba");
-        let core = StoreHash::new_unchecked("hash000000000000000000000000core");
+        let app = StoreHash::parse("sp3sj3kyaz322v3ns73ajkkfag3j2b36").unwrap();
+        let lib_a = StoreHash::parse("inh3dflbrnq3mywv1n03xf4b9n835ycv").unwrap();
+        let core = StoreHash::parse("fvpnng72fkpynppsfbp6nz7jf3pfn7pa").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -1039,7 +1066,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-liba", lib_a)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-app"),
+                nar_digest: test_digest("blob-app"),
                 nar_size: 500,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1056,7 +1083,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-core", core)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-liba"),
+                nar_digest: test_digest("blob-liba"),
                 nar_size: 300,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1073,7 +1100,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-core"),
+                nar_digest: test_digest("blob-core"),
                 nar_size: 200,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1089,7 +1116,8 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::Transitive);
-        let res_transitive = evaluate_cache_purge(&entries, &HashMap::new(), &selector_transitive);
+        let res_transitive =
+            evaluate_cache_purge(&entries, &HashMap::new(), &selector_transitive).unwrap();
         assert_eq!(res_transitive.purged_entries.len(), 2);
         assert!(res_transitive.purged_entries.contains_key(&lib_a));
         assert!(res_transitive.purged_entries.contains_key(&core));
@@ -1101,7 +1129,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::FullTree);
-        let res_full = evaluate_cache_purge(&entries, &HashMap::new(), &selector_full);
+        let res_full = evaluate_cache_purge(&entries, &HashMap::new(), &selector_full).unwrap();
         assert_eq!(res_full.purged_entries.len(), 3);
         assert!(res_full.purged_entries.contains_key(&app));
         assert!(res_full.purged_entries.contains_key(&lib_a));
@@ -1111,9 +1139,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_purge_pattern_and_time_and_size_filter() {
-        let hash_chromium = StoreHash::new_unchecked("hash00000000000000000000chromium");
-        let hash_small = StoreHash::new_unchecked("hash00000000000000000000000small");
-        let hash_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
+        let hash_chromium = StoreHash::parse("blamgln5vwadzwndb4a5g4nmvcaxzcnx").unwrap();
+        let hash_small = StoreHash::parse("yb766zpjy37f677ayv7n6gp2yk7y6p7s").unwrap();
+        let hash_old = StoreHash::parse("0rihhxi48r908drl09i0hdil899h8xr4").unwrap();
 
         let mut entries = HashMap::new();
         entries.insert(
@@ -1126,7 +1154,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "chromium-120.0.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-chromium"),
+                nar_digest: test_digest("blob-chromium"),
                 nar_size: 500_000_000,
                 added: "2026-08-25T10:00:00Z".to_string(),
                 origin_job: Some("run:1001:job:build-x86".to_string()),
@@ -1143,7 +1171,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "small-lib.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-small"),
+                nar_digest: test_digest("blob-small"),
                 nar_size: 1_000,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: Some("run:1002:job:build-x86".to_string()),
@@ -1160,7 +1188,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     nar_basename: "old-lib.nar.xz".to_string(),
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-old"),
+                nar_digest: test_digest("blob-old"),
                 nar_size: 2_000,
                 added: "2026-07-01T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1173,7 +1201,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::Exact);
-        let res_pat = evaluate_cache_purge(&entries, &HashMap::new(), &selector_pat);
+        let res_pat = evaluate_cache_purge(&entries, &HashMap::new(), &selector_pat).unwrap();
         assert_eq!(res_pat.purged_hashes, vec![hash_chromium.clone()]);
 
         // Size filter: MinBytes(100MB)
@@ -1182,7 +1210,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::Exact);
-        let res_size = evaluate_cache_purge(&entries, &HashMap::new(), &selector_size);
+        let res_size = evaluate_cache_purge(&entries, &HashMap::new(), &selector_size).unwrap();
         assert_eq!(res_size.purged_hashes, vec![hash_chromium.clone()]);
 
         // Time filter: Before 2026-08-01
@@ -1195,7 +1223,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::Exact);
-        let res_time = evaluate_cache_purge(&entries, &HashMap::new(), &selector_time);
+        let res_time = evaluate_cache_purge(&entries, &HashMap::new(), &selector_time).unwrap();
         assert_eq!(res_time.purged_hashes, vec![hash_old.clone()]);
 
         // System filter
@@ -1207,15 +1235,15 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
             ..Default::default()
         })
         .with_cascade(CascadeMode::Exact);
-        let res_sys = evaluate_cache_purge(&entries, &HashMap::new(), &selector_sys);
+        let res_sys = evaluate_cache_purge(&entries, &HashMap::new(), &selector_sys).unwrap();
         assert_eq!(res_sys.purged_hashes, vec![hash_old.clone()]);
     }
 
     #[test]
     fn test_purge_gc_roots_resynchronization() {
-        let root_x86 = StoreHash::new_unchecked("000000000000000000000000000root1");
-        let root_arm = StoreHash::new_unchecked("000000000000000000000000000root2");
-        let dep_x86 = StoreHash::new_unchecked("0000000000000000000000000000dep1");
+        let root_x86 = StoreHash::parse("2zb2sbvnjpbsakby2gbjsvv6j7baa3bf").unwrap();
+        let root_arm = StoreHash::parse("inh3dflbrnq3mywv1n03xf4b9n835ycv").unwrap();
+        let dep_x86 = StoreHash::parse("3c2d7cfdk42mp4f53w2x7wfxkl25plfm").unwrap();
 
         let mut entries = HashMap::new();
         let mut gc_roots = HashMap::new();
@@ -1233,7 +1261,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-dep-x86", dep_x86)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-root-x86"),
+                nar_digest: test_digest("blob-root-x86"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1251,7 +1279,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-dep-x86"),
+                nar_digest: test_digest("blob-dep-x86"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1269,7 +1297,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:blob-root-arm"),
+                nar_digest: test_digest("blob-root-arm"),
                 nar_size: 100,
                 added: "2026-08-29T10:00:00Z".to_string(),
                 origin_job: None,
@@ -1285,7 +1313,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         })
         .with_cascade(CascadeMode::Exact);
 
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         // root_x86 should be pruned because its dependency dep_x86 was purged!
         // root_arm should remain untouched!
         assert_eq!(
@@ -1297,9 +1325,9 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
 
     #[test]
     fn test_purge_with_protect_gc_roots() {
-        let root_app = StoreHash::new_unchecked("hash0000000000000000000000000app");
-        let shared_dep = StoreHash::new_unchecked("hash0000000000000000000000000dep");
-        let orphan_old = StoreHash::new_unchecked("hash0000000000000000000000000old");
+        let root_app = StoreHash::parse("sp3sj3kyaz322v3ns73ajkkfag3j2b36").unwrap();
+        let shared_dep = StoreHash::parse("cmx4c1d0l5m4li5hc5xlcidhlmmll150").unwrap();
+        let orphan_old = StoreHash::parse("0rihhxi48r908drl09i0hdil899h8xr4").unwrap();
 
         let mut entries = HashMap::new();
         let mut gc_roots = HashMap::new();
@@ -1318,7 +1346,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![format!("{}-shared-dep", shared_dep)],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:root-blob"),
+                nar_digest: test_digest("root-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
                 origin_job: None,
@@ -1336,7 +1364,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:dep-blob"),
+                nar_digest: test_digest("dep-blob"),
                 nar_size: 100,
                 added: sixty_days_ago.clone(),
                 origin_job: None,
@@ -1354,7 +1382,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                     references: vec![],
                     ..Default::default()
                 },
-                nar_digest: NarDigest::new_unchecked("sha256:old-blob"),
+                nar_digest: test_digest("old-blob"),
                 nar_size: 100,
                 added: sixty_days_ago,
                 origin_job: None,
@@ -1370,7 +1398,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         .with_protect_gc_roots(true)
         .with_cascade(CascadeMode::Exact);
 
-        let result = evaluate_cache_purge(&entries, &gc_roots, &selector);
+        let result = evaluate_cache_purge(&entries, &gc_roots, &selector).unwrap();
         assert_eq!(result.purged_hashes, vec![orphan_old]);
         assert_eq!(result.kept_entries.len(), 2);
         assert!(result.kept_entries.contains_key(&root_app));
@@ -1384,7 +1412,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
     #[test]
     fn test_selector_predicates_and_describe() {
         let mut hashes = HashSet::new();
-        let hash = StoreHash::new_unchecked("0000000000000000000000000000pkg1");
+        let hash = StoreHash::parse("w5dlwixh4m5l41m0wmd4w1x045544imh").unwrap();
         hashes.insert(hash);
 
         let mut systems = HashSet::new();

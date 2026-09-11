@@ -1,8 +1,12 @@
 use crate::{
     error::NarInfoParseError,
     lookup::extract_nar_basename,
-    types::{NarInfoMeta, StoreHash},
+    types::{
+        NarInfoMeta, StoreHash, normalize_store_reference, validate_nar_basename,
+        validate_nix_hash, validate_store_path,
+    },
 };
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 
 /// 强类型 NARInfo 描述结构体
@@ -45,6 +49,7 @@ impl NarInfo {
         let mut deriver = None;
         let mut signatures = Vec::new();
         let mut ca = None;
+        let mut seen_fields = HashSet::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -52,68 +57,136 @@ impl NarInfo {
                 continue;
             }
 
-            if let Some((key, value)) = line.split_once(':') {
-                let key = key.trim();
-                let value = value.trim();
+            let Some((key, value)) = line.split_once(':') else {
+                return Err(NarInfoParseError::MalformedLine(line.to_string()));
+            };
+            let key = key.trim();
+            let value = value.trim();
 
-                match key {
-                    "StorePath" => store_path = Some(value.to_string()),
-                    "URL" => {
-                        let extracted = extract_nar_basename(value);
-                        if !extracted.is_empty() {
-                            nar_basename = Some(extracted.to_string());
-                        }
+            let single_field = match key {
+                "StorePath" => Some("StorePath"),
+                "URL" => Some("URL"),
+                "Compression" => Some("Compression"),
+                "FileHash" => Some("FileHash"),
+                "FileSize" => Some("FileSize"),
+                "NarHash" => Some("NarHash"),
+                "NarSize" => Some("NarSize"),
+                "References" => Some("References"),
+                "Deriver" => Some("Deriver"),
+                "CA" => Some("CA"),
+                _ => None,
+            };
+            if let Some(field) = single_field
+                && !seen_fields.insert(field)
+            {
+                return Err(NarInfoParseError::DuplicateField(field));
+            }
+
+            match key {
+                "StorePath" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("StorePath"));
                     }
-                    "Compression" => {
-                        if !value.is_empty() && value != "none" {
-                            compression = Some(value.to_string());
-                        }
-                    }
-                    "FileHash" => file_hash = Some(value.to_string()),
-                    "FileSize" => {
-                        let parsed = value.parse::<u64>().map_err(|source| {
-                            NarInfoParseError::InvalidNumber {
-                                field: "FileSize",
-                                source,
-                            }
-                        })?;
-                        file_size = Some(parsed);
-                    }
-                    "NarHash" => nar_hash = Some(value.to_string()),
-                    "NarSize" => {
-                        let parsed = value.parse::<u64>().map_err(|source| {
-                            NarInfoParseError::InvalidNumber {
-                                field: "NarSize",
-                                source,
-                            }
-                        })?;
-                        nar_size = Some(parsed);
-                    }
-                    "References" => {
-                        for token in value.split_whitespace() {
-                            let item = token.trim();
-                            if item.is_empty() {
-                                continue;
-                            }
-                            let bname = if let Some(pos) = item.rfind('/') {
-                                &item[pos + 1..]
-                            } else {
-                                item
-                            };
-                            references.push(bname.to_string());
-                        }
-                    }
-                    "Deriver" if !value.is_empty() => {
-                        deriver = Some(value.to_string());
-                    }
-                    "Sig" if !value.is_empty() => {
-                        signatures.push(value.to_string());
-                    }
-                    "CA" if !value.is_empty() => {
-                        ca = Some(value.to_string());
-                    }
-                    _ => {}
+                    validate_store_path(value)
+                        .map_err(|_| NarInfoParseError::InvalidStorePath(value.to_string()))?;
+                    store_path = Some(value.to_string());
                 }
+                "URL" => {
+                    nar_basename = Some(parse_nar_url(value)?);
+                }
+                "Compression" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("Compression"));
+                    }
+                    if value != "none" {
+                        compression = Some(value.to_string());
+                    }
+                }
+                "FileHash" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("FileHash"));
+                    }
+                    validate_nix_hash(value).map_err(|source| NarInfoParseError::InvalidHash {
+                        field: "FileHash",
+                        source,
+                    })?;
+                    file_hash = Some(value.to_string());
+                }
+                "FileSize" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("FileSize"));
+                    }
+                    let parsed = value.parse::<u64>().map_err(|source| {
+                        NarInfoParseError::InvalidNumber {
+                            field: "FileSize",
+                            source,
+                        }
+                    })?;
+                    if parsed == 0 {
+                        return Err(NarInfoParseError::NonPositiveSize("FileSize"));
+                    }
+                    file_size = Some(parsed);
+                }
+                "NarHash" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("NarHash"));
+                    }
+                    validate_nix_hash(value).map_err(|source| NarInfoParseError::InvalidHash {
+                        field: "NarHash",
+                        source,
+                    })?;
+                    nar_hash = Some(value.to_string());
+                }
+                "NarSize" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("NarSize"));
+                    }
+                    let parsed = value.parse::<u64>().map_err(|source| {
+                        NarInfoParseError::InvalidNumber {
+                            field: "NarSize",
+                            source,
+                        }
+                    })?;
+                    if parsed == 0 {
+                        return Err(NarInfoParseError::NonPositiveSize("NarSize"));
+                    }
+                    nar_size = Some(parsed);
+                }
+                "References" => {
+                    for token in value.split_whitespace() {
+                        let normalized = normalize_store_reference(token)
+                            .map_err(|_| NarInfoParseError::InvalidReference(token.to_string()))?;
+                        references.push(normalized);
+                    }
+                }
+                "Deriver" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("Deriver"));
+                    }
+                    let normalized = normalize_store_reference(value).map_err(|_| {
+                        NarInfoParseError::InvalidField {
+                            field: "Deriver",
+                            details: "must be a valid StorePath basename or full path".to_string(),
+                        }
+                    })?;
+                    if !normalized.ends_with(".drv") {
+                        return Err(NarInfoParseError::InvalidField {
+                            field: "Deriver",
+                            details: "must end with .drv".to_string(),
+                        });
+                    }
+                    deriver = Some(normalized);
+                }
+                "Sig" if !value.is_empty() => {
+                    signatures.push(value.to_string());
+                }
+                "CA" => {
+                    if value.is_empty() {
+                        return Err(NarInfoParseError::EmptyField("CA"));
+                    }
+                    ca = Some(value.to_string());
+                }
+                _ => {}
             }
         }
 
@@ -134,6 +207,12 @@ impl NarInfo {
             signatures,
             ca,
         };
+
+        meta.validate_structure()
+            .map_err(|error| NarInfoParseError::InvalidField {
+                field: "NarInfo",
+                details: error.to_string(),
+            })?;
 
         Ok(Self { meta, nar_size })
     }
@@ -162,4 +241,27 @@ impl NarInfo {
     pub fn into_meta(self) -> (NarInfoMeta, u64) {
         (self.meta, self.nar_size)
     }
+}
+
+fn parse_nar_url(value: &str) -> Result<String, NarInfoParseError> {
+    if value.is_empty() {
+        return Err(NarInfoParseError::EmptyField("URL"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+        || value.contains('\\')
+    {
+        return Err(NarInfoParseError::InvalidUrl(value.to_string()));
+    }
+    if value
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(NarInfoParseError::InvalidUrl(value.to_string()));
+    }
+    let basename = extract_nar_basename(value);
+    validate_nar_basename(basename)
+        .map_err(|_| NarInfoParseError::InvalidUrl(value.to_string()))?;
+    Ok(basename.to_string())
 }

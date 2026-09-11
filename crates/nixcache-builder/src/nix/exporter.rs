@@ -281,6 +281,10 @@ impl ParallelExporter {
             .into());
         }
         let hash = &file_name[..32];
+        let store_hash = StoreHash::parse(hash)?;
+        if !file_name[32..].starts_with('-') {
+            return Err(NarInfoParseError::InvalidStorePath(store_path.clone()).into());
+        }
 
         let mut dump_proc = Command::new("nix-store")
             .args(["--dump", store_path])
@@ -335,20 +339,26 @@ impl ParallelExporter {
             .into());
         }
 
+        let nar_digest_obj = NarDigest::parse(&nar_digest)?;
+        let deriver_bname = item
+            .deriver
+            .as_deref()
+            .map(|deriver| {
+                Path::new(deriver)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| NarInfoParseError::InvalidStorePath(deriver.to_string()))
+            })
+            .transpose()?;
+
         // 构造 NarInfo 与 IndexEntry
-        let raw_hash = nar_digest.strip_prefix("sha256:").unwrap_or(&nar_digest);
-        let deriver_bname = item.deriver.as_deref().and_then(|d| {
-            Path::new(d)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-        });
 
         let narinfo_meta = NarInfoMeta {
             store_path: store_path.to_string(),
             nar_basename: format!("{}.nar.zst", hash),
             compression: Some("zstd".to_string()),
-            file_hash: Some(format!("sha256:{}", raw_hash)),
+            file_hash: Some(nar_digest_obj.to_string()),
             file_size: Some(nar_size),
             nar_hash: item.nar_hash.clone(),
             references: item.normalized_references(),
@@ -357,16 +367,12 @@ impl ParallelExporter {
             ca: item.ca.clone(),
         };
 
-        let store_hash = StoreHash::parse(hash).unwrap_or_else(|_| StoreHash::new_unchecked(hash));
-        let nar_digest_obj =
-            NarDigest::parse(&nar_digest).unwrap_or_else(|_| NarDigest::new_unchecked(&nar_digest));
-
         let name = Path::new(store_path)
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|s| s.split_once('-'))
             .map(|x| x.1.to_string())
-            .unwrap_or_else(|| hash.to_string());
+            .ok_or_else(|| NarInfoParseError::InvalidStorePath(store_path.clone()))?;
 
         let index_entry = IndexEntry {
             name,
@@ -377,6 +383,7 @@ impl ParallelExporter {
             added: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             origin_job: origin_job.map(|s| s.to_string()),
         };
+        index_entry.validate_structure()?;
 
         Ok(ExportedStorePath {
             store_hash,
@@ -506,10 +513,11 @@ mod tests {
 
     #[test]
     fn test_exported_store_path_structure() {
-        let store_hash = StoreHash::new_unchecked("s66mzxpvicwk07gjbjfw9izjfa797vsw");
-        let nar_digest = NarDigest::new_unchecked(
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        );
+        let store_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+        let nar_digest = NarDigest::new_sha256(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
         let meta = nixcache_core::NarInfoMeta {
             store_path: "/nix/store/s66mzxpvicwk07gjbjfw9izjfa797vsw-test".to_string(),
             nar_basename: "s66mzxpvicwk07gjbjfw9izjfa797vsw.nar.zst".to_string(),

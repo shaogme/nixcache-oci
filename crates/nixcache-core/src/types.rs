@@ -7,8 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    borrow::Borrow, collections::HashMap, convert::Infallible, env, fmt, ops::Deref, path::Path,
-    str::FromStr,
+    borrow::Borrow, collections::HashMap, convert::Infallible, env, fmt, ops::Deref, str::FromStr,
 };
 use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
@@ -192,6 +191,11 @@ impl NarDigest {
         let Some((algo, hex)) = trimmed.split_once(':') else {
             return Err(TypeError::NarDigestMissingPrefix { raw: s.to_string() });
         };
+        if algo != "sha256" {
+            return Err(TypeError::NarDigestInvalidAlgorithm {
+                algorithm: algo.to_string(),
+            });
+        }
         if hex.len() != 64 {
             return Err(TypeError::NarDigestInvalidHexLength { actual: hex.len() });
         }
@@ -200,28 +204,11 @@ impl NarDigest {
                 return Err(TypeError::NarDigestInvalidHexChar { char: c, index });
             }
         }
-        let _ = algo;
-        Ok(Self(trimmed.to_string()))
+        Ok(Self(format!("sha256:{}", hex.to_ascii_lowercase())))
     }
 
     pub fn new_sha256(hex: &str) -> Result<Self, TypeError> {
-        let trimmed = hex.trim();
-        if trimmed.len() != 64 {
-            return Err(TypeError::NarDigestInvalidHexLength {
-                actual: trimmed.len(),
-            });
-        }
-        for (index, c) in trimmed.chars().enumerate() {
-            if !c.is_ascii_hexdigit() {
-                return Err(TypeError::NarDigestInvalidHexChar { char: c, index });
-            }
-        }
-        Ok(Self(format!("sha256:{}", trimmed)))
-    }
-
-    /// 不做合法性校验直接构造 NarDigest (仅限受信任的内部或测试场景)
-    pub fn new_unchecked(s: impl Into<String>) -> Self {
-        Self(s.into())
+        Self::parse(&format!("sha256:{}", hex.trim()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -507,8 +494,133 @@ impl<'de> Deserialize<'de> for SystemArch {
     }
 }
 
+pub(crate) fn validate_store_path(value: &str) -> Result<StoreHash, TypeError> {
+    let Some(basename) = value.strip_prefix("/nix/store/") else {
+        return Err(TypeError::InvalidStorePathFormat {
+            raw: value.to_string(),
+        });
+    };
+    if basename.is_empty() || basename.contains('/') || basename.contains('\\') {
+        return Err(TypeError::InvalidStorePathFormat {
+            raw: value.to_string(),
+        });
+    }
+    validate_store_path_basename(basename)
+}
+
+pub(crate) fn validate_store_path_basename(value: &str) -> Result<StoreHash, TypeError> {
+    let Some((hash, name)) = value.split_once('-') else {
+        return Err(TypeError::InvalidStorePathFormat {
+            raw: value.to_string(),
+        });
+    };
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(TypeError::InvalidStorePathFormat {
+            raw: value.to_string(),
+        });
+    }
+    StoreHash::parse(hash)
+}
+
+pub(crate) fn normalize_store_reference(value: &str) -> Result<String, TypeError> {
+    let basename = if value.starts_with("/nix/store/") {
+        validate_store_path(value)?;
+        value
+            .strip_prefix("/nix/store/")
+            .expect("validated StorePath prefix")
+    } else {
+        if value.contains('/') || value.contains('\\') {
+            return Err(TypeError::InvalidStorePathFormat {
+                raw: value.to_string(),
+            });
+        }
+        validate_store_path_basename(value)?;
+        value
+    };
+    Ok(basename.to_string())
+}
+
+pub(crate) fn validate_nar_basename(value: &str) -> Result<(), TypeError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(TypeError::InvalidNarBasename {
+            raw: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_nix_hash(value: &str) -> Result<(), TypeError> {
+    let Some((algorithm, separator, encoded)) = value
+        .split_once(':')
+        .map(|(algorithm, encoded)| (algorithm, ':', encoded))
+        .or_else(|| {
+            value
+                .split_once('-')
+                .map(|(algorithm, encoded)| (algorithm, '-', encoded))
+        })
+    else {
+        return Err(TypeError::NixHashInvalidAlgorithm {
+            algorithm: String::new(),
+        });
+    };
+    if algorithm != "sha256" {
+        return Err(TypeError::NixHashInvalidAlgorithm {
+            algorithm: algorithm.to_string(),
+        });
+    }
+    if separator == '-'
+        && encoded.len() == 44
+        && encoded.as_bytes()[43] == b'='
+        && encoded[..43]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    {
+        return Ok(());
+    }
+    if encoded.len() == 52 {
+        for (index, byte) in encoded.bytes().enumerate() {
+            if !matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'd'
+                    | b'f'..=b'n'
+                    | b'p'..=b's'
+                    | b'v'..=b'z'
+            ) {
+                return Err(TypeError::NixHashInvalidChar {
+                    char: byte as char,
+                    index,
+                });
+            }
+        }
+        return Ok(());
+    }
+    if encoded.len() == 64
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(TypeError::NixHashInvalidLength {
+        expected: "52 Nix base32, 64 lowercase hexadecimal, or 44 base64 characters",
+        actual: encoded.len(),
+    })
+}
+
 /// 强类型结构化 NarInfo 元数据 (去除冗余文本与重复解析)
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct NarInfoMeta {
     pub store_path: String,
     pub nar_basename: String,
@@ -523,35 +635,83 @@ pub struct NarInfoMeta {
 }
 
 impl NarInfoMeta {
-    /// 从 store_path 中提取 32 字符 Nix 散列值
-    pub fn store_hash(&self) -> Option<StoreHash> {
-        let name = Path::new(&self.store_path)
-            .file_name()
-            .and_then(|n| n.to_str())?;
-        if name.len() >= 32 {
-            StoreHash::parse(&name[..32]).ok()
-        } else {
-            None
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        validate_store_path(&self.store_path).map_err(|error| CoreError::InvalidEntry {
+            details: format!("StorePath: {error}"),
+        })?;
+        validate_nar_basename(&self.nar_basename).map_err(|error| CoreError::InvalidEntry {
+            details: format!("NAR basename: {error}"),
+        })?;
+        if let Some(file_hash) = &self.file_hash {
+            if file_hash.is_empty() {
+                return Err(CoreError::InvalidEntry {
+                    details: "FileHash must not be empty".to_string(),
+                });
+            }
+            validate_nix_hash(file_hash).map_err(|error| CoreError::InvalidEntry {
+                details: format!("FileHash: {error}"),
+            })?;
         }
+        if self.compression.as_deref().is_some_and(str::is_empty) {
+            return Err(CoreError::InvalidEntry {
+                details: "Compression must not be empty".to_string(),
+            });
+        }
+        if self.ca.as_deref().is_some_and(str::is_empty) {
+            return Err(CoreError::InvalidEntry {
+                details: "CA must not be empty".to_string(),
+            });
+        }
+        if self.file_size == Some(0) {
+            return Err(CoreError::InvalidEntry {
+                details: "FileSize must be greater than zero".to_string(),
+            });
+        }
+        validate_nix_hash(&self.nar_hash).map_err(|error| CoreError::InvalidEntry {
+            details: format!("NarHash: {error}"),
+        })?;
+        for reference in &self.references {
+            normalize_store_reference(reference).map_err(|error| CoreError::InvalidEntry {
+                details: format!("reference '{reference}': {error}"),
+            })?;
+        }
+        if let Some(deriver) = &self.deriver {
+            let normalized =
+                normalize_store_reference(deriver).map_err(|error| CoreError::InvalidEntry {
+                    details: format!("Deriver '{deriver}': {error}"),
+                })?;
+            if !normalized.ends_with(".drv") {
+                return Err(CoreError::InvalidEntry {
+                    details: format!("Deriver '{deriver}' must end with .drv"),
+                });
+            }
+        }
+        Ok(())
     }
 
-    /// 提取引用中的有效 StoreHash 迭代器
-    pub fn reference_hashes(&self) -> impl Iterator<Item = StoreHash> + '_ {
-        self.references.iter().filter_map(|r| {
-            let candidate = if let Some(pos) = r.rfind('/') {
-                &r[pos + 1..]
-            } else {
-                r.as_str()
-            };
-            if candidate.len() >= 32 {
-                Some(
-                    StoreHash::parse(&candidate[..32])
-                        .unwrap_or_else(|_| StoreHash::new_unchecked(&candidate[..32])),
-                )
-            } else {
-                None
-            }
-        })
+    /// 从 store_path 中提取 32 字符 Nix 散列值
+    pub fn store_hash(&self) -> Option<StoreHash> {
+        validate_store_path(&self.store_path).ok()
+    }
+
+    /// 提取引用中的有效 StoreHash；任何损坏引用都会传播为错误。
+    pub fn reference_hashes(&self) -> Result<Vec<StoreHash>, TypeError> {
+        self.references
+            .iter()
+            .map(|reference| {
+                let normalized = normalize_store_reference(reference)?;
+                let (hash, _) = normalized.split_once('-').ok_or_else(|| {
+                    TypeError::InvalidStorePathFormat {
+                        raw: reference.clone(),
+                    }
+                })?;
+                StoreHash::parse(hash)
+            })
+            .collect()
+    }
+
+    pub fn try_reference_hashes(&self) -> Result<Vec<StoreHash>, TypeError> {
+        self.reference_hashes()
     }
 
     /// 渲染为标准 Nix .narinfo 文本
@@ -590,8 +750,47 @@ impl NarInfoMeta {
     }
 }
 
+#[derive(Deserialize)]
+struct NarInfoMetaWire {
+    store_path: String,
+    nar_basename: String,
+    compression: Option<String>,
+    file_hash: Option<String>,
+    file_size: Option<u64>,
+    nar_hash: String,
+    references: Vec<String>,
+    deriver: Option<String>,
+    signatures: Vec<String>,
+    ca: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for NarInfoMeta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = NarInfoMetaWire::deserialize(deserializer)?;
+        let value = Self {
+            store_path: wire.store_path,
+            nar_basename: wire.nar_basename,
+            compression: wire.compression,
+            file_hash: wire.file_hash,
+            file_size: wire.file_size,
+            nar_hash: wire.nar_hash,
+            references: wire.references,
+            deriver: wire.deriver,
+            signatures: wire.signatures,
+            ca: wire.ca,
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// 强类型 IndexEntry，定义单个 Nix Store 产物及其 NAR 存储元数据
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexEntry {
     pub name: String,
     pub system: Option<SystemArch>,
@@ -604,6 +803,38 @@ pub struct IndexEntry {
 }
 
 impl IndexEntry {
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.name.is_empty() {
+            return Err(CoreError::InvalidEntry {
+                details: "entry name must not be empty".to_string(),
+            });
+        }
+        if let Some(system) = self.system
+            && !system.is_known()
+        {
+            return Err(CoreError::InvalidEntry {
+                details: "entry system must be known".to_string(),
+            });
+        }
+        self.narinfo_meta.validate_structure()?;
+        NarDigest::parse(self.nar_digest.as_str()).map_err(|error| CoreError::InvalidEntry {
+            details: format!("NAR digest: {error}"),
+        })?;
+        if self.nar_size == 0 {
+            return Err(CoreError::InvalidEntry {
+                details: "NAR size must be greater than zero".to_string(),
+            });
+        }
+        if self.added.trim().is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&self.added).is_err()
+        {
+            return Err(CoreError::InvalidEntry {
+                details: "added must be a valid RFC3339 timestamp".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// 零开销获取 NAR 基础文件名
     pub fn nar_basename(&self) -> &str {
         &self.narinfo_meta.nar_basename
@@ -620,6 +851,39 @@ impl IndexEntry {
     }
 }
 
+#[derive(Deserialize)]
+struct IndexEntryWire {
+    name: String,
+    system: Option<SystemArch>,
+    narinfo_meta: NarInfoMeta,
+    nar_digest: NarDigest,
+    nar_size: u64,
+    added: String,
+    origin_job: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for IndexEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = IndexEntryWire::deserialize(deserializer)?;
+        let value = Self {
+            name: wire.name,
+            system: wire.system,
+            narinfo_meta: wire.narinfo_meta,
+            nar_digest: wire.nar_digest,
+            nar_size: wire.nar_size,
+            added: wire.added,
+            origin_job: wire.origin_job,
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// 构建任务执行摘要元数据
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct JobSummaryMetadata {
@@ -631,7 +895,7 @@ pub struct JobSummaryMetadata {
 }
 
 /// 单个分片描述符 (Merkle Tree 叶子节点)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// 分片前缀编号 (0..1023)
     pub shard_id: u16,
@@ -650,6 +914,49 @@ pub struct ShardDescriptor {
 }
 
 impl ShardDescriptor {
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.shard_id >= NUM_SHARDS as u16 {
+            return Err(CoreError::InvalidIndex {
+                details: format!("shard id {} is out of range", self.shard_id),
+            });
+        }
+        let expected_prefix = shard_id_to_prefix(self.shard_id);
+        if self.prefix != expected_prefix {
+            return Err(CoreError::InvalidIndex {
+                details: format!("shard {} has an invalid prefix", self.shard_id),
+            });
+        }
+        if self.is_empty() {
+            if !self.blob_digest.is_empty()
+                || self.compressed_size != 0
+                || self.uncompressed_size != 0
+                || self.merkle_hash != EMPTY_SHARD_MERKLE_HASH
+            {
+                return Err(CoreError::InvalidIndex {
+                    details: format!("empty shard {} has non-empty metadata", self.shard_id),
+                });
+            }
+        } else {
+            validate_sha256(&self.blob_digest).map_err(|details| CoreError::InvalidIndex {
+                details: format!("shard {} digest: {details}", self.shard_id),
+            })?;
+            if self.compressed_size == 0 || self.uncompressed_size == 0 {
+                return Err(CoreError::InvalidIndex {
+                    details: format!("non-empty shard {} has zero size", self.shard_id),
+                });
+            }
+            if self.entry_count == 0 {
+                return Err(CoreError::InvalidIndex {
+                    details: format!("non-empty shard {} has zero entries", self.shard_id),
+                });
+            }
+            validate_sha256(&self.merkle_hash).map_err(|details| CoreError::InvalidIndex {
+                details: format!("shard {} Merkle hash: {details}", self.shard_id),
+            })?;
+        }
+        Ok(())
+    }
+
     /// 创建一个空的初始分片描述符
     pub fn empty(shard_id: u16) -> Self {
         Self {
@@ -687,8 +994,41 @@ impl ShardDescriptor {
     }
 }
 
+#[derive(Deserialize)]
+struct ShardDescriptorWire {
+    shard_id: u16,
+    prefix: String,
+    blob_digest: String,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    entry_count: usize,
+    merkle_hash: String,
+}
+
+impl<'de> Deserialize<'de> for ShardDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ShardDescriptorWire::deserialize(deserializer)?;
+        let value = Self {
+            shard_id: wire.shard_id,
+            prefix: wire.prefix,
+            blob_digest: wire.blob_digest,
+            compressed_size: wire.compressed_size,
+            uncompressed_size: wire.uncompressed_size,
+            entry_count: wire.entry_count,
+            merkle_hash: wire.merkle_hash,
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// 单架构全局分片索引根目录 (Schema v6 Root)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardedArchCacheIndexData {
     pub version: u32,
     pub system: SystemArch,
@@ -768,26 +1108,27 @@ impl ShardedArchCacheIndexData {
         }
     }
 
-    pub fn validate_for<L: IndexValidationLimits>(
-        &self,
-        system: &SystemArch,
-        repo: &str,
-        registry: &str,
-        limits: &L,
-    ) -> Result<(), CoreError> {
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
         if self.version != SCHEMA_VERSION_V6 {
             return Err(CoreError::InvalidIndex {
                 details: format!("version must be {SCHEMA_VERSION_V6}"),
             });
         }
-        if !self.system.is_known() || self.system != *system {
+        if !self.system.is_known() {
             return Err(CoreError::InvalidIndex {
-                details: "root system does not match the requested system".to_string(),
+                details: "root system must be known".to_string(),
             });
         }
-        if self.repo != repo || self.registry != registry {
+        if self.repo.trim().is_empty() || self.registry.trim().is_empty() {
             return Err(CoreError::InvalidIndex {
-                details: "root repository or registry does not match the client target".to_string(),
+                details: "root repository and registry must not be empty".to_string(),
+            });
+        }
+        if self.generated.trim().is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&self.generated).is_err()
+        {
+            return Err(CoreError::InvalidIndex {
+                details: "root generated must be a valid RFC3339 timestamp".to_string(),
             });
         }
         if self.shards.len() != NUM_SHARDS {
@@ -802,30 +1143,39 @@ impl ShardedArchCacheIndexData {
                     details: format!("shard descriptor at index {index} has wrong id"),
                 });
             }
-            if shard.prefix != shard_id_to_prefix(expected_id) {
-                return Err(CoreError::InvalidIndex {
-                    details: format!("shard {expected_id} has an invalid prefix"),
-                });
-            }
-            if shard.is_empty() {
-                if !shard.blob_digest.is_empty()
-                    || shard.compressed_size != 0
-                    || shard.uncompressed_size != 0
-                    || shard.merkle_hash != EMPTY_SHARD_MERKLE_HASH
-                {
-                    return Err(CoreError::InvalidIndex {
-                        details: format!("empty shard {expected_id} has non-empty metadata"),
-                    });
-                }
-            } else {
-                validate_sha256(&shard.blob_digest).map_err(|details| CoreError::InvalidIndex {
-                    details: format!("shard {expected_id} digest: {details}"),
-                })?;
-                if shard.compressed_size == 0 || shard.uncompressed_size == 0 {
-                    return Err(CoreError::InvalidIndex {
-                        details: format!("non-empty shard {expected_id} has zero size"),
-                    });
-                }
+            shard.validate_structure()?;
+        }
+        validate_sha256(&self.merkle_root).map_err(|details| CoreError::InvalidIndex {
+            details: format!("root Merkle hash: {details}"),
+        })?;
+        if compute_merkle_root(&self.shards) != self.merkle_root {
+            return Err(CoreError::InvalidIndex {
+                details: "root Merkle hash does not match shard descriptors".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_for<L: IndexValidationLimits>(
+        &self,
+        system: &SystemArch,
+        repo: &str,
+        registry: &str,
+        limits: &L,
+    ) -> Result<(), CoreError> {
+        self.validate_structure()?;
+        if self.system != *system {
+            return Err(CoreError::InvalidIndex {
+                details: "root system does not match the requested system".to_string(),
+            });
+        }
+        if self.repo != repo || self.registry != registry {
+            return Err(CoreError::InvalidIndex {
+                details: "root repository or registry does not match the client target".to_string(),
+            });
+        }
+        for shard in &self.shards {
+            if !shard.is_empty() {
                 if shard.uncompressed_size > limits.max_uncompressed_bytes() {
                     return Err(CoreError::LimitExceeded {
                         target: "shard uncompressed bytes",
@@ -840,18 +1190,7 @@ impl ShardedArchCacheIndexData {
                         actual: shard.entry_count as u64,
                     });
                 }
-                validate_sha256(&shard.merkle_hash).map_err(|details| CoreError::InvalidIndex {
-                    details: format!("shard {expected_id} Merkle hash: {details}"),
-                })?;
             }
-        }
-        validate_sha256(&self.merkle_root).map_err(|details| CoreError::InvalidIndex {
-            details: format!("root Merkle hash: {details}"),
-        })?;
-        if compute_merkle_root(&self.shards) != self.merkle_root {
-            return Err(CoreError::InvalidIndex {
-                details: "root Merkle hash does not match shard descriptors".to_string(),
-            });
         }
         if self.gc_roots.len() as u64 > limits.max_gc_roots() {
             return Err(CoreError::LimitExceeded {
@@ -864,8 +1203,47 @@ impl ShardedArchCacheIndexData {
     }
 }
 
+#[derive(Deserialize)]
+struct ShardedArchCacheIndexDataWire {
+    version: u32,
+    system: SystemArch,
+    repo: String,
+    registry: String,
+    generated: String,
+    public_key: String,
+    shards: Vec<ShardDescriptor>,
+    merkle_root: String,
+    gc_roots: Vec<StoreHash>,
+    last_promoted_run: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ShardedArchCacheIndexData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ShardedArchCacheIndexDataWire::deserialize(deserializer)?;
+        let value = Self {
+            version: wire.version,
+            system: wire.system,
+            repo: wire.repo,
+            registry: wire.registry,
+            generated: wire.generated,
+            public_key: wire.public_key,
+            shards: wire.shards,
+            merkle_root: wire.merkle_root,
+            gc_roots: wire.gc_roots,
+            last_promoted_run: wire.last_promoted_run,
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// 单个分片内部的实际数据 Payload (独立 Zstd 压缩存储)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardDataPayload {
     pub version: u32,
     pub shard_id: u16,
@@ -904,17 +1282,54 @@ impl ShardDataPayload {
         self.entries.len()
     }
 
+    pub fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.version != SCHEMA_VERSION_V6 {
+            return Err(CoreError::InvalidShard {
+                details: format!("version must be {SCHEMA_VERSION_V6}"),
+            });
+        }
+        if self.shard_id >= NUM_SHARDS as u16 {
+            return Err(CoreError::InvalidShard {
+                details: format!("shard id {} is out of range", self.shard_id),
+            });
+        }
+        if self.prefix != shard_id_to_prefix(self.shard_id) {
+            return Err(CoreError::InvalidShard {
+                details: "payload prefix does not match shard id".to_string(),
+            });
+        }
+        for (hash, entry) in &self.entries {
+            entry
+                .validate_structure()
+                .map_err(|error| CoreError::InvalidShard {
+                    details: format!("entry {hash}: {error}"),
+                })?;
+            if hash.shard_id() != self.shard_id {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} belongs to another shard"),
+                });
+            }
+            if entry.system.is_none_or(|system| !system.is_known()) {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} has an unknown or missing system"),
+                });
+            }
+            if entry.store_hash().as_ref() != Some(hash) {
+                return Err(CoreError::InvalidShard {
+                    details: format!("entry {hash} StorePath does not match map key"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_for<L: IndexValidationLimits>(
         &self,
         shard_id: u16,
         system: &SystemArch,
         limits: &L,
     ) -> Result<(), CoreError> {
-        if self.version != SCHEMA_VERSION_V6 {
-            return Err(CoreError::InvalidShard {
-                details: format!("version must be {SCHEMA_VERSION_V6}"),
-            });
-        }
+        self.validate_structure()?;
         if shard_id >= NUM_SHARDS as u16 || self.shard_id != shard_id {
             return Err(CoreError::InvalidShard {
                 details: "payload shard id is invalid or does not match the descriptor".to_string(),
@@ -933,19 +1348,9 @@ impl ShardDataPayload {
             });
         }
         for (hash, entry) in &self.entries {
-            if hash.shard_id() != shard_id {
-                return Err(CoreError::InvalidShard {
-                    details: format!("entry {hash} belongs to another shard"),
-                });
-            }
             if entry.system != Some(*system) {
                 return Err(CoreError::InvalidShard {
                     details: format!("entry {hash} has a mismatched or missing system"),
-                });
-            }
-            if !is_sha256(entry.nar_digest.as_str()) {
-                return Err(CoreError::InvalidShard {
-                    details: format!("entry {hash} has an invalid NAR digest"),
                 });
             }
             if entry.nar_size > limits.max_nar_size() {
@@ -966,6 +1371,33 @@ impl ShardDataPayload {
             });
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct ShardDataPayloadWire {
+    version: u32,
+    shard_id: u16,
+    prefix: String,
+    entries: HashMap<StoreHash, IndexEntry>,
+}
+
+impl<'de> Deserialize<'de> for ShardDataPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ShardDataPayloadWire::deserialize(deserializer)?;
+        let value = Self {
+            version: wire.version,
+            shard_id: wire.shard_id,
+            prefix: wire.prefix,
+            entries: wire.entries,
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 

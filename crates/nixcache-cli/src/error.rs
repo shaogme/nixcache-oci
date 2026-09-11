@@ -1,3 +1,4 @@
+use nixcache_core::TypeError;
 use nixcache_oci::OciError;
 use std::{io, net::AddrParseError};
 use thiserror::Error;
@@ -12,4 +13,11 @@ pub enum CliError {
 
     #[error(transparent)]
     Oci(#[from] OciError),
+
+    #[error("Invalid StoreHash '{value}': {source}")]
+    InvalidStoreHash {
+        value: String,
+        #[source]
+        source: TypeError,
+    },
 }

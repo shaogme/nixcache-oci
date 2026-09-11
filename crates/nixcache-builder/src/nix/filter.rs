@@ -246,7 +246,7 @@ mod tests {
     /// 验证远端已存在的 StoreHash 被先验过滤
     #[test]
     fn test_filter_already_cached_store_hashes() {
-        let sh = StoreHash::new_unchecked("22222222222222222222222222222222");
+        let sh = StoreHash::parse("22222222222222222222222222222222").unwrap();
         let item = NixPathInfoItem {
             path: "/nix/store/22222222222222222222222222222222-my-app-1.0".to_string(),
             signatures: vec![],

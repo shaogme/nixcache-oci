@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use nixcache_core::{
-    IndexEntry, NarDigest, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
-    SystemArch,
+    IndexEntry, NarDigest, NarInfoMeta, ShardDataPayload, ShardDescriptor,
+    ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 use nixcache_oci::{
     CacheLayerMediaType, GenericOciDriver, IndexCodec, MockResponse, MockRouterTransport,
@@ -126,7 +126,7 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
     let transport = MockRouterTransport::default();
     transport.add_route(
         "DELETE",
-        "/blobs/sha256:b1",
+        "/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000001",
         MockResponse {
             status: StatusCode::ACCEPTED,
             headers: HeaderMap::new(),
@@ -135,7 +135,7 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
     );
     transport.add_route(
         "DELETE",
-        "/blobs/sha256:b2",
+        "/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000002",
         MockResponse {
             status: StatusCode::NOT_FOUND,
             headers: HeaderMap::new(),
@@ -144,7 +144,7 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
     );
     transport.add_route(
         "DELETE",
-        "/blobs/sha256:b3",
+        "/blobs/sha256:0000000000000000000000000000000000000000000000000000000000000003",
         MockResponse {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             headers: HeaderMap::new(),
@@ -164,9 +164,12 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
     .unwrap();
 
     let digests = vec![
-        NarDigest::new_unchecked("sha256:b1"),
-        NarDigest::new_unchecked("sha256:b2"),
-        NarDigest::new_unchecked("sha256:b3"),
+        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap(),
+        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000002")
+            .unwrap(),
+        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000003")
+            .unwrap(),
     ];
 
     // Non-strict mode accumulates failures without aborting
@@ -248,9 +251,18 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
     let store_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
     let shard_id = store_hash.shard_id();
     let entry = IndexEntry {
+        name: "pkg".to_string(),
         system: Some(SystemArch::X86_64Linux),
+        narinfo_meta: NarInfoMeta {
+            store_path: format!("/nix/store/{}-pkg", store_hash),
+            nar_basename: "pkg.nar.xz".to_string(),
+            nar_hash: "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                .to_string(),
+            ..Default::default()
+        },
         nar_digest: nar_digest.clone(),
         nar_size: 2048,
+        added: "2026-08-29T00:00:00Z".to_string(),
         ..Default::default()
     };
     let shard_payload =
@@ -310,5 +322,69 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
     assert_eq!(summary.blobs_discovered, 4);
     assert_eq!(summary.manifests_deleted, 1);
     assert_eq!(summary.blobs_deleted, 4);
+    assert_eq!(summary.already_absent, 0);
+}
+
+#[tokio::test]
+async fn test_generic_oci_deletes_direct_shard_with_manifest_system_context() {
+    let transport = MockRouterTransport::default();
+    let nar_digest =
+        NarDigest::new_sha256("1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0")
+            .unwrap();
+    let store_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
+    let shard_id = store_hash.shard_id();
+    let entry = IndexEntry {
+        name: "pkg".to_string(),
+        system: Some(SystemArch::X86_64Linux),
+        narinfo_meta: NarInfoMeta {
+            store_path: format!("/nix/store/{}-pkg", store_hash),
+            nar_basename: "pkg.nar.xz".to_string(),
+            nar_hash: "sha256:1d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                .to_string(),
+            ..Default::default()
+        },
+        nar_digest: nar_digest.clone(),
+        nar_size: 2048,
+        added: "2026-08-29T00:00:00Z".to_string(),
+        ..Default::default()
+    };
+    let shard_payload =
+        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)]));
+    let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
+    let shard_digest = digest_bytes(&shard_bytes);
+    let config_digest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    let manifest_body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":2}},"layers":[{{"mediaType":"{}","digest":"{}","size":{}}}],"annotations":{{"org.nixos.nixcache.system":"x86_64-linux"}}}}"#,
+        config_digest,
+        CacheLayerMediaType::SHARD_DATA_V6_ZSTD,
+        shard_digest,
+        shard_bytes.len()
+    );
+    store_manifest(&transport, "cache-index", &manifest_body);
+
+    for (digest, bytes) in [
+        (shard_digest, shard_bytes),
+        (nar_digest.to_string(), Bytes::from_static(b"nar")),
+        (config_digest.to_string(), Bytes::from_static(b"{}")),
+    ] {
+        let _ = transport.stored_blobs.upsert_sync(digest, bytes);
+    }
+
+    let client = OciClient::new(
+        "registry.local:5000",
+        "myorg/repo",
+        "",
+        true,
+        GenericOciDriver,
+        transport,
+        Default::default(),
+    )
+    .unwrap();
+    let summary = client.deletion().delete_entire_package().await.unwrap();
+    assert_eq!(summary.tags_discovered, 1);
+    assert_eq!(summary.manifests_discovered, 1);
+    assert_eq!(summary.blobs_discovered, 3);
+    assert_eq!(summary.manifests_deleted, 1);
+    assert_eq!(summary.blobs_deleted, 3);
     assert_eq!(summary.already_absent, 0);
 }

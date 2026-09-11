@@ -231,11 +231,11 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(
             roots[0],
-            StoreHash::new_unchecked("11111111111111111111111111111111")
+            StoreHash::parse("11111111111111111111111111111111").unwrap()
         );
         assert_eq!(
             roots[1],
-            StoreHash::new_unchecked("22222222222222222222222222222222")
+            StoreHash::parse("22222222222222222222222222222222").unwrap()
         );
     }
 

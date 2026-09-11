@@ -65,7 +65,10 @@ impl PurgeArgs {
     }
 
     /// 转换为 nixcache-core 的 CacheSelector 结构体 (Purge 默认采用 Dependents 级联及 RequireExplicit 策略)
-    pub fn to_purge_filter(&self, extra_hashes: &[StoreHash]) -> CacheSelector {
+    pub fn to_purge_filter(
+        &self,
+        extra_hashes: &[StoreHash],
+    ) -> Result<CacheSelector, crate::error::CliError> {
         self.selector.to_purge_selector(extra_hashes)
     }
 }
@@ -101,7 +104,7 @@ mod tests {
         };
 
         assert!(!args.selector.resolve_all());
-        assert_eq!(args.selector.resolve_hashes().len(), 2);
+        assert_eq!(args.selector.resolve_hashes().unwrap().len(), 2);
         assert_eq!(args.selector.resolve_patterns(), vec!["*chromium*"]);
         assert_eq!(
             args.selector.resolve_systems(),
@@ -120,7 +123,7 @@ mod tests {
         assert!(args.selector.resolve_protect_gc_roots());
         assert!(args.resolve_dry_run());
 
-        let selector = args.to_purge_filter(&[]);
+        let selector = args.to_purge_filter(&[]).unwrap();
         assert_eq!(selector.cascade_mode, CascadeMode::Transitive);
         assert!(selector.protect_gc_roots);
         if let SelectionScope::Filtered(predicates) = &selector.scope {

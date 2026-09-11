@@ -309,8 +309,8 @@ impl NixCli {
 
         let own_hashes_set: HashSet<StoreHash> = own_hashes
             .iter()
-            .map(|s| StoreHash::parse(s).unwrap_or_else(|_| StoreHash::new_unchecked(s)))
-            .collect();
+            .map(|s| StoreHash::parse(s))
+            .collect::<Result<_, _>>()?;
 
         let filter_ctx = NixArtifactFilterContext {
             own_public_key: None,

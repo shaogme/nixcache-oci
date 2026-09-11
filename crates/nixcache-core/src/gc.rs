@@ -1,4 +1,5 @@
 use crate::{
+    error::CoreError,
     filter::{CacheSelector, CascadeMode, FilterPredicates, TimeFilter},
     purge::evaluate_cache_purge,
     types::{IndexEntry, StoreHash, SystemArch},
@@ -20,7 +21,7 @@ pub fn evaluate_gc(
     entries: &HashMap<StoreHash, IndexEntry>,
     gc_roots: &[StoreHash],
     cutoff: &DateTime<Utc>,
-) -> GcEvaluationResult {
+) -> Result<GcEvaluationResult, CoreError> {
     let mut roots_map = HashMap::new();
     if !gc_roots.is_empty() {
         roots_map.insert(SystemArch::Unknown, gc_roots.to_vec());
@@ -33,7 +34,7 @@ pub fn evaluate_multi_arch_gc(
     entries: &HashMap<StoreHash, IndexEntry>,
     gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     cutoff: &DateTime<Utc>,
-) -> GcEvaluationResult {
+) -> Result<GcEvaluationResult, CoreError> {
     let selector = CacheSelector::filtered(FilterPredicates {
         time_filter: Some(TimeFilter::Before(*cutoff)),
         ..Default::default()
@@ -41,7 +42,7 @@ pub fn evaluate_multi_arch_gc(
     .with_protect_gc_roots(true)
     .with_cascade(CascadeMode::Exact);
 
-    let purge_res = evaluate_cache_purge(entries, gc_roots, &selector);
+    let purge_res = evaluate_cache_purge(entries, gc_roots, &selector)?;
 
     // 计算跨所有架构系统收集的顶层活跃根及传递可达集合
     let mut initial_roots = HashSet::new();
@@ -56,7 +57,7 @@ pub fn evaluate_multi_arch_gc(
         if reachable.insert(current_hash.clone())
             && let Some(entry) = entries.get(&current_hash)
         {
-            for dep_hash in entry.narinfo_meta.reference_hashes() {
+            for dep_hash in entry.narinfo_meta.reference_hashes()? {
                 if !reachable.contains(&dep_hash) {
                     queue.push_back(dep_hash);
                 }
@@ -64,10 +65,10 @@ pub fn evaluate_multi_arch_gc(
         }
     }
 
-    GcEvaluationResult {
+    Ok(GcEvaluationResult {
         kept_entries: purge_res.kept_entries,
         deleted_hashes: purge_res.purged_hashes,
         reachable_roots: reachable,
         cutoff_utc: cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    }
+    })
 }

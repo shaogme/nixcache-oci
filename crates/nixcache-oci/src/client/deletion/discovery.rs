@@ -6,11 +6,11 @@ use crate::{
     integrity::ContentDigest,
     manifest::{
         CacheLayerMediaType, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-        OciArtifactManifest,
+        OciArtifactManifest, OciDescriptor, OciImageManifest,
     },
     transport::OciTransport,
 };
-use nixcache_core::{ShardDataPayload, ShardedArchCacheIndexData};
+use nixcache_core::{ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -142,7 +142,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                         self.client.repo(),
                     )?;
 
-                    for layer in manifest.layers {
+                    for layer in &manifest.layers {
                         add_blob(
                             &mut plan,
                             &layer.digest,
@@ -154,14 +154,14 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                         let Some(layer_type) = CacheLayerMediaType::parse(&layer.media_type) else {
                             continue;
                         };
-                        let layer_bytes = self
-                            .client
-                            .blobs()
-                            .get_descriptor(&layer)
-                            .await
-                            .map_err(|error| {
-                                discovery_error("cache_layer_get", &layer.digest, error)
-                            })?;
+                        let layer_bytes =
+                            self.client
+                                .blobs()
+                                .get_descriptor(layer)
+                                .await
+                                .map_err(|error| {
+                                    discovery_error("cache_layer_get", &layer.digest, error)
+                                })?;
                         if layer_type.is_root_index() {
                             let root: ShardedArchCacheIndexData = IndexCodec::decode_zstd(
                                 &layer_bytes,
@@ -221,6 +221,12 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                             .map_err(|error| {
                                 discovery_error("shard_decode", &layer.digest, error)
                             })?;
+                            let system = resolve_shard_system(&manifest, layer, &layer.digest)?;
+                            shard
+                                .validate_for(shard.shard_id, &system, self.client.limits())
+                                .map_err(|error| {
+                                    discovery_error("shard_validate", &layer.digest, error)
+                                })?;
                             add_nar_blobs(&mut plan, &shard, &layer.digest, self.client.repo())?;
                         }
                     }
@@ -253,6 +259,65 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
         tags.dedup();
         Ok(tags)
     }
+}
+
+fn resolve_shard_system(
+    manifest: &OciImageManifest,
+    layer: &OciDescriptor,
+    target: &str,
+) -> Result<SystemArch, OciError> {
+    let mut candidates = Vec::new();
+    if let Some(platform) = &manifest.config.platform {
+        candidates.push(("manifest config platform", platform.to_system()));
+    }
+    if let Some(platform) = &layer.platform {
+        candidates.push(("shard layer platform", platform.to_system()));
+    }
+    if let Some(annotations) = &manifest.annotations
+        && let Some(system) = annotations.get("org.nixos.nixcache.system")
+    {
+        candidates.push((
+            "manifest system annotation",
+            SystemArch::from(system.as_str()),
+        ));
+    }
+    if let Some(annotations) = &layer.annotations
+        && let Some(system) = annotations.get("org.nixos.nixcache.system")
+    {
+        candidates.push((
+            "shard layer system annotation",
+            SystemArch::from(system.as_str()),
+        ));
+    }
+
+    let mut resolved = None;
+    for (source, system) in candidates {
+        if !system.is_known() {
+            return Err(discovery_error(
+                "shard_context",
+                target,
+                format!("{source} is unknown"),
+            ));
+        }
+        if let Some(previous) = resolved
+            && previous != system
+        {
+            return Err(discovery_error(
+                "shard_context",
+                target,
+                "manifest and shard layer systems do not match",
+            ));
+        }
+        resolved = Some(system);
+    }
+
+    resolved.ok_or_else(|| {
+        discovery_error(
+            "shard_context",
+            target,
+            "direct shard payload has no manifest or layer system",
+        )
+    })
 }
 
 fn valid_digest(digest: &str) -> bool {

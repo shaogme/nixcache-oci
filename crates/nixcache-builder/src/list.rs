@@ -321,8 +321,8 @@ pub async fn run_list(
         extra_hashes.extend(flake_hashes);
     }
 
-    let selector = args.selector.to_list_selector(&extra_hashes);
-    let query_res: CacheQueryResult = evaluate_cache_query(&all_entries, &all_gc_roots, &selector);
+    let selector = args.selector.to_list_selector(&extra_hashes)?;
+    let query_res: CacheQueryResult = evaluate_cache_query(&all_entries, &all_gc_roots, &selector)?;
 
     let total_entries = all_entries.len();
     let total_bytes: u64 = all_entries.values().map(|e| e.nar_size).sum();
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_table_formatting() {
-        let hash1 = StoreHash::new_unchecked("0000000000000000000000000000pkg1");
+        let hash1 = StoreHash::parse("00000000000000000000000000000001").unwrap();
         let mut arch_breakdown = HashMap::new();
         arch_breakdown.insert(
             "x86_64-linux".to_string(),

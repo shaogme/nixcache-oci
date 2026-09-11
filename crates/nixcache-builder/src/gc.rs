@@ -124,7 +124,7 @@ mod tests {
         entries.insert(hash_dead_recent.clone(), entry_dead_recent);
 
         let cutoff = now - chrono::Duration::days(30);
-        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff);
+        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff).unwrap();
 
         assert_eq!(result.deleted_hashes, vec![hash_dead_old]);
         assert_eq!(result.kept_entries.len(), 3);
@@ -204,7 +204,7 @@ mod tests {
         }
 
         let cutoff = now - chrono::Duration::days(30);
-        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff);
+        let result = evaluate_multi_arch_gc(&entries, &gc_roots, &cutoff).unwrap();
 
         assert_eq!(result.deleted_hashes, vec![hash_orphan_ancient]);
         assert_eq!(result.kept_entries.len(), 5);

@@ -1,4 +1,7 @@
-use crate::types::{IndexEntry, StoreHash, SystemArch};
+use crate::{
+    error::CoreError,
+    types::{IndexEntry, StoreHash, SystemArch},
+};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -416,7 +419,7 @@ pub fn evaluate_arch_cache_query(
     gc_roots: &[StoreHash],
     system: SystemArch,
     selector: &CacheSelector,
-) -> CacheQueryResult {
+) -> Result<CacheQueryResult, CoreError> {
     let mut roots_map = HashMap::new();
     if !gc_roots.is_empty() {
         roots_map.insert(system, gc_roots.to_vec());
@@ -429,13 +432,13 @@ pub fn evaluate_cache_query(
     entries: &HashMap<StoreHash, IndexEntry>,
     gc_roots: &HashMap<SystemArch, Vec<StoreHash>>,
     selector: &CacheSelector,
-) -> CacheQueryResult {
+) -> Result<CacheQueryResult, CoreError> {
     // 1. 构建正向依赖图 (A -> References) 与 反向依赖图 (B -> Dependents of B)
     let mut forward_graph: HashMap<StoreHash, Vec<StoreHash>> = HashMap::new();
     let mut reverse_graph: HashMap<StoreHash, Vec<StoreHash>> = HashMap::new();
 
     for (hash, entry) in entries {
-        let deps: Vec<StoreHash> = entry.narinfo_meta.reference_hashes().collect();
+        let deps = entry.narinfo_meta.reference_hashes()?;
         for dep in &deps {
             reverse_graph
                 .entry(dep.clone())
@@ -621,7 +624,7 @@ pub fn evaluate_cache_query(
 
     final_matched_hashes.sort();
 
-    CacheQueryResult {
+    Ok(CacheQueryResult {
         matched_entries,
         unmatched_entries,
         initial_matched_hashes,
@@ -630,5 +633,5 @@ pub fn evaluate_cache_query(
         matched_bytes,
         unmatched_bytes,
         active_gc_roots,
-    }
+    })
 }

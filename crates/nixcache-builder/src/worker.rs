@@ -417,7 +417,18 @@ mod tests {
         payload.entries.insert(
             h1.clone(),
             IndexEntry {
+                name: "pkg".to_string(),
                 system: Some(SystemArch::X86_64Linux),
+                narinfo_meta: nixcache_core::NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg", h1),
+                    nar_basename: "pkg.nar.xz".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
+                    ..Default::default()
+                },
+                nar_size: 100,
+                added: "2026-08-29T00:00:00Z".to_string(),
                 ..Default::default()
             },
         );

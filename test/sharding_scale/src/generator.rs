@@ -57,7 +57,7 @@ pub fn generate_store_hashes(count: usize, seed: u64) -> Vec<StoreHash> {
             *b = NIX_BASE32_ALPHABET[idx];
         }
         let s = unsafe { str::from_utf8_unchecked(&buf) };
-        hashes.push(StoreHash::new_unchecked(s));
+        hashes.push(StoreHash::parse(s).expect("generated StoreHash must be valid"));
     }
 
     hashes
@@ -100,7 +100,7 @@ pub fn generate_index_entries(
             name: pkg_name,
             system: Some(system),
             narinfo_meta,
-            nar_digest: NarDigest::new_unchecked(base_digest),
+            nar_digest: NarDigest::parse(base_digest).expect("generated digest must be valid"),
             nar_size,
             added: "2026-08-30T00:00:00Z".to_string(),
             origin_job: Some(format!("job-{}", (i % 128))),
@@ -124,7 +124,7 @@ pub fn generate_non_existent_hashes(count: usize, seed: u64) -> Vec<StoreHash> {
             *b = NIX_BASE32_ALPHABET[idx];
         }
         let s = unsafe { str::from_utf8_unchecked(&buf) };
-        hashes.push(StoreHash::new_unchecked(s));
+        hashes.push(StoreHash::parse(s).expect("generated StoreHash must be valid"));
     }
 
     hashes

@@ -12,11 +12,32 @@ pub enum TypeError {
     #[error("NarDigest missing 'sha256:' prefix in '{raw}'")]
     NarDigestMissingPrefix { raw: String },
 
+    #[error("Unsupported NarDigest algorithm '{algorithm}'; only sha256 is accepted")]
+    NarDigestInvalidAlgorithm { algorithm: String },
+
     #[error("NarDigest hex decode failed: expected 64 hex characters, found {actual}")]
     NarDigestInvalidHexLength { actual: usize },
 
     #[error("Invalid hex character '{char}' in digest at index {index}")]
     NarDigestInvalidHexChar { char: char, index: usize },
+
+    #[error("Unsupported Nix hash algorithm '{algorithm}'; only sha256 is accepted")]
+    NixHashInvalidAlgorithm { algorithm: String },
+
+    #[error("Nix hash length mismatch: expected {expected}, found {actual}")]
+    NixHashInvalidLength {
+        expected: &'static str,
+        actual: usize,
+    },
+
+    #[error("Invalid Nix hash character '{char}' at index {index}")]
+    NixHashInvalidChar { char: char, index: usize },
+
+    #[error("Invalid StorePath format: '{raw}'")]
+    InvalidStorePathFormat { raw: String },
+
+    #[error("Invalid NAR basename: '{raw}'")]
+    InvalidNarBasename { raw: String },
 
     #[error("Unsupported system architecture identifier: '{raw}'")]
     UnknownSystemArch { raw: String },
@@ -46,6 +67,37 @@ pub enum NarInfoParseError {
     #[error("Invalid store path format in StorePath field: '{0}'")]
     InvalidStorePath(String),
 
+    #[error("Invalid URL or NAR basename: '{0}'")]
+    InvalidUrl(String),
+
+    #[error("Invalid reference: '{0}'")]
+    InvalidReference(String),
+
+    #[error("Invalid field '{field}': {details}")]
+    InvalidField {
+        field: &'static str,
+        details: String,
+    },
+
+    #[error("Field '{0}' must not be empty")]
+    EmptyField(&'static str),
+
+    #[error("Field '{0}' may only occur once")]
+    DuplicateField(&'static str),
+
+    #[error("Invalid hash in field '{field}': {source}")]
+    InvalidHash {
+        field: &'static str,
+        #[source]
+        source: TypeError,
+    },
+
+    #[error("Field '{0}' must be greater than zero")]
+    NonPositiveSize(&'static str),
+
+    #[error("Malformed narinfo line: '{0}'")]
+    MalformedLine(String),
+
     #[error("NarInfo content is empty or contains no valid key-value pairs")]
     EmptyContent,
 }
@@ -69,6 +121,9 @@ pub enum CoreError {
 
     #[error("Invalid Schema v6 shard payload: {details}")]
     InvalidShard { details: String },
+
+    #[error("Invalid Schema v6 index entry or metadata: {details}")]
+    InvalidEntry { details: String },
 
     #[error("Schema v6 {target} exceeds limit {limit} (actual {actual})")]
     LimitExceeded {
