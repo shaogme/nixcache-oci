@@ -508,6 +508,12 @@ npins update
 > [!TIP]
 > **凭据自动探测机制**：`--github-token`（或 `GITHUB_TOKEN` / `GH_TOKEN`）在未显式提供时，程序会自动回退尝试调用本地已登录的 GitHub CLI (`gh auth token`) 探测认证凭据。`--registry-username`（或 `REGISTRY_USERNAME` / `OCI_USERNAME`）用于 Bearer token exchange 的 Basic 用户名；Registry 返回的 challenge realm、service 和 scope 始终优先。
 
+### Bearer Token 的并发与刷新语义
+
+OCI 客户端的 token single-flight 只共享当前网络 fetch 的完成状态，不把 token 放进永久广播值。缓存按 `realm/service/scope` challenge key、generation 和有限 TTL 隔离；waiter 被唤醒后必须重新读取当前有效缓存。
+
+leader 的正常完成、transport/HTTP 错误、panic 或 task abort 都会释放当前 flight 并唤醒 waiter；waiter 自身超时或取消不会破坏 leader。401 重试使用显式 `refresh_token`，会递增当前 challenge 的 generation，使旧 fetch 的结果既不能回填缓存，也不能满足刷新请求。旧的 `TokenBroadcaster`、`InFlightState` 和无过期语义的 `TokenStorage` API 已删除。
+
 ### 代理服务 (nixcache-proxy) 配置
 
 | 命令行参数 | 环境变量 | 默认值 | 描述 |
@@ -1066,7 +1072,7 @@ flowchart TB
 # 运行工作区全部 100+ 单元与集成测试（内存级 WireMock 与 Axum 模拟，< 0.5s）
 cargo test --workspace
 
-# 运行 Loom 形式化并发模型检验（验证 CAS 状态机与 Token 并发竞态无锁安全性）
+# 运行 Loom 形式化并发模型检验（验证 generation flight、取消恢复与过期隔离）
 RUSTFLAGS="--cfg loom" cargo test -p nixcache-oci --features loom --test token_loom -- --nocapture
 
 # 执行 Rust 编码规范与 Clippy 静态分析

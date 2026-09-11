@@ -39,6 +39,9 @@ pub enum TokenError {
     #[error("Registry bearer token missing in response body")]
     TokenMissingInBody,
 
+    #[error("Bearer token fetch flight failed before a token was cached")]
+    FlightFailed,
+
     #[error("Bearer token exchange failed at realm '{realm}' with HTTP {status}")]
     ExchangeFailed { realm: String, status: StatusCode },
 

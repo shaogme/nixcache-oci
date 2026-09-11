@@ -28,6 +28,8 @@ pub use manifest::{
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
     ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use mock::MockTokenGate;
 pub use mock::{MockPutRequest, MockResponse, MockRouterTransport};
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,

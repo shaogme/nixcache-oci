@@ -88,7 +88,7 @@ async fn challenge_retry_headers<T: OciTransport + Clone>(
     })?;
     let token = client
         .token_manager()
-        .get_token_for_challenge(client.transport(), &challenge, true)
+        .refresh_token(client.transport(), &challenge)
         .await?;
     let mut headers = client.get_auth_headers().await?;
     let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {

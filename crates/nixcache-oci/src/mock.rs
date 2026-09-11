@@ -13,10 +13,13 @@ use sha2::{Digest, Sha256};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::Notify;
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::stream::BoxStream;
@@ -54,6 +57,46 @@ pub struct MockResponse {
     pub body: Bytes,
 }
 
+/// 可控的 token GET 闸门，供并发取消和代际交错测试使用。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub struct MockTokenGate {
+    entered: Arc<AtomicBool>,
+    entered_notify: Arc<Notify>,
+    released: Arc<AtomicBool>,
+    release_notify: Arc<Notify>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MockTokenGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn wait_until_entered(&self) {
+        let notified = self.entered_notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if !self.entered.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    async fn wait_until_released(&self) {
+        let notified = self.release_notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if !self.released.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MockPutRequest {
     pub url: String,
@@ -69,6 +112,10 @@ pub struct MockRouterTransport {
     pub put_requests: Arc<SegQueue<MockPutRequest>>,
     pub stored_blobs: Arc<SccHashMap<String, Bytes>>,
     pub stored_manifests: Arc<SccHashMap<String, (Bytes, String)>>,
+    token_responses: Arc<SegQueue<MockResponse>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    token_gate: Arc<std::sync::Mutex<Option<MockTokenGate>>>,
+    panic_on_token: Arc<AtomicBool>,
 }
 
 impl MockRouterTransport {
@@ -80,6 +127,22 @@ impl MockRouterTransport {
         let _ = self
             .responses
             .upsert_sync((method.to_string(), url_suffix.to_string()), resp);
+    }
+
+    pub fn add_token_response(&self, response: MockResponse) {
+        self.token_responses.push(response);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_token_gate(&self, gate: MockTokenGate) {
+        *self
+            .token_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    pub fn set_panic_on_token(&self, panic: bool) {
+        self.panic_on_token.store(panic, Ordering::Release);
     }
 }
 
@@ -143,6 +206,28 @@ impl OciTransport for MockRouterTransport {
     ) -> Result<(StatusCode, HeaderMap, Bytes), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
+
+        if path.ends_with("/token") {
+            if self.panic_on_token.load(Ordering::Acquire) {
+                panic!("mock token transport panic");
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let gate = self
+                .token_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(gate) = gate {
+                gate.entered.store(true, Ordering::Release);
+                gate.entered_notify.notify_waiters();
+                gate.wait_until_released().await;
+            }
+            if let Some(response) = self.token_responses.pop() {
+                return Ok((response.status, response.headers, response.body));
+            }
+        }
+
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
             if m == "GET" && path.ends_with(suffix) {
