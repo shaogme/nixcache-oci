@@ -383,16 +383,23 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                 let bytes: Bytes = item?;
                 buffer.extend_from_slice(&bytes);
             }
-            hash_state
+            let stream_digest = hash_state
                 .digest()
                 .ok_or(OciError::UploadDigestUnavailable)?;
             let total_size = hash_state.bytes_streamed();
             let pushed_digest = self.push_bytes(buffer.freeze()).await?;
+            if pushed_digest != stream_digest {
+                return Err(OciError::DigestMismatch {
+                    target: "buffered streaming blob".to_string(),
+                    expected: stream_digest.to_string(),
+                    actual: pushed_digest.to_string(),
+                });
+            }
             info!(
                 "Successfully uploaded streaming blob {} ({} bytes)",
-                pushed_digest, total_size
+                stream_digest, total_size
             );
-            return Ok((pushed_digest, total_size));
+            return Ok((stream_digest, total_size));
         }
 
         info!("Executing standard chunked resumable upload for large stream");

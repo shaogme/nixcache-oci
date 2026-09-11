@@ -120,13 +120,37 @@ pub struct UploadChunkResponse {
     pub range: Option<(u64, u64)>,
 }
 
+#[derive(Debug, Clone)]
+enum StreamHashTerminal {
+    Complete(ContentDigest),
+    Failed,
+    Aborted,
+}
+
 #[derive(Debug, Default)]
 struct StreamHashInner {
     bytes_streamed: AtomicU64,
-    finalized_digest: OnceLock<ContentDigest>,
+    terminal: OnceLock<StreamHashTerminal>,
 }
 
-/// 零锁流式哈希与进度观察句柄
+/// 流式哈希的终态快照。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamHashStatus {
+    /// 尚未观察到 EOF，也没有发生错误或提前终止。
+    InProgress,
+    /// 已观察到 EOF，digest 覆盖完整输入。
+    Complete,
+    /// 底层流返回了错误；该状态不可恢复。
+    Failed,
+    /// `HashingStream` 在观察到 EOF 前被丢弃。
+    Aborted,
+}
+
+/// 零锁流式哈希与进度观察句柄。
+///
+/// `digest` 只在关联的 [`HashingStream`] 观察到底层流的 EOF 后返回完整输入
+/// 的 digest。它不会返回已读前缀的 digest；流尚未结束、返回错误或在 EOF 前
+/// 被丢弃时均返回 `None`。
 #[derive(Clone, Default, Debug)]
 pub struct StreamHashState {
     inner: Arc<StreamHashInner>,
@@ -144,11 +168,29 @@ impl StreamHashState {
 
     #[inline]
     pub fn digest(&self) -> Option<ContentDigest> {
-        self.inner.finalized_digest.get().cloned()
+        match self.inner.terminal.get() {
+            Some(StreamHashTerminal::Complete(digest)) => Some(digest.clone()),
+            Some(StreamHashTerminal::Failed | StreamHashTerminal::Aborted) | None => None,
+        }
+    }
+
+    /// 返回当前终态，但不会暴露不完整输入的 digest。
+    #[inline]
+    pub fn status(&self) -> StreamHashStatus {
+        match self.inner.terminal.get() {
+            Some(StreamHashTerminal::Complete(_)) => StreamHashStatus::Complete,
+            Some(StreamHashTerminal::Failed) => StreamHashStatus::Failed,
+            Some(StreamHashTerminal::Aborted) => StreamHashStatus::Aborted,
+            None => StreamHashStatus::InProgress,
+        }
     }
 }
 
-/// 100% 零锁流式计算 Stream
+/// 计算完整输入 SHA-256 的流包装器。
+///
+/// 只有底层流返回 `None`（EOF）后，关联的 [`StreamHashState::digest`] 才会
+/// 变为可用。底层错误会永久进入失败终态；在 EOF 前丢弃此包装器会进入提前
+/// 终止终态。这两种情况都不会产生 digest，也不会在后续 poll 中被转化为成功。
 pub struct HashingStream<S> {
     inner: S,
     hasher: Sha256,
@@ -276,6 +318,12 @@ impl<S> HashingStream<S> {
     }
 }
 
+impl<S> Drop for HashingStream<S> {
+    fn drop(&mut self) {
+        let _ = self.state.inner.terminal.set(StreamHashTerminal::Aborted);
+    }
+}
+
 impl<S, E> Stream for HashingStream<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -284,9 +332,12 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
+        if this.state.inner.terminal.get().is_some() {
+            return Poll::Ready(None);
+        }
         match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
             Some(Ok(bytes)) => {
-                // 100% 零锁操作！直接更新本地独占的 hasher
+                // hasher 由当前 stream 独占；共享句柄只观察进度和终态。
                 this.hasher.update(&bytes);
                 this.state
                     .inner
@@ -294,13 +345,17 @@ where
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Poll::Ready(Some(Ok(bytes)))
             }
-            Some(Err(e)) => Poll::Ready(Some(Err(e))),
+            Some(Err(e)) => {
+                let _ = this.state.inner.terminal.set(StreamHashTerminal::Failed);
+                Poll::Ready(Some(Err(e)))
+            }
             None => {
-                // 流结束，一次性无锁计算并存入 OnceLock
-                this.state
+                let digest = ContentDigest::from_hasher(this.hasher.clone());
+                let _ = this
+                    .state
                     .inner
-                    .finalized_digest
-                    .get_or_init(|| ContentDigest::from_hasher(this.hasher.clone()));
+                    .terminal
+                    .set(StreamHashTerminal::Complete(digest));
                 Poll::Ready(None)
             }
         }

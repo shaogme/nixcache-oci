@@ -54,9 +54,11 @@ pub use nixcache_core::{
     shard_id_to_prefix,
 };
 pub use token::TokenManager;
+/// 流式哈希状态只会在底层流观察到 EOF 后提供完整 body digest；错误、提前
+/// drop 或尚未结束的流都不会暴露可用于 OCI 身份的部分 digest。
 pub use transport::{
-    HashingStream, OciBlobStream, OciTransport, StreamHashState, UploadChunkResponse,
-    VerifiedBlobStream, check_content_length, collect_limited, parse_content_length,
-    parse_range_header,
+    HashingStream, OciBlobStream, OciTransport, StreamHashState, StreamHashStatus,
+    UploadChunkResponse, VerifiedBlobStream, check_content_length, collect_limited,
+    parse_content_length, parse_range_header,
 };
 pub use upload::{BlobPayload, UploadConfig};

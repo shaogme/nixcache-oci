@@ -4,7 +4,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use nixcache_oci::{
     ContentDigest, DockerHubDriver, GenericOciDriver, GhcrDriver, HashingStream, MockPatchOutcome,
     MockPatchRequest, MockResponse, MockRouterTransport, OciClient, OciError, OciReadLimits,
-    StreamHashState, TransportError, UploadConfig, parse_range_header,
+    StreamHashStatus, TransportError, UploadConfig, parse_range_header,
 };
 use std::time::Duration;
 
@@ -93,7 +93,6 @@ async fn ghcr_resumable_upload_uses_fixed_two_step_strategy() {
 
 #[tokio::test]
 async fn stream_hash_state_is_shared_without_losing_progress() {
-    let state = StreamHashState::new();
     let input = futures_util::stream::iter(vec![
         Ok::<Bytes, TransportError>(Bytes::from_static(b"chunk1 ")),
         Ok::<Bytes, TransportError>(Bytes::from_static(b"chunk2")),
@@ -105,12 +104,38 @@ async fn stream_hash_state_is_shared_without_losing_progress() {
     }
     assert_eq!(stream_state.bytes_streamed(), 13);
     assert_eq!(state_clone.bytes_streamed(), 13);
-    assert_eq!(state.digest(), None);
-    assert!(stream_state.digest().is_some());
+    let expected = ContentDigest::from_bytes(b"chunk1 chunk2");
+    assert_eq!(stream_state.status(), StreamHashStatus::Complete);
+    assert_eq!(stream_state.digest(), Some(expected.clone()));
+    assert_eq!(state_clone.digest(), Some(expected));
+    assert!(stream.next().await.is_none());
+    assert_eq!(stream_state.status(), StreamHashStatus::Complete);
 }
 
 #[tokio::test]
-async fn stream_hash_state_never_exposes_digest_after_input_error() {
+async fn incomplete_stream_never_exposes_digest_and_drop_marks_it_aborted() {
+    let input = futures_util::stream::iter(vec![
+        Ok::<Bytes, TransportError>(Bytes::from_static(b"first")),
+        Ok::<Bytes, TransportError>(Bytes::from_static(b"second")),
+    ]);
+    let (mut stream, state) = HashingStream::new(input);
+    assert_eq!(state.status(), StreamHashStatus::InProgress);
+    assert_eq!(state.digest(), None);
+    assert_eq!(
+        stream.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"first")
+    );
+    assert_eq!(state.bytes_streamed(), 5);
+    assert_eq!(state.status(), StreamHashStatus::InProgress);
+    assert_eq!(state.digest(), None);
+
+    drop(stream);
+    assert_eq!(state.status(), StreamHashStatus::Aborted);
+    assert_eq!(state.digest(), None);
+}
+
+#[tokio::test]
+async fn stream_hash_state_never_exposes_digest_after_input_error_or_later_eof() {
     let input = futures_util::stream::iter(vec![
         Ok::<Bytes, TransportError>(Bytes::from_static(b"partial")),
         Err(TransportError::Io(std::io::Error::other("read failed"))),
@@ -122,7 +147,45 @@ async fn stream_hash_state_never_exposes_digest_after_input_error() {
     );
     assert!(stream.next().await.unwrap().is_err());
     assert_eq!(state.bytes_streamed(), 7);
+    assert_eq!(state.status(), StreamHashStatus::Failed);
     assert!(state.digest().is_none());
+    assert!(stream.next().await.is_none());
+    assert_eq!(state.status(), StreamHashStatus::Failed);
+    assert!(state.digest().is_none());
+}
+
+#[tokio::test]
+async fn empty_stream_is_digestible_only_after_eof() {
+    let (mut stream, state) =
+        HashingStream::new(futures_util::stream::empty::<Result<Bytes, TransportError>>());
+    assert_eq!(state.status(), StreamHashStatus::InProgress);
+    assert_eq!(state.digest(), None);
+
+    assert!(stream.next().await.is_none());
+    assert_eq!(state.status(), StreamHashStatus::Complete);
+    assert_eq!(
+        state.digest(),
+        Some(ContentDigest::from_bytes(&[])),
+        "an explicitly observed empty-stream EOF has a valid digest"
+    );
+}
+
+#[tokio::test]
+async fn buffered_resumable_upload_returns_body_digest() {
+    let transport = MockRouterTransport::default();
+    let body = Bytes::from_static(b"buffered resumable body");
+    let expected = ContentDigest::from_bytes(&body);
+    let (actual, size) = chunked_client(transport.clone())
+        .blobs()
+        .push_resumable(stream_for(body.clone()), &chunked_config(1))
+        .await
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    assert_eq!(size, body.len() as u64);
+    let (url, posted_body) = transport.posted_bodies.pop().expect("buffered upload POST");
+    assert_eq!(posted_body, body);
+    assert!(url.ends_with(&format!("?digest={}", expected.as_str())));
 }
 
 fn chunked_config(max_retry_attempts: usize) -> UploadConfig {
