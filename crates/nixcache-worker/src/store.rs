@@ -144,11 +144,12 @@ impl CacheStore {
                 self.config.baseline_tag,
                 self.config.target_system.as_str()
             );
-            let remote_head = match self.oci_client.head_manifest(&arch_tag).await {
+            let remote_head = match self.oci_client.manifests().head(&arch_tag).await {
                 Ok(Some(h)) => Some(h),
                 Ok(None) => self
                     .oci_client
-                    .head_manifest(&self.config.baseline_tag)
+                    .manifests()
+                    .head(&self.config.baseline_tag)
                     .await
                     .ok()
                     .flatten(),
@@ -294,7 +295,7 @@ impl CacheStore {
         }
 
         // 3. L3 OCI GHCR
-        match self.oci_client.get_shard_data(blob_digest).await {
+        match self.oci_client.indexes().get_shard_data(blob_digest).await {
             Ok(payload) => {
                 self.set_remote_status(true, None);
                 let nar_lookup = build_nar_lookup_map(&payload.entries);
@@ -411,7 +412,8 @@ impl CacheStore {
 
         let fetch_root = self
             .oci_client
-            .get_sharded_root_index(&self.config.baseline_tag, &self.config.target_system)
+            .indexes()
+            .get_sharded_root(&self.config.baseline_tag, &self.config.target_system)
             .await;
 
         let (root_data, manifest_digest) = match fetch_root {

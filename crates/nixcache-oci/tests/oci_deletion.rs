@@ -82,7 +82,7 @@ async fn test_generic_oci_two_stage_tag_deletion() {
         transport,
     );
 
-    let del_res = client.delete_tag_strict("run-100").await;
+    let del_res = client.deletion().delete_tag("run-100").await;
     assert!(del_res.is_ok());
 }
 
@@ -109,7 +109,8 @@ async fn test_generic_oci_manifest_delete_405_rejected() {
     );
 
     let err = client
-        .delete_manifest_strict("sha256:failmanifest")
+        .deletion()
+        .delete_manifest("sha256:failmanifest")
         .await
         .unwrap_err();
     assert!(matches!(err, OciError::OperationNotSupported { .. }));
@@ -163,7 +164,8 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
 
     // Non-strict mode accumulates failures without aborting
     let summary = client
-        .batch_delete_blobs_strict(&digests, 4, false)
+        .deletion()
+        .batch_delete_blobs(&digests, 4, false)
         .await
         .unwrap();
     assert_eq!(summary.deleted_count, 1); // b1 (202)
@@ -172,7 +174,8 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
 
     // Strict mode aborts on non-404 error
     let strict_err = client
-        .batch_delete_blobs_strict(&digests, 4, true)
+        .deletion()
+        .batch_delete_blobs(&digests, 4, true)
         .await
         .unwrap_err();
     assert!(matches!(strict_err, OciError::DeletionFailed { .. }));
@@ -213,7 +216,7 @@ async fn test_generic_oci_deletes_complete_tag_reachable_graph() {
         GenericOciDriver,
         transport,
     );
-    let summary = client.delete_entire_package_strict().await.unwrap();
+    let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 2);
     assert_eq!(summary.manifests_discovered, 3);
     assert_eq!(summary.blobs_discovered, 4);
@@ -279,7 +282,7 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         GenericOciDriver,
         transport,
     );
-    let summary = client.delete_entire_package_strict().await.unwrap();
+    let summary = client.deletion().delete_entire_package().await.unwrap();
     assert_eq!(summary.tags_discovered, 1);
     assert_eq!(summary.manifests_discovered, 1);
     assert_eq!(summary.blobs_discovered, 4);

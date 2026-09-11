@@ -185,7 +185,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             // 1. 级联反向解析 NAR Digest (Tier 0 -> Tier 1 -> Tier 2 -> Tier 3)
             if let Ok(Some(digest)) = store.lookup_nar_digest(&ctx.env, nar_name).await {
-                match store.oci_client().stream_blob(digest.as_str()).await {
+                match store.oci_client().blobs().stream(digest.as_str()).await {
                     Ok(blob_stream) if blob_stream.status.is_success() => {
                         store.set_remote_status(true, None);
                         let headers = Headers::new();

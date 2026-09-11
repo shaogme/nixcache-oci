@@ -185,7 +185,7 @@ impl CacheIndex {
             return None;
         }
 
-        match self.oci_client.get_shard_data(blob_digest).await {
+        match self.oci_client.indexes().get_shard_data(blob_digest).await {
             Ok(payload) => {
                 self.set_remote_status(true, None);
                 let nar_map = build_nar_lookup_map(&payload.entries);
@@ -332,7 +332,8 @@ impl CacheIndex {
 
         match self
             .oci_client
-            .get_sharded_root_index(&tag_str, &system_clone)
+            .indexes()
+            .get_sharded_root(&tag_str, &system_clone)
             .await
         {
             Ok(Some((root_data, _manifest_digest))) => {

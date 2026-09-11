@@ -144,7 +144,7 @@ pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
 ) -> HashSet<StoreHash> {
     let mut own_hashes = HashSet::new();
 
-    if let Ok(Some((root_data, _))) = oci.get_sharded_root_index("cache-index", system).await {
+    if let Ok(Some((root_data, _))) = oci.indexes().get_sharded_root("cache-index", system).await {
         let non_empty_shards: Vec<_> = root_data
             .shards
             .iter()
@@ -154,7 +154,7 @@ pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
 
         let futures = non_empty_shards.into_iter().map(|digest| {
             let oci = oci.clone();
-            async move { oci.get_shard_data(&digest).await.ok() }
+            async move { oci.indexes().get_shard_data(&digest).await.ok() }
         });
         let payloads = futures_util::future::join_all(futures).await;
         for payload in payloads.into_iter().flatten() {
@@ -395,7 +395,7 @@ mod tests {
         payload.entries.insert(h1.clone(), IndexEntry::default());
 
         let (shard_digest, comp_size, uncomp_size) =
-            client.push_shard_data(&payload).await.unwrap();
+            client.indexes().push_shard_data(&payload).await.unwrap();
 
         let mut root_data =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
@@ -408,7 +408,8 @@ mod tests {
         root_data.recalculate_merkle_root();
 
         client
-            .push_sharded_root_index("cache-index-x86_64-linux", &root_data)
+            .indexes()
+            .push_sharded_root("cache-index-x86_64-linux", &root_data)
             .await
             .unwrap();
 

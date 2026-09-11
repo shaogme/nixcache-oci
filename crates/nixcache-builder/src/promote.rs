@@ -121,7 +121,7 @@ pub async fn run_promote(
     let mut target_systems: HashSet<SystemArch> = incoming_entries_by_sys.keys().copied().collect();
     target_systems.extend(incoming_roots_by_sys.keys().copied());
 
-    if let Ok(Some(artifact)) = oci.fetch_artifact(target_tag).await {
+    if let Ok(Some(artifact)) = oci.manifests().fetch_artifact(target_tag).await {
         match artifact.manifest {
             OciArtifactManifest::Index(index) => {
                 for desc in index.manifests {
@@ -171,7 +171,7 @@ pub async fn run_promote(
         async move {
             // 3.1 获取现存该架构的 Root Index 或新建空白结构
             let (mut root_index, _prev_digest) =
-                match oci.get_sharded_root_index(&target_tag, &sys).await? {
+                match oci.indexes().get_sharded_root(&target_tag, &sys).await? {
                     Some((data, digest)) => (data, Some(digest)),
                     None => (ShardedArchCacheIndexData::new(sys, &repo, &registry), None),
                 };
@@ -195,7 +195,9 @@ pub async fn run_promote(
                     let existing_desc = &root_index.shards[shard_id as usize];
                     let mut shard_payload =
                         if existing_desc.entry_count > 0 && !existing_desc.blob_digest.is_empty() {
-                            oci.get_shard_data(&existing_desc.blob_digest).await?
+                            oci.indexes()
+                                .get_shard_data(&existing_desc.blob_digest)
+                                .await?
                         } else {
                             ShardDataPayload::new(shard_id)
                         };
@@ -203,7 +205,7 @@ pub async fn run_promote(
                     shard_payload.entries.extend(incoming_shard_entries);
 
                     let (new_blob_digest, comp_size, uncomp_size) =
-                        oci.push_shard_data(&shard_payload).await?;
+                        oci.indexes().push_shard_data(&shard_payload).await?;
 
                     let desc = &mut root_index.shards[shard_id as usize];
                     desc.blob_digest = new_blob_digest;
@@ -228,7 +230,10 @@ pub async fn run_promote(
 
             // 3.5 推送架构专属 Sub-Manifest (如 cache-index-x86_64-linux)
             let arch_tag = format!("{}-{}", target_tag, sys.as_str());
-            let sub_manifest_digest = oci.push_sharded_root_index(&arch_tag, &root_index).await?;
+            let sub_manifest_digest = oci
+                .indexes()
+                .push_sharded_root(&arch_tag, &root_index)
+                .await?;
 
             info!(
                 "Pushed Sharded Sub-Manifest for {}: digest {} (tag: {})",
@@ -258,15 +263,16 @@ pub async fn run_promote(
 
     // 4. 组装并原子发布顶层 OCI Image Index (cache-index)
     let final_descriptors = manifest_descriptors;
-    oci.update_image_index_single_writer(target_tag, |_existing| {
-        let mut index = build_image_index(
-            final_descriptors.clone(),
-            "NixCache Multi-Architecture Global Index",
-        );
-        index.schema_version = 2;
-        Ok(index)
-    })
-    .await?;
+    oci.indexes()
+        .update_single_writer(target_tag, |_existing| {
+            let mut index = build_image_index(
+                final_descriptors.clone(),
+                "NixCache Multi-Architecture Global Index",
+            );
+            index.schema_version = 2;
+            Ok(index)
+        })
+        .await?;
 
     info!(
         "Promote complete! Multi-Architecture OCI Image Index published for tag '{}'.",

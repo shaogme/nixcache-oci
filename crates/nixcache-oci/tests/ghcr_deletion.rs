@@ -221,9 +221,9 @@ async fn test_ghcr_client_integration_via_oci_client() {
     );
 
     // delete_tag_strict should route to GitHubPackagesClient and succeed
-    assert!(oci.delete_tag_strict("run-99").await.is_ok());
+    assert!(oci.deletion().delete_tag("run-99").await.is_ok());
 
     // delete_blob_strict on GHCR must fail fast with OperationNotSupported
-    let blob_err = oci.delete_blob_strict("sha256:blob").await.unwrap_err();
+    let blob_err = oci.deletion().delete_blob("sha256:blob").await.unwrap_err();
     assert!(matches!(blob_err, OciError::OperationNotSupported { .. }));
 }

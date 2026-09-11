@@ -53,7 +53,7 @@ pub async fn run_purge(
             }
             PackageDeletionSupport::NativeComplete | PackageDeletionSupport::TaggedGraphOnly => {
                 if dry_run {
-                    let preview = oci.preview_tag_reachable_package().await?;
+                    let preview = oci.deletion().preview_package().await?;
                     info!(
                         "Dry run package deletion on '{}': {} tag(s), {} manifest(s), {} blob(s) are discoverable",
                         oci.kind(),
@@ -84,7 +84,7 @@ pub async fn run_purge(
                     registry,
                     repo
                 );
-                let summary = oci.delete_entire_package_strict().await?;
+                let summary = oci.deletion().delete_entire_package().await?;
                 info!(
                     "Package deletion completed: {} manifest(s), {} blob(s) deleted; {} already absent",
                     summary.manifests_deleted, summary.blobs_deleted, summary.already_absent
@@ -106,7 +106,7 @@ pub async fn run_purge(
 
     // 2. 探查多架构并加载现存基线索引数据
     let mut target_systems: HashSet<SystemArch> = HashSet::new();
-    if let Ok(Some(artifact)) = oci.fetch_artifact("cache-index").await {
+    if let Ok(Some(artifact)) = oci.manifests().fetch_artifact("cache-index").await {
         match artifact.manifest {
             OciArtifactManifest::Index(index) => {
                 for desc in index.manifests {
@@ -147,7 +147,9 @@ pub async fn run_purge(
     let root_futures = target_systems.into_iter().map(|sys| {
         let oci = oci.clone();
         async move {
-            if let Some((root_data, _)) = oci.get_sharded_root_index("cache-index", &sys).await? {
+            if let Some((root_data, _)) =
+                oci.indexes().get_sharded_root("cache-index", &sys).await?
+            {
                 let non_empty_shards: Vec<_> = root_data
                     .shards
                     .iter()
@@ -157,7 +159,7 @@ pub async fn run_purge(
 
                 let shard_futures = non_empty_shards.into_iter().map(|digest| {
                     let oci = oci.clone();
-                    async move { oci.get_shard_data(&digest).await }
+                    async move { oci.indexes().get_shard_data(&digest).await }
                 });
                 let payloads = try_join_all(shard_futures).await?;
                 let mut entries = HashMap::new();
@@ -263,7 +265,7 @@ pub async fn run_purge(
                         let mut payload = ShardDataPayload::new(shard_id);
                         payload.entries = kept_for_shard;
                         let (blob_digest, comp_size, uncomp_size) =
-                            oci.push_shard_data(&payload).await?;
+                            oci.indexes().push_shard_data(&payload).await?;
 
                         desc.blob_digest = blob_digest;
                         desc.compressed_size = comp_size;
@@ -282,8 +284,10 @@ pub async fn run_purge(
                     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                 let arch_tag = format!("cache-index-{}", sys.as_str());
-                let sub_manifest_digest =
-                    oci.push_sharded_root_index(&arch_tag, &root_index).await?;
+                let sub_manifest_digest = oci
+                    .indexes()
+                    .push_sharded_root(&arch_tag, &root_index)
+                    .await?;
 
                 info!(
                     "Pushed updated Sharded Sub-Manifest for {} after purge: digest {} (tag: {})",
@@ -315,30 +319,32 @@ pub async fn run_purge(
     let final_descriptors = manifest_descriptors;
     match oci.capabilities().manifest_cas_support {
         ManifestCasSupport::IfMatch => {
-            oci.update_image_index_cas("cache-index", 5, |_existing| {
-                let mut index = build_image_index(
-                    final_descriptors.clone(),
-                    "NixCache Multi-Architecture Global Index",
-                );
-                index.schema_version = 2;
-                Ok(index)
-            })
-            .await?;
+            oci.indexes()
+                .update_cas("cache-index", 5, |_existing| {
+                    let mut index = build_image_index(
+                        final_descriptors.clone(),
+                        "NixCache Multi-Architecture Global Index",
+                    );
+                    index.schema_version = 2;
+                    Ok(index)
+                })
+                .await?;
         }
         ManifestCasSupport::Unsupported => {
             info!(
                 "Registry backend '{}' does not support manifest CAS; using explicit single-writer index update",
                 oci.kind()
             );
-            oci.update_image_index_single_writer("cache-index", |_existing| {
-                let mut index = build_image_index(
-                    final_descriptors.clone(),
-                    "NixCache Multi-Architecture Global Index",
-                );
-                index.schema_version = 2;
-                Ok(index)
-            })
-            .await?;
+            oci.indexes()
+                .update_single_writer("cache-index", |_existing| {
+                    let mut index = build_image_index(
+                        final_descriptors.clone(),
+                        "NixCache Multi-Architecture Global Index",
+                    );
+                    index.schema_version = 2;
+                    Ok(index)
+                })
+                .await?;
         }
     }
 
@@ -371,7 +377,8 @@ pub async fn run_purge(
                 purge_result.purged_nar_digests.len()
             );
             let summary = oci
-                .batch_delete_blobs_strict(&purge_result.purged_nar_digests, 8, strict_mode)
+                .deletion()
+                .batch_delete_blobs(&purge_result.purged_nar_digests, 8, strict_mode)
                 .await?;
             info!(
                 "Blob deletion complete: {} physically deleted, {} failed/skipped.",

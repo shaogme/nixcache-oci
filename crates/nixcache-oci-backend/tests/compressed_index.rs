@@ -192,14 +192,16 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     // Push blob
-    let (pushed_digest, comp_size, uncomp_size) = client.push_zstd_blob(&arch_data).await.unwrap();
+    let (pushed_digest, comp_size, uncomp_size) =
+        client.blobs().push_zstd(&arch_data).await.unwrap();
     assert_eq!(pushed_digest, blob_digest);
     assert_eq!(comp_size, blob_size);
     assert!(uncomp_size > comp_size);
 
     // Fetch sharded arch index
     let fetched = client
-        .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+        .indexes()
+        .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
         .await
         .unwrap();
     assert!(fetched.is_some());
@@ -368,7 +370,8 @@ async fn test_get_multi_arch_sharded_index_routing() {
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
     let (fetched_x86, digest) = client
-        .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+        .indexes()
+        .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
         .await
         .unwrap()
         .unwrap();
@@ -377,7 +380,8 @@ async fn test_get_multi_arch_sharded_index_routing() {
     assert_eq!(fetched_x86.total_entries(), 1);
 
     let (fetched_arm, digest) = client
-        .get_sharded_root_index("cache-index", &SystemArch::Aarch64Linux)
+        .indexes()
+        .get_sharded_root("cache-index", &SystemArch::Aarch64Linux)
         .await
         .unwrap()
         .unwrap();
@@ -428,7 +432,8 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
 
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let err = client
-        .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+        .indexes()
+        .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
         .await
         .expect_err("Should reject legacy v1+json media type");
 
@@ -466,7 +471,8 @@ async fn test_get_sharded_root_index_rejects_corrupted_blob_data() {
 
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
     let err = client
-        .get_sharded_root_index("cache-index", &SystemArch::X86_64Linux)
+        .indexes()
+        .get_sharded_root("cache-index", &SystemArch::X86_64Linux)
         .await
         .expect_err("Should reject invalid zstd magic blob");
 
@@ -506,11 +512,19 @@ async fn test_get_shard_data_roundtrip() {
 
     let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
 
-    let (pushed_digest, comp_size, _) = client.push_shard_data(&shard_payload).await.unwrap();
+    let (pushed_digest, comp_size, _) = client
+        .indexes()
+        .push_shard_data(&shard_payload)
+        .await
+        .unwrap();
     assert_eq!(pushed_digest, shard_digest);
     assert_eq!(comp_size, shard_bytes.len() as u64);
 
-    let retrieved_shard = client.get_shard_data(&shard_digest).await.unwrap();
+    let retrieved_shard = client
+        .indexes()
+        .get_shard_data(&shard_digest)
+        .await
+        .unwrap();
     assert_eq!(retrieved_shard.shard_id, 42);
     assert_eq!(retrieved_shard.entries.len(), 1);
 }
@@ -567,7 +581,8 @@ async fn test_update_sharded_arch_index_cas_flow() {
     );
 
     let updated_digest = client
-        .update_sharded_arch_index_cas("cache-index", &SystemArch::X86_64Linux, 3, |existing| {
+        .indexes()
+        .update_sharded_cas("cache-index", &SystemArch::X86_64Linux, 3, |existing| {
             let mut root = existing.unwrap_or_else(|| {
                 ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io")
             });

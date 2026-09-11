@@ -550,7 +550,7 @@ mod tests {
 
         let credentials = nixcache_oci::RegistryCredentials::with_username("custom", "secret");
         let client = super::create_tokio_reqwest_client(&host, "test/repo", credentials, false);
-        let artifact = client.get_manifest("cache-index").await.unwrap();
+        let artifact = client.manifests().get("cache-index").await.unwrap();
         assert!(artifact.is_some());
     }
 
@@ -635,7 +635,8 @@ mod tests {
         let transport = super::ReqwestTransport::default();
         let client = OciClient::new(&host, "test/repo", "", true, GenericOciDriver, transport);
         let result = client
-            .push_blob_streaming_resumable(
+            .blobs()
+            .push_resumable(
                 stream_for(Bytes::from(vec![0x42; 1024 * 1024])),
                 &chunked_config(),
             )
@@ -691,7 +692,8 @@ mod tests {
         let transport = super::ReqwestTransport::new(http_client);
         let client = OciClient::new(&host, "test/repo", "", true, GenericOciDriver, transport);
         let result = client
-            .push_blob_streaming_resumable(
+            .blobs()
+            .push_resumable(
                 stream_for(Bytes::from(vec![0x43; 1024 * 1024])),
                 &chunked_config(),
             )

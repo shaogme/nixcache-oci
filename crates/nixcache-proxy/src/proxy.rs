@@ -197,7 +197,7 @@ async fn serve_nar(State(state): State<AppState>, Path(nar_name): Path<String>) 
 
     // 1. Try our GHCR cache — stream directly
     if let Some(digest) = state.index.find_nar_digest(&nar_name).await {
-        match state.oci_client.stream_blob(digest.as_str()).await {
+        match state.oci_client.blobs().stream(digest.as_str()).await {
             Ok(resp) if resp.status.is_success() => {
                 state.index.set_remote_status(true, None);
                 let content_len = resp.content_length();

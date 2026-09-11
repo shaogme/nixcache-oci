@@ -233,7 +233,7 @@ pub async fn run_list(
 
     // 1. 探查多架构并获取所有架构的 ShardedArchCacheIndexData
     let mut target_systems: HashSet<SystemArch> = HashSet::new();
-    if let Ok(Some(artifact)) = oci.fetch_artifact(&target_tag).await {
+    if let Ok(Some(artifact)) = oci.manifests().fetch_artifact(&target_tag).await {
         match artifact.manifest {
             OciArtifactManifest::Index(index) => {
                 for desc in index.manifests {
@@ -271,7 +271,7 @@ pub async fn run_list(
         let oci = oci.clone();
         let tag = target_tag.clone();
         async move {
-            if let Some((root_data, _)) = oci.get_sharded_root_index(&tag, &sys).await? {
+            if let Some((root_data, _)) = oci.indexes().get_sharded_root(&tag, &sys).await? {
                 let non_empty_shards: Vec<_> = root_data
                     .shards
                     .iter()
@@ -281,7 +281,7 @@ pub async fn run_list(
 
                 let shard_futures = non_empty_shards.into_iter().map(|digest| {
                     let oci = oci.clone();
-                    async move { oci.get_shard_data(&digest).await }
+                    async move { oci.indexes().get_shard_data(&digest).await }
                 });
                 let payloads = try_join_all(shard_futures).await?;
                 let mut entries = HashMap::new();
