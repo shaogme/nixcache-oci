@@ -9,7 +9,8 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use loom::{model::Builder, sync::atomic::Ordering, thread};
 use nixcache_oci::{
-    BearerChallenge, GenericOciDriver, MockResponse, MockRouterTransport, TokenManager,
+    BearerChallenge, GenericOciDriver, MockResponse, MockRouterTransport, RegistryEndpoint,
+    TokenManager,
     token::sync::{LoomTestAcquire, LoomTestRegistry},
 };
 use std::{
@@ -27,6 +28,10 @@ fn challenge(scope: &str) -> BearerChallenge {
         Some(format!("repository:test/repo/nix-cache:{scope}")),
     )
     .unwrap()
+}
+
+fn test_endpoint() -> RegistryEndpoint {
+    RegistryEndpoint::parse("test.registry.io").unwrap()
 }
 
 fn loom_block_on<F: Future>(fut: F) -> F::Output {
@@ -66,8 +71,9 @@ fn transport_with_route(status: StatusCode, token: &str) -> Arc<MockRouterTransp
 fn loom_verify_same_challenge_has_one_current_leader() {
     loom::model(|| {
         let transport = transport_with_route(StatusCode::OK, "loom-token");
+        let endpoint = test_endpoint();
         let manager = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &endpoint,
             "test/repo",
             "secret",
             false,
@@ -98,8 +104,9 @@ fn loom_verify_different_challenges_do_not_share_flight_or_cache() {
     builder.preemption_bound = Some(4);
     builder.check(|| {
         let transport = transport_with_route(StatusCode::OK, "scoped-token");
+        let endpoint = test_endpoint();
         let manager = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &endpoint,
             "test/repo",
             "secret",
             false,
@@ -125,8 +132,9 @@ fn loom_verify_different_challenges_do_not_share_flight_or_cache() {
 fn loom_verify_failed_flight_wakes_waiter_without_stale_result() {
     loom::model(|| {
         let transport = transport_with_route(StatusCode::INTERNAL_SERVER_ERROR, "unused");
+        let endpoint = test_endpoint();
         let manager = Arc::new(TokenManager::new(
-            "test.registry.io",
+            &endpoint,
             "test/repo",
             "secret",
             false,
@@ -164,13 +172,8 @@ fn loom_verify_refresh_starts_new_generation() {
             headers: HeaderMap::new(),
             body: Bytes::from(r#"{"token":"generation-1","expires_in":300}"#),
         });
-        let manager = TokenManager::new(
-            "test.registry.io",
-            "test/repo",
-            "secret",
-            false,
-            GenericOciDriver,
-        );
+        let endpoint = test_endpoint();
+        let manager = TokenManager::new(&endpoint, "test/repo", "secret", false, GenericOciDriver);
         let first = loom_block_on(manager.get_token(&*transport, &challenge("pull"))).unwrap();
         let refreshed =
             loom_block_on(manager.refresh_token(&*transport, &challenge("pull"))).unwrap();
