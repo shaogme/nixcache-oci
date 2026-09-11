@@ -7,7 +7,7 @@ use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_cli::PurgeArgs;
 use nixcache_core::{
-    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
     partition_entries_by_shard,
 };
@@ -19,7 +19,7 @@ use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-/// 执行缓存主动清理与失效工作流 (Schema v6 分片梅克尔基数索引)
+/// 执行缓存主动清理与失效工作流 (Schema v7 分层 Merkle 索引)
 pub async fn run_purge(
     args: &PurgeArgs,
     repo: &str,
@@ -259,10 +259,10 @@ pub async fn run_purge(
                     let desc = &mut root_index.shards[shard_id as usize];
 
                     if kept_for_shard.is_empty() {
-                        *desc = ShardDescriptor::empty(shard_id);
+                        *desc = ShardDescriptor::empty(shard_id)?;
                     } else if desc.entry_count != kept_for_shard.len() {
                         // 该分片有部分条目被清除，重新序列化并推送
-                        let mut payload = ShardDataPayload::new(shard_id);
+                        let mut payload = ShardDataPayload::new(shard_id)?;
                         payload.entries = kept_for_shard;
                         let (blob_digest, comp_size, uncomp_size) =
                             oci.indexes().push_shard_data(&payload).await?;
@@ -271,15 +271,15 @@ pub async fn run_purge(
                         desc.compressed_size = comp_size;
                         desc.uncompressed_size = uncomp_size;
                         desc.entry_count = payload.len();
-                        desc.merkle_hash = payload.compute_merkle_hash();
+                        desc.merkle_hash = payload.compute_merkle_hash()?;
                     }
                     // 未发生变更的分片：完全复用原描述符
                 }
 
                 root_index.gc_roots = updated_roots;
-                root_index.recalculate_merkle_root();
+                root_index.recalculate_merkle_root()?;
 
-                root_index.version = SCHEMA_VERSION_V6;
+                root_index.version = SCHEMA_VERSION_V7;
                 root_index.generated =
                     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 

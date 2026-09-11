@@ -266,7 +266,7 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         ..Default::default()
     };
     let shard_payload =
-        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)]));
+        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)])).unwrap();
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = digest_bytes(&shard_bytes);
 
@@ -281,14 +281,15 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
         shard_bytes.len() as u64,
         serde_json::to_vec(&shard_payload).unwrap().len() as u64,
         shard_payload.len(),
-        shard_payload.compute_merkle_hash(),
-    );
-    root.recalculate_merkle_root();
+        shard_payload.compute_merkle_hash().unwrap(),
+    )
+    .unwrap();
+    root.recalculate_merkle_root().unwrap();
     let root_bytes = IndexCodec::encode_zstd(&root, 3).unwrap();
     let root_digest = digest_bytes(&root_bytes);
     let manifest_body = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}},"layers":[{{"mediaType":"{}","digest":"{}","size":{}}}]}}"#,
-        CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
         root_digest,
         root_bytes.len()
     );
@@ -349,14 +350,14 @@ async fn test_generic_oci_deletes_direct_shard_with_manifest_system_context() {
         ..Default::default()
     };
     let shard_payload =
-        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)]));
+        ShardDataPayload::with_entries(shard_id, HashMap::from([(store_hash, entry)])).unwrap();
     let shard_bytes = IndexCodec::encode_zstd(&shard_payload, 3).unwrap();
     let shard_digest = digest_bytes(&shard_bytes);
     let config_digest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
     let manifest_body = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":2}},"layers":[{{"mediaType":"{}","digest":"{}","size":{}}}],"annotations":{{"org.nixos.nixcache.system":"x86_64-linux"}}}}"#,
         config_digest,
-        CacheLayerMediaType::SHARD_DATA_V6_ZSTD,
+        CacheLayerMediaType::SHARD_DATA_V7_ZSTD,
         shard_digest,
         shard_bytes.len()
     );

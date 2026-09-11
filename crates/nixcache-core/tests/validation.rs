@@ -131,7 +131,7 @@ fn root_and_payload_deserialization_validate_structure() {
     root.validate_structure().unwrap();
 
     let mut root_value = serde_json::to_value(&root).unwrap();
-    root_value["version"] = json!(7);
+    root_value["version"] = json!(6);
     assert!(serde_json::from_value::<ShardedArchCacheIndexData>(root_value).is_err());
 
     let mut bad_root = serde_json::to_value(&root).unwrap();
@@ -141,7 +141,8 @@ fn root_and_payload_deserialization_validate_structure() {
     let payload = ShardDataPayload::with_entries(
         hash.shard_id(),
         HashMap::from([(hash.clone(), entry(&hash, "hello"))]),
-    );
+    )
+    .unwrap();
     payload.validate_structure().unwrap();
     let round_trip: ShardDataPayload =
         serde_json::from_value(serde_json::to_value(&payload).unwrap()).unwrap();
@@ -152,7 +153,7 @@ fn root_and_payload_deserialization_validate_structure() {
         json!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-other");
     assert!(serde_json::from_value::<ShardDataPayload>(bad_payload).is_err());
 
-    let mut bad_descriptor = ShardDescriptor::empty(0);
+    let mut bad_descriptor = ShardDescriptor::empty(0).unwrap();
     bad_descriptor.entry_count = 1;
     bad_descriptor.blob_digest = "sha256:bad".to_string();
     let mut descriptor_value = serde_json::to_value(&bad_descriptor).unwrap();

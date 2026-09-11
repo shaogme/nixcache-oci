@@ -14,32 +14,32 @@ pub const EMPTY_CONFIG_DIGEST: &str =
 /// OCI 空配置 Blob 大小 (2 字节)
 pub const EMPTY_CONFIG_SIZE: u64 = 2;
 
-/// Schema v6 媒体类型静态常量
-pub struct CacheLayerMediaTypeV6;
+/// Schema v7 媒体类型静态常量
+pub struct CacheLayerMediaTypeV7;
 
-impl CacheLayerMediaTypeV6 {
+impl CacheLayerMediaTypeV7 {
     /// 单架构分片索引根目录元数据清单
-    pub const ROOT_INDEX_V6_ZSTD: &'static str = "application/vnd.nix.cache.root.v6+zstd";
+    pub const ROOT_INDEX_V7_ZSTD: &'static str = "application/vnd.nix.cache.root.v7+zstd";
     /// 单个分片数据内容层
-    pub const SHARD_DATA_V6_ZSTD: &'static str = "application/vnd.nix.cache.shard.v6+zstd";
+    pub const SHARD_DATA_V7_ZSTD: &'static str = "application/vnd.nix.cache.shard.v7+zstd";
 }
 
-/// 强类型 OCI NixCache Layer 媒体类型 (Schema v6)
+/// 强类型 OCI NixCache Layer 媒体类型 (Schema v7)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheLayerMediaType {
-    RootIndexV6Zstd,
-    ShardDataV6Zstd,
+    RootIndexV7Zstd,
+    ShardDataV7Zstd,
 }
 
 impl CacheLayerMediaType {
-    pub const ROOT_INDEX_V6_ZSTD: &'static str = CacheLayerMediaTypeV6::ROOT_INDEX_V6_ZSTD;
-    pub const SHARD_DATA_V6_ZSTD: &'static str = CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD;
+    pub const ROOT_INDEX_V7_ZSTD: &'static str = CacheLayerMediaTypeV7::ROOT_INDEX_V7_ZSTD;
+    pub const SHARD_DATA_V7_ZSTD: &'static str = CacheLayerMediaTypeV7::SHARD_DATA_V7_ZSTD;
 
     /// 从媒体类型字符串严格解析
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            Self::ROOT_INDEX_V6_ZSTD => Some(Self::RootIndexV6Zstd),
-            Self::SHARD_DATA_V6_ZSTD => Some(Self::ShardDataV6Zstd),
+            Self::ROOT_INDEX_V7_ZSTD => Some(Self::RootIndexV7Zstd),
+            Self::SHARD_DATA_V7_ZSTD => Some(Self::ShardDataV7Zstd),
             _ => None,
         }
     }
@@ -47,19 +47,19 @@ impl CacheLayerMediaType {
     /// 转换为静态媒体类型字符串
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::RootIndexV6Zstd => Self::ROOT_INDEX_V6_ZSTD,
-            Self::ShardDataV6Zstd => Self::SHARD_DATA_V6_ZSTD,
+            Self::RootIndexV7Zstd => Self::ROOT_INDEX_V7_ZSTD,
+            Self::ShardDataV7Zstd => Self::SHARD_DATA_V7_ZSTD,
         }
     }
 
     /// 是否为分片根目录索引类型
     pub const fn is_root_index(&self) -> bool {
-        matches!(self, Self::RootIndexV6Zstd)
+        matches!(self, Self::RootIndexV7Zstd)
     }
 
     /// 是否为分片数据类型
     pub const fn is_shard_data(&self) -> bool {
-        matches!(self, Self::ShardDataV6Zstd)
+        matches!(self, Self::ShardDataV7Zstd)
     }
 }
 
@@ -301,7 +301,7 @@ impl OciImageManifest {
         Ok(())
     }
 
-    pub fn validate_schema_v6_root(
+    pub fn validate_schema_v7_root(
         &self,
         system: &SystemArch,
         merkle_root: &str,
@@ -317,11 +317,11 @@ impl OciImageManifest {
             .as_ref()
             .ok_or_else(|| OciError::InvalidDescriptor {
                 target: target.to_string(),
-                details: "Schema v6 root manifest annotations are missing".to_string(),
+                details: "Schema v7 root manifest annotations are missing".to_string(),
             })?;
-        validate_v6_annotations(annotations, system, merkle_root, target)?;
+        validate_v7_annotations(annotations, system, merkle_root, target)?;
         let layer = &self.layers[0];
-        if layer.media_type != CacheLayerMediaTypeV6::ROOT_INDEX_V6_ZSTD {
+        if layer.media_type != CacheLayerMediaTypeV7::ROOT_INDEX_V7_ZSTD {
             return Err(OciError::UnsupportedMediaType(layer.media_type.clone()));
         }
         if layer.platform.as_ref().map(OciPlatform::to_system) != Some(*system) {
@@ -336,9 +336,9 @@ impl OciImageManifest {
                 .as_ref()
                 .ok_or_else(|| OciError::InvalidDescriptor {
                     target: layer.digest.clone(),
-                    details: "Schema v6 root layer annotations are missing".to_string(),
+                    details: "Schema v7 root layer annotations are missing".to_string(),
                 })?;
-        validate_v6_annotations(layer_annotations, system, merkle_root, &layer.digest)?;
+        validate_v7_annotations(layer_annotations, system, merkle_root, &layer.digest)?;
         Ok(layer)
     }
 
@@ -412,7 +412,7 @@ impl OciArtifactManifest {
     }
 }
 
-fn validate_v6_annotations(
+fn validate_v7_annotations(
     annotations: &HashMap<String, String>,
     system: &SystemArch,
     merkle_root: &str,
@@ -427,7 +427,7 @@ fn validate_v6_annotations(
         || annotations
             .get("org.nixos.nixcache.schema")
             .map(String::as_str)
-            != Some("6")
+            != Some("7")
         || annotations
             .get("org.nixos.nixcache.merkle_root")
             .map(String::as_str)
@@ -435,17 +435,17 @@ fn validate_v6_annotations(
     {
         return Err(OciError::InvalidDescriptor {
             target: target.to_string(),
-            details: "Schema v6 annotations are missing or inconsistent".to_string(),
+            details: "Schema v7 annotations are missing or inconsistent".to_string(),
         });
     }
     ContentDigest::parse(merkle_root).map_err(|_| OciError::InvalidDescriptor {
         target: target.to_string(),
-        details: "Schema v6 merkle_root is not a canonical SHA-256 digest".to_string(),
+        details: "Schema v7 merkle_root is not a canonical SHA-256 digest".to_string(),
     })?;
     Ok(())
 }
 
-/// 单架构 Schema v6 Baseline Root Index Image Manifest 构建参数
+/// 单架构 Schema v7 Baseline Root Index Image Manifest 构建参数
 #[derive(Debug, Clone)]
 pub struct ShardedArchIndexManifestParams<'a> {
     pub root_blob_digest: &'a str,
@@ -456,7 +456,7 @@ pub struct ShardedArchIndexManifestParams<'a> {
     pub merkle_root: &'a str,
 }
 
-/// 构造强类型的单架构 Schema v6 Baseline Root Index Image Manifest (内置 1024 分片描述符，彻底废除全局 Bloom Filter)
+/// 构造强类型的单架构 Schema v7 Baseline Root Index Image Manifest (内置 1024 分片描述符，彻底废除全局 Bloom Filter)
 pub fn build_sharded_arch_index_manifest(
     params: ShardedArchIndexManifestParams<'_>,
 ) -> OciImageManifest {
@@ -469,7 +469,7 @@ pub fn build_sharded_arch_index_manifest(
         "org.nixos.nixcache.merkle_root".to_string(),
         params.merkle_root.to_string(),
     );
-    root_layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
+    root_layer_annotations.insert("org.nixos.nixcache.schema".to_string(), "7".to_string());
 
     let mut manifest_annotations = HashMap::new();
     manifest_annotations.insert(
@@ -491,10 +491,10 @@ pub fn build_sharded_arch_index_manifest(
         "org.nixos.nixcache.merkle_root".to_string(),
         params.merkle_root.to_string(),
     );
-    manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
+    manifest_annotations.insert("org.nixos.nixcache.schema".to_string(), "7".to_string());
 
     let layers = vec![OciDescriptor {
-        media_type: CacheLayerMediaTypeV6::ROOT_INDEX_V6_ZSTD.to_string(),
+        media_type: CacheLayerMediaTypeV7::ROOT_INDEX_V7_ZSTD.to_string(),
         digest: params.root_blob_digest.to_string(),
         size: params.root_blob_size,
         platform: Some(OciPlatform::from_system(params.system)),

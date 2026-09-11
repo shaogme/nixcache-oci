@@ -24,15 +24,15 @@ pub use purge::{
     PurgeEvaluationResult, evaluate_arch_cache_purge, evaluate_cache_purge, prune_broken_gc_roots,
 };
 pub use sharding::{
-    EMPTY_SHARD_MERKLE_HASH, NIX_BASE32_ALPHABET, calculate_shard_id, calculate_shard_id_from_str,
-    compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors, nix_base32_char,
-    nix_base32_val, partition_entries_by_shard, partition_hashes_by_shard, shard_id_to_prefix,
+    NIX_BASE32_ALPHABET, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
+    compute_shard_merkle_hash, diff_shard_descriptors, nix_base32_char, nix_base32_val,
+    partition_entries_by_shard, partition_hashes_by_shard, shard_id_to_prefix,
     shard_id_to_prefix_bytes,
 };
 pub use types::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, DefaultIndexValidationLimits, IndexEntry,
     IndexValidationLimits, JobSummaryMetadata, NUM_SHARDS, NarDigest, NarInfoMeta, RECEIPT_VERSION,
-    RUN_SESSION_VERSION, SCHEMA_VERSION, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    RUN_SESSION_VERSION, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 
@@ -41,16 +41,16 @@ mod tests {
     use super::{
         BloomError, BloomFilter, BuildReceipt, BuildStats, CACHE_INDEX_VERSION, CacheQueryResult,
         CacheSelector, CascadeMode, CoreError, DefaultIndexValidationLimits,
-        EMPTY_SHARD_MERKLE_HASH, FastBlockedBloomFilter, FilterPredicates, IndexEntry,
-        JobSummaryMetadata, NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta,
-        NarInfoParseError, RECEIPT_VERSION, SCHEMA_VERSION_V6, SelectionScope, ShardDataPayload,
-        ShardDescriptor, ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter,
-        TypeError, build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str,
-        compute_merkle_root, compute_shard_merkle_hash, diff_shard_descriptors,
-        evaluate_arch_cache_purge, evaluate_arch_cache_query, evaluate_cache_purge,
-        evaluate_cache_query, evaluate_gc, evaluate_multi_arch_gc, extract_nar_basename,
-        extract_store_hash, extract_store_hash_str, matches_pattern, nix_base32_char,
-        nix_base32_val, partition_entries_by_shard, shard_id_to_prefix,
+        FastBlockedBloomFilter, FilterPredicates, IndexEntry, JobSummaryMetadata,
+        NIX_BASE32_ALPHABET, NUM_SHARDS, NarDigest, NarInfo, NarInfoMeta, NarInfoParseError,
+        RECEIPT_VERSION, SCHEMA_VERSION_V7, SelectionScope, ShardDataPayload, ShardDescriptor,
+        ShardedArchCacheIndexData, SizeFilter, StoreHash, SystemArch, TimeFilter, TypeError,
+        build_nar_lookup_map, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
+        compute_shard_merkle_hash, diff_shard_descriptors, evaluate_arch_cache_purge,
+        evaluate_arch_cache_query, evaluate_cache_purge, evaluate_cache_query, evaluate_gc,
+        evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash, extract_store_hash_str,
+        matches_pattern, nix_base32_char, nix_base32_val, partition_entries_by_shard,
+        shard_id_to_prefix,
     };
     use chrono::{DateTime, Duration, Utc};
     use sha2::{Digest, Sha256};
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_root_and_shard_validators_reject_structural_tampering() {
+    fn schema_v7_root_and_shard_validators_reject_structural_tampering() {
         let system = SystemArch::X86_64Linux;
         let limits = DefaultIndexValidationLimits::default();
         let mut root = ShardedArchCacheIndexData::new(system, "repo", "registry");
@@ -185,7 +185,8 @@ mod tests {
                     origin_job: None,
                 },
             )]),
-        );
+        )
+        .expect("test payload shard id and entries are valid");
         payload
             .validate_for(shard_id, &system, &limits)
             .expect("matching shard payload should be valid");
@@ -456,48 +457,72 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
                 name: "pkg1".to_string(),
                 nar_size: 500,
                 nar_digest: test_digest("digest1"),
+                narinfo_meta: NarInfoMeta {
+                    store_path: format!("/nix/store/{}-pkg1", h1),
+                    nar_basename: "pkg1.nar.xz".to_string(),
+                    nar_hash:
+                        "sha256:0d1b50428e2194f481ad1cf387f3b8908861cf12674e1d743a6d9627fb2e2ff0"
+                            .to_string(),
+                    ..Default::default()
+                },
+                added: "2026-08-29T00:00:00Z".to_string(),
                 ..Default::default()
             },
         );
 
-        let hash_a = compute_shard_merkle_hash(&entries1);
-        let hash_b = compute_shard_merkle_hash(&entries1);
+        let hash_a = compute_shard_merkle_hash(h1.shard_id(), &entries1).unwrap();
+        let hash_b = compute_shard_merkle_hash(h1.shard_id(), &entries1).unwrap();
         assert_eq!(hash_a, hash_b, "Merkle hash must be deterministic");
 
         let empty_entries = HashMap::new();
+        let empty_hash = compute_shard_merkle_hash(0, &empty_entries).unwrap();
         assert_eq!(
-            compute_shard_merkle_hash(&empty_entries),
-            EMPTY_SHARD_MERKLE_HASH
+            empty_hash,
+            ShardDataPayload::new(0)
+                .unwrap()
+                .compute_merkle_hash()
+                .unwrap()
         );
 
         let mut shards1 = Vec::with_capacity(NUM_SHARDS);
         let mut shards2 = Vec::with_capacity(NUM_SHARDS);
         for id in 0..NUM_SHARDS {
-            shards1.push(ShardDescriptor::empty(id as u16));
-            shards2.push(ShardDescriptor::empty(id as u16));
+            shards1.push(ShardDescriptor::empty(id as u16).unwrap());
+            shards2.push(ShardDescriptor::empty(id as u16).unwrap());
         }
 
-        let root1 = compute_merkle_root(&shards1);
-        let root2 = compute_merkle_root(&shards2);
+        let root1 = compute_merkle_root(&shards1).unwrap();
+        let root2 = compute_merkle_root(&shards2).unwrap();
         assert_eq!(root1, root2);
-        assert!(diff_shard_descriptors(&shards1, &shards2).is_empty());
+        assert!(
+            diff_shard_descriptors(&shards1, &shards2)
+                .unwrap()
+                .is_empty()
+        );
 
         // Modify shard 42 in shards2
-        shards2[42].merkle_hash = "sha256:changed42".to_string();
-        shards2[42].entry_count = 1;
+        shards2[42] = ShardDescriptor::new(
+            42,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            1,
+            1,
+            1,
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
 
-        let root2_changed = compute_merkle_root(&shards2);
+        let root2_changed = compute_merkle_root(&shards2).unwrap();
         assert_ne!(root1, root2_changed);
 
-        let diff = diff_shard_descriptors(&shards1, &shards2);
+        let diff = diff_shard_descriptors(&shards1, &shards2).unwrap();
         assert_eq!(diff, vec![42]);
     }
 
     #[test]
-    fn test_schema_v6_structures_and_serialization() {
+    fn test_schema_v7_structures_and_serialization() {
         let mut root_index =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "owner/repo", "ghcr.io");
-        assert_eq!(root_index.version, SCHEMA_VERSION_V6);
+        assert_eq!(root_index.version, SCHEMA_VERSION_V7);
         assert_eq!(root_index.shards.len(), NUM_SHARDS);
         assert_eq!(root_index.total_entries(), 0);
 
@@ -512,13 +537,13 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         target_shard.uncompressed_size = 4096;
         target_shard.merkle_hash =
             "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
-        root_index.recalculate_merkle_root();
+        root_index.recalculate_merkle_root().unwrap();
 
         let json = serde_json::to_string(&root_index).expect("Serialize root index");
         let deserialized: ShardedArchCacheIndexData =
             serde_json::from_str(&json).expect("Deserialize root index");
 
-        assert_eq!(deserialized.version, SCHEMA_VERSION_V6);
+        assert_eq!(deserialized.version, SCHEMA_VERSION_V7);
         assert_eq!(deserialized.system, SystemArch::X86_64Linux);
         assert_eq!(deserialized.total_entries(), 1);
         assert_eq!(deserialized.shards.len(), NUM_SHARDS);
@@ -529,7 +554,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert!(deserialized.is_shard_empty(&h_empty));
 
         // ShardDataPayload
-        let mut payload = ShardDataPayload::new(838);
+        let mut payload = ShardDataPayload::new(838).unwrap();
         payload.entries.insert(
             h1.clone(),
             IndexEntry {
@@ -551,7 +576,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         );
         let payload_json = serde_json::to_string(&payload).unwrap();
         let loaded_payload: ShardDataPayload = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V6);
+        assert_eq!(loaded_payload.version, SCHEMA_VERSION_V7);
         assert_eq!(loaded_payload.shard_id, 838);
         assert_eq!(loaded_payload.len(), 1);
 
@@ -629,7 +654,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         )
         .with_run_info(Some(12345), Some("job1".to_string()));
         assert_eq!(receipt.version, RECEIPT_VERSION);
-        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V6);
+        assert_eq!(CACHE_INDEX_VERSION, SCHEMA_VERSION_V7);
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub async fn run_full_scale_simulation(
     system: SystemArch,
 ) -> Result<FullScaleReport, String> {
     info!(
-        "=== 启动 Schema v6 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
+        "=== 启动 Schema v7 分片索引海量规模 ({}) 自动化检验与高并发压测套件 ===",
         entries_count
     );
 
@@ -107,7 +107,8 @@ pub async fn run_full_scale_simulation(
     // 预热分片表
     let partitioned = partition_entries_by_shard(entries.clone());
     for (sid, s_entries) in partitioned {
-        let payload = ShardDataPayload::with_entries(sid, s_entries);
+        let payload =
+            ShardDataPayload::with_entries(sid, s_entries).map_err(|error| error.to_string())?;
         let _ = sm_arc.insert_sync(sid, Arc::new(payload));
     }
 

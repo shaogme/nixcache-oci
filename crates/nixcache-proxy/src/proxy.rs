@@ -434,7 +434,7 @@ mod tests {
         .unwrap();
         let hash1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let shard_id = calculate_shard_id(&hash1);
-        let mut shard = ShardDataPayload::new(shard_id);
+        let mut shard = ShardDataPayload::new(shard_id).unwrap();
         shard.entries.insert(
             hash1.clone(),
             IndexEntry {
@@ -539,7 +539,7 @@ mod tests {
         };
         let local_rendered = entry.to_narinfo_string();
         let shard_id = calculate_shard_id(&local_hash);
-        let mut shard = ShardDataPayload::new(shard_id);
+        let mut shard = ShardDataPayload::new(shard_id).unwrap();
         shard.entries.insert(local_hash.clone(), entry);
 
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
@@ -663,7 +663,7 @@ mod tests {
         let local_hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
         let digest_str = "3733cd977ff8eb18b987357e22ced99f46097f31ecb239e878ae63760e83e4d5";
         let shard_id = calculate_shard_id(&local_hash);
-        let mut shard = ShardDataPayload::new(shard_id);
+        let mut shard = ShardDataPayload::new(shard_id).unwrap();
         shard.entries.insert(
             local_hash.clone(),
             IndexEntry {

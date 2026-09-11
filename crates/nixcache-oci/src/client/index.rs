@@ -6,7 +6,7 @@ use crate::{
     codec::IndexCodec,
     error::{OciError, TransportError},
     manifest::{
-        CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
+        CacheLayerMediaTypeV7, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, OCI_IMAGE_INDEX_MEDIA_TYPE,
         OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest,
         ShardedArchIndexManifestParams, build_sharded_arch_index_manifest,
     },
@@ -137,10 +137,10 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
             .and_then(|annotations| annotations.get("org.nixos.nixcache.merkle_root"))
             .ok_or_else(|| OciError::InvalidDescriptor {
                 target: target.to_string(),
-                details: "Schema v6 root manifest merkle_root annotation is missing".to_string(),
+                details: "Schema v7 root manifest merkle_root annotation is missing".to_string(),
             })?;
         let layer =
-            manifest.validate_schema_v6_root(system, merkle_root, self.client.limits(), target)?;
+            manifest.validate_schema_v7_root(system, merkle_root, self.client.limits(), target)?;
         let blob_bytes = self.client.blobs().get_descriptor(layer).await?;
         let decoded = IndexCodec::decode_zstd(
             &blob_bytes,
@@ -180,6 +180,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         tag: &str,
         root_data: &ShardedArchCacheIndexData,
     ) -> Result<String, OciError> {
+        root_data.validate_structure()?;
         let (root_blob_digest, root_compressed_size, _) =
             self.client.blobs().push_zstd(root_data).await?;
         let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
@@ -207,6 +208,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
                 backend: self.client.kind(),
             });
         }
+        root_data.validate_structure()?;
         let (root_blob_digest, root_compressed_size, _) =
             self.client.blobs().push_zstd(root_data).await?;
         let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
@@ -230,23 +232,24 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         descriptor: &ShardDescriptor,
         system: &SystemArch,
     ) -> Result<ShardDataPayload, OciError> {
+        descriptor.validate_structure()?;
         if descriptor.entry_count == 0 {
             if descriptor.shard_id >= NUM_SHARDS as u16
                 || !descriptor.blob_digest.is_empty()
                 || descriptor.compressed_size != 0
                 || descriptor.uncompressed_size != 0
                 || descriptor.merkle_hash
-                    != ShardDataPayload::new(descriptor.shard_id).compute_merkle_hash()
+                    != ShardDataPayload::new(descriptor.shard_id)?.compute_merkle_hash()?
             {
                 return Err(OciError::InvalidDescriptor {
                     target: descriptor.shard_id.to_string(),
                     details: "empty shard descriptor has non-empty metadata".to_string(),
                 });
             }
-            return Ok(ShardDataPayload::new(descriptor.shard_id));
+            return Ok(ShardDataPayload::new(descriptor.shard_id)?);
         }
         let blob_descriptor = OciDescriptor {
-            media_type: CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD.to_string(),
+            media_type: CacheLayerMediaTypeV7::SHARD_DATA_V7_ZSTD.to_string(),
             digest: descriptor.blob_digest.clone(),
             size: descriptor.compressed_size,
             platform: None,
@@ -255,7 +258,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         let blob_bytes = self.client.blobs().get_descriptor(&blob_descriptor).await?;
         let decoded = IndexCodec::decode_zstd(
             &blob_bytes,
-            CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD,
+            CacheLayerMediaTypeV7::SHARD_DATA_V7_ZSTD,
             self.client.limits().max_index_uncompressed_bytes(),
         )?;
         if decoded.uncompressed_size != descriptor.uncompressed_size {
@@ -282,6 +285,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         &self,
         payload: &ShardDataPayload,
     ) -> Result<(String, u64, u64), OciError> {
+        payload.validate_structure()?;
         self.client.blobs().push_zstd(payload).await
     }
 

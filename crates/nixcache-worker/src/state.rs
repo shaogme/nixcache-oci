@@ -45,7 +45,7 @@ pub struct CachedShardEntry {
     pub expires_at: f64,
 }
 
-/// 收敛的 Worker 全局内存状态 (Schema v6 SMRI with SWR Self-Healing)
+/// 收敛的 Worker 全局内存状态 (Schema v7 SMRI with SWR Self-Healing)
 pub struct WorkerState {
     pub mem_baseline_cache: ArcSwapOption<CachedBaselineEntry>,
     pub mem_shard_cache: SccHashMap<u16, Arc<CachedShardEntry>>,

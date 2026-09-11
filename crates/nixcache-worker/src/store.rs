@@ -288,8 +288,8 @@ impl CacheStore {
             return Ok((cached.payload.clone(), cached.nar_lookup.clone()));
         }
 
-        // 2. L2 Cloudflare KV (Content-Addressable: shard_v6_{blob_digest})
-        let kv_key = format!("shard_v6_{}", blob_digest);
+        // 2. L2 Cloudflare KV (Content-Addressable: shard_v7_{blob_digest})
+        let kv_key = format!("shard_v7_{}", blob_digest);
 
         if let Ok(kv) = env.kv("NIXCACHE_KV")
             && let Ok(Some(wrapper)) = kv
@@ -372,7 +372,7 @@ impl CacheStore {
         }
     }
 
-    /// 获取生产基线分片根索引 (L1 Memory -> L2 KV -> L3 GHCR，纯粹单原子 baseline_v6_{system})
+    /// 获取生产基线分片根索引 (L1 Memory -> L2 KV -> L3 GHCR，纯粹单原子 baseline_v7_{system})
     pub async fn get_baseline_data(
         &self,
         env: &Env,
@@ -386,14 +386,14 @@ impl CacheStore {
             return Ok((cached.root.clone(), cached.manifest_digest.clone()));
         }
 
-        // 2. L2 Cloudflare KV (单原子 baseline_v6_{system})
+        // 2. L2 Cloudflare KV (单原子 baseline_v7_{system})
         let kv = env
             .kv("NIXCACHE_KV")
             .map_err(|e| WorkerStoreError::KvGetFailed {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
+        let baseline_key = format!("baseline_v7_{}", self.config.target_system.as_str());
 
         if let Ok(Some(wrapper)) = kv
             .get(&baseline_key)
@@ -473,7 +473,7 @@ impl CacheStore {
         if let Some(old_b) = old_cached
             && old_b.root.merkle_root != root_data.merkle_root
         {
-            let invalidated_shards = diff_shard_descriptors(&old_b.root.shards, &root_data.shards);
+            let invalidated_shards = diff_shard_descriptors(&old_b.root.shards, &root_data.shards)?;
             for shard_id in invalidated_shards {
                 WorkerState::global().mem_shard_cache.remove_sync(&shard_id);
             }
@@ -485,7 +485,7 @@ impl CacheStore {
                 key: "NIXCACHE_KV".to_string(),
                 message: e.to_string(),
             })?;
-        let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
+        let baseline_key = format!("baseline_v7_{}", self.config.target_system.as_str());
 
         let wrapper = KVCacheWrapper {
             data: root_data.clone(),
@@ -521,7 +521,7 @@ impl CacheStore {
         {
             cached.root.shards.clone()
         } else if let Ok(kv) = env.kv("NIXCACHE_KV") {
-            let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
+            let baseline_key = format!("baseline_v7_{}", self.config.target_system.as_str());
             if let Ok(Some(wrapper)) = kv
                 .get(&baseline_key)
                 .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
@@ -557,7 +557,11 @@ impl CacheStore {
         };
 
         // 2. 比对变动分片并主动预热 (Active Shard Warm-Up)
-        let changed_shard_ids = diff_shard_descriptors(&old_shards, &baseline.shards);
+        let changed_shard_ids = if old_shards.is_empty() {
+            Vec::new()
+        } else {
+            diff_shard_descriptors(&old_shards, &baseline.shards)?
+        };
         let mut warm_up_futures = Vec::new();
         for shard_id in changed_shard_ids {
             if let Some(shard_desc) = baseline.find_shard_by_id(shard_id)
@@ -595,7 +599,7 @@ impl CacheStore {
         let (baseline_count, manifest_digest, generated) = match baseline_res {
             Ok((ref b, ref digest)) => (b.total_entries(), digest.clone(), b.generated.clone()),
             Err(_) => {
-                let baseline_key = format!("baseline_v6_{}", self.config.target_system.as_str());
+                let baseline_key = format!("baseline_v7_{}", self.config.target_system.as_str());
                 let kv_data = match env.kv("NIXCACHE_KV") {
                     Ok(kv) => kv
                         .get(&baseline_key)
@@ -643,7 +647,7 @@ impl CacheStore {
 mod tests {
     use super::{RemoteStatus, WorkerProxyConfig};
     use nixcache_core::{
-        IndexEntry, NarDigest, NarInfoMeta, SCHEMA_VERSION_V6, ShardDataPayload,
+        IndexEntry, NarDigest, NarInfoMeta, SCHEMA_VERSION_V7, ShardDataPayload,
         ShardedArchCacheIndexData, StoreHash, SystemArch, build_nar_lookup_map,
         diff_shard_descriptors,
     };
@@ -715,13 +719,13 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_v6_sharding_serialization() {
+    fn test_schema_v7_sharding_serialization() {
         let root = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
-        assert_eq!(root.version, SCHEMA_VERSION_V6);
+        assert_eq!(root.version, SCHEMA_VERSION_V7);
         assert_eq!(root.shards.len(), 1024);
 
-        let shard = ShardDataPayload::new(0);
-        assert_eq!(shard.version, SCHEMA_VERSION_V6);
+        let shard = ShardDataPayload::new(0).unwrap();
+        assert_eq!(shard.version, SCHEMA_VERSION_V7);
     }
 
     #[test]
@@ -729,10 +733,22 @@ mod tests {
         let root1 = ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         let mut root2 = root1.clone();
 
-        root2.shards[0].blob_digest = "sha256:new_digest_0".to_string();
-        root2.shards[5].blob_digest = "sha256:new_digest_5".to_string();
+        root2.shards[0].blob_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        root2.shards[0].compressed_size = 1;
+        root2.shards[0].uncompressed_size = 1;
+        root2.shards[0].entry_count = 1;
+        root2.shards[0].merkle_hash =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        root2.shards[5].blob_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        root2.shards[5].compressed_size = 1;
+        root2.shards[5].uncompressed_size = 1;
+        root2.shards[5].entry_count = 1;
+        root2.shards[5].merkle_hash =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
 
-        let diff = diff_shard_descriptors(&root1.shards, &root2.shards);
+        let diff = diff_shard_descriptors(&root1.shards, &root2.shards).unwrap();
         assert_eq!(diff, vec![0, 5]);
     }
 }

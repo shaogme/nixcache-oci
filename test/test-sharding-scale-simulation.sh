@@ -7,8 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 
-echo "=== Starting NixCache Schema v6 Sharding Scale & Concurrency Stress Test Suite ==="
+echo "=== Starting NixCache Schema v7 Sharding Scale & Concurrency Stress Test Suite ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-scale-test-XXXXXX)
 export GITHUB_ENV="$TMP_DIR/github_env"
@@ -62,11 +63,11 @@ find_sim_binary() {
     if [[ "$SCALE_ENTRIES" -ge 500000 ]]; then
         echo ">>> Compiling sharding-scale-sim in --release mode for large scale (${SCALE_ENTRIES} entries)..."
         cargo build --release --bin sharding-scale-sim
-        SIM_BIN="./target/release/sharding-scale-sim"
+        SIM_BIN="$BUILD_TARGET_DIR/release/sharding-scale-sim"
     else
         echo ">>> Compiling sharding-scale-sim in debug mode..."
         cargo build --bin sharding-scale-sim
-        SIM_BIN="./target/debug/sharding-scale-sim"
+        SIM_BIN="$BUILD_TARGET_DIR/debug/sharding-scale-sim"
     fi
 }
 
@@ -133,7 +134,7 @@ find_builder_binary() {
 
     echo ">>> Building nixcache-builder..."
     cargo build --bin nixcache-builder
-    BUILDER_BIN="./target/debug/nixcache-builder"
+    BUILDER_BIN="$BUILD_TARGET_DIR/debug/nixcache-builder"
 }
 
 find_builder_binary
@@ -215,8 +216,8 @@ export GITHUB_TOKEN="dummy-token"
 echo ">>> Executing nixcache-builder promote across 5,000 entries..."
 "$BUILDER_BIN" promote --receipts-dir "$RECEIPTS_DIR" --target-tag "cache-index"
 
-# 7. 校验 OCI 中的 Sharded Root Index (Schema v6 单层架构)
-echo ">>> Verifying OCI Sharded Root Index Layer (Schema v6)..."
+# 7. 校验 OCI 中的 Sharded Root Index (Schema v7 分层 Merkle 架构)
+echo ">>> Verifying OCI Sharded Root Index Layer (Schema v7)..."
 MANIFEST_INDEX_JSON=$(curl -fs -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json" "http://127.0.0.1:${REGISTRY_PORT}/v2/scale-test/cache/nix-cache/manifests/cache-index")
 
 python3 -c "
@@ -232,10 +233,10 @@ sub_raw = subprocess.check_output([
 ])
 sub_manifest = json.loads(sub_raw)
 
-assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V6), got {len(sub_manifest["layers"])}'
+assert len(sub_manifest['layers']) == 1, f'Expected 1 layer (Root Index V7), got {len(sub_manifest["layers"])}'
 root_layer = sub_manifest['layers'][0]
 
-assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v6+zstd'
+assert root_layer['mediaType'] == 'application/vnd.nix.cache.root.v7+zstd'
 
 # Decompress and verify Root Index
 blob_digest = root_layer['digest']
@@ -246,7 +247,7 @@ blob_bytes = subprocess.check_output([
 decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 root_data = json.loads(decompressed)
 
-assert root_data['version'] == 6
+assert root_data['version'] == 7
 assert len(root_data['shards']) == 1024
 total_entries = sum(s['entry_count'] for s in root_data['shards'])
 assert total_entries == 5000, f'Expected 5000 entries across shards, got {total_entries}'

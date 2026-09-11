@@ -34,7 +34,8 @@ pub fn verify_merkle_determinism(entries: &HashMap<StoreHash, IndexEntry>) -> Re
         }
 
         // 1. 基准哈希计算
-        let base_hash = compute_shard_merkle_hash(&shard_entries);
+        let base_hash = compute_shard_merkle_hash(shard_id, &shard_entries)
+            .map_err(|error| error.to_string())?;
 
         // 2. 构造多种不同插入顺序的 HashMap (包含完全逆序与所有循环移位打乱)
         let entry_list: Vec<(StoreHash, IndexEntry)> = shard_entries.into_iter().collect();
@@ -43,7 +44,8 @@ pub fn verify_merkle_determinism(entries: &HashMap<StoreHash, IndexEntry>) -> Re
         let mut reversed_list = entry_list.clone();
         reversed_list.reverse();
         let map_reversed: HashMap<_, _> = reversed_list.into_iter().collect();
-        let hash_reversed = compute_shard_merkle_hash(&map_reversed);
+        let hash_reversed = compute_shard_merkle_hash(shard_id, &map_reversed)
+            .map_err(|error| error.to_string())?;
         if hash_reversed != base_hash {
             return Err(format!(
                 "Determinism violation on shard {}: reversed hash '{}' != base '{}'",
@@ -56,7 +58,8 @@ pub fn verify_merkle_determinism(entries: &HashMap<StoreHash, IndexEntry>) -> Re
             let mut rotated = entry_list.clone();
             rotated.rotate_left(rot);
             let map_rotated: HashMap<_, _> = rotated.into_iter().collect();
-            let hash_rotated = compute_shard_merkle_hash(&map_rotated);
+            let hash_rotated = compute_shard_merkle_hash(shard_id, &map_rotated)
+                .map_err(|error| error.to_string())?;
             if hash_rotated != base_hash {
                 return Err(format!(
                     "Determinism violation on shard {}: rotated ({}) hash '{}' != base '{}'",
@@ -81,21 +84,29 @@ pub fn verify_merkle_tamper_detection(
     for shard_id in 0..NUM_SHARDS as u16 {
         let shard_entries = partitioned.get(&shard_id).cloned().unwrap_or_default();
         let count = shard_entries.len();
-        let payload = ShardDataPayload::with_entries(shard_id, shard_entries);
-        let merkle = payload.compute_merkle_hash();
-        let digest = format!("sha256:blob-fake-{}", shard_id);
-
-        root_index.shards[shard_id as usize] = ShardDescriptor::new(
-            shard_id,
-            digest,
-            (count * 50) as u64,
-            (count * 200) as u64,
-            count,
-            merkle,
-        );
+        let payload = ShardDataPayload::with_entries(shard_id, shard_entries)
+            .map_err(|error| error.to_string())?;
+        let merkle = payload
+            .compute_merkle_hash()
+            .map_err(|error| error.to_string())?;
+        root_index.shards[shard_id as usize] = if count == 0 {
+            ShardDescriptor::empty(shard_id).map_err(|error| error.to_string())?
+        } else {
+            ShardDescriptor::new(
+                shard_id,
+                format!("sha256:{shard_id:064x}"),
+                (count * 50) as u64,
+                (count * 200) as u64,
+                count,
+                merkle,
+            )
+            .map_err(|error| error.to_string())?
+        };
         payloads.push(payload);
     }
-    root_index.recalculate_merkle_root();
+    root_index
+        .recalculate_merkle_root()
+        .map_err(|error| error.to_string())?;
 
     let original_root = root_index.merkle_root.clone();
 
@@ -114,14 +125,18 @@ pub fn verify_merkle_tamper_detection(
         .cloned()
         .ok_or_else(|| "Empty entries in target shard".to_string())?;
 
-    let original_shard_hash = target_payload.compute_merkle_hash();
+    let original_shard_hash = target_payload
+        .compute_merkle_hash()
+        .map_err(|error| error.to_string())?;
 
     // 篡改条目的 nar_size
     if let Some(entry) = target_payload.entries.get_mut(&first_hash) {
         entry.nar_size += 1;
     }
 
-    let tampered_shard_hash = target_payload.compute_merkle_hash();
+    let tampered_shard_hash = target_payload
+        .compute_merkle_hash()
+        .map_err(|error| error.to_string())?;
     if tampered_shard_hash == original_shard_hash {
         return Err(format!(
             "Tamper detection failed on shard {}: hash remained unchanged after modifying nar_size",
@@ -131,7 +146,9 @@ pub fn verify_merkle_tamper_detection(
 
     // 更新 root_index 对应分片并重算
     root_index.shards[target_shard_id as usize].merkle_hash = tampered_shard_hash;
-    root_index.recalculate_merkle_root();
+    root_index
+        .recalculate_merkle_root()
+        .map_err(|error| error.to_string())?;
 
     if root_index.merkle_root == original_root {
         return Err(
@@ -158,20 +175,28 @@ pub fn verify_incremental_diff_accuracy(
             .cloned()
             .unwrap_or_default();
         let count = entries_in_shard.len();
-        let payload = ShardDataPayload::with_entries(shard_id, entries_in_shard);
-        let merkle = payload.compute_merkle_hash();
-        let digest = format!("sha256:base-blob-{}", shard_id);
-
-        root_index.shards[shard_id as usize] = ShardDescriptor::new(
-            shard_id,
-            digest,
-            (count * 50) as u64,
-            (count * 200) as u64,
-            count,
-            merkle,
-        );
+        let payload = ShardDataPayload::with_entries(shard_id, entries_in_shard)
+            .map_err(|error| error.to_string())?;
+        let merkle = payload
+            .compute_merkle_hash()
+            .map_err(|error| error.to_string())?;
+        root_index.shards[shard_id as usize] = if count == 0 {
+            ShardDescriptor::empty(shard_id).map_err(|error| error.to_string())?
+        } else {
+            ShardDescriptor::new(
+                shard_id,
+                format!("sha256:{shard_id:064x}"),
+                (count * 50) as u64,
+                (count * 200) as u64,
+                count,
+                merkle,
+            )
+            .map_err(|error| error.to_string())?
+        };
     }
-    root_index.recalculate_merkle_root();
+    root_index
+        .recalculate_merkle_root()
+        .map_err(|error| error.to_string())?;
     let old_merkle_root = root_index.merkle_root.clone();
     let old_shards = root_index.shards.clone();
 
@@ -191,9 +216,12 @@ pub fn verify_incremental_diff_accuracy(
             combined.extend(incoming);
 
             let new_count = combined.len();
-            let new_payload = ShardDataPayload::with_entries(shard_id, combined);
-            let new_merkle = new_payload.compute_merkle_hash();
-            let new_digest = format!("sha256:updated-blob-{}", shard_id);
+            let new_payload = ShardDataPayload::with_entries(shard_id, combined)
+                .map_err(|error| error.to_string())?;
+            let new_merkle = new_payload
+                .compute_merkle_hash()
+                .map_err(|error| error.to_string())?;
+            let new_digest = format!("sha256:{:064x}", 100_000 + shard_id as u64);
 
             updated_shards[shard_id as usize] = ShardDescriptor::new(
                 shard_id,
@@ -202,14 +230,17 @@ pub fn verify_incremental_diff_accuracy(
                 (new_count * 200) as u64,
                 new_count,
                 new_merkle,
-            );
+            )
+            .map_err(|error| error.to_string())?;
         }
     }
 
-    let detected_affected_shards = diff_shard_descriptors(&old_shards, &updated_shards);
+    let detected_affected_shards =
+        diff_shard_descriptors(&old_shards, &updated_shards).map_err(|error| error.to_string())?;
     let diff_matches_exact = expected_affected_shards == detected_affected_shards;
 
-    let new_merkle_root = compute_merkle_root(&updated_shards);
+    let new_merkle_root =
+        compute_merkle_root(&updated_shards).map_err(|error| error.to_string())?;
     let roots_differ = (old_merkle_root != new_merkle_root) || new_entries.is_empty();
 
     let unchanged_shards_count = NUM_SHARDS - detected_affected_shards.len();

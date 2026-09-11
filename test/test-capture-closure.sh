@@ -7,7 +7,7 @@
 #   4. Target expression & Flake resolution without out-link
 #   5. Strict closure validation (rejection of missing target outputs)
 #   6. Permissive fallback mode (--no-strict-closure / diff-all)
-#   7. Remote OCI session manifest Schema v6 CAS merge & GC root purification
+#   7. Remote OCI session manifest Schema v7 CAS merge & GC root purification
 #   8. Multi-architecture promote & ephemeral session tag cleanup
 #   9. Proxy binary substitution & executable roundtrip validation
 
@@ -375,7 +375,7 @@ blob_bytes = subprocess.check_output([
 
 decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 idx = json.loads(decompressed)
-assert idx['version'] == 6, f'Expected version 6, got {idx.get(\"version\")}'
+assert idx['version'] == 7, f'Expected version 7, got {idx.get(\"version\")}'
 assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx.get(\"last_promoted_run\")}'
 total_entries = sum(s['entry_count'] for s in idx['shards'])
 assert total_entries == 4, f'Expected 4 entries across shards, got {total_entries}'

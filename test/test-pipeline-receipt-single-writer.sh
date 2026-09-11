@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-pipeline-receipt-single-writer.sh — End-to-end integration test for Schema v6 BuildReceipt Single-Writer Pipeline & 2-Tier Proxy
+# test-pipeline-receipt-single-writer.sh — End-to-end integration test for Schema v7 BuildReceipt Single-Writer Pipeline & 2-Tier Proxy
 # Verifies:
 #   1. Clean OCI Registry setup and proxy startup (2-Tier cascade)
 #   2. Concurrent matrix workers generating derivations and exporting BuildReceipts
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-echo "=== Starting NixCache Schema v6 BuildReceipt Single-Writer Pipeline Test ==="
+echo "=== Starting NixCache Schema v7 BuildReceipt Single-Writer Pipeline Test ==="
 
 TMP_DIR=$(mktemp -d /tmp/nixcache-pipeline-test-XXXXXX)
 RECEIPTS_DIR="$TMP_DIR/receipts"
@@ -220,11 +220,11 @@ blob_bytes = subprocess.check_output([
 
 decompressed = subprocess.check_output(['zstd', '-dc'], input=blob_bytes)
 idx = json.loads(decompressed)
-assert idx['version'] == 6, f'Expected version 6, got {idx[\"version\"]}'
+assert idx['version'] == 7, f'Expected version 7, got {idx[\"version\"]}'
 assert idx['last_promoted_run'] == $RUN_ID, f'Expected last_promoted_run $RUN_ID, got {idx[\"last_promoted_run\"]}'
 total_entries = sum(s['entry_count'] for s in idx['shards'])
 assert total_entries == 4, f'Expected 4 promoted entries across shards, got {total_entries}'
-print('>>> Promoted cache-index verified (Schema v6, single-writer compacted 4 entries across shards).')
+print('>>> Promoted cache-index verified (Schema v7, single-writer compacted 4 entries across shards).')
 "
 
 # 9. Test Proxy Refresh: Baseline Tier 1 Loading
@@ -250,4 +250,4 @@ if [[ -f "$SNAPSHOT_FILE" ]]; then
 fi
 echo ">>> Session clean verified."
 
-echo "=== ALL SCHEMA V6 RECEIPT & SINGLE-WRITER PIPELINE TESTS PASSED ==="
+echo "=== ALL SCHEMA V7 RECEIPT & SINGLE-WRITER PIPELINE TESTS PASSED ==="

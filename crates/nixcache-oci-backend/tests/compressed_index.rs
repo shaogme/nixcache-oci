@@ -37,7 +37,7 @@ fn sample_sharded_arch_index_data(
         "s66mzxpvicwk07gjbjfw9izjfa797vsa"
     };
     let hash = StoreHash::parse(hash_str).unwrap();
-    let mut shard_payload = ShardDataPayload::new(hash.shard_id());
+    let mut shard_payload = ShardDataPayload::new(hash.shard_id()).unwrap();
     shard_payload.entries.insert(
         hash.clone(),
         IndexEntry {
@@ -69,7 +69,7 @@ fn sample_sharded_arch_index_data(
 }
 
 #[test]
-fn test_manifest_builder_generates_v6_zstd_descriptors() {
+fn test_manifest_builder_generates_v7_zstd_descriptors() {
     let system = SystemArch::X86_64Linux;
     let index_manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
         root_blob_digest: "sha256:rootblob123",
@@ -87,7 +87,7 @@ fn test_manifest_builder_generates_v6_zstd_descriptors() {
     let root_layer = &index_manifest.layers[0];
     assert_eq!(
         root_layer.media_type,
-        CacheLayerMediaType::ROOT_INDEX_V6_ZSTD
+        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD
     );
     assert_eq!(root_layer.digest, "sha256:rootblob123");
     assert_eq!(root_layer.size, 500);
@@ -97,7 +97,7 @@ fn test_manifest_builder_generates_v6_zstd_descriptors() {
         annotations
             .get("org.nixos.nixcache.schema")
             .map(|s| s.as_str()),
-        Some("6")
+        Some("7")
     );
     assert_eq!(
         annotations
@@ -131,9 +131,10 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
         shard_bytes.len() as u64,
         serde_json::to_vec(&shard_payload).unwrap().len() as u64,
         shard_payload.len(),
-        shard_payload.compute_merkle_hash(),
-    );
-    arch_data.recalculate_merkle_root();
+        shard_payload.compute_merkle_hash().unwrap(),
+    )
+    .unwrap();
+    arch_data.recalculate_merkle_root().unwrap();
 
     let compressed_bytes = IndexCodec::encode_zstd(&arch_data, 3).unwrap();
     let blob_digest = compute_sha256(&compressed_bytes);
@@ -242,9 +243,10 @@ async fn test_get_multi_arch_sharded_index_routing() {
         shard_bytes_x86.len() as u64,
         serde_json::to_vec(&shard_x86).unwrap().len() as u64,
         shard_x86.len(),
-        shard_x86.compute_merkle_hash(),
-    );
-    data_x86.recalculate_merkle_root();
+        shard_x86.compute_merkle_hash().unwrap(),
+    )
+    .unwrap();
+    data_x86.recalculate_merkle_root().unwrap();
 
     let bytes_x86 = IndexCodec::encode_zstd(&data_x86, 3).unwrap();
     let digest_x86 = compute_sha256(&bytes_x86);
@@ -261,9 +263,10 @@ async fn test_get_multi_arch_sharded_index_routing() {
         shard_bytes_arm.len() as u64,
         serde_json::to_vec(&shard_arm).unwrap().len() as u64,
         shard_arm.len(),
-        shard_arm.compute_merkle_hash(),
-    );
-    data_arm.recalculate_merkle_root();
+        shard_arm.compute_merkle_hash().unwrap(),
+    )
+    .unwrap();
+    data_arm.recalculate_merkle_root().unwrap();
 
     let bytes_arm = IndexCodec::encode_zstd(&data_arm, 3).unwrap();
     let digest_arm = compute_sha256(&bytes_arm);
@@ -438,7 +441,7 @@ async fn test_get_sharded_root_index_rejects_unsupported_media_type() {
                 "org.nixos.nixcache.system".to_string(),
                 "x86_64-linux".to_string(),
             ),
-            ("org.nixos.nixcache.schema".to_string(), "6".to_string()),
+            ("org.nixos.nixcache.schema".to_string(), "7".to_string()),
             (
                 "org.nixos.nixcache.merkle_root".to_string(),
                 legacy_root.merkle_root,
@@ -573,8 +576,9 @@ async fn test_get_shard_data_roundtrip() {
                 comp_size,
                 uncomp_size,
                 shard_payload.len(),
-                shard_payload.compute_merkle_hash(),
-            ),
+                shard_payload.compute_merkle_hash().unwrap(),
+            )
+            .unwrap(),
             &SystemArch::X86_64Linux,
         )
         .await

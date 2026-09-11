@@ -325,7 +325,7 @@ impl CacheIndex {
         }
     }
 
-    /// 获取生产基线全局分片索引 (Schema v6 Root)
+    /// 获取生产基线全局分片索引 (Schema v7 Root)
     pub async fn get_baseline_data(&self) -> Arc<CachedBaseline> {
         let tag = &self.config.baseline_tag;
         let system = &self.config.target_system;
@@ -359,14 +359,20 @@ impl CacheIndex {
                     && old_entry.baseline.root.merkle_root != root_data.merkle_root
                 {
                     let changed =
-                        diff_shard_descriptors(&old_entry.baseline.root.shards, &root_data.shards);
+                        diff_shard_descriptors(&old_entry.baseline.root.shards, &root_data.shards)
+                            .unwrap_or_else(|error| {
+                                error!(
+                                    "[nixcache-proxy] Failed to diff v7 shard descriptors: {error}"
+                                );
+                                Vec::new()
+                            });
                     for sid in changed {
                         let _ = self.shard_cache.remove_sync(&sid);
                     }
                 }
 
                 // 保存本地单架构根索引备份
-                let file_name = format!("cache-index-{}.json.zst", system_clone.as_str());
+                let file_name = format!("cache-index-v7-{}.json.zst", system_clone.as_str());
                 let file_path = self.config.index_dir.join(&file_name);
                 if let Some(parent) = file_path.parent() {
                     let _ = fs::create_dir_all(parent).await;
@@ -407,14 +413,14 @@ impl CacheIndex {
             let arch_backup = self
                 .config
                 .index_dir
-                .join(format!("cache-index-{}.json.zst", system_clone.as_str()));
+                .join(format!("cache-index-v7-{}.json.zst", system_clone.as_str()));
 
             if arch_backup.exists() {
                 match fs::read(&arch_backup).await {
                     Ok(bytes) => {
                         if let Ok(decoded) = IndexCodec::decode_zstd::<ShardedArchCacheIndexData>(
                             &bytes,
-                            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+                            CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
                             self.oci_client.limits().max_index_uncompressed_bytes(),
                         ) {
                             let root_data = decoded.value;
@@ -526,8 +532,11 @@ impl CacheIndex {
                 encoded.len() as u64,
                 uncompressed_size,
                 shard.entries.len(),
-                shard.compute_merkle_hash(),
-            );
+                shard
+                    .compute_merkle_hash()
+                    .expect("test shard hash should succeed"),
+            )
+            .expect("test descriptor should be valid");
             let shard_blob_digest = shard_desc.blob_digest.clone();
             if let Some(d) = root.find_shard_by_id_mut(shard.shard_id) {
                 *d = shard_desc;
@@ -544,7 +553,8 @@ impl CacheIndex {
             );
         }
 
-        root.recalculate_merkle_root();
+        root.recalculate_merkle_root()
+            .expect("test baseline root should recalculate");
         root.validate_for(
             &self.config.target_system,
             &self.config.repo,
@@ -622,7 +632,7 @@ mod tests {
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "ghcr.io");
         base_root.public_key = "base-pubkey:AAA=".to_string();
         let shard_id = calculate_shard_id(&hash_base);
-        let mut shard_payload = ShardDataPayload::new(shard_id);
+        let mut shard_payload = ShardDataPayload::new(shard_id).unwrap();
         shard_payload
             .entries
             .insert(hash_base.clone(), baseline_entry);
@@ -724,8 +734,8 @@ mod tests {
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "127.0.0.1:9");
         root_data.public_key = "backup-pubkey:CCC=".to_string();
 
-        // Pre-create cache-index-x86_64-linux.json.zst in the index dir
-        let backup_file = temp_dir.path().join("cache-index-x86_64-linux.json.zst");
+        // Pre-create cache-index-v7-x86_64-linux.json.zst in the index dir
+        let backup_file = temp_dir.path().join("cache-index-v7-x86_64-linux.json.zst");
         let compressed = IndexCodec::encode_zstd(&root_data, DEFAULT_ZSTD_COMPRESSION_LEVEL)
             .expect("Compression should succeed");
         tokio::fs::write(&backup_file, &compressed).await.unwrap();

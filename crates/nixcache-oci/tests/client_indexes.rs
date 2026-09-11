@@ -1,7 +1,8 @@
 use nixcache_oci::{
     CacheLayerMediaType, DockerHubDriver, GenericOciDriver, IndexEntry, MockRouterTransport,
-    NarInfoMeta, OciClient, OciDescriptor, OciImageIndex, OciPlatform, ShardDataPayload,
-    ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch, build_image_index,
+    NarInfoMeta, OciClient, OciDescriptor, OciImageIndex, OciPlatform, OciReadLimits,
+    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, ShardedArchIndexManifestParams,
+    StoreHash, SystemArch, build_image_index, build_sharded_arch_index_manifest,
 };
 
 #[tokio::test]
@@ -17,7 +18,7 @@ async fn sharded_root_and_shard_data_round_trip() {
     .unwrap();
     let hash = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
     let shard_id = hash.shard_id();
-    let mut shard = ShardDataPayload::new(shard_id);
+    let mut shard = ShardDataPayload::new(shard_id).unwrap();
     shard.entries.insert(
         hash,
         IndexEntry {
@@ -47,8 +48,9 @@ async fn sharded_root_and_shard_data_round_trip() {
         compressed_size,
         uncompressed_size,
         shard.len(),
-        shard.compute_merkle_hash(),
-    );
+        shard.compute_merkle_hash().unwrap(),
+    )
+    .unwrap();
     let fetched_shard = client
         .indexes()
         .get_shard_data(&descriptor, &SystemArch::X86_64Linux)
@@ -63,8 +65,8 @@ async fn sharded_root_and_shard_data_round_trip() {
     root.shards[shard_id as usize].compressed_size = compressed_size;
     root.shards[shard_id as usize].uncompressed_size = uncompressed_size;
     root.shards[shard_id as usize].entry_count = 1;
-    root.shards[shard_id as usize].merkle_hash = shard.compute_merkle_hash();
-    root.recalculate_merkle_root();
+    root.shards[shard_id as usize].merkle_hash = shard.compute_merkle_hash().unwrap();
+    root.recalculate_merkle_root().unwrap();
     let manifest_digest = client
         .indexes()
         .push_sharded_root("cache-index-x86_64-linux", &root)
@@ -199,8 +201,9 @@ async fn sharded_root_cas_update_is_exposed_by_index_client() {
                 1,
                 5,
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            );
-            root.recalculate_merkle_root();
+            )
+            .unwrap();
+            root.recalculate_merkle_root().unwrap();
             Ok(root)
         })
         .await
@@ -219,8 +222,39 @@ fn index_data_types_remain_public() {
     let index = OciImageIndex::new();
     assert!(index.media_type.is_empty() || index.media_type.contains("oci"));
     assert_eq!(
-        CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
-        "application/vnd.nix.cache.root.v6+zstd"
+        CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
+        "application/vnd.nix.cache.root.v7+zstd"
     );
     let _ = GenericOciDriver;
+}
+
+#[test]
+fn schema_v6_root_annotation_is_rejected_by_v7_validator() {
+    let system = SystemArch::X86_64Linux;
+    let mut manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+        root_blob_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        root_blob_size: 1,
+        config_digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        config_size: 2,
+        system: &system,
+        merkle_root: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    });
+    manifest
+        .annotations
+        .as_mut()
+        .expect("manifest has annotations")
+        .insert("org.nixos.nixcache.schema".to_string(), "6".to_string());
+
+    let error = manifest
+        .validate_schema_v7_root(
+            &system,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            &OciReadLimits::default(),
+            "test-manifest",
+        )
+        .expect_err("v6 root annotations must be rejected");
+    assert!(matches!(
+        error,
+        nixcache_oci::OciError::InvalidDescriptor { .. }
+    ));
 }

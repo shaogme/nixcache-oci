@@ -116,16 +116,28 @@ pub enum CoreError {
     #[error("Serialization / Deserialization error: {0}")]
     Json(String),
 
-    #[error("Invalid Schema v6 root index: {details}")]
+    #[error("Invalid Schema v7 root index: {details}")]
     InvalidIndex { details: String },
 
-    #[error("Invalid Schema v6 shard payload: {details}")]
+    #[error("Invalid Schema v7 shard payload: {details}")]
     InvalidShard { details: String },
 
-    #[error("Invalid Schema v6 index entry or metadata: {details}")]
+    #[error("Invalid Schema v7 index entry or metadata: {details}")]
     InvalidEntry { details: String },
 
-    #[error("Schema v6 {target} exceeds limit {limit} (actual {actual})")]
+    #[error("Invalid Schema v7 Merkle structure: {details}")]
+    InvalidMerkle { details: String },
+
+    #[error("Invalid Schema v7 shard descriptor set: {details}")]
+    InvalidShardSet { details: String },
+
+    #[error("Invalid canonical digest in {field}: {details}")]
+    InvalidCanonicalDigest {
+        field: &'static str,
+        details: String,
+    },
+
+    #[error("Schema v7 {target} exceeds limit {limit} (actual {actual})")]
     LimitExceeded {
         target: &'static str,
         limit: u64,

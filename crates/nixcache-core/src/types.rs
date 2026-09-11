@@ -1,8 +1,7 @@
 use crate::{
     error::{CoreError, TypeError},
     sharding::{
-        EMPTY_SHARD_MERKLE_HASH, calculate_shard_id, compute_merkle_root,
-        compute_shard_merkle_hash, shard_id_to_prefix,
+        calculate_shard_id, compute_merkle_root, compute_shard_merkle_hash, shard_id_to_prefix,
     },
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -11,9 +10,8 @@ use std::{
 };
 use strum::{EnumIter, IntoEnumIterator, VariantArray};
 
-pub const SCHEMA_VERSION: u32 = 6;
-pub const SCHEMA_VERSION_V6: u32 = 6;
-pub const CACHE_INDEX_VERSION: u32 = 6;
+pub const SCHEMA_VERSION_V7: u32 = 7;
+pub const CACHE_INDEX_VERSION: u32 = SCHEMA_VERSION_V7;
 pub const RUN_SESSION_VERSION: u32 = 6;
 pub const RECEIPT_VERSION: u32 = 6;
 pub const NUM_SHARDS: usize = 1024;
@@ -894,7 +892,7 @@ pub struct JobSummaryMetadata {
     pub timestamp: String,
 }
 
-/// 单个分片描述符 (Merkle Tree 叶子节点)
+/// 单个分片描述符 (Schema v7 Merkle Tree 叶子节点)
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// 分片前缀编号 (0..1023)
@@ -927,10 +925,11 @@ impl ShardDescriptor {
             });
         }
         if self.is_empty() {
+            let expected_merkle_hash = compute_shard_merkle_hash(self.shard_id, &HashMap::new())?;
             if !self.blob_digest.is_empty()
                 || self.compressed_size != 0
                 || self.uncompressed_size != 0
-                || self.merkle_hash != EMPTY_SHARD_MERKLE_HASH
+                || self.merkle_hash != expected_merkle_hash
             {
                 return Err(CoreError::InvalidIndex {
                     details: format!("empty shard {} has non-empty metadata", self.shard_id),
@@ -958,16 +957,17 @@ impl ShardDescriptor {
     }
 
     /// 创建一个空的初始分片描述符
-    pub fn empty(shard_id: u16) -> Self {
-        Self {
+    pub fn empty(shard_id: u16) -> Result<Self, CoreError> {
+        let merkle_hash = compute_shard_merkle_hash(shard_id, &HashMap::new())?;
+        Ok(Self {
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             blob_digest: String::new(),
             compressed_size: 0,
             uncompressed_size: 0,
             entry_count: 0,
-            merkle_hash: EMPTY_SHARD_MERKLE_HASH.to_string(),
-        }
+            merkle_hash,
+        })
     }
 
     pub fn new(
@@ -977,8 +977,8 @@ impl ShardDescriptor {
         uncompressed_size: u64,
         entry_count: usize,
         merkle_hash: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CoreError> {
+        let value = Self {
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             blob_digest: blob_digest.into(),
@@ -986,7 +986,9 @@ impl ShardDescriptor {
             uncompressed_size,
             entry_count,
             merkle_hash: merkle_hash.into(),
-        }
+        };
+        value.validate_structure()?;
+        Ok(value)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1027,7 +1029,7 @@ impl<'de> Deserialize<'de> for ShardDescriptor {
     }
 }
 
-/// 单架构全局分片索引根目录 (Schema v6 Root)
+/// 单架构全局分片索引根目录 (Schema v7 Root)
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardedArchCacheIndexData {
     pub version: u32,
@@ -1046,16 +1048,20 @@ pub struct ShardedArchCacheIndexData {
 }
 
 impl ShardedArchCacheIndexData {
-    /// 创建一个全新的 Schema v6 单架构分片索引根目录 (包含 1024 个空分片描述符)
+    /// 创建一个全新的 Schema v7 单架构分片索引根目录 (包含 1024 个空分片描述符)
     pub fn new(system: SystemArch, repo: impl Into<String>, registry: impl Into<String>) -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for id in 0..NUM_SHARDS {
-            shards.push(ShardDescriptor::empty(id as u16));
+            shards.push(
+                ShardDescriptor::empty(id as u16)
+                    .expect("the fixed v7 shard range must always be valid"),
+            );
         }
-        let merkle_root = compute_merkle_root(&shards);
+        let merkle_root = compute_merkle_root(&shards)
+            .expect("a freshly created complete shard set must have a valid Merkle root");
 
         Self {
-            version: SCHEMA_VERSION_V6,
+            version: SCHEMA_VERSION_V7,
             system,
             repo: repo.into(),
             registry: registry.into(),
@@ -1096,8 +1102,9 @@ impl ShardedArchCacheIndexData {
     }
 
     /// 重新计算并更新全局 Merkle Root Hash
-    pub fn recalculate_merkle_root(&mut self) {
-        self.merkle_root = compute_merkle_root(&self.shards);
+    pub fn recalculate_merkle_root(&mut self) -> Result<(), CoreError> {
+        self.merkle_root = compute_merkle_root(&self.shards)?;
+        Ok(())
     }
 
     /// 直接判断 StoreHash 所在的分片是否为空 (O(1) 确定性硬件级零误杀硬过滤)
@@ -1109,9 +1116,9 @@ impl ShardedArchCacheIndexData {
     }
 
     pub fn validate_structure(&self) -> Result<(), CoreError> {
-        if self.version != SCHEMA_VERSION_V6 {
+        if self.version != SCHEMA_VERSION_V7 {
             return Err(CoreError::InvalidIndex {
-                details: format!("version must be {SCHEMA_VERSION_V6}"),
+                details: format!("version must be {SCHEMA_VERSION_V7}"),
             });
         }
         if !self.system.is_known() {
@@ -1148,7 +1155,7 @@ impl ShardedArchCacheIndexData {
         validate_sha256(&self.merkle_root).map_err(|details| CoreError::InvalidIndex {
             details: format!("root Merkle hash: {details}"),
         })?;
-        if compute_merkle_root(&self.shards) != self.merkle_root {
+        if compute_merkle_root(&self.shards)? != self.merkle_root {
             return Err(CoreError::InvalidIndex {
                 details: "root Merkle hash does not match shard descriptors".to_string(),
             });
@@ -1252,26 +1259,31 @@ pub struct ShardDataPayload {
 }
 
 impl ShardDataPayload {
-    pub fn new(shard_id: u16) -> Self {
-        Self {
-            version: SCHEMA_VERSION_V6,
+    pub fn new(shard_id: u16) -> Result<Self, CoreError> {
+        if shard_id >= NUM_SHARDS as u16 {
+            return Err(CoreError::InvalidShard {
+                details: format!("shard id {shard_id} is out of range"),
+            });
+        }
+        Ok(Self {
+            version: SCHEMA_VERSION_V7,
             shard_id,
             prefix: shard_id_to_prefix(shard_id),
             entries: HashMap::new(),
-        }
+        })
     }
 
-    pub fn with_entries(shard_id: u16, entries: HashMap<StoreHash, IndexEntry>) -> Self {
-        Self {
-            version: SCHEMA_VERSION_V6,
-            shard_id,
-            prefix: shard_id_to_prefix(shard_id),
-            entries,
-        }
+    pub fn with_entries(
+        shard_id: u16,
+        entries: HashMap<StoreHash, IndexEntry>,
+    ) -> Result<Self, CoreError> {
+        let mut payload = Self::new(shard_id)?;
+        payload.entries = entries;
+        Ok(payload)
     }
 
-    pub fn compute_merkle_hash(&self) -> String {
-        compute_shard_merkle_hash(&self.entries)
+    pub fn compute_merkle_hash(&self) -> Result<String, CoreError> {
+        compute_shard_merkle_hash(self.shard_id, &self.entries)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1283,9 +1295,9 @@ impl ShardDataPayload {
     }
 
     pub fn validate_structure(&self) -> Result<(), CoreError> {
-        if self.version != SCHEMA_VERSION_V6 {
+        if self.version != SCHEMA_VERSION_V7 {
             return Err(CoreError::InvalidShard {
-                details: format!("version must be {SCHEMA_VERSION_V6}"),
+                details: format!("version must be {SCHEMA_VERSION_V7}"),
             });
         }
         if self.shard_id >= NUM_SHARDS as u16 {
@@ -1365,7 +1377,7 @@ impl ShardDataPayload {
     }
 
     pub fn validate_merkle_hash(&self, expected: &str) -> Result<(), CoreError> {
-        if self.compute_merkle_hash() != expected {
+        if self.compute_merkle_hash()? != expected {
             return Err(CoreError::InvalidShard {
                 details: "payload Merkle hash does not match root descriptor".to_string(),
             });

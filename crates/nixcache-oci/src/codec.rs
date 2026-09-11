@@ -4,7 +4,7 @@ pub use nixcache_utils::DEFAULT_ZSTD_COMPRESSION_LEVEL;
 use nixcache_utils::ZstdCodec;
 use serde::{Serialize, de::DeserializeOwned};
 
-/// 强类型索引与清单编解码器 (Schema v6)
+/// 强类型索引与清单编解码器 (Schema v7)
 pub struct IndexCodec;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,12 +67,16 @@ mod tests {
     #[test]
     fn test_cache_layer_media_type_parsing_and_helpers() {
         assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.root.v6+zstd"),
-            Some(CacheLayerMediaType::RootIndexV6Zstd)
+            CacheLayerMediaType::parse("application/vnd.nix.cache.root.v7+zstd"),
+            Some(CacheLayerMediaType::RootIndexV7Zstd)
         );
         assert_eq!(
-            CacheLayerMediaType::parse("application/vnd.nix.cache.shard.v6+zstd"),
-            Some(CacheLayerMediaType::ShardDataV6Zstd)
+            CacheLayerMediaType::parse("application/vnd.nix.cache.shard.v7+zstd"),
+            Some(CacheLayerMediaType::ShardDataV7Zstd)
+        );
+        assert_eq!(
+            CacheLayerMediaType::parse("application/vnd.nix.cache.root.v6+zstd"),
+            None
         );
         assert_eq!(
             CacheLayerMediaType::parse("application/vnd.nix.cache.delta.v6+zstd"),
@@ -96,7 +100,7 @@ mod tests {
         assert!(IndexCodec::is_valid_zstd_magic(&encoded));
 
         let decoded =
-            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V6_ZSTD, 1024)
+            IndexCodec::decode_zstd(&encoded, CacheLayerMediaType::ROOT_INDEX_V7_ZSTD, 1024)
                 .expect("Decoding should succeed");
         assert_eq!(original, decoded.value);
     }
@@ -127,7 +131,7 @@ mod tests {
         let plain_json = br#"{"name":"test","items":[1,2,3],"nested":null}"#;
         let err = IndexCodec::decode_zstd::<SampleData>(
             plain_json,
-            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+            CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
             1024,
         )
         .expect_err("Should reject non-zstd plain JSON payload");
@@ -143,7 +147,7 @@ mod tests {
         let empty = b"";
         let err = IndexCodec::decode_zstd::<SampleData>(
             empty,
-            CacheLayerMediaType::SHARD_DATA_V6_ZSTD,
+            CacheLayerMediaType::SHARD_DATA_V7_ZSTD,
             1024,
         )
         .expect_err("Should reject empty bytes");
@@ -161,7 +165,7 @@ mod tests {
 
         let err = IndexCodec::decode_zstd::<SampleData>(
             &corrupt,
-            CacheLayerMediaType::ROOT_INDEX_V6_ZSTD,
+            CacheLayerMediaType::ROOT_INDEX_V7_ZSTD,
             1024,
         )
         .expect_err("Should reject corrupted payload");

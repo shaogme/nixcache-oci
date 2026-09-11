@@ -413,7 +413,7 @@ mod tests {
         .unwrap();
 
         let h1 = StoreHash::parse("s66mzxpvicwk07gjbjfw9izjfa797vsw").unwrap();
-        let mut payload = ShardDataPayload::new(h1.shard_id());
+        let mut payload = ShardDataPayload::new(h1.shard_id()).unwrap();
         payload.entries.insert(
             h1.clone(),
             IndexEntry {
@@ -443,8 +443,8 @@ mod tests {
         root_data.shards[sid].compressed_size = comp_size;
         root_data.shards[sid].uncompressed_size = uncomp_size;
         root_data.shards[sid].entry_count = 1;
-        root_data.shards[sid].merkle_hash = payload.compute_merkle_hash();
-        root_data.recalculate_merkle_root();
+        root_data.shards[sid].merkle_hash = payload.compute_merkle_hash().unwrap();
+        root_data.recalculate_merkle_root().unwrap();
 
         client
             .indexes()

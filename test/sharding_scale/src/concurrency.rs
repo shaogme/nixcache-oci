@@ -237,7 +237,8 @@ pub async fn simulate_concurrent_delta_and_compaction(
     for (&shard_id, incoming_shard) in &incoming_partitioned {
         let mut shard_entries = base_partitioned.get(&shard_id).cloned().unwrap_or_default();
         shard_entries.extend(incoming_shard.clone());
-        let hash = compute_shard_merkle_hash(&shard_entries);
+        let hash = compute_shard_merkle_hash(shard_id, &shard_entries)
+            .map_err(|error| error.to_string())?;
         partial_compacted_hashes.insert(shard_id, hash);
     }
     let partial_compaction_duration_ms = partial_start.elapsed().as_secs_f64() * 1000.0;
@@ -249,7 +250,8 @@ pub async fn simulate_concurrent_delta_and_compaction(
         if let Some(incoming_shard) = incoming_partitioned.remove(&shard_id) {
             shard_entries.extend(incoming_shard);
         }
-        let _ = compute_shard_merkle_hash(&shard_entries);
+        let _ = compute_shard_merkle_hash(shard_id, &shard_entries)
+            .map_err(|error| error.to_string())?;
     }
     let full_compaction_duration_ms = full_start.elapsed().as_secs_f64() * 1000.0;
 

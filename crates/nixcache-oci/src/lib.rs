@@ -31,7 +31,7 @@ pub use error::{OciError, TokenError, TransportError};
 pub use integrity::{ContentDigest, verify_buffered_body, verify_size};
 pub use limits::{OciReadLimits, ReadLimitsError};
 pub use manifest::{
-    CacheLayerMediaType, CacheLayerMediaTypeV6, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
+    CacheLayerMediaType, CacheLayerMediaTypeV7, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE,
     OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
     ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
@@ -43,12 +43,11 @@ pub use mock::{
 };
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
-    NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
-    SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash,
-    SystemArch, build_nar_lookup_map, calculate_shard_id, compute_merkle_root,
-    compute_shard_merkle_hash, diff_shard_descriptors, evaluate_multi_arch_gc,
-    extract_nar_basename, extract_store_hash, extract_store_hash_str, partition_entries_by_shard,
-    shard_id_to_prefix,
+    NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION_V7,
+    ShardDataPayload, ShardDescriptor, ShardedArchCacheIndexData, StoreHash, SystemArch,
+    build_nar_lookup_map, calculate_shard_id, compute_merkle_root, compute_shard_merkle_hash,
+    diff_shard_descriptors, evaluate_multi_arch_gc, extract_nar_basename, extract_store_hash,
+    extract_store_hash_str, partition_entries_by_shard, shard_id_to_prefix,
 };
 pub use token::TokenManager;
 pub use transport::{

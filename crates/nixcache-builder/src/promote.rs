@@ -2,7 +2,7 @@ use crate::{error::BuilderError, summary::write_promote_step_summary};
 use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_core::{
-    BuildReceipt, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V6, ShardDataPayload, ShardDescriptor,
+    BuildReceipt, IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V7, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch, partition_entries_by_shard,
 };
 use nixcache_oci::{
@@ -177,7 +177,9 @@ pub async fn run_promote(
                 };
 
             if root_index.shards.len() != NUM_SHARDS {
-                root_index.shards = (0..NUM_SHARDS as u16).map(ShardDescriptor::empty).collect();
+                root_index.shards = (0..NUM_SHARDS as u16)
+                    .map(ShardDescriptor::empty)
+                    .collect::<Result<Vec<_>, _>>()?;
             }
 
             if !base_pub_key.is_empty() && root_index.public_key.is_empty() {
@@ -197,7 +199,7 @@ pub async fn run_promote(
                         if existing_desc.entry_count > 0 && !existing_desc.blob_digest.is_empty() {
                             oci.indexes().get_shard_data(existing_desc, &sys).await?
                         } else {
-                            ShardDataPayload::new(shard_id)
+                            ShardDataPayload::new(shard_id)?
                         };
 
                     shard_payload.entries.extend(incoming_shard_entries);
@@ -210,7 +212,7 @@ pub async fn run_promote(
                     desc.compressed_size = comp_size;
                     desc.uncompressed_size = uncomp_size;
                     desc.entry_count = shard_payload.len();
-                    desc.merkle_hash = shard_payload.compute_merkle_hash();
+                    desc.merkle_hash = shard_payload.compute_merkle_hash()?;
                 }
                 // 未发生变更的分片：完全复用原有 blob_digest、compressed_size 与 merkle_hash (零开销)
             }
@@ -219,9 +221,9 @@ pub async fn run_promote(
             root_index.gc_roots.extend(new_roots);
             root_index.gc_roots.sort_unstable();
             root_index.gc_roots.dedup();
-            root_index.recalculate_merkle_root();
+            root_index.recalculate_merkle_root()?;
 
-            root_index.version = SCHEMA_VERSION_V6;
+            root_index.version = SCHEMA_VERSION_V7;
             root_index.generated = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             root_index.last_promoted_run =
                 env::var("GITHUB_RUN_ID").ok().and_then(|v| v.parse().ok());
@@ -408,9 +410,13 @@ mod tests {
         // 模拟 shard 0 写入条目
         let sid1 = h1.shard_id() as usize;
         root.shards[sid1].entry_count = 1;
-        root.shards[sid1].blob_digest = "sha256:blob_shard_0".to_string();
-        root.shards[sid1].merkle_hash = "sha256:merkle_shard_0".to_string();
-        root.recalculate_merkle_root();
+        root.shards[sid1].blob_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        root.shards[sid1].compressed_size = 1;
+        root.shards[sid1].uncompressed_size = 1;
+        root.shards[sid1].merkle_hash =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        root.recalculate_merkle_root().unwrap();
 
         let intermediate_root_hash = root.merkle_root.clone();
         assert_ne!(initial_root_hash, intermediate_root_hash);
@@ -420,9 +426,13 @@ mod tests {
         let shard0_desc_before = root.shards[sid1].clone();
 
         root.shards[sid2].entry_count = 1;
-        root.shards[sid2].blob_digest = "sha256:blob_shard_s6".to_string();
-        root.shards[sid2].merkle_hash = "sha256:merkle_shard_s6".to_string();
-        root.recalculate_merkle_root();
+        root.shards[sid2].blob_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        root.shards[sid2].compressed_size = 1;
+        root.shards[sid2].uncompressed_size = 1;
+        root.shards[sid2].merkle_hash =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string();
+        root.recalculate_merkle_root().unwrap();
 
         // shard 0 完全保持一致（零开销复用）
         assert_eq!(root.shards[sid1], shard0_desc_before);
