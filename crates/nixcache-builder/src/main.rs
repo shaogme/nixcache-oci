@@ -39,6 +39,7 @@ async fn main() -> Result<(), BuilderError> {
                 let baseline_tag = args.cache.resolve_baseline_tag();
                 let signing_key = args.signing.resolve_signing_key_str();
                 let snapshot_path = args.cache.resolve_snapshot_path();
+                let registry_username = args.auth.resolve_registry_username();
 
                 let init_opts = SessionInitOptions {
                     repo: &repo,
@@ -49,6 +50,7 @@ async fn main() -> Result<(), BuilderError> {
                     baseline_ttl,
                     baseline_tag: &baseline_tag,
                     github_token: &active_token,
+                    registry_username: registry_username.as_deref(),
                     signing_key_file: signing_key.as_deref(),
                     snapshot_path: Some(&snapshot_path),
                 };
@@ -60,6 +62,7 @@ async fn main() -> Result<(), BuilderError> {
             }
             SessionCommands::Capture(args) => {
                 let active_token = args.auth.resolve_token().await;
+                let credentials = args.auth.credentials_from_token(active_token);
                 let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
                 let run_id = args.session.resolve_run_id().unwrap_or(0);
                 let job_id = args.session.resolve_job_id("default-job");
@@ -82,7 +85,7 @@ async fn main() -> Result<(), BuilderError> {
                     job_id: &job_id,
                     system_opt: system.as_deref(),
                     signing_key_file: signing_key.as_deref(),
-                    github_token: &active_token,
+                    credentials,
                     output_receipt_path: output_receipt.as_deref(),
                     proxy_url: Some(&proxy_url),
                     snapshot_before: Some(&snapshot_before),
@@ -111,6 +114,7 @@ async fn main() -> Result<(), BuilderError> {
 
         Commands::Build(args) => {
             let active_token = args.auth.resolve_token().await;
+            let credentials = args.auth.credentials_from_token(active_token.clone());
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
             let signing_key = args.signing.resolve_signing_key_str();
             let system_name = args.resolve_system();
@@ -136,6 +140,7 @@ async fn main() -> Result<(), BuilderError> {
                 registry: &registry,
                 signing_key_file: signing_key.as_deref(),
                 github_token: &active_token,
+                credentials,
                 output_receipt_path: &receipt_path,
                 strict,
                 export_concurrency,
@@ -148,43 +153,42 @@ async fn main() -> Result<(), BuilderError> {
         }
 
         Commands::Promote(args) => {
-            let active_token = args.auth.resolve_token().await;
+            let credentials = args.auth.resolve_credentials().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
             let target_tag = args.resolve_target_tag();
             let paths = args.resolve_receipt_paths();
 
-            if let Err(e) = run_promote(&paths, &repo, &registry, &target_tag, &active_token).await
-            {
+            if let Err(e) = run_promote(&paths, &repo, &registry, &target_tag, credentials).await {
                 eprintln!("Promote failed: {}", e);
                 process::exit(1);
             }
         }
 
         Commands::List(args) => {
-            let active_token = args.auth.resolve_token().await;
+            let credentials = args.auth.resolve_credentials().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
 
-            if let Err(e) = run_list(&args, &repo, &registry, &active_token).await {
+            if let Err(e) = run_list(&args, &repo, &registry, credentials).await {
                 eprintln!("Cache list failed: {}", e);
                 process::exit(1);
             }
         }
 
         Commands::Gc(args) => {
-            let active_token = args.auth.resolve_token().await;
+            let credentials = args.auth.resolve_credentials().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
 
-            if let Err(e) = run_gc(&args, &repo, &registry, &active_token).await {
+            if let Err(e) = run_gc(&args, &repo, &registry, credentials).await {
                 eprintln!("Garbage collection failed: {}", e);
                 process::exit(1);
             }
         }
 
         Commands::Purge(args) => {
-            let active_token = args.auth.resolve_token().await;
+            let credentials = args.auth.resolve_credentials().await;
             let (repo, registry) = args.oci.resolve(DEFAULT_NIXCACHE_REPO);
 
-            if let Err(e) = run_purge(&args, &repo, &registry, &active_token).await {
+            if let Err(e) = run_purge(&args, &repo, &registry, credentials).await {
                 eprintln!("Purge failed: {}", e);
                 process::exit(1);
             }

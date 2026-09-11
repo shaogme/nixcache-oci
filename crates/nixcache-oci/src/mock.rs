@@ -342,6 +342,17 @@ impl OciTransport for MockRouterTransport {
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<StatusCode, TransportError> {
+        self.put_bytes_with_headers(url, headers, body)
+            .await
+            .map(|(status, _)| status)
+    }
+
+    async fn put_bytes_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.put_requests.push(MockPutRequest {
             url: url.to_string(),
@@ -374,7 +385,7 @@ impl OciTransport for MockRouterTransport {
             if let Some(expected) = headers.get(IF_MATCH).and_then(|value| value.to_str().ok())
                 && current_digest.as_deref() != Some(expected)
             {
-                return Ok(StatusCode::PRECONDITION_FAILED);
+                return Ok((StatusCode::PRECONDITION_FAILED, HeaderMap::new()));
             }
             if headers
                 .get(IF_NONE_MATCH)
@@ -382,7 +393,7 @@ impl OciTransport for MockRouterTransport {
                 == Some("*")
                 && current_digest.is_some()
             {
-                return Ok(StatusCode::PRECONDITION_FAILED);
+                return Ok((StatusCode::PRECONDITION_FAILED, HeaderMap::new()));
             }
 
             let digest = mock_sha256(&body);
@@ -397,13 +408,13 @@ impl OciTransport for MockRouterTransport {
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
             if m == "PUT" && path.ends_with(suffix) {
-                found = Some(resp.status);
+                found = Some((resp.status, resp.headers.clone()));
                 false
             } else {
                 true
             }
         });
-        Ok(found.unwrap_or(StatusCode::CREATED))
+        Ok(found.unwrap_or((StatusCode::CREATED, HeaderMap::new())))
     }
 
     async fn put_stream(
@@ -416,30 +427,55 @@ impl OciTransport for MockRouterTransport {
         self.put_bytes(url, headers, Bytes::new()).await
     }
 
-    async fn delete(&self, url: &str, _headers: HeaderMap) -> Result<StatusCode, TransportError> {
+    async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError> {
+        self.delete_with_headers(url, headers)
+            .await
+            .map(|(status, _)| status)
+    }
+
+    async fn delete_with_headers(
+        &self,
+        url: &str,
+        _headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = url.split_once('?').map(|(p, _)| p).unwrap_or(url);
-
-        if let Some(idx) = path.rfind("/blobs/") {
-            let digest = &path[idx + 7..];
-            let _ = self.stored_blobs.remove_sync(&digest.to_string());
-        }
-
-        if let Some(idx) = path.rfind("/manifests/") {
-            let tag = &path[idx + 11..];
-            let _ = self.stored_manifests.remove_sync(&tag.to_string());
-        }
 
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
             if m == "DELETE" && path.ends_with(suffix) {
-                found = Some(resp.status);
+                found = Some((resp.status, resp.headers.clone()));
                 false
             } else {
                 true
             }
         });
-        Ok(found.unwrap_or(StatusCode::ACCEPTED))
+        let (status, response_headers) = found.unwrap_or((StatusCode::ACCEPTED, HeaderMap::new()));
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            if let Some(idx) = path.rfind("/blobs/") {
+                let digest = &path[idx + 7..];
+                let _ = self.stored_blobs.remove_sync(&digest.to_string());
+            }
+
+            if let Some(idx) = path.rfind("/manifests/") {
+                let reference = &path[idx + 11..];
+                if reference.starts_with("sha256:") {
+                    let mut tags = Vec::new();
+                    self.stored_manifests.iter_sync(|tag, entry| {
+                        if entry.1 == reference {
+                            tags.push(tag.clone());
+                        }
+                        true
+                    });
+                    for tag in tags {
+                        let _ = self.stored_manifests.remove_sync(&tag);
+                    }
+                } else {
+                    let _ = self.stored_manifests.remove_sync(&reference.to_string());
+                }
+            }
+        }
+        Ok((status, response_headers))
     }
 
     async fn sleep(&self, _duration: Duration) {}

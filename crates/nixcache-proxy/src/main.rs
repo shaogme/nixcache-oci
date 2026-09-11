@@ -88,7 +88,7 @@ async fn main() -> Result<(), ProxyError> {
     let (listen, port) = args
         .bind
         .resolve(DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT);
-    let github_token = args.auth.resolve_token().await;
+    let credentials = args.auth.resolve_credentials().await;
 
     let index_dir = args.cache.resolve_index_dir(&repo);
     let upstream_caches = args.cache.resolve_upstream_list();
@@ -118,7 +118,7 @@ async fn main() -> Result<(), ProxyError> {
     info!("Index cache directory: {:?}", index_dir);
     info!("Upstream caches: {:?}", upstream_caches);
 
-    let oci = create_tokio_reqwest_client(&registry, &repo, &github_token, false);
+    let oci = create_tokio_reqwest_client(&registry, &repo, credentials.clone(), false);
 
     let proxy_config = CascadingProxyConfig {
         repo: repo.clone(),
@@ -130,7 +130,7 @@ async fn main() -> Result<(), ProxyError> {
         target_system,
     };
 
-    let cache_index = CacheIndex::with_config(proxy_config, &github_token);
+    let cache_index = CacheIndex::with_config(proxy_config, credentials);
 
     let state = AppState {
         repo,

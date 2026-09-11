@@ -1,8 +1,9 @@
 use crate::{
+    auth::{BearerChallenge, RegistryCredentials, parse_www_authenticate},
     backend::{
         BlobUploadStrategy, GitHubPackagesClient, ManifestCasSupport, OciDriver,
-        RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver,
-        driver_for_kind,
+        PackageDeletionSupport, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind,
+        detect_driver, driver_for_kind,
     },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::{OciError, TransportError},
@@ -13,7 +14,7 @@ use crate::{
         build_sharded_arch_index_manifest,
     },
     token::TokenManager,
-    transport::{HashingStream, OciBlobStream, OciTransport},
+    transport::{HashingStream, OciBlobStream, OciTransport, UploadChunkResponse},
     upload::UploadConfig,
 };
 use bytes::{Bytes, BytesMut};
@@ -21,9 +22,15 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode, header::IF_MATCH};
 use nixcache_core::{NarDigest, ShardDataPayload, ShardedArchCacheIndexData, SystemArch};
 use nixcache_utils::get_process_id;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{pin::pin, str::from_utf8, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    pin::pin,
+    str::from_utf8,
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{info, warn};
 
 /// Manifest 发布时使用的 CAS 前置条件。
@@ -47,6 +54,32 @@ fn compute_sha256_digest(bytes: &[u8]) -> String {
     )
 }
 
+fn encode_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                vec![byte as char]
+            } else {
+                vec!['%', hex_digit(byte >> 4), hex_digit(byte & 0x0f)]
+            }
+        })
+        .collect()
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + value - 10) as char,
+        _ => unreachable!(),
+    }
+}
+
+#[derive(Deserialize)]
+struct OciTagsListResponse {
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeletionSummary {
     pub deleted_count: usize,
@@ -54,6 +87,45 @@ pub struct DeletionSummary {
     pub failed_count: usize,
     pub freed_bytes: u64,
 }
+
+/// 单个 manifest/blob DELETE 的明确结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionOutcome {
+    Deleted,
+    AlreadyAbsent,
+}
+
+/// 一次严格包删除的可审计汇总。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageDeletionSummary {
+    pub tags_discovered: usize,
+    pub manifests_discovered: usize,
+    pub blobs_discovered: usize,
+    pub manifests_deleted: usize,
+    pub blobs_deleted: usize,
+    pub already_absent: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DeletionPlan {
+    tags: Vec<String>,
+    manifests: HashMap<String, String>,
+    blobs: HashMap<String, u64>,
+}
+
+impl DeletionPlan {
+    fn summary(&self) -> PackageDeletionSummary {
+        PackageDeletionSummary {
+            tags_discovered: self.tags.len(),
+            manifests_discovered: self.manifests.len(),
+            blobs_discovered: self.blobs.len(),
+            ..PackageDeletionSummary::default()
+        }
+    }
+}
+
+const MAX_DELETION_MANIFESTS: usize = 100_000;
+const MAX_DELETION_BLOBS: usize = 2_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedOciArtifact {
@@ -75,7 +147,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     pub fn new(
         registry: &str,
         repo: &str,
-        auth_token: &str,
+        credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         driver: impl Into<OciDriver>,
         transport: T,
@@ -86,7 +158,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let token_manager = TokenManager::new(
             &canonical_registry,
             &canonical_repo,
-            auth_token,
+            credentials,
             write_access,
             driver,
         );
@@ -105,24 +177,24 @@ impl<T: OciTransport + Clone> OciClient<T> {
         kind: RegistryKind,
         registry: &str,
         repo: &str,
-        auth_token: &str,
+        credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         transport: T,
     ) -> Self {
         let driver = driver_for_kind(kind);
-        Self::new(registry, repo, auth_token, write_access, driver, transport)
+        Self::new(registry, repo, credentials, write_access, driver, transport)
     }
 
     /// 自动根据 registry 域名推导后端类型并构造 OCI 客户端
     pub fn with_transport(
         registry: &str,
         repo: &str,
-        auth_token: &str,
+        credentials: impl Into<RegistryCredentials>,
         write_access: bool,
         transport: T,
     ) -> Self {
         let driver = detect_driver(registry);
-        Self::new(registry, repo, auth_token, write_access, driver, transport)
+        Self::new(registry, repo, credentials, write_access, driver, transport)
     }
 
     pub fn driver(&self) -> &OciDriver {
@@ -165,8 +237,10 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    pub async fn get_token(&self) -> Result<Arc<str>, OciError> {
-        self.token_manager.get_token(&self.transport).await
+    pub async fn get_token(&self, challenge: &BearerChallenge) -> Result<Arc<str>, OciError> {
+        self.token_manager
+            .get_token(&self.transport, challenge)
+            .await
     }
 
     pub async fn get_auth_headers(&self) -> Result<HeaderMap, OciError> {
@@ -178,14 +252,302 @@ impl<T: OciTransport + Clone> OciClient<T> {
             ),
         );
 
-        let token = self.get_token().await?;
-        if !token.is_empty() {
+        if let Some(token) = self.token_manager.cached_token().await {
             let auth_val = format!("Bearer {}", token);
             if let Ok(val) = HeaderValue::from_str(&auth_val) {
                 headers.insert("Authorization", val);
             }
         }
         Ok(headers)
+    }
+
+    fn auth_error(
+        operation: &'static str,
+        status: StatusCode,
+        details: impl Into<String>,
+    ) -> OciError {
+        OciError::AuthenticationFailed {
+            operation,
+            status,
+            details: details.into(),
+        }
+    }
+
+    fn with_bearer(mut headers: HeaderMap, token: &str) -> HeaderMap {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert("Authorization", value);
+        }
+        headers
+    }
+
+    async fn challenge_for_response(
+        &self,
+        operation: &'static str,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> Result<(BearerChallenge, HeaderMap), OciError> {
+        if status != StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                status,
+                "unexpected authentication response",
+            ));
+        }
+        let challenge = parse_www_authenticate(headers)?.ok_or_else(|| {
+            Self::auth_error(
+                operation,
+                status,
+                "registry returned 401 without a Bearer challenge",
+            )
+        })?;
+        self.token_manager.invalidate_challenge(&challenge).await;
+        let token = self
+            .token_manager
+            .get_token_for_challenge(&self.transport, &challenge, true)
+            .await?;
+        let request_headers = Self::with_bearer(self.get_auth_headers().await?, &token);
+        Ok((challenge, request_headers))
+    }
+
+    async fn get_with_auth_retry(
+        &self,
+        url: &str,
+        operation: &'static str,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), OciError> {
+        let headers = self.get_auth_headers().await?;
+        let first = self.transport.get(url, headers).await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let (_, retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        let second = self.transport.get(url, retry_headers).await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second)
+    }
+
+    async fn head_with_auth_retry(
+        &self,
+        url: &str,
+        operation: &'static str,
+    ) -> Result<(StatusCode, HeaderMap), OciError> {
+        let headers = self.get_auth_headers().await?;
+        let first = self.transport.head_with_headers(url, headers).await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let (_, retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        let second = self.transport.head_with_headers(url, retry_headers).await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second)
+    }
+
+    async fn post_with_auth_retry(
+        &self,
+        url: &str,
+        operation: &'static str,
+    ) -> Result<(StatusCode, HeaderMap), OciError> {
+        let headers = self.get_auth_headers().await?;
+        let first = self.transport.post(url, headers).await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let (_, retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        let second = self.transport.post(url, retry_headers).await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second)
+    }
+
+    async fn post_bytes_with_auth_retry(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        operation: &'static str,
+    ) -> Result<StatusCode, OciError> {
+        let first = self
+            .transport
+            .post_bytes(url, headers.clone(), body.clone())
+            .await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first.0);
+        }
+        let (_, mut retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        for (name, value) in &headers {
+            if name.as_str() != "authorization" {
+                retry_headers.insert(name.clone(), value.clone());
+            }
+        }
+        let second = self.transport.post_bytes(url, retry_headers, body).await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second.0)
+    }
+
+    async fn put_bytes_with_auth_retry(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        operation: &'static str,
+    ) -> Result<StatusCode, OciError> {
+        let first = self
+            .transport
+            .put_bytes_with_headers(url, headers.clone(), body.clone())
+            .await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first.0);
+        }
+        let (_, mut retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        for (name, value) in &headers {
+            if name.as_str() != "authorization" {
+                retry_headers.insert(name.clone(), value.clone());
+            }
+        }
+        let second = self
+            .transport
+            .put_bytes_with_headers(url, retry_headers, body)
+            .await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second.0)
+    }
+
+    async fn patch_chunk_with_auth_retry(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        chunk: Bytes,
+        byte_range: (u64, u64),
+        operation: &'static str,
+    ) -> Result<UploadChunkResponse, OciError> {
+        let first = self
+            .transport
+            .patch_chunk(url, headers.clone(), chunk.clone(), byte_range)
+            .await?;
+        if first.status != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let (_, mut retry_headers) = self
+            .challenge_for_response(operation, first.status, &first.headers)
+            .await?;
+        for (name, value) in &headers {
+            if name.as_str() != "authorization" {
+                retry_headers.insert(name.clone(), value.clone());
+            }
+        }
+        let second = self
+            .transport
+            .patch_chunk(url, retry_headers, chunk, byte_range)
+            .await?;
+        if second.status == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.status,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second)
+    }
+
+    async fn put_chunk_finish_with_auth_retry(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        final_chunk: Option<(Bytes, (u64, u64))>,
+        operation: &'static str,
+    ) -> Result<StatusCode, OciError> {
+        let first = self
+            .transport
+            .put_chunk_finish_with_headers(url, headers.clone(), final_chunk.clone())
+            .await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first.0);
+        }
+        let (_, mut retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        for (name, value) in &headers {
+            if name.as_str() != "authorization" {
+                retry_headers.insert(name.clone(), value.clone());
+            }
+        }
+        let second = self
+            .transport
+            .put_chunk_finish_with_headers(url, retry_headers, final_chunk)
+            .await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second.0)
+    }
+
+    async fn delete_with_auth_retry(
+        &self,
+        url: &str,
+        operation: &'static str,
+    ) -> Result<StatusCode, OciError> {
+        let headers = self.get_auth_headers().await?;
+        let first = self.transport.delete_with_headers(url, headers).await?;
+        if first.0 != StatusCode::UNAUTHORIZED {
+            return Ok(first.0);
+        }
+        let (_, retry_headers) = self
+            .challenge_for_response(operation, first.0, &first.1)
+            .await?;
+        let second = self
+            .transport
+            .delete_with_headers(url, retry_headers)
+            .await?;
+        if second.0 == StatusCode::UNAUTHORIZED {
+            return Err(Self::auth_error(
+                operation,
+                second.0,
+                "Bearer challenge retry was rejected",
+            ));
+        }
+        Ok(second.0)
     }
 
     pub async fn head_blob(&self, digest: &str) -> Result<bool, OciError> {
@@ -197,8 +559,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             digest
         );
 
-        let headers = self.get_auth_headers().await?;
-        let status = self.transport.head(&url, headers).await?;
+        let (status, _response_headers) = self.head_with_auth_retry(&url, "head blob").await?;
 
         if status == StatusCode::OK {
             Ok(true)
@@ -222,8 +583,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
             self.repo
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
+        let (status, resp_headers) = self
+            .post_with_auth_retry(&upload_init_url, "initialize blob upload")
+            .await?;
 
         if !status.is_success() {
             return Err(OciError::BlobUploadFailed(status));
@@ -249,7 +611,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let put_status = self.transport.put_bytes(&put_url, headers, bytes).await?;
+        let put_status = self
+            .put_bytes_with_auth_retry(&put_url, headers, bytes, "upload blob")
+            .await?;
 
         if put_status == StatusCode::CREATED
             || put_status == StatusCode::ACCEPTED
@@ -296,20 +660,22 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 );
 
                 match self
-                    .transport
-                    .post_bytes(&monolithic_url, headers.clone(), bytes.clone())
+                    .post_bytes_with_auth_retry(
+                        &monolithic_url,
+                        headers,
+                        bytes.clone(),
+                        "monolithic blob upload",
+                    )
                     .await
                 {
-                    Ok((status, _resp_headers))
-                        if status == StatusCode::CREATED || status == StatusCode::OK =>
-                    {
+                    Ok(status) if status == StatusCode::CREATED || status == StatusCode::OK => {
                         info!(
                             "Successfully uploaded blob via 1-RTT Monolithic POST: {}",
                             digest
                         );
                         Ok(digest.to_string())
                     }
-                    Ok((status, _)) => {
+                    Ok(status) => {
                         warn!(
                             "Monolithic POST returned status {}, falling back to two-step upload for blob {}",
                             status, digest
@@ -361,8 +727,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
             self.repo
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
+        let (status, resp_headers) = self
+            .post_with_auth_retry(&upload_init_url, "initialize blob stream upload")
+            .await?;
 
         if !status.is_success() {
             return Err(OciError::BlobUploadFailed(status));
@@ -388,11 +755,16 @@ impl<T: OciTransport + Clone> OciClient<T> {
             HeaderValue::from_static("application/octet-stream"),
         );
 
-        let put_status = self
+        let (put_status, _put_headers) = self
             .transport
-            .put_stream(&put_url, headers, stream, content_len)
+            .put_stream_with_headers(&put_url, headers, stream, content_len)
             .await?;
 
+        if put_status == StatusCode::UNAUTHORIZED {
+            return Err(OciError::AuthenticationNotReplayable {
+                operation: "upload blob stream",
+            });
+        }
         if put_status == StatusCode::CREATED
             || put_status == StatusCode::ACCEPTED
             || put_status == StatusCode::OK
@@ -477,8 +849,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
             self.repo
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport.post(&upload_init_url, headers).await?;
+        let (status, resp_headers) = self
+            .post_with_auth_retry(&upload_init_url, "initialize chunked upload")
+            .await?;
         if !status.is_success() {
             return Err(OciError::BlobUploadFailed(status));
         }
@@ -523,12 +896,12 @@ impl<T: OciTransport + Clone> OciClient<T> {
             let end_offset = current_offset + send_bytes.len() as u64 - 1;
             let headers = self.get_auth_headers().await?;
             let resp = self
-                .transport
-                .patch_chunk(
+                .patch_chunk_with_auth_retry(
                     &session_url,
                     headers,
                     send_bytes,
                     (current_offset, end_offset),
+                    "upload blob chunk",
                 )
                 .await?;
 
@@ -556,8 +929,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let finish_url = format!("{}{}digest={}", session_url, separator, final_digest);
         let headers = self.get_auth_headers().await?;
         let finish_status = self
-            .transport
-            .put_chunk_finish(&finish_url, headers, None)
+            .put_chunk_finish_with_auth_retry(&finish_url, headers, None, "finish blob upload")
             .await?;
 
         if finish_status == StatusCode::CREATED
@@ -609,14 +981,20 @@ impl<T: OciTransport + Clone> OciClient<T> {
             tag
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers, bytes) = self.transport.get(&url, headers).await?;
+        let (status, resp_headers, bytes) = self.get_with_auth_retry(&url, "get manifest").await?;
 
         if status == StatusCode::OK {
             let digest_header = resp_headers
                 .get("Docker-Content-Digest")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_string)
+                        .map_err(|_| TransportError::HeaderParse {
+                            header: "Docker-Content-Digest",
+                        })
+                })
+                .transpose()?;
 
             let body = from_utf8(&bytes)?;
 
@@ -646,8 +1024,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             tag
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, resp_headers) = self.transport.head_with_headers(&url, headers).await?;
+        let (status, resp_headers) = self.head_with_auth_retry(&url, "head manifest").await?;
 
         if status == StatusCode::OK {
             let digest = resp_headers
@@ -681,17 +1058,23 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 self.repo
             );
             if let Some(ref last) = last_tag {
-                url.push_str(&format!("&last={}", last));
+                url.push_str("&last=");
+                url.push_str(&encode_query_value(last));
             }
 
-            let headers = self.get_auth_headers().await?;
-            let (status, _resp_headers, body) = match self.transport.get(&url, headers).await {
-                Ok(res) => res,
-                Err(e) => return Err(OciError::Transport(e)),
-            };
+            let (status, _resp_headers, body) = self.get_with_auth_retry(&url, "list tags").await?;
 
             if status == StatusCode::NOT_FOUND {
-                // 若仓库尚无任何 tag，返回当前收集到的列表 (空)
+                if !all_tags.is_empty() {
+                    return Err(OciError::DeletionDiscoveryFailed {
+                        stage: "list_tags",
+                        target: self.repo.clone(),
+                        details: "registry returned 404 after a partial tag listing".to_string(),
+                    });
+                }
+                // 仅将首页 404 解释为不存在仓库或空仓库。
+                all_tags.sort();
+                all_tags.dedup();
                 return Ok(all_tags);
             }
 
@@ -704,13 +1087,16 @@ impl<T: OciTransport + Clone> OciClient<T> {
                         self.registry,
                         self.repo
                     );
-                    if let Ok(headers) = self.get_auth_headers().await
-                        && let Ok((plain_status, _, plain_body)) =
-                            self.transport.get(&plain_url, headers).await
-                        && plain_status.is_success()
-                        && let Ok(resp) = serde_json::from_slice::<OciTagsListResponse>(&plain_body)
-                    {
-                        return Ok(resp.tags);
+                    let (plain_status, _, plain_body) = self
+                        .get_with_auth_retry(&plain_url, "list tags fallback")
+                        .await?;
+                    if plain_status.is_success() {
+                        let resp = serde_json::from_slice::<OciTagsListResponse>(&plain_body)
+                            .map_err(OciError::Json)?;
+                        all_tags.extend(resp.tags);
+                        all_tags.sort();
+                        all_tags.dedup();
+                        return Ok(all_tags);
                     }
                 }
                 return Err(OciError::Transport(TransportError::HttpStatus {
@@ -719,18 +1105,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 }));
             }
 
-            #[derive(serde::Deserialize)]
-            struct OciTagsListResponse {
-                #[serde(default)]
-                tags: Vec<String>,
-            }
-
             let parsed: OciTagsListResponse = match serde_json::from_slice(&body) {
                 Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to parse OCI tags list response: {}", e);
-                    break;
-                }
+                Err(e) => return Err(OciError::Json(e)),
             };
 
             if parsed.tags.is_empty() {
@@ -741,8 +1118,15 @@ impl<T: OciTransport + Clone> OciClient<T> {
             let new_last = parsed.tags.last().cloned();
             all_tags.extend(parsed.tags);
 
-            if count < 100 || new_last == last_tag {
+            if count < 100 {
                 break;
+            }
+            if new_last == last_tag || new_last.is_none() {
+                return Err(OciError::DeletionDiscoveryFailed {
+                    stage: "list_tags",
+                    target: self.repo.clone(),
+                    details: "registry returned a non-advancing pagination cursor".to_string(),
+                });
             }
             last_tag = new_last;
         }
@@ -750,8 +1134,8 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if all_tags.is_empty()
             && self.capabilities().deletion_strategy
                 == RegistryDeletionStrategy::GitHubPackagesRestApi
-            && let Ok(versions) = self.ghcr_client().list_package_versions().await
         {
+            let versions = self.ghcr_client().list_package_versions().await?;
             for v in versions {
                 if let Some(meta) = v.metadata
                     && let Some(container) = meta.container
@@ -763,6 +1147,8 @@ impl<T: OciTransport + Clone> OciClient<T> {
             all_tags.dedup();
         }
 
+        all_tags.sort();
+        all_tags.dedup();
         Ok(all_tags)
     }
 
@@ -999,7 +1385,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
         );
 
         let bytes = Bytes::copy_from_slice(manifest.as_bytes());
-        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+        let status = self
+            .put_bytes_with_auth_retry(&url, headers, bytes, "push manifest")
+            .await?;
 
         if status == StatusCode::OK
             || status == StatusCode::CREATED
@@ -1039,7 +1427,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
         let expected = Self::insert_manifest_cas_condition(&mut headers, &condition)?;
 
         let bytes = Bytes::copy_from_slice(manifest.as_bytes());
-        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+        let status = self
+            .put_bytes_with_auth_retry(&url, headers, bytes, "push manifest with CAS")
+            .await?;
 
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
             return Err(OciError::CasPreconditionFailed {
@@ -1077,7 +1467,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
         let index_json = index.to_json_string()?;
         let bytes = Bytes::copy_from_slice(index_json.as_bytes());
-        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+        let status = self
+            .put_bytes_with_auth_retry(&url, headers, bytes, "push image index")
+            .await?;
 
         if status == StatusCode::OK
             || status == StatusCode::CREATED
@@ -1115,7 +1507,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
         let index_json = index.to_json_string()?;
         let bytes = Bytes::copy_from_slice(index_json.as_bytes());
-        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+        let status = self
+            .put_bytes_with_auth_retry(&url, headers, bytes, "push image index with CAS")
+            .await?;
 
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
             return Err(OciError::CasPreconditionFailed {
@@ -1152,6 +1546,389 @@ impl<T: OciTransport + Clone> OciClient<T> {
         )
     }
 
+    fn valid_digest(digest: &str) -> bool {
+        let Some(hex) = digest.strip_prefix("sha256:") else {
+            return false;
+        };
+        hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn discovery_error(
+        stage: &'static str,
+        target: impl Into<String>,
+        error: impl ToString,
+    ) -> OciError {
+        OciError::DeletionDiscoveryFailed {
+            stage,
+            target: target.into(),
+            details: error.to_string(),
+        }
+    }
+
+    fn parse_discovered_manifest(
+        body: &str,
+        target: &str,
+    ) -> Result<OciArtifactManifest, OciError> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .map_err(|error| Self::discovery_error("manifest_json", target, error))?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                Self::discovery_error("manifest_json", target, "missing schemaVersion")
+            })?;
+        if schema_version != 2 {
+            return Err(Self::discovery_error(
+                "manifest_json",
+                target,
+                "unsupported OCI schemaVersion",
+            ));
+        }
+        let media_type = value
+            .get("mediaType")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Self::discovery_error("manifest_json", target, "missing mediaType"))?;
+        if !matches!(
+            media_type,
+            OCI_IMAGE_INDEX_MEDIA_TYPE | OCI_IMAGE_MANIFEST_MEDIA_TYPE
+        ) {
+            return Err(Self::discovery_error(
+                "manifest_json",
+                target,
+                format!("unsupported OCI manifest media type '{media_type}'"),
+            ));
+        }
+        serde_json::from_value(value)
+            .map_err(|error| Self::discovery_error("manifest_json", target, error))
+    }
+
+    async fn discover_tag_reachable_graph(&self) -> Result<DeletionPlan, OciError> {
+        let mut tags = self.list_tags().await?;
+        tags.sort();
+        tags.dedup();
+
+        let mut plan = DeletionPlan {
+            tags,
+            manifests: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        let mut pending = VecDeque::new();
+        let mut queued_manifests = HashSet::new();
+        let mut decoded_shard_blobs = HashSet::new();
+
+        for tag in &plan.tags {
+            let Some((body, digest)) = self
+                .get_manifest_with_digest(tag)
+                .await
+                .map_err(|error| Self::discovery_error("manifest_get", tag, error))?
+            else {
+                // Tag lists and manifests can race. A tag which disappeared is
+                // not evidence that the repository was empty.
+                continue;
+            };
+            if !Self::valid_digest(&digest) {
+                return Err(Self::discovery_error(
+                    "manifest_digest",
+                    tag,
+                    "registry returned an invalid Docker-Content-Digest",
+                ));
+            }
+            let computed = compute_sha256_digest(body.as_bytes());
+            if computed != digest {
+                return Err(Self::discovery_error(
+                    "manifest_digest",
+                    tag,
+                    format!("digest header/body mismatch: header {digest}, body {computed}"),
+                ));
+            }
+            if queued_manifests.contains(&digest) {
+                continue;
+            }
+            if queued_manifests.len() >= MAX_DELETION_MANIFESTS {
+                return Err(OciError::DeletionObjectLimitExceeded {
+                    target: self.repo.clone(),
+                });
+            }
+            queued_manifests.insert(digest.clone());
+            pending.push_back((digest, body, tag.clone()));
+        }
+
+        while let Some((digest, body, source)) = pending.pop_front() {
+            if plan.manifests.contains_key(&digest) {
+                continue;
+            }
+            if plan.manifests.len() >= MAX_DELETION_MANIFESTS {
+                return Err(OciError::DeletionObjectLimitExceeded {
+                    target: self.repo.clone(),
+                });
+            }
+            let computed = compute_sha256_digest(body.as_bytes());
+            if computed != digest {
+                return Err(Self::discovery_error(
+                    "manifest_digest",
+                    &digest,
+                    format!("digest/body mismatch while traversing tag {source}"),
+                ));
+            }
+            let artifact = Self::parse_discovered_manifest(&body, &digest)?;
+            plan.manifests.insert(digest.clone(), body);
+
+            match artifact {
+                OciArtifactManifest::Index(index) => {
+                    for descriptor in index.manifests {
+                        if !Self::valid_digest(&descriptor.digest) {
+                            return Err(Self::discovery_error(
+                                "manifest_descriptor",
+                                &digest,
+                                "index contains an invalid manifest digest",
+                            ));
+                        }
+                        if !matches!(
+                            descriptor.media_type.as_str(),
+                            OCI_IMAGE_INDEX_MEDIA_TYPE | OCI_IMAGE_MANIFEST_MEDIA_TYPE
+                        ) {
+                            return Err(Self::discovery_error(
+                                "manifest_descriptor",
+                                &digest,
+                                format!(
+                                    "unsupported child manifest media type '{}'",
+                                    descriptor.media_type
+                                ),
+                            ));
+                        }
+                        if queued_manifests.contains(&descriptor.digest) {
+                            continue;
+                        }
+                        if queued_manifests.len() >= MAX_DELETION_MANIFESTS {
+                            return Err(OciError::DeletionObjectLimitExceeded {
+                                target: descriptor.digest,
+                            });
+                        }
+                        queued_manifests.insert(descriptor.digest.clone());
+                        let Some((child_body, child_digest)) = self
+                            .get_manifest_with_digest(&descriptor.digest)
+                            .await
+                            .map_err(|error| {
+                                Self::discovery_error("manifest_get", &descriptor.digest, error)
+                            })?
+                        else {
+                            return Err(Self::discovery_error(
+                                "manifest_get",
+                                &descriptor.digest,
+                                "child manifest disappeared during discovery",
+                            ));
+                        };
+                        if child_digest != descriptor.digest
+                            || compute_sha256_digest(child_body.as_bytes()) != descriptor.digest
+                        {
+                            return Err(Self::discovery_error(
+                                "manifest_digest",
+                                &descriptor.digest,
+                                "child manifest digest does not match descriptor",
+                            ));
+                        }
+                        pending.push_back((descriptor.digest, child_body, source.clone()));
+                    }
+                }
+                OciArtifactManifest::Manifest(manifest) => {
+                    if !Self::valid_digest(&manifest.config.digest) {
+                        return Err(Self::discovery_error(
+                            "blob_descriptor",
+                            &digest,
+                            "manifest contains an invalid config digest",
+                        ));
+                    }
+                    if plan.blobs.len() >= MAX_DELETION_BLOBS
+                        && !plan.blobs.contains_key(&manifest.config.digest)
+                    {
+                        return Err(OciError::DeletionObjectLimitExceeded {
+                            target: self.repo.clone(),
+                        });
+                    }
+                    plan.blobs
+                        .entry(manifest.config.digest.clone())
+                        .or_insert(manifest.config.size);
+
+                    for layer in manifest.layers {
+                        if !Self::valid_digest(&layer.digest) {
+                            return Err(Self::discovery_error(
+                                "blob_descriptor",
+                                &digest,
+                                "manifest contains an invalid layer digest",
+                            ));
+                        }
+                        if plan.blobs.len() >= MAX_DELETION_BLOBS
+                            && !plan.blobs.contains_key(&layer.digest)
+                        {
+                            return Err(OciError::DeletionObjectLimitExceeded {
+                                target: self.repo.clone(),
+                            });
+                        }
+                        plan.blobs.entry(layer.digest.clone()).or_insert(layer.size);
+
+                        let Some(layer_type) = CacheLayerMediaType::parse(&layer.media_type) else {
+                            continue;
+                        };
+                        let layer_bytes = self.get_blob(&layer.digest).await.map_err(|error| {
+                            Self::discovery_error("cache_layer_get", &layer.digest, error)
+                        })?;
+                        let computed_layer_digest = compute_sha256_digest(&layer_bytes);
+                        if computed_layer_digest != layer.digest {
+                            return Err(Self::discovery_error(
+                                "cache_layer_digest",
+                                &layer.digest,
+                                format!(
+                                    "cache layer body digest mismatch: expected {}, got {}",
+                                    layer.digest, computed_layer_digest
+                                ),
+                            ));
+                        }
+                        if layer_type.is_root_index() {
+                            let root: ShardedArchCacheIndexData = IndexCodec::decode_zstd(
+                                &layer_bytes,
+                                &layer.media_type,
+                            )
+                            .map_err(|error| {
+                                Self::discovery_error("root_index_decode", &layer.digest, error)
+                            })?;
+                            for shard in root.shards {
+                                if shard.entry_count == 0 {
+                                    continue;
+                                }
+                                if shard.blob_digest.is_empty() {
+                                    return Err(Self::discovery_error(
+                                        "root_index_decode",
+                                        &layer.digest,
+                                        "non-empty root shard is missing its blob digest",
+                                    ));
+                                }
+                                if !Self::valid_digest(&shard.blob_digest) {
+                                    return Err(Self::discovery_error(
+                                        "root_index_decode",
+                                        &layer.digest,
+                                        "root index contains an invalid shard digest",
+                                    ));
+                                }
+                                if plan.blobs.len() >= MAX_DELETION_BLOBS
+                                    && !plan.blobs.contains_key(&shard.blob_digest)
+                                {
+                                    return Err(OciError::DeletionObjectLimitExceeded {
+                                        target: self.repo.clone(),
+                                    });
+                                }
+                                let shard_digest = shard.blob_digest.clone();
+                                plan.blobs
+                                    .entry(shard_digest.clone())
+                                    .or_insert(shard.compressed_size);
+
+                                if decoded_shard_blobs.insert(shard_digest.clone()) {
+                                    let shard_bytes =
+                                        self.get_blob(&shard_digest).await.map_err(|error| {
+                                            Self::discovery_error("shard_get", &shard_digest, error)
+                                        })?;
+                                    let computed_shard_digest = compute_sha256_digest(&shard_bytes);
+                                    if computed_shard_digest != shard_digest {
+                                        return Err(Self::discovery_error(
+                                            "shard_digest",
+                                            &shard_digest,
+                                            format!(
+                                                "shard body digest mismatch: expected {}, got {}",
+                                                shard_digest, computed_shard_digest
+                                            ),
+                                        ));
+                                    }
+                                    let shard_data: ShardDataPayload = IndexCodec::decode_zstd(
+                                        &shard_bytes,
+                                        CacheLayerMediaTypeV6::SHARD_DATA_V6_ZSTD,
+                                    )
+                                    .map_err(|error| {
+                                        Self::discovery_error("shard_decode", &shard_digest, error)
+                                    })?;
+                                    for entry in shard_data.entries.values() {
+                                        let nar_digest = entry.nar_digest.to_string();
+                                        if !Self::valid_digest(&nar_digest) {
+                                            return Err(Self::discovery_error(
+                                                "shard_decode",
+                                                &shard_digest,
+                                                "shard contains an invalid NAR digest",
+                                            ));
+                                        }
+                                        if plan.blobs.len() >= MAX_DELETION_BLOBS
+                                            && !plan.blobs.contains_key(&nar_digest)
+                                        {
+                                            return Err(OciError::DeletionObjectLimitExceeded {
+                                                target: self.repo.clone(),
+                                            });
+                                        }
+                                        plan.blobs.entry(nar_digest).or_insert(entry.nar_size);
+                                    }
+                                }
+                            }
+                        } else {
+                            let shard: ShardDataPayload =
+                                IndexCodec::decode_zstd(&layer_bytes, &layer.media_type).map_err(
+                                    |error| {
+                                        Self::discovery_error("shard_decode", &layer.digest, error)
+                                    },
+                                )?;
+                            for entry in shard.entries.values() {
+                                let nar_digest = entry.nar_digest.to_string();
+                                if !Self::valid_digest(&nar_digest) {
+                                    return Err(Self::discovery_error(
+                                        "shard_decode",
+                                        &layer.digest,
+                                        "shard contains an invalid NAR digest",
+                                    ));
+                                }
+                                if plan.blobs.len() >= MAX_DELETION_BLOBS
+                                    && !plan.blobs.contains_key(&nar_digest)
+                                {
+                                    return Err(OciError::DeletionObjectLimitExceeded {
+                                        target: self.repo.clone(),
+                                    });
+                                }
+                                plan.blobs.entry(nar_digest).or_insert(entry.nar_size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    /// 只读发现当前所有 tag 可达的对象图，供 dry-run 和审计使用。
+    pub async fn preview_tag_reachable_package(&self) -> Result<PackageDeletionSummary, OciError> {
+        Ok(self.discover_tag_reachable_graph().await?.summary())
+    }
+
+    async fn verify_manifest_absent(&self, digest: &str) -> Result<(), OciError> {
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            digest
+        );
+        let (status, _) = self
+            .head_with_auth_retry(&url, "verify manifest deletion")
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            Ok(())
+        } else if status == StatusCode::OK {
+            Err(OciError::DeletionVerificationFailed {
+                target: digest.to_string(),
+                details: "manifest is still present after DELETE".to_string(),
+            })
+        } else {
+            Err(OciError::DeletionVerificationFailed {
+                target: digest.to_string(),
+                details: format!("manifest verification returned HTTP {status}"),
+            })
+        }
+    }
+
     /// 严格删除指定 Tag：
     /// - GHCR: 走 GitHub Packages REST API 查找并删除对应的 Package Version；
     /// - Generic OCI: 两阶段安全删除（先 HEAD/GET /manifests/<tag> 获得 Manifest Digest，再 DELETE /manifests/<digest>）；
@@ -1172,12 +1949,9 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     self.repo,
                     tag
                 );
-                let headers = self.get_auth_headers().await?;
-                let (status, resp_headers, body) =
-                    match self.transport.get(&head_url, headers).await {
-                        Ok(res) => res,
-                        Err(e) => return Err(OciError::Transport(e)),
-                    };
+                let (status, resp_headers, body) = self
+                    .get_with_auth_retry(&head_url, "get tag manifest")
+                    .await?;
 
                 if status == StatusCode::NOT_FOUND {
                     return Ok(());
@@ -1211,8 +1985,17 @@ impl<T: OciTransport + Clone> OciClient<T> {
                     self.repo,
                     tag
                 );
-                let tag_headers = self.get_auth_headers().await?;
-                let _ = self.transport.delete(&tag_url, tag_headers).await;
+                let tag_status = self.delete_with_auth_retry(&tag_url, "delete tag").await?;
+                if tag_status != StatusCode::NOT_FOUND
+                    && !tag_status.is_success()
+                    && tag_status != StatusCode::ACCEPTED
+                {
+                    return Err(OciError::DeletionFailed {
+                        target: tag.to_string(),
+                        status: tag_status,
+                        details: "registry rejected tag deletion".to_string(),
+                    });
+                }
 
                 Ok(())
             }
@@ -1228,7 +2011,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     }
 
     /// 严格删除指定 Manifest Digest (DELETE /v2/<repo>/manifests/<digest>)
-    pub async fn delete_manifest_strict(&self, digest: &str) -> Result<(), OciError> {
+    pub async fn delete_manifest_strict(&self, digest: &str) -> Result<DeletionOutcome, OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
@@ -1237,15 +2020,13 @@ impl<T: OciTransport + Clone> OciClient<T> {
             digest
         );
 
-        let headers = self.get_auth_headers().await?;
-        let status = self.transport.delete(&url, headers).await?;
+        let status = self.delete_with_auth_retry(&url, "delete manifest").await?;
 
-        if status.is_success()
-            || status == StatusCode::ACCEPTED
-            || status == StatusCode::NO_CONTENT
-            || status == StatusCode::NOT_FOUND
+        if status.is_success() || status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT
         {
-            Ok(())
+            Ok(DeletionOutcome::Deleted)
+        } else if status == StatusCode::NOT_FOUND {
+            Ok(DeletionOutcome::AlreadyAbsent)
         } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             Err(OciError::InsufficientPermission {
                 target: digest.to_string(),
@@ -1276,7 +2057,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
     /// 严格删除单个 OCI NAR Blob (DELETE /v2/<repo>/blobs/<digest>)
     /// 若后端不支持物理删除 (如 GHCR)，抛出 OperationNotSupported 错误
-    pub async fn delete_blob_strict(&self, digest: &str) -> Result<(), OciError> {
+    pub async fn delete_blob_strict(&self, digest: &str) -> Result<DeletionOutcome, OciError> {
         if !self.capabilities().supports_blob_physical_deletion {
             return Err(OciError::OperationNotSupported {
                 operation: "delete_blob",
@@ -1296,15 +2077,13 @@ impl<T: OciTransport + Clone> OciClient<T> {
             digest
         );
 
-        let headers = self.get_auth_headers().await?;
-        let status = self.transport.delete(&url, headers).await?;
+        let status = self.delete_with_auth_retry(&url, "delete blob").await?;
 
-        if status.is_success()
-            || status == StatusCode::ACCEPTED
-            || status == StatusCode::NO_CONTENT
-            || status == StatusCode::NOT_FOUND
+        if status.is_success() || status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT
         {
-            Ok(())
+            Ok(DeletionOutcome::Deleted)
+        } else if status == StatusCode::NOT_FOUND {
+            Ok(DeletionOutcome::AlreadyAbsent)
         } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             Err(OciError::InsufficientPermission {
                 target: digest.to_string(),
@@ -1375,7 +2154,8 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
         while let Some(res) = stream.next().await {
             match res {
-                Ok(()) => summary.deleted_count += 1,
+                Ok(DeletionOutcome::Deleted) => summary.deleted_count += 1,
+                Ok(DeletionOutcome::AlreadyAbsent) => summary.not_found_count += 1,
                 Err(e) => {
                     if strict_mode {
                         return Err(e);
@@ -1390,37 +2170,69 @@ impl<T: OciTransport + Clone> OciClient<T> {
         Ok(summary)
     }
 
-    /// 彻底删除/重置远程 Package (适用于 purge --all)：
-    /// - GHCR: DELETE /orgs或users/{owner}/packages/container/{pkg}；
-    /// - Generic OCI: 遍历删除已知 index 和 manifests，并清空 blobs。
-    pub async fn delete_entire_package_strict(&self) -> Result<(), OciError> {
-        match self.capabilities().deletion_strategy {
-            RegistryDeletionStrategy::GitHubPackagesRestApi => {
-                self.ghcr_client().delete_entire_package().await
+    /// 严格删除远程 Package，成功时返回可审计的发现、删除和幂等计数。
+    pub async fn delete_entire_package_strict(&self) -> Result<PackageDeletionSummary, OciError> {
+        match self.capabilities().package_deletion_support {
+            PackageDeletionSupport::NativeComplete => {
+                self.ghcr_client().delete_entire_package().await?;
+                Ok(PackageDeletionSummary::default())
             }
-            RegistryDeletionStrategy::StandardOciDelete
-            | RegistryDeletionStrategy::DockerHubRestApi
-            | RegistryDeletionStrategy::AwsEcrApi => {
-                // 标准 OCI: 尝试拉取 cache-index 并删除各子架构清单及顶层 index
-                if let Ok(Some(artifact)) = self.fetch_artifact("cache-index").await {
-                    match artifact.manifest {
-                        OciArtifactManifest::Index(idx) => {
-                            for sub in idx.manifests {
-                                let _ = self.delete_manifest_strict(&sub.digest).await;
-                            }
-                        }
-                        OciArtifactManifest::Manifest(_) => {}
+            PackageDeletionSupport::TaggedGraphOnly => {
+                let plan = self.discover_tag_reachable_graph().await?;
+                let mut summary = plan.summary();
+
+                let mut manifests: Vec<_> = plan.manifests.keys().cloned().collect();
+                manifests.sort();
+                for digest in manifests {
+                    match self.delete_manifest_strict(&digest).await? {
+                        DeletionOutcome::Deleted => summary.manifests_deleted += 1,
+                        DeletionOutcome::AlreadyAbsent => summary.already_absent += 1,
                     }
-                    let _ = self.delete_manifest_strict(&artifact.digest).await;
-                    let _ = self.delete_tag_strict("cache-index").await;
                 }
-                Ok(())
+
+                let mut blobs: Vec<_> = plan.blobs.keys().cloned().collect();
+                blobs.sort();
+                for digest in blobs {
+                    match self.delete_blob_strict(&digest).await? {
+                        DeletionOutcome::Deleted => summary.blobs_deleted += 1,
+                        DeletionOutcome::AlreadyAbsent => summary.already_absent += 1,
+                    }
+                }
+
+                let remaining_tags = self
+                    .list_tags()
+                    .await
+                    .map_err(|error| Self::discovery_error("final_list_tags", &self.repo, error))?;
+                if !remaining_tags.is_empty() {
+                    return Err(OciError::DeletionVerificationFailed {
+                        target: self.repo.clone(),
+                        details: format!(
+                            "{} tag(s) remain after deleting the discovered graph",
+                            remaining_tags.len()
+                        ),
+                    });
+                }
+
+                for digest in plan.manifests.keys() {
+                    self.verify_manifest_absent(digest).await?;
+                }
+                for digest in plan.blobs.keys() {
+                    let present = self.head_blob(digest).await?;
+                    if present {
+                        return Err(OciError::DeletionVerificationFailed {
+                            target: digest.clone(),
+                            details: "blob is still present after DELETE".to_string(),
+                        });
+                    }
+                }
+
+                Ok(summary)
             }
-            RegistryDeletionStrategy::Unsupported => Err(OciError::OperationNotSupported {
+            PackageDeletionSupport::Unsupported => Err(OciError::OperationNotSupported {
                 operation: "delete_package",
                 backend: self.kind(),
                 reason: format!(
-                    "Package deletion is not supported on backend '{}'",
+                    "Registry backend '{}' cannot prove complete package deletion",
                     self.kind()
                 ),
             }),
@@ -1595,8 +2407,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
             digest
         );
 
-        let headers = self.get_auth_headers().await?;
-        let (status, _resp_headers, bytes) = self.transport.get(&url, headers).await?;
+        let (status, _resp_headers, bytes) = self.get_with_auth_retry(&url, "get blob").await?;
 
         if status.is_success() {
             Ok(bytes)
@@ -1622,7 +2433,23 @@ impl<T: OciTransport + Clone> OciClient<T> {
         );
 
         let headers = self.get_auth_headers().await?;
-        let (status, resp_headers, stream) = self.transport.stream(&url, headers).await?;
+        let first = self.transport.stream(&url, headers).await?;
+        let (status, resp_headers, stream) = if first.0 == StatusCode::UNAUTHORIZED {
+            let (_, retry_headers) = self
+                .challenge_for_response("stream blob", first.0, &first.1)
+                .await?;
+            let second = self.transport.stream(&url, retry_headers).await?;
+            if second.0 == StatusCode::UNAUTHORIZED {
+                return Err(Self::auth_error(
+                    "stream blob",
+                    second.0,
+                    "Bearer challenge retry was rejected",
+                ));
+            }
+            second
+        } else {
+            first
+        };
 
         if status.is_success() {
             Ok(OciBlobStream::new(status, resp_headers, stream))

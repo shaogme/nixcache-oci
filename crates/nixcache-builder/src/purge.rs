@@ -1,5 +1,7 @@
 use crate::{
-    error::BuilderError, nix::resolve_flake_output_hashes, summary::write_purge_step_summary,
+    error::BuilderError,
+    nix::resolve_flake_output_hashes,
+    summary::{write_package_deletion_summary, write_purge_step_summary},
 };
 use chrono::Utc;
 use futures_util::future::try_join_all;
@@ -10,8 +12,8 @@ use nixcache_core::{
     partition_entries_by_shard,
 };
 use nixcache_oci::{
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciPlatform,
-    build_image_index,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor, OciError, OciPlatform,
+    PackageDeletionSupport, RegistryCredentials, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
@@ -22,7 +24,7 @@ pub async fn run_purge(
     args: &PurgeArgs,
     repo: &str,
     registry: &str,
-    github_token: &str,
+    credentials: impl Into<RegistryCredentials>,
 ) -> Result<(), BuilderError> {
     let dry_run = args.resolve_dry_run();
     let delete_blobs = args.resolve_delete_blobs();
@@ -34,34 +36,72 @@ pub async fn run_purge(
         registry, repo, dry_run, delete_blobs, strict_mode, is_all
     );
 
-    let oci = create_tokio_reqwest_client(registry, repo, github_token, true);
+    let oci = create_tokio_reqwest_client(registry, repo, credentials, true);
 
-    // 1. 若指定了 --all 且后端支持原生包删除 (如 GHCR)，直接执行彻底重置/删除
-    if is_all && oci.capabilities().supports_package_deletion {
-        if dry_run {
-            info!(
-                "Dry run mode active: would delete entire remote package {}/{} on backend '{}'",
-                registry,
-                repo,
-                oci.kind()
-            );
-            write_purge_step_summary(true, 0, 0, 0, 0).await;
-            return Ok(());
+    // 1. --all 必须显式遵守后端能够证明的删除范围。
+    if is_all {
+        match oci.capabilities().package_deletion_support {
+            PackageDeletionSupport::Unsupported => {
+                return Err(BuilderError::Oci(OciError::OperationNotSupported {
+                    operation: "delete_package",
+                    backend: oci.kind(),
+                    reason: format!(
+                        "backend '{}' cannot prove complete package deletion; use its native package API or garbage collection",
+                        oci.kind()
+                    ),
+                }));
+            }
+            PackageDeletionSupport::NativeComplete | PackageDeletionSupport::TaggedGraphOnly => {
+                if dry_run {
+                    let preview = oci.preview_tag_reachable_package().await?;
+                    info!(
+                        "Dry run package deletion on '{}': {} tag(s), {} manifest(s), {} blob(s) are discoverable",
+                        oci.kind(),
+                        preview.tags_discovered,
+                        preview.manifests_discovered,
+                        preview.blobs_discovered
+                    );
+                    write_package_deletion_summary(
+                        true,
+                        preview.tags_discovered,
+                        preview.manifests_discovered,
+                        preview.blobs_discovered,
+                        0,
+                        0,
+                        0,
+                    )
+                    .await;
+                    return Ok(());
+                }
+
+                info!(
+                    "Executing '{}' package deletion for {}/{}...",
+                    match oci.capabilities().package_deletion_support {
+                        PackageDeletionSupport::NativeComplete => "native-complete",
+                        PackageDeletionSupport::TaggedGraphOnly => "tag-reachable-graph",
+                        PackageDeletionSupport::Unsupported => "unsupported",
+                    },
+                    registry,
+                    repo
+                );
+                let summary = oci.delete_entire_package_strict().await?;
+                info!(
+                    "Package deletion completed: {} manifest(s), {} blob(s) deleted; {} already absent",
+                    summary.manifests_deleted, summary.blobs_deleted, summary.already_absent
+                );
+                write_package_deletion_summary(
+                    false,
+                    summary.tags_discovered,
+                    summary.manifests_discovered,
+                    summary.blobs_discovered,
+                    summary.manifests_deleted,
+                    summary.blobs_deleted,
+                    summary.already_absent,
+                )
+                .await;
+                return Ok(());
+            }
         }
-
-        info!(
-            "Executing complete package deletion for {}/{} on backend '{}'...",
-            registry,
-            repo,
-            oci.kind()
-        );
-        oci.delete_entire_package_strict().await?;
-        info!(
-            "Successfully deleted entire remote package {}/{}",
-            registry, repo
-        );
-        write_purge_step_summary(false, 0, 0, 0, 0).await;
-        return Ok(());
     }
 
     // 2. 探查多架构并加载现存基线索引数据

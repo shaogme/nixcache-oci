@@ -38,10 +38,45 @@ pub enum TransportError {
 pub enum TokenError {
     #[error("Registry bearer token missing in response body")]
     TokenMissingInBody,
+
+    #[error("Bearer token exchange failed at realm '{realm}' with HTTP {status}")]
+    ExchangeFailed { realm: String, status: StatusCode },
+
+    #[error("Bearer token response at realm '{realm}' is invalid: {details}")]
+    InvalidResponse {
+        realm: String,
+        details: &'static str,
+    },
 }
 
 #[derive(Error, Debug)]
 pub enum OciError {
+    #[error("Invalid OCI authentication challenge: {details}")]
+    AuthChallengeInvalid { details: String },
+
+    #[error("OCI authentication failed during '{operation}' with HTTP {status}: {details}")]
+    AuthenticationFailed {
+        operation: &'static str,
+        status: StatusCode,
+        details: String,
+    },
+
+    #[error("OCI authentication challenge retry cannot replay operation '{operation}'")]
+    AuthenticationNotReplayable { operation: &'static str },
+
+    #[error("Deletion discovery failed during '{stage}' for '{target}': {details}")]
+    DeletionDiscoveryFailed {
+        stage: &'static str,
+        target: String,
+        details: String,
+    },
+
+    #[error("Deletion verification failed for '{target}': {details}")]
+    DeletionVerificationFailed { target: String, details: String },
+
+    #[error("Deletion discovery exceeded the object limit for '{target}'")]
+    DeletionObjectLimitExceeded { target: String },
+
     #[error("Operation '{operation}' not supported on registry backend '{backend}': {reason}")]
     OperationNotSupported {
         operation: &'static str,

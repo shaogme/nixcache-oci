@@ -10,6 +10,7 @@ use crate::{
 pub use error::WorkerStoreError;
 use futures_util::TryStreamExt;
 use nixcache_core::SystemArch;
+use nixcache_oci::RegistryCredentials;
 use worker::{Env, Fetch, Headers, Request, Response, Result, Router, event};
 
 pub fn parse_upstream_list(upstream_str: &str) -> Vec<String> {
@@ -77,11 +78,20 @@ fn get_store(env: &Env) -> Result<CacheStore> {
         .or_else(|_| env.var("NIXCACHE_AUTH_TOKEN"))
         .map(|v| v.to_string())
         .unwrap_or_default();
+    let registry_username = env
+        .var("REGISTRY_USERNAME")
+        .or_else(|_| env.var("OCI_USERNAME"))
+        .ok()
+        .map(|v| v.to_string());
+    let credentials = match registry_username {
+        Some(username) => RegistryCredentials::with_username(username, github_token),
+        None => RegistryCredentials::new(github_token),
+    };
 
     let oci_client = WorkerOciClient::with_transport(
         &config.registry,
         &config.repo,
-        &github_token,
+        credentials,
         false,
         WorkerFetchTransport,
     );

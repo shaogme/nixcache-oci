@@ -138,6 +138,19 @@ pub enum ManifestCasSupport {
     Unsupported,
 }
 
+/// 后端能够证明的包删除范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageDeletionSupport {
+    /// 后端原生 API 能枚举并删除完整 package/version 集合。
+    NativeComplete,
+    /// 标准 OCI API 只能覆盖当前 tag 可达的对象图。
+    TaggedGraphOnly,
+    /// 后端没有可验证的包删除能力。
+    #[default]
+    Unsupported,
+}
+
 /// 后端静态能力描述符 (编译期/初始化时确定，拒绝运行时嗅探)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryCapabilities {
@@ -151,16 +164,13 @@ pub struct RegistryCapabilities {
     pub requires_library_namespace_expansion: bool,
     /// 固定的上传协议策略
     pub fixed_upload_strategy: BlobUploadStrategy,
-    /// 专用 Token Auth Server 覆盖地址
-    pub custom_auth_endpoint: Option<&'static str>,
-
     // === 新增核心删除能力字段 ===
     /// 当前后端采用的删除调度策略
     pub deletion_strategy: RegistryDeletionStrategy,
     /// 是否支持物理删除 OCI NAR Blobs
     pub supports_blob_physical_deletion: bool,
-    /// 是否支持物理删除整个 Package / Repository
-    pub supports_package_deletion: bool,
+    /// 当前后端可证明的包删除范围。
+    pub package_deletion_support: PackageDeletionSupport,
 }
 
 /// 注册表后端删除策略分类

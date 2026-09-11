@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod backend;
 pub mod client;
 pub mod codec;
@@ -8,12 +9,15 @@ pub mod token;
 pub mod transport;
 pub mod upload;
 
+pub use auth::{
+    BearerChallenge, RegistryCredentials, parse_www_authenticate, parse_www_authenticate_value,
+};
 pub use backend::{
     AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
     GenericOciDriver, GhcrDriver, GitHubContainerMetadata, GitHubPackageVersion,
     GitHubPackageVersionMetadata, GitHubPackagesClient, ManifestCasSupport, OciBackendDriver,
-    OciDriver, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver,
-    driver_for_kind,
+    OciDriver, PackageDeletionSupport, RegistryCapabilities, RegistryDeletionStrategy,
+    RegistryKind, detect_driver, driver_for_kind,
 };
 pub use client::{DeletionSummary, FetchedOciArtifact, ManifestCasCondition, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
@@ -44,11 +48,12 @@ pub use upload::{BlobPayload, UploadConfig};
 #[cfg(test)]
 mod tests {
     use super::{
-        AwsEcrDriver, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST, GenericOciDriver,
-        GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport, NarDigest,
-        OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform, RegistryDeletionStrategy,
-        RegistryKind, ShardDataPayload, ShardedArchCacheIndexData, StoreHash, StreamHashState,
-        SystemArch, TransportError, UploadConfig, build_image_index, parse_range_header,
+        AwsEcrDriver, BearerChallenge, BlobUploadStrategy, DockerHubDriver, EMPTY_CONFIG_DIGEST,
+        GenericOciDriver, GhcrDriver, HashingStream, IndexEntry, MockResponse, MockRouterTransport,
+        NarDigest, OciClient, OciDescriptor, OciError, OciImageIndex, OciPlatform,
+        RegistryDeletionStrategy, RegistryKind, ShardDataPayload, ShardedArchCacheIndexData,
+        StoreHash, StreamHashState, SystemArch, TransportError, UploadConfig, build_image_index,
+        parse_range_header,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -73,18 +78,12 @@ mod tests {
             RegistryDeletionStrategy::GitHubPackagesRestApi
         );
         assert!(!ghcr.capabilities().supports_blob_physical_deletion);
-        assert!(ghcr.capabilities().supports_package_deletion);
         assert_eq!(ghcr.canonicalize_endpoint("  GHCR.IO "), "ghcr.io");
         assert_eq!(ghcr.canonicalize_repository("/Owner/Repo/"), "owner/repo");
         assert_eq!(
             ghcr.format_auth_scope("owner/repo", true),
             "repository:owner/repo/nix-cache:pull,push"
         );
-        assert_eq!(
-            ghcr.resolve_token_endpoint("ghcr.io", "owner/repo", true),
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:owner/repo/nix-cache:pull,push"
-        );
-
         let docker = DockerHubDriver;
         assert_eq!(docker.kind(), RegistryKind::DockerHub);
         assert!(docker.capabilities().supports_chunked_patch);
@@ -111,11 +110,6 @@ mod tests {
             docker.format_auth_scope("ubuntu", false),
             "repository:library/ubuntu/nix-cache:pull"
         );
-        assert_eq!(
-            docker.resolve_token_endpoint("docker.io", "ubuntu", false),
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu/nix-cache:pull"
-        );
-
         let generic = GenericOciDriver;
         assert_eq!(generic.kind(), RegistryKind::GenericOci);
         assert_eq!(
@@ -123,11 +117,6 @@ mod tests {
             RegistryDeletionStrategy::StandardOciDelete
         );
         assert!(generic.capabilities().supports_blob_physical_deletion);
-        assert_eq!(
-            generic.resolve_token_endpoint("localhost:5000", "myrepo", true),
-            "http://localhost:5000/token?service=localhost:5000&scope=repository:myrepo/nix-cache:pull,push"
-        );
-
         let aws = AwsEcrDriver;
         assert_eq!(aws.kind(), RegistryKind::AwsEcr);
         assert!(!aws.capabilities().supports_chunked_patch);
@@ -139,7 +128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oci_client_token_fallback() {
+    async fn test_oci_client_token_exchange_failure_is_visible() {
         let transport = MockRouterTransport::default();
         transport.add_route(
             "GET",
@@ -158,11 +147,13 @@ mod tests {
             true,
             transport,
         );
-        let token = client
-            .get_token()
-            .await
-            .expect("Should fallback to github_token");
-        assert_eq!(token.as_ref(), "fallback-token");
+        let challenge = BearerChallenge::new(
+            "https://auth.example.test/token",
+            Some("example.com".to_string()),
+            Some("repository:test/repo/nix-cache:pull,push".to_string()),
+        )
+        .unwrap();
+        assert!(client.get_token(&challenge).await.is_err());
     }
 
     #[tokio::test]
@@ -565,7 +556,8 @@ mod tests {
             .batch_delete_blobs_strict(&digests, 2, false)
             .await
             .unwrap();
-        assert_eq!(summary.deleted_count, 2); // blob1 and blob2 (404 idempotent)
+        assert_eq!(summary.deleted_count, 1); // blob1
+        assert_eq!(summary.not_found_count, 1); // blob2 (404 idempotent)
         assert_eq!(summary.failed_count, 1); // blob3 (405 error)
 
         let strict_err = client

@@ -151,6 +151,34 @@ pub async fn write_purge_step_summary_to(
     append_summary(content, file_opt).await;
 }
 
+/// 为 `purge --all` 输出完整的远程对象删除审计信息。
+pub async fn write_package_deletion_summary(
+    dry_run: bool,
+    tags_discovered: usize,
+    manifests_discovered: usize,
+    blobs_discovered: usize,
+    manifests_deleted: usize,
+    blobs_deleted: usize,
+    already_absent: usize,
+) {
+    let mode = if dry_run {
+        " (Dry Run - Preview Only)"
+    } else {
+        ""
+    };
+    let content = format!(
+        "### 🗑️ NixCache Package Deletion Report{}\n\n- **Tags Discovered:** `{}`\n- **Manifests Discovered:** `{}`\n- **Blobs Discovered:** `{}`\n- **Manifests Deleted:** `{}`\n- **Blobs Deleted:** `{}`\n- **Already Absent:** `{}`\n",
+        mode,
+        tags_discovered,
+        manifests_discovered,
+        blobs_discovered,
+        manifests_deleted,
+        blobs_deleted,
+        already_absent,
+    );
+    append_summary(content, None).await;
+}
+
 /// 为 List 步骤生成并写入 GitHub Actions Step Summary
 pub async fn write_list_step_summary(
     report: &CacheListSummaryReport,

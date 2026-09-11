@@ -260,12 +260,36 @@ pub trait OciTransport: 'static {
         final_chunk: Option<(Bytes, (u64, u64))>,
     ) -> Result<StatusCode, TransportError>;
 
+    /// 完成分块上传并保留 response headers，以便处理空 body PUT 的 challenge。
+    async fn put_chunk_finish_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        final_chunk: Option<(Bytes, (u64, u64))>,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        self.put_chunk_finish(url, headers, final_chunk)
+            .await
+            .map(|status| (status, HeaderMap::new()))
+    }
+
     async fn put_bytes(
         &self,
         url: &str,
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<StatusCode, TransportError>;
+
+    /// 与 `put_bytes` 相同，但保留 response headers 以便处理 Bearer challenge。
+    async fn put_bytes_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        self.put_bytes(url, headers, body)
+            .await
+            .map(|status| (status, HeaderMap::new()))
+    }
 
     async fn put_stream(
         &self,
@@ -275,7 +299,31 @@ pub trait OciTransport: 'static {
         content_len: u64,
     ) -> Result<StatusCode, TransportError>;
 
+    /// 流式 body 已经可能被消费，返回 headers 仅用于把 401 映射为不可重放错误。
+    async fn put_stream_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        stream: Self::BodyStream,
+        content_len: u64,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        self.put_stream(url, headers, stream, content_len)
+            .await
+            .map(|status| (status, HeaderMap::new()))
+    }
+
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<StatusCode, TransportError>;
+
+    /// 与 `delete` 相同，但保留 response headers 以便处理 Bearer challenge。
+    async fn delete_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, HeaderMap), TransportError> {
+        self.delete(url, headers)
+            .await
+            .map(|status| (status, HeaderMap::new()))
+    }
 
     async fn sleep(&self, duration: Duration);
 }

@@ -7,7 +7,7 @@ use crate::{
 };
 use chrono::Utc;
 use nixcache_core::{BuildReceipt, BuildStats, IndexEntry, StoreHash, SystemArch};
-use nixcache_oci::{OciClient, OciTransport};
+use nixcache_oci::{OciClient, OciTransport, RegistryCredentials};
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::{
     collections::{HashMap, HashSet},
@@ -43,6 +43,7 @@ pub async fn setup_self_substituter(
     repo: &str,
     registry: &str,
     github_token: &str,
+    registry_username: Option<&str>,
     signing_key_file: Option<&str>,
     strict: bool,
 ) -> Result<ProxyGuard, BuilderError> {
@@ -59,6 +60,9 @@ pub async fn setup_self_substituter(
         .env("GITHUB_TOKEN", github_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(username) = registry_username {
+        proxy_cmd.env("REGISTRY_USERNAME", username);
+    }
 
     let (proxy_child, ready) = match proxy_cmd.spawn() {
         Ok(mut child) => {
@@ -173,13 +177,14 @@ pub async fn fetch_remote_cache_hashes<T: OciTransport + Clone>(
     own_hashes
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BuildWorkerOptions<'a> {
     pub build_config: &'a BuildConfig,
     pub repo: &'a str,
     pub registry: &'a str,
     pub signing_key_file: Option<&'a str>,
     pub github_token: &'a str,
+    pub credentials: RegistryCredentials,
     pub output_receipt_path: &'a Path,
     pub strict: bool,
     pub export_concurrency: usize,
@@ -202,6 +207,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         opts.repo,
         opts.registry,
         opts.github_token,
+        opts.credentials.username(),
         opts.signing_key_file,
         opts.strict,
     )
@@ -216,7 +222,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     info!("Built {} top-level output path(s)", output_paths.len());
 
     // 4. 获取已有远端 hashes
-    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.github_token, true);
+    let oci = create_tokio_reqwest_client(opts.registry, opts.repo, opts.credentials.clone(), true);
     let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
     info!(
         "Remote index contains {} previously-cached entries for {}",
