@@ -41,6 +41,7 @@ web-time = { workspace = true }
 [dev-dependencies]
 loom = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+trybuild = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

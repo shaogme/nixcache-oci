@@ -92,6 +92,9 @@ pub enum OciError {
         actual: Option<String>,
     },
 
+    #[error("Manifest CAS is not supported on registry backend '{backend}' for tag '{tag}'")]
+    CasUnsupported { tag: String, backend: RegistryKind },
+
     #[error("Upload session location missing in 202 Accepted response")]
     UploadLocationMissing,
 

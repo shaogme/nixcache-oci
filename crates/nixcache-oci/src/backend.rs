@@ -10,4 +10,7 @@ pub use ghcr::{
     GitHubContainerMetadata, GitHubPackageVersion, GitHubPackageVersionMetadata,
     GitHubPackagesClient,
 };
-pub use kind::{BlobUploadStrategy, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind};
+pub use kind::{
+    BlobUploadStrategy, ManifestCasSupport, RegistryCapabilities, RegistryDeletionStrategy,
+    RegistryKind,
+};

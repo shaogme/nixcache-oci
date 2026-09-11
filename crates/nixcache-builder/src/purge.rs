@@ -242,9 +242,8 @@ pub async fn run_purge(
                     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                 let arch_tag = format!("cache-index-{}", sys.as_str());
-                let sub_manifest_digest = oci
-                    .push_sharded_root_index(&arch_tag, &root_index, None)
-                    .await?;
+                let sub_manifest_digest =
+                    oci.push_sharded_root_index(&arch_tag, &root_index).await?;
 
                 info!(
                     "Pushed updated Sharded Sub-Manifest for {} after purge: digest {} (tag: {})",

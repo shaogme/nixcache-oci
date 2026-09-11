@@ -17,12 +17,29 @@ struct TokenResponse {
     access_token: Option<String>,
 }
 
+/// 仅供 crate 内部使用的凭据容器。
+///
+/// 故意不实现 `Debug`、`Display` 或序列化 trait，避免凭据通过通用格式化
+/// 或诊断路径意外离开认证代码。
+#[derive(Clone)]
+pub(crate) struct SecretToken(String);
+
+impl SecretToken {
+    pub(crate) fn new(value: &str) -> Self {
+        Self(value.to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// OCI 注册表鉴权令牌管理器（零锁 Singleflight 状态机）
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TokenManager {
     registry: String,
     repo: String,
-    github_token: String,
+    github_token: SecretToken,
     write_access: bool,
     driver: OciDriver,
     storage: TokenStorage,
@@ -44,7 +61,7 @@ impl TokenManager {
         Self {
             registry: clean_registry,
             repo: clean_repo,
-            github_token: github_token.to_string(),
+            github_token: SecretToken::new(github_token),
             write_access,
             driver,
             storage: TokenStorage::new(),
@@ -53,8 +70,8 @@ impl TokenManager {
         }
     }
 
-    pub fn auth_token(&self) -> &str {
-        &self.github_token
+    pub(crate) fn auth_token(&self) -> &str {
+        self.github_token.as_str()
     }
 
     /// 核心鉴权方法：99.9% 场景为 Wait-Free 无锁读取，返回不可变共享 Arc<str>
@@ -106,8 +123,8 @@ impl TokenManager {
                 .resolve_token_endpoint(&self.registry, &self.repo, self.write_access);
 
         let mut headers = HeaderMap::new();
-        if !self.github_token.is_empty() {
-            let auth_str = format!("token:{}", self.github_token);
+        if !self.github_token.as_str().is_empty() {
+            let auth_str = format!("token:{}", self.github_token.as_str());
             let b64 = STANDARD.encode(auth_str);
             if let Ok(val) = HeaderValue::from_str(&format!("Basic {}", b64)) {
                 headers.insert("Authorization", val);
@@ -119,8 +136,8 @@ impl TokenManager {
                 let parsed = serde_json::from_slice::<TokenResponse>(&bytes).ok();
                 let token_opt = parsed.and_then(|r| r.token.or(r.access_token));
                 token_opt.or_else(|| {
-                    if !self.github_token.is_empty() {
-                        Some(self.github_token.clone())
+                    if !self.github_token.as_str().is_empty() {
+                        Some(self.github_token.as_str().to_string())
                     } else {
                         None
                     }

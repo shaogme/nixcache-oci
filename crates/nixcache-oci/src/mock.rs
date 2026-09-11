@@ -4,7 +4,10 @@ use crate::{
 };
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{
+    HeaderMap, HeaderValue, StatusCode,
+    header::{IF_MATCH, IF_NONE_MATCH},
+};
 use scc::HashMap as SccHashMap;
 use sha2::{Digest, Sha256};
 use std::{
@@ -51,11 +54,19 @@ pub struct MockResponse {
     pub body: Bytes,
 }
 
+#[derive(Clone)]
+pub struct MockPutRequest {
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
 #[derive(Clone, Default)]
 pub struct MockRouterTransport {
     pub call_count: Arc<AtomicUsize>,
     pub responses: Arc<SccHashMap<(String, String), MockResponse>>,
     pub posted_bodies: Arc<SegQueue<(String, Bytes)>>,
+    pub put_requests: Arc<SegQueue<MockPutRequest>>,
     pub stored_blobs: Arc<SccHashMap<String, Bytes>>,
     pub stored_manifests: Arc<SccHashMap<String, (Bytes, String)>>,
 }
@@ -328,10 +339,15 @@ impl OciTransport for MockRouterTransport {
     async fn put_bytes(
         &self,
         url: &str,
-        _headers: HeaderMap,
+        headers: HeaderMap,
         body: Bytes,
     ) -> Result<StatusCode, TransportError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.put_requests.push(MockPutRequest {
+            url: url.to_string(),
+            headers: headers.clone(),
+            body: body.clone(),
+        });
 
         if let Some(digest) = extract_digest_param(url) {
             let _ = self.stored_blobs.upsert_sync(digest, body.clone());
@@ -350,6 +366,25 @@ impl OciTransport for MockRouterTransport {
 
         if let Some(idx) = path.rfind("/manifests/") {
             let tag = &path[idx + 11..];
+
+            let current_digest = self
+                .stored_manifests
+                .get_sync(tag)
+                .map(|entry| entry.get().1.clone());
+            if let Some(expected) = headers.get(IF_MATCH).and_then(|value| value.to_str().ok())
+                && current_digest.as_deref() != Some(expected)
+            {
+                return Ok(StatusCode::PRECONDITION_FAILED);
+            }
+            if headers
+                .get(IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                == Some("*")
+                && current_digest.is_some()
+            {
+                return Ok(StatusCode::PRECONDITION_FAILED);
+            }
+
             let digest = mock_sha256(&body);
             let _ = self
                 .stored_manifests

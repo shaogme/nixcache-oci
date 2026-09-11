@@ -3,11 +3,12 @@ use nixcache_core::{
     StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, IndexCodec,
-    OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciError, OciImageManifest, OciPlatform,
-    ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
+    CacheLayerMediaType, EMPTY_CONFIG_DIGEST, EMPTY_CONFIG_SIZE, GcpArtifactRegistryDriver,
+    IndexCodec, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciDescriptor, OciError, OciImageManifest,
+    OciPlatform, ShardedArchIndexManifestParams, build_image_index,
+    build_sharded_arch_index_manifest,
 };
-use nixcache_oci_backend::create_tokio_reqwest_client;
+use nixcache_oci_backend::{create_tokio_reqwest_client, create_tokio_reqwest_client_with_driver};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use wiremock::{
@@ -557,7 +558,13 @@ async fn test_update_sharded_arch_index_cas_flow() {
         .mount(&server)
         .await;
 
-    let client = create_tokio_reqwest_client(&host, "test/repo", "token123", true);
+    let client = create_tokio_reqwest_client_with_driver(
+        &host,
+        "test/repo",
+        "token123",
+        true,
+        GcpArtifactRegistryDriver,
+    );
 
     let updated_digest = client
         .update_sharded_arch_index_cas("cache-index", &SystemArch::X86_64Linux, 3, |existing| {

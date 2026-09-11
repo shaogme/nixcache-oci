@@ -1,5 +1,6 @@
 use crate::backend::kind::{
-    BlobUploadStrategy, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind,
+    BlobUploadStrategy, ManifestCasSupport, RegistryCapabilities, RegistryDeletionStrategy,
+    RegistryKind,
 };
 use std::{fmt::Debug, sync::Arc};
 
@@ -27,7 +28,7 @@ pub trait OciBackendDriver: Send + Sync + Debug + 'static {
 pub static GHCR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: false,
     supports_monolithic_post_1rtt: false,
-    supports_manifest_cas_if_match: false,
+    manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::FixedTwoStepPut,
     custom_auth_endpoint: Some("https://ghcr.io/token"),
@@ -114,7 +115,7 @@ impl OciBackendDriver for GhcrDriver {
 pub static DOCKER_HUB_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: true,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: true,
+    manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: true,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: Some("https://auth.docker.io/token"),
@@ -209,7 +210,7 @@ impl OciBackendDriver for DockerHubDriver {
 pub static AWS_ECR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: false,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: false,
+    manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
@@ -295,7 +296,7 @@ impl OciBackendDriver for AwsEcrDriver {
 pub static GCP_GAR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: true,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: true,
+    manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
@@ -381,7 +382,7 @@ impl OciBackendDriver for GcpArtifactRegistryDriver {
 pub static AZURE_ACR_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: true,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: true,
+    manifest_cas_support: ManifestCasSupport::IfMatch,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::PreferMonolithicPost,
     custom_auth_endpoint: None,
@@ -467,7 +468,7 @@ impl OciBackendDriver for AzureAcrDriver {
 pub static GENERIC_OCI_CAPABILITIES: RegistryCapabilities = RegistryCapabilities {
     supports_chunked_patch: true,
     supports_monolithic_post_1rtt: true,
-    supports_manifest_cas_if_match: false,
+    manifest_cas_support: ManifestCasSupport::Unsupported,
     requires_library_namespace_expansion: false,
     fixed_upload_strategy: BlobUploadStrategy::ResumableChunkedPatch,
     custom_auth_endpoint: None,

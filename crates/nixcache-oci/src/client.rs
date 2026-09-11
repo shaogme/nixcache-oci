@@ -1,7 +1,8 @@
 use crate::{
     backend::{
-        BlobUploadStrategy, GitHubPackagesClient, OciDriver, RegistryCapabilities,
-        RegistryDeletionStrategy, RegistryKind, detect_driver, driver_for_kind,
+        BlobUploadStrategy, GitHubPackagesClient, ManifestCasSupport, OciDriver,
+        RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver,
+        driver_for_kind,
     },
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::{OciError, TransportError},
@@ -24,6 +25,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{pin::pin, str::from_utf8, sync::Arc, time::Duration};
 use tracing::{info, warn};
+
+/// Manifest 发布时使用的 CAS 前置条件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestCasCondition {
+    /// 只有目标 tag 不存在时才允许发布。
+    CreateOnly,
+    /// 只有目标 tag 当前 digest 与此值一致时才允许发布。
+    Match(String),
+}
 
 fn compute_sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -51,7 +61,7 @@ pub struct FetchedOciArtifact {
     pub digest: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OciClient<T: OciTransport> {
     registry: String,
     repo: String,
@@ -882,7 +892,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
         &self,
         tag: &str,
         root_data: &ShardedArchCacheIndexData,
-        previous_digest: Option<&str>,
     ) -> Result<String, OciError> {
         let (root_blob_digest, root_compressed_size, _) = self.push_zstd_blob(root_data).await?;
 
@@ -896,8 +905,32 @@ impl<T: OciTransport + Clone> OciClient<T> {
         });
 
         let manifest_str = manifest.to_json_string()?;
-        self.put_manifest_conditional(tag, &manifest_str, previous_digest)
-            .await?;
+        self.put_manifest(tag, &manifest_str).await?;
+        let manifest_digest = compute_sha256_digest(manifest_str.as_bytes());
+        Ok(manifest_digest)
+    }
+
+    /// 推送单架构分片根索引目录清单，并要求后端执行 manifest CAS。
+    pub async fn push_sharded_root_index_cas(
+        &self,
+        tag: &str,
+        root_data: &ShardedArchCacheIndexData,
+        condition: ManifestCasCondition,
+    ) -> Result<String, OciError> {
+        self.ensure_manifest_cas_supported(tag)?;
+        let (root_blob_digest, root_compressed_size, _) = self.push_zstd_blob(root_data).await?;
+
+        let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
+            root_blob_digest: &root_blob_digest,
+            root_blob_size: root_compressed_size,
+            config_digest: EMPTY_CONFIG_DIGEST,
+            config_size: EMPTY_CONFIG_SIZE,
+            system: &root_data.system,
+            merkle_root: &root_data.merkle_root,
+        });
+
+        let manifest_str = manifest.to_json_string()?;
+        self.put_manifest_cas(tag, &manifest_str, condition).await?;
         let manifest_digest = compute_sha256_digest(manifest_str.as_bytes());
         Ok(manifest_digest)
     }
@@ -916,12 +949,37 @@ impl<T: OciTransport + Clone> OciClient<T> {
         self.push_zstd_blob(payload).await
     }
 
-    pub async fn put_manifest_conditional(
-        &self,
-        tag: &str,
-        manifest: &str,
-        previous_digest: Option<&str>,
-    ) -> Result<(), OciError> {
+    fn ensure_manifest_cas_supported(&self, tag: &str) -> Result<(), OciError> {
+        if self.driver.capabilities().manifest_cas_support == ManifestCasSupport::IfMatch {
+            Ok(())
+        } else {
+            Err(OciError::CasUnsupported {
+                tag: tag.to_string(),
+                backend: self.kind(),
+            })
+        }
+    }
+
+    fn insert_manifest_cas_condition(
+        headers: &mut HeaderMap,
+        condition: &ManifestCasCondition,
+    ) -> Result<Option<String>, OciError> {
+        match condition {
+            ManifestCasCondition::CreateOnly => {
+                headers.insert("If-None-Match", HeaderValue::from_static("*"));
+                Ok(None)
+            }
+            ManifestCasCondition::Match(expected) => {
+                let value = HeaderValue::from_str(expected).map_err(|_| {
+                    OciError::Transport(TransportError::HeaderParse { header: "If-Match" })
+                })?;
+                headers.insert(IF_MATCH, value);
+                Ok(Some(expected.clone()))
+            }
+        }
+    }
+
+    pub async fn put_manifest(&self, tag: &str, manifest: &str) -> Result<(), OciError> {
         if manifest.contains(EMPTY_CONFIG_DIGEST) {
             self.ensure_empty_config_blob().await?;
         }
@@ -940,12 +998,45 @@ impl<T: OciTransport + Clone> OciClient<T> {
             HeaderValue::from_static(OCI_IMAGE_MANIFEST_MEDIA_TYPE),
         );
 
-        if self.driver.capabilities().supports_manifest_cas_if_match
-            && let Some(prev) = previous_digest
-            && let Ok(val) = HeaderValue::from_str(prev)
+        let bytes = Bytes::copy_from_slice(manifest.as_bytes());
+        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+
+        if status == StatusCode::OK
+            || status == StatusCode::CREATED
+            || status == StatusCode::ACCEPTED
         {
-            headers.insert(IF_MATCH, val);
+            info!("Successfully pushed manifest for tag {}", tag);
+            Ok(())
+        } else {
+            Err(OciError::ManifestPushFailed(status))
         }
+    }
+
+    pub async fn put_manifest_cas(
+        &self,
+        tag: &str,
+        manifest: &str,
+        condition: ManifestCasCondition,
+    ) -> Result<(), OciError> {
+        self.ensure_manifest_cas_supported(tag)?;
+        if manifest.contains(EMPTY_CONFIG_DIGEST) {
+            self.ensure_empty_config_blob().await?;
+        }
+
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag
+        );
+
+        let mut headers = self.get_auth_headers().await?;
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static(OCI_IMAGE_MANIFEST_MEDIA_TYPE),
+        );
+        let expected = Self::insert_manifest_cas_condition(&mut headers, &condition)?;
 
         let bytes = Bytes::copy_from_slice(manifest.as_bytes());
         let status = self.transport.put_bytes(&url, headers, bytes).await?;
@@ -953,7 +1044,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
             return Err(OciError::CasPreconditionFailed {
                 tag: tag.to_string(),
-                expected: previous_digest.map(|s| s.to_string()),
+                expected,
                 actual: None,
             });
         }
@@ -969,12 +1060,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
-    pub async fn put_image_index_conditional(
-        &self,
-        tag: &str,
-        index: &OciImageIndex,
-        previous_digest: Option<&str>,
-    ) -> Result<(), OciError> {
+    pub async fn put_image_index(&self, tag: &str, index: &OciImageIndex) -> Result<(), OciError> {
         let url = format!(
             "{}://{}/v2/{}/nix-cache/manifests/{}",
             self.url_scheme(),
@@ -989,12 +1075,43 @@ impl<T: OciTransport + Clone> OciClient<T> {
             HeaderValue::from_static(OCI_IMAGE_INDEX_MEDIA_TYPE),
         );
 
-        if self.driver.capabilities().supports_manifest_cas_if_match
-            && let Some(prev) = previous_digest
-            && let Ok(val) = HeaderValue::from_str(prev)
+        let index_json = index.to_json_string()?;
+        let bytes = Bytes::copy_from_slice(index_json.as_bytes());
+        let status = self.transport.put_bytes(&url, headers, bytes).await?;
+
+        if status == StatusCode::OK
+            || status == StatusCode::CREATED
+            || status == StatusCode::ACCEPTED
         {
-            headers.insert(IF_MATCH, val);
+            info!("Successfully pushed OCI Image Index for tag {}", tag);
+            Ok(())
+        } else {
+            Err(OciError::ManifestPushFailed(status))
         }
+    }
+
+    pub async fn put_image_index_cas(
+        &self,
+        tag: &str,
+        index: &OciImageIndex,
+        condition: ManifestCasCondition,
+    ) -> Result<(), OciError> {
+        self.ensure_manifest_cas_supported(tag)?;
+
+        let url = format!(
+            "{}://{}/v2/{}/nix-cache/manifests/{}",
+            self.url_scheme(),
+            self.registry,
+            self.repo,
+            tag
+        );
+
+        let mut headers = self.get_auth_headers().await?;
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static(OCI_IMAGE_INDEX_MEDIA_TYPE),
+        );
+        let expected = Self::insert_manifest_cas_condition(&mut headers, &condition)?;
 
         let index_json = index.to_json_string()?;
         let bytes = Bytes::copy_from_slice(index_json.as_bytes());
@@ -1003,7 +1120,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
         if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
             return Err(OciError::CasPreconditionFailed {
                 tag: tag.to_string(),
-                expected: previous_digest.map(|s| s.to_string()),
+                expected,
                 actual: None,
             });
         }
@@ -1020,11 +1137,11 @@ impl<T: OciTransport + Clone> OciClient<T> {
     }
 
     pub async fn push_image_index(&self, tag: &str, index: &OciImageIndex) -> Result<(), OciError> {
-        self.put_image_index_conditional(tag, index, None).await
+        self.put_image_index(tag, index).await
     }
 
     pub async fn push_manifest(&self, tag: &str, manifest: &str) -> Result<(), OciError> {
-        self.put_manifest_conditional(tag, manifest, None).await
+        self.put_manifest(tag, manifest).await
     }
 
     pub fn ghcr_client(&self) -> GitHubPackagesClient<T> {
@@ -1343,17 +1460,21 @@ impl<T: OciTransport + Clone> OciClient<T> {
     where
         F: FnMut(Option<OciImageIndex>) -> Result<OciImageIndex, OciError>,
     {
+        self.ensure_manifest_cas_supported(tag)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let (existing_index, prev_digest) = match self.fetch_artifact(tag).await? {
-                Some(artifact) => (artifact.manifest.as_index().cloned(), Some(artifact.digest)),
-                None => (None, None),
+            let (existing_index, condition) = match self.fetch_artifact(tag).await? {
+                Some(artifact) => (
+                    artifact.manifest.as_index().cloned(),
+                    ManifestCasCondition::Match(artifact.digest),
+                ),
+                None => (None, ManifestCasCondition::CreateOnly),
             };
 
             let updated_index = mutator(existing_index)?;
             match self
-                .put_image_index_conditional(tag, &updated_index, prev_digest.as_deref())
+                .put_image_index_cas(tag, &updated_index, condition)
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -1374,6 +1495,23 @@ impl<T: OciTransport + Clone> OciClient<T> {
         }
     }
 
+    /// 在调用方已提供外部互斥时更新 Image Index。
+    pub async fn update_image_index_single_writer<F>(
+        &self,
+        tag: &str,
+        mut mutator: F,
+    ) -> Result<(), OciError>
+    where
+        F: FnMut(Option<OciImageIndex>) -> Result<OciImageIndex, OciError>,
+    {
+        let existing_index = self
+            .fetch_artifact(tag)
+            .await?
+            .and_then(|artifact| artifact.manifest.as_index().cloned());
+        let updated_index = mutator(existing_index)?;
+        self.put_image_index(tag, &updated_index).await
+    }
+
     /// 单架构分片索引根目录 CAS 更新状态机
     pub async fn update_sharded_arch_index_cas<F>(
         &self,
@@ -1385,6 +1523,7 @@ impl<T: OciTransport + Clone> OciClient<T> {
     where
         F: FnMut(Option<ShardedArchCacheIndexData>) -> Result<ShardedArchCacheIndexData, OciError>,
     {
+        self.ensure_manifest_cas_supported(tag)?;
         let mut attempt = 0;
         let arch_tag = if tag.ends_with(system.as_str()) {
             tag.to_string()
@@ -1394,16 +1533,16 @@ impl<T: OciTransport + Clone> OciClient<T> {
 
         loop {
             attempt += 1;
-            let (existing_root, prev_digest) =
+            let (existing_root, condition) =
                 match self.get_sharded_root_index(&arch_tag, system).await? {
-                    Some((data, digest)) => (Some(data), Some(digest)),
-                    None => (None, None),
+                    Some((data, digest)) => (Some(data), ManifestCasCondition::Match(digest)),
+                    None => (None, ManifestCasCondition::CreateOnly),
                 };
 
             let updated_root = mutator(existing_root)?;
 
             match self
-                .push_sharded_root_index(&arch_tag, &updated_root, prev_digest.as_deref())
+                .push_sharded_root_index_cas(&arch_tag, &updated_root, condition)
                 .await
             {
                 Ok(digest) => return Ok(digest),
@@ -1422,6 +1561,29 @@ impl<T: OciTransport + Clone> OciClient<T> {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// 在调用方已提供外部互斥时更新单架构分片根索引。
+    pub async fn update_sharded_arch_index_single_writer<F>(
+        &self,
+        tag: &str,
+        system: &SystemArch,
+        mut mutator: F,
+    ) -> Result<String, OciError>
+    where
+        F: FnMut(Option<ShardedArchCacheIndexData>) -> Result<ShardedArchCacheIndexData, OciError>,
+    {
+        let arch_tag = if tag.ends_with(system.as_str()) {
+            tag.to_string()
+        } else {
+            format!("{}-{}", tag, system.as_str())
+        };
+        let existing_root = self
+            .get_sharded_root_index(&arch_tag, system)
+            .await?
+            .map(|(data, _)| data);
+        let updated_root = mutator(existing_root)?;
+        self.push_sharded_root_index(&arch_tag, &updated_root).await
     }
 
     pub async fn get_blob(&self, digest: &str) -> Result<Bytes, OciError> {

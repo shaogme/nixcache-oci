@@ -1,4 +1,4 @@
-use crate::{error::OciError, transport::OciTransport};
+use crate::{error::OciError, token::SecretToken, transport::OciTransport};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,10 +29,9 @@ pub struct GitHubPackageVersion {
 }
 
 /// GitHub Packages REST API 专用客户端 (处理 GHCR 上的包版本与 Tag 物理删除)
-#[derive(Debug)]
 pub struct GitHubPackagesClient<T: OciTransport> {
     transport: T,
-    token: String,
+    token: SecretToken,
     owner: String,
     package_name: String,
     /// 0 = 未知 (首次探测), 1 = 组织 (orgs), 2 = 用户 (users)
@@ -69,7 +68,7 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
 
         Self {
             transport,
-            token: token.to_string(),
+            token: SecretToken::new(token),
             owner,
             package_name: pkg,
             owner_type: AtomicU8::new(0),
@@ -95,8 +94,8 @@ impl<T: OciTransport> GitHubPackagesClient<T> {
             HeaderValue::from_static("2022-11-28"),
         );
         headers.insert("User-Agent", HeaderValue::from_static("nixcache-oci"));
-        if !self.token.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", self.token))
+        if !self.token.as_str().is_empty()
+            && let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", self.token.as_str()))
         {
             headers.insert("Authorization", val);
         }

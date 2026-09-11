@@ -124,6 +124,20 @@ impl FromStr for BlobUploadStrategy {
     }
 }
 
+/// Manifest 条件发布能力。
+///
+/// `IfMatch` 同时要求后端支持已有对象的 `If-Match` 和创建对象的
+/// `If-None-Match: *`，否则不能提供完整的 manifest CAS 语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestCasSupport {
+    /// 支持基于 digest 的更新和 create-only 发布。
+    IfMatch,
+    /// 不提供可验证的条件发布保证。
+    #[default]
+    Unsupported,
+}
+
 /// 后端静态能力描述符 (编译期/初始化时确定，拒绝运行时嗅探)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryCapabilities {
@@ -131,8 +145,8 @@ pub struct RegistryCapabilities {
     pub supports_chunked_patch: bool,
     /// 是否支持 1-RTT Monolithic POST 直传
     pub supports_monolithic_post_1rtt: bool,
-    /// 是否支持 Manifest CAS 提交 (If-Match 头)
-    pub supports_manifest_cas_if_match: bool,
+    /// Manifest 是否支持完整条件发布 CAS。
+    pub manifest_cas_support: ManifestCasSupport,
     /// 是否需要官方命名空间自动补齐 (例如 docker.io 的 library/)
     pub requires_library_namespace_expansion: bool,
     /// 固定的上传协议策略

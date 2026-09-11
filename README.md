@@ -6,14 +6,16 @@
 
 ## 主流 OCI 注册表支持矩阵
 
-| 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | 删除与清理机制 (`DeletionStrategy`) | 特性说明 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 严禁 PATCH，无 416 风险；原生支持 Tag 与 Package 物理删除 |
-| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **Hub 专有 REST API** (`DockerHubRestApi`) | 自动规范化域名为 `registry-1.docker.io` |
-| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **AWS ECR API** (`AwsEcrApi`) | 原生适配 AWS ECR 端点与 BatchDeleteImage |
-| **GCP GAR** (`gcp_artifact_registry`) | `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
-| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Azure 容器注册表 |
-| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 严格遵循 OCI Distribution Spec，支持 Manifest 与 Blob 物理删除 |
+| 注册表类型 (`--registry-kind`) | 目标主机示例 | Repository 命名空间规范 | 认证与 Token 服务 | Blob 上传策略 (`BlobUploadStrategy`) | Manifest 更新保证 | 删除与清理机制 (`DeletionStrategy`) | 特性说明 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **GHCR** (`ghcr`) *(默认)* | `ghcr.io` | `<owner>/<repo>` | `https://ghcr.io/token` | **固化两阶段 Monolithic PUT** (`FixedTwoStepPut`) | **不支持 CAS；单写者发布** | **GitHub Packages REST API** (`GitHubPackagesRestApi`) | 严禁 PATCH，无 416 风险；原生支持 Tag 与 Package 物理删除 |
+| **Docker Hub** (`docker_hub`) | `docker.io` | 官方包补齐 `library/`；用户包 `<user>/<repo>` | `https://auth.docker.io/token` | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **Hub 专有 REST API** (`DockerHubRestApi`) | 自动规范化域名为 `registry-1.docker.io` |
+| **AWS ECR** (`aws_ecr`) | `*.dkr.ecr.*.amazonaws.com` | `<repo-name>` | HTTP Basic (`AWS:<token>`) / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **不支持 CAS；单写者发布** | **AWS ECR API** (`AwsEcrApi`) | 原生适配 AWS ECR 端点与 BatchDeleteImage |
+| **GCP GAR** (`gcp_artifact_registry`) | `*-docker.pkg.dev` / `gcr.io` | `<project>/<repo>/<pkg>` | OAuth2 Access Token / Bearer | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Google Cloud Artifact Registry |
+| **Azure ACR** (`azure_acr`) | `*.azurecr.io` | `<repo-name>` | OAuth2 / Bearer 挑战鉴权 | **优先 1-RTT 直传** (`PreferMonolithicPost`) | **`If-Match`/`If-None-Match` CAS** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 原生支持 Azure 容器注册表 |
+| **Generic OCI** (`generic_oci`) | 自建 Harbor, Zot, Distribution, Quay 等 | 任意多级命名空间 | 标准 `Www-Authenticate` 挑战 | **完整分块断点续传** (`ResumableChunkedPatch`) | **不支持 CAS；单写者发布** | **两阶段 OCI Spec 1.1** (`StandardOciDelete`) | 严格遵循 OCI Distribution Spec，支持 Manifest 与 Blob 物理删除 |
+
+Manifest CAS 仅由显式 `*_cas` API 使用；不支持条件发布的后端会返回 `CasUnsupported`，不会静默退化为无条件覆盖。`promote` 使用单写者 API，必须由 CI concurrency 或外部锁保证同一目标索引不会并发发布。
 
 ## 快速开始
 
@@ -86,6 +88,9 @@ jobs:
     name: Promote & Publish Cache Index
     needs: build-matrix
     runs-on: ubuntu-latest
+    concurrency:
+      group: nixcache-index-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Promote Receipts & Finalize Index
         uses: shaogme/nixcache-oci/promote@main
@@ -620,7 +625,7 @@ nixcache-builder build \
 
 #### 3. `promote` (Coordinator 汇聚与晋升发布节点专用)
 
-单写模式（Single-Writer）收集所有 Matrix 节点的 Build Receipts，压实合并全局分片索引清单并发布至目标 OCI 仓库：
+单写模式（Single-Writer）收集所有 Matrix 节点的 Build Receipts，压实合并全局分片索引清单并发布至目标 OCI 仓库。`promote` 使用显式 single-writer 发布接口，不提供 CAS 重试；必须为同一 registry/repository/tag 配置外部锁或 GitHub Actions concurrency。
 
 ```bash
 # 方式 A：通过 Receipts 目录合并发布
@@ -704,6 +709,8 @@ nixcache-builder purge \
 | `--registry <REGISTRY>` | `NIXCACHE_REGISTRY` | `ghcr.io` | 目标 OCI 镜像托管源 |
 | `--registry-kind <KIND>` | `NIXCACHE_REGISTRY_KIND` | （自动探测，默认 `ghcr`） | OCI 注册表后端种类 (`ghcr`, `docker_hub`, `aws_ecr`, `gcp_artifact_registry`, `azure_acr`, `generic_oci`) |
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
+
+`purge` 的索引合并路径使用严格 CAS。GHCR、AWS ECR 和 Generic OCI 不支持该条件发布能力时会直接失败，避免清理结果覆盖其他 writer；请改用单写者调度或外部锁后重新执行。
 
 #### 6. `list` (构建缓存多维查询、列表与统计)
 
@@ -976,7 +983,7 @@ flowchart TD
     Core["crates/nixcache-core<br>(纯核心模型 / Schema v6 1024 阶分片 Merkle 索引 / NarInfo 解析 / 纯函数 GC 算法 / Wasm 兼容)"]
     Utils["crates/nixcache-utils<br>(跨平台压缩抽象 zstd/ruzstd / 纯标准库 Env 工具)"]
     CLI["crates/nixcache-cli<br>(共享 CLI 参数组件 / 认证探测 / 强类型配置转换)"]
-    OCI["crates/nixcache-oci<br>(强类型 OCI Spec / CAS 并发原子更新 / Token 管理)"]
+    OCI["crates/nixcache-oci<br>(强类型 OCI Spec / 显式 CAS 与单写者更新 / Token 管理)"]
     Backend["crates/nixcache-oci-backend<br>(通用 OCI 后端抽象 / tokio-reqwest / 压缩索引切片)"]
     Proxy["crates/nixcache-proxy<br>(Axum 4 级级联代理 / O(1) 内存双向查找 / 流式转发)"]
     Builder["crates/nixcache-builder<br>(CI 构建协调 / 会话生命周期 / 安全环境隔离)"]
@@ -1006,7 +1013,7 @@ flowchart TD
 - **`crates/nixcache-core`**：单一真实来源（Single Source of Truth），定义 Schema v6 规范 `ShardedArchCacheIndexData`、1024 阶分片描述符 `ShardDescriptor`、`ShardDataPayload`、`BuildReceipt`、`IndexEntry`、强类型 `NarInfo` 解析器、反向索引表 `NarLookupMap` 与纯函数多架构 GC 依赖图算法。零平台原生 IO 依赖，全环境及 Wasm 兼容。
 - **`crates/nixcache-utils`**：跨平台系统调用封装、纯标准库环境变量读取清洗（`Env` 抽象），以及实现了原生平台（`zstd`）与 WASM 平台（`ruzstd`）的统一解压缩接口抽象。严格保持零 `tokio`/`clap` 依赖。
 - **`crates/nixcache-cli`**：CLI 选项积木化共享组件库，提供 `OciTargetArgs`（包含 `--registry-kind` 强类型后端种类与自动探测）、`AuthTokenArgs`、`ServerBindArgs`、`SessionContextArgs`、`SigningKeyArgs`、`CachePolicyArgs`，以及异步 Token 探测（`gh auth token` 兜底）与 `AsyncResolve`/`Resolve` 声明式配置转换机制。
-- **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、指数退避 CAS 原子条件写入（`update_manifest_cas`）与并发防击穿 Token 管理器。
+- **`crates/nixcache-oci`**：强类型 OCI Spec 协议交互引擎、`OciBackendDriver` 多态驱动抽象、`RegistryKind`、`RegistryCapabilities`、`BlobUploadStrategy`、显式区分 CAS/单写者的 manifest 更新 API 与并发防击穿 Token 管理器。
 - **`crates/nixcache-oci-backend`**：多后端提供者驱动实现（`GhcrDriver`、`DockerHubDriver`、`AwsEcrDriver`、`GcpArtifactRegistryDriver`、`AzureAcrDriver`、`GenericOciDriver`）与 `tokio-reqwest` 运行时实现，支持异步 OCI Registry 客户端封装、压缩索引分片读写与高并发确定性流式传输。
 - **`crates/nixcache-proxy`**：本地反向代理服务，基于 Axum 与 `nixcache-cli` 实现 Tier 0 (Hot) -> Tier 1 (Baseline) 2 级精炼级联解析与上游回退，全链路 $O(1)$ 内存哈希映射，直通式流传输。
 - **`crates/nixcache-builder`**：CI 构建与多架构流水线协调器，基于 `nixcache-cli` 驱动 `NixCli` 导出与压缩产物，通过驱动特性矩阵执行确定性无降级上传，导出标准构建回执 `BuildReceipt`，并通过单写压实聚合模式发布多架构全局基线索引。
@@ -1106,7 +1113,7 @@ nix-build default.nix -A tests.vmtest --no-out-link
 #### 端到端（E2E）与替换器测试
 
 > [!TIP]
-> **容器化 OCI Registry 驱动**：本地集成测试统一采用 Podman 或 Docker 自动启动官方 OCI Registry 容器（`test/run_registry.py`），提供与真实生产环境完全一致的 OCI Distribution v2 规范能力与 CAS/并发/物理删除测试闭环。
+> **容器化 OCI Registry 驱动**：本地集成测试统一采用 Podman 或 Docker 自动启动官方 OCI Registry 容器（`test/run_registry.py`），验证 OCI Distribution v2 读写、显式单写者路径和后端能力声明；只有真实支持条件请求的 Registry 才能纳入 CAS/并发冲突测试。
 
 ```bash
 # 1. 单节点 E2E 测试 (参数: [cargo|nix-source|nix-bin] [flake|legacy])

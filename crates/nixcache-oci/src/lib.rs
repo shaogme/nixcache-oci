@@ -11,10 +11,11 @@ pub mod upload;
 pub use backend::{
     AwsEcrDriver, AzureAcrDriver, BlobUploadStrategy, DockerHubDriver, GcpArtifactRegistryDriver,
     GenericOciDriver, GhcrDriver, GitHubContainerMetadata, GitHubPackageVersion,
-    GitHubPackageVersionMetadata, GitHubPackagesClient, OciBackendDriver, OciDriver,
-    RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver, driver_for_kind,
+    GitHubPackageVersionMetadata, GitHubPackagesClient, ManifestCasSupport, OciBackendDriver,
+    OciDriver, RegistryCapabilities, RegistryDeletionStrategy, RegistryKind, detect_driver,
+    driver_for_kind,
 };
-pub use client::{DeletionSummary, FetchedOciArtifact, OciClient};
+pub use client::{DeletionSummary, FetchedOciArtifact, ManifestCasCondition, OciClient};
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec};
 pub use error::{OciError, TokenError, TransportError};
 pub use manifest::{
@@ -23,7 +24,7 @@ pub use manifest::{
     OciArtifactManifest, OciDescriptor, OciImageIndex, OciImageManifest, OciPlatform,
     ShardedArchIndexManifestParams, build_image_index, build_sharded_arch_index_manifest,
 };
-pub use mock::{MockResponse, MockRouterTransport};
+pub use mock::{MockPutRequest, MockResponse, MockRouterTransport};
 pub use nixcache_core::{
     BuildReceipt, BuildStats, CACHE_INDEX_VERSION, IndexEntry, JobSummaryMetadata, NUM_SHARDS,
     NarDigest, NarInfo, NarInfoMeta, RECEIPT_VERSION, RUN_SESSION_VERSION, SCHEMA_VERSION,
@@ -51,9 +52,12 @@ mod tests {
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
-    use http::{HeaderMap, StatusCode};
+    use http::{
+        HeaderMap, StatusCode,
+        header::{IF_MATCH, IF_NONE_MATCH},
+    };
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::atomic::Ordering};
 
     #[test]
     fn test_driver_capabilities_and_canonicalization() {
@@ -311,7 +315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_manifest_conditional_cas_conflict() {
+    async fn test_put_manifest_cas_conflict() {
         let transport = MockRouterTransport::default();
         transport.add_route(
             "PUT",
@@ -323,21 +327,155 @@ mod tests {
             },
         );
 
-        // 使用支持 CAS If-Match 的 Generic 驱动
+        // 使用支持完整 manifest CAS 的 Docker Hub 驱动
         let client = OciClient::new(
             "example.com",
             "test/repo",
             "",
             true,
-            GenericOciDriver,
+            DockerHubDriver,
             transport,
         );
         let err = client
-            .put_manifest_conditional("run-123", "{}", Some("sha256:old"))
+            .put_manifest_cas(
+                "run-123",
+                "{}",
+                super::ManifestCasCondition::Match("sha256:old".to_string()),
+            )
             .await
             .unwrap_err();
 
         assert!(matches!(err, OciError::CasPreconditionFailed { tag, .. } if tag == "run-123"));
+        let request = client
+            .transport()
+            .put_requests
+            .pop()
+            .expect("CAS PUT should be recorded");
+        assert_eq!(
+            request
+                .headers
+                .get(IF_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("sha256:old")
+        );
+        assert!(request.headers.get(IF_NONE_MATCH).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cas_rejected_without_backend_support_before_io() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        let mut mutator_called = false;
+
+        let err = client
+            .update_image_index_cas("run-unsupported", 3, |_| {
+                mutator_called = true;
+                Ok(OciImageIndex::new())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, OciError::CasUnsupported { tag, .. } if tag == "run-unsupported"));
+        assert!(!mutator_called);
+        assert_eq!(client.transport().call_count.load(Ordering::SeqCst), 0);
+        assert!(client.transport().put_requests.pop().is_none());
+
+        let err = client
+            .put_image_index_cas(
+                "run-unsupported",
+                &OciImageIndex::new(),
+                super::ManifestCasCondition::CreateOnly,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OciError::CasUnsupported { .. }));
+        assert_eq!(client.transport().call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cas_create_only_uses_if_none_match() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            DockerHubDriver,
+            transport,
+        );
+
+        client
+            .put_manifest_cas("new-tag", "{}", super::ManifestCasCondition::CreateOnly)
+            .await
+            .unwrap();
+
+        let request = client
+            .transport()
+            .put_requests
+            .pop()
+            .expect("CAS PUT should be recorded");
+        assert_eq!(
+            request
+                .headers
+                .get(IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert!(request.headers.get(IF_MATCH).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cas_stale_writer_cannot_overwrite_new_manifest() {
+        let transport = MockRouterTransport::default();
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            DockerHubDriver,
+            transport,
+        );
+        client
+            .push_manifest("shared", "{\"version\":0}")
+            .await
+            .unwrap();
+
+        let (_, old_digest) = client
+            .get_manifest_with_digest("shared")
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, second_old_digest) = client
+            .get_manifest_with_digest("shared")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_digest, second_old_digest);
+
+        client
+            .put_manifest_cas(
+                "shared",
+                "{\"version\":1}",
+                super::ManifestCasCondition::Match(old_digest.clone()),
+            )
+            .await
+            .unwrap();
+        let err = client
+            .put_manifest_cas(
+                "shared",
+                "{\"version\":2}",
+                super::ManifestCasCondition::Match(second_old_digest),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OciError::CasPreconditionFailed { .. }));
+
+        let (body, _) = client
+            .get_manifest_with_digest("shared")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, "{\"version\":1}");
     }
 
     #[tokio::test]
@@ -473,7 +611,7 @@ mod tests {
         root_index.recalculate_merkle_root();
 
         let manifest_digest = client
-            .push_sharded_root_index("cache-index-x86_64-linux", &root_index, None)
+            .push_sharded_root_index("cache-index-x86_64-linux", &root_index)
             .await
             .expect("Push sharded root index should succeed");
         assert!(manifest_digest.starts_with("sha256:"));
@@ -754,7 +892,14 @@ mod tests {
     #[tokio::test]
     async fn test_update_sharded_arch_index_cas_mock() {
         let transport = MockRouterTransport::default();
-        let client = OciClient::with_transport("example.com", "test/repo", "", true, transport);
+        let client = OciClient::new(
+            "example.com",
+            "test/repo",
+            "",
+            true,
+            DockerHubDriver,
+            transport,
+        );
 
         let res = client
             .update_sharded_arch_index_cas(
@@ -795,7 +940,7 @@ mod tests {
         let root_x86 =
             ShardedArchCacheIndexData::new(SystemArch::X86_64Linux, "test/repo", "example.com");
         let digest_x86 = client
-            .push_sharded_root_index("sub-manifest-x86", &root_x86, None)
+            .push_sharded_root_index("sub-manifest-x86", &root_x86)
             .await
             .unwrap();
 
@@ -803,7 +948,7 @@ mod tests {
         let root_arm =
             ShardedArchCacheIndexData::new(SystemArch::Aarch64Linux, "test/repo", "example.com");
         let digest_arm = client
-            .push_sharded_root_index("sub-manifest-arm", &root_arm, None)
+            .push_sharded_root_index("sub-manifest-arm", &root_arm)
             .await
             .unwrap();
 

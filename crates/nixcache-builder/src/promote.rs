@@ -228,9 +228,7 @@ pub async fn run_promote(
 
             // 3.5 推送架构专属 Sub-Manifest (如 cache-index-x86_64-linux)
             let arch_tag = format!("{}-{}", target_tag, sys.as_str());
-            let sub_manifest_digest = oci
-                .push_sharded_root_index(&arch_tag, &root_index, None)
-                .await?;
+            let sub_manifest_digest = oci.push_sharded_root_index(&arch_tag, &root_index).await?;
 
             info!(
                 "Pushed Sharded Sub-Manifest for {}: digest {} (tag: {})",
@@ -260,7 +258,7 @@ pub async fn run_promote(
 
     // 4. 组装并原子发布顶层 OCI Image Index (cache-index)
     let final_descriptors = manifest_descriptors;
-    oci.update_image_index_cas(target_tag, 5, |_existing| {
+    oci.update_image_index_single_writer(target_tag, |_existing| {
         let mut index = build_image_index(
             final_descriptors.clone(),
             "NixCache Multi-Architecture Global Index",

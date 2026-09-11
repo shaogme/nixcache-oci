@@ -402,7 +402,7 @@ mod tests {
         root_data.recalculate_merkle_root();
 
         client
-            .push_sharded_root_index("cache-index-x86_64-linux", &root_data, None)
+            .push_sharded_root_index("cache-index-x86_64-linux", &root_data)
             .await
             .unwrap();
 
