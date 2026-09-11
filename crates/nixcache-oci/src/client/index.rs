@@ -184,7 +184,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         let (root_blob_digest, root_compressed_size, _) =
             self.client.blobs().push_zstd(root_data).await?;
         let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
-            root_blob_digest: &root_blob_digest,
+            root_blob_digest: root_blob_digest.as_str(),
             root_blob_size: root_compressed_size,
             config_digest: EMPTY_CONFIG_DIGEST,
             config_size: EMPTY_CONFIG_SIZE,
@@ -212,7 +212,7 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         let (root_blob_digest, root_compressed_size, _) =
             self.client.blobs().push_zstd(root_data).await?;
         let manifest = build_sharded_arch_index_manifest(ShardedArchIndexManifestParams {
-            root_blob_digest: &root_blob_digest,
+            root_blob_digest: root_blob_digest.as_str(),
             root_blob_size: root_compressed_size,
             config_digest: EMPTY_CONFIG_DIGEST,
             config_size: EMPTY_CONFIG_SIZE,
@@ -286,7 +286,13 @@ impl<'a, T: OciTransport + Clone> IndexClient<'a, T> {
         payload: &ShardDataPayload,
     ) -> Result<(String, u64, u64), OciError> {
         payload.validate_structure()?;
-        self.client.blobs().push_zstd(payload).await
+        self.client
+            .blobs()
+            .push_zstd(payload)
+            .await
+            .map(|(digest, compressed, uncompressed)| {
+                (digest.to_string(), compressed, uncompressed)
+            })
     }
 
     pub async fn put(&self, tag: &str, index: &OciImageIndex) -> Result<(), OciError> {

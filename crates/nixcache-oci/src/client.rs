@@ -7,9 +7,13 @@ mod request;
 mod upload;
 
 pub use blob::BlobClient;
-pub use deletion::{DeletionClient, DeletionOutcome, DeletionSummary, PackageDeletionSummary};
+pub use deletion::{
+    BlobDeletionOutcome, BlobDeletionTarget, DeletionBatchResult, DeletionClient, DeletionFailure,
+    DeletionFailureKind, DeletionObjectType, DeletionSummary, ManifestDeletionOutcome,
+    PackageDeletionScope, PackageDeletionSummary,
+};
 pub use index::IndexClient;
-pub use manifest::{FetchedOciArtifact, ManifestCasCondition, ManifestClient};
+pub use manifest::{FetchedOciArtifact, ManifestCasCondition, ManifestClient, TagList};
 
 use crate::{
     auth::RegistryCredentials,

@@ -312,6 +312,27 @@ impl OciTransport for MockRouterTransport {
 
         let mut found = None;
         self.responses.iter_sync(|(m, suffix), resp| {
+            if m == "GET" && url.ends_with(suffix) {
+                found = Some((resp.status, resp.headers.clone(), resp.body.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(res) = found {
+            let (status, headers, body) = res;
+            check_content_length(url, &headers, max_bytes)?;
+            let body = collect_limited(
+                url,
+                max_bytes,
+                futures_util::stream::once(async move { Ok(body) }),
+            )
+            .await?;
+            return Ok((status, headers, body));
+        }
+
+        let mut found = None;
+        self.responses.iter_sync(|(m, suffix), resp| {
             if m == "GET" && path.ends_with(suffix) {
                 found = Some((resp.status, resp.headers.clone(), resp.body.clone()));
                 false

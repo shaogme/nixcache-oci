@@ -1,6 +1,28 @@
 use crate::list::{CacheListSummaryReport, ListItemDto, format_bytes};
+use nixcache_oci::PackageDeletionSummary;
 use std::env;
 use tokio::fs;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlobDeletionReport {
+    pub deleted_count: usize,
+    pub already_absent_count: usize,
+    pub failed_count: usize,
+    pub deleted_bytes: u64,
+    pub complete: bool,
+}
+
+impl Default for BlobDeletionReport {
+    fn default() -> Self {
+        Self {
+            deleted_count: 0,
+            already_absent_count: 0,
+            failed_count: 0,
+            deleted_bytes: 0,
+            complete: true,
+        }
+    }
+}
 
 async fn append_summary(content: String, target_file_opt: Option<&str>) {
     let path = match target_file_opt {
@@ -117,14 +139,14 @@ pub async fn write_purge_step_summary(
     dry_run: bool,
     purged_count: usize,
     kept_count: usize,
-    freed_bytes: u64,
+    selected_bytes: u64,
     blobs_deleted: usize,
 ) {
     write_purge_step_summary_to(
         dry_run,
         purged_count,
         kept_count,
-        freed_bytes,
+        selected_bytes,
         blobs_deleted,
         None,
     )
@@ -135,8 +157,48 @@ pub async fn write_purge_step_summary_to(
     dry_run: bool,
     purged_count: usize,
     kept_count: usize,
-    freed_bytes: u64,
+    selected_bytes: u64,
     blobs_deleted: usize,
+    file_opt: Option<&str>,
+) {
+    write_purge_step_summary_with_report_to(
+        dry_run,
+        purged_count,
+        kept_count,
+        selected_bytes,
+        BlobDeletionReport {
+            deleted_count: blobs_deleted,
+            ..Default::default()
+        },
+        file_opt,
+    )
+    .await;
+}
+
+pub async fn write_purge_step_summary_with_report(
+    dry_run: bool,
+    purged_count: usize,
+    kept_count: usize,
+    selected_bytes: u64,
+    report: BlobDeletionReport,
+) {
+    write_purge_step_summary_with_report_to(
+        dry_run,
+        purged_count,
+        kept_count,
+        selected_bytes,
+        report,
+        None,
+    )
+    .await;
+}
+
+pub async fn write_purge_step_summary_with_report_to(
+    dry_run: bool,
+    purged_count: usize,
+    kept_count: usize,
+    selected_bytes: u64,
+    report: BlobDeletionReport,
     file_opt: Option<&str>,
 ) {
     let mode_str = if dry_run {
@@ -145,37 +207,59 @@ pub async fn write_purge_step_summary_to(
         ""
     };
     let content = format!(
-        "### 🧹 NixCache Cache Purge Report{}\n\n- **Purged Entries:** `{}`\n- **Kept Entries:** `{}`\n- **Estimated Space Freed:** `{}` bytes\n- **Physical Blobs Deleted:** `{}`\n",
-        mode_str, purged_count, kept_count, freed_bytes, blobs_deleted
+        "### 🧹 NixCache Cache Purge Report{}\n\n- **Purged Entries:** `{}`\n- **Kept Entries:** `{}`\n- **Selected Blob Bytes:** `{}` bytes\n- **Physical Blobs Deleted:** `{}`\n- **Blobs Already Absent:** `{}`\n- **Blob Deletion Failures:** `{}`\n- **Deleted Blob Bytes:** `{}` bytes\n- **Blob Deletion Complete:** `{}`\n",
+        mode_str,
+        purged_count,
+        kept_count,
+        selected_bytes,
+        report.deleted_count,
+        report.already_absent_count,
+        report.failed_count,
+        report.deleted_bytes,
+        report.complete,
     );
     append_summary(content, file_opt).await;
 }
 
 /// 为 `purge --all` 输出完整的远程对象删除审计信息。
-pub async fn write_package_deletion_summary(
-    dry_run: bool,
-    tags_discovered: usize,
-    manifests_discovered: usize,
-    blobs_discovered: usize,
-    manifests_deleted: usize,
-    blobs_deleted: usize,
-    already_absent: usize,
-) {
+pub async fn write_package_deletion_summary(dry_run: bool, summary: &PackageDeletionSummary) {
     let mode = if dry_run {
         " (Dry Run - Preview Only)"
     } else {
         ""
     };
     let content = format!(
-        "### 🗑️ NixCache Package Deletion Report{}\n\n- **Tags Discovered:** `{}`\n- **Manifests Discovered:** `{}`\n- **Blobs Discovered:** `{}`\n- **Manifests Deleted:** `{}`\n- **Blobs Deleted:** `{}`\n- **Already Absent:** `{}`\n",
+        "### 🗑️ NixCache Package Deletion Report{}\n\n- **Scope:** `{:?}`\n- **Counts Known:** `{}`\n- **Complete:** `{}`\n- **Tags Discovered:** `{}`\n- **Manifests Discovered:** `{}`\n- **Blobs Discovered:** `{}`\n- **Manifests Deleted:** `{}`\n- **Blobs Deleted:** `{}`\n- **Manifests Already Absent:** `{}`\n- **Blobs Already Absent:** `{}`\n- **Deleted Blob Bytes:** `{}` bytes\n- **Failures:** `{}`\n",
         mode,
-        tags_discovered,
-        manifests_discovered,
-        blobs_discovered,
-        manifests_deleted,
-        blobs_deleted,
-        already_absent,
+        summary.scope,
+        summary.counts_known,
+        summary.complete,
+        summary.tags_discovered,
+        summary.manifests_discovered,
+        summary.blobs_discovered,
+        summary.manifests_deleted,
+        summary.blobs_deleted,
+        summary.manifests_already_absent,
+        summary.blobs_already_absent,
+        summary.deleted_blob_bytes,
+        summary.failures.len(),
     );
+    let content = if summary.failures.is_empty() {
+        content
+    } else {
+        format!(
+            "{content}\n{}",
+            summary
+                .failures
+                .iter()
+                .map(|failure| format!(
+                    "- `{}` ({:?}): {}",
+                    failure.digest, failure.kind, failure.details
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     append_summary(content, None).await;
 }
 

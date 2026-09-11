@@ -339,7 +339,7 @@ impl ParallelExporter {
             .into());
         }
 
-        let nar_digest_obj = NarDigest::parse(&nar_digest)?;
+        let nar_digest_obj = NarDigest::parse(nar_digest.as_str())?;
         let deriver_bname = item
             .deriver
             .as_deref()

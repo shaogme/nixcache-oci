@@ -6,11 +6,17 @@ use crate::{
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedBlob {
+    pub digest: NarDigest,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeEvaluationResult {
     pub kept_entries: HashMap<StoreHash, IndexEntry>,
     pub purged_entries: HashMap<StoreHash, IndexEntry>,
     pub purged_hashes: Vec<StoreHash>,
-    pub purged_nar_digests: Vec<NarDigest>,
+    pub purged_blobs: Vec<PurgedBlob>,
     pub updated_gc_roots: HashMap<SystemArch, Vec<StoreHash>>,
     pub estimated_freed_bytes: u64,
     pub reason_map: HashMap<StoreHash, String>,
@@ -100,17 +106,24 @@ pub fn evaluate_cache_purge(
 
     let purged_hashes_set: HashSet<StoreHash> = query_res.matched_entries.keys().cloned().collect();
     let updated_gc_roots = prune_broken_gc_roots(entries, gc_roots, &purged_hashes_set)?;
-    let purged_nar_digests: Vec<NarDigest> = query_res
-        .matched_entries
-        .values()
-        .map(|e| e.nar_digest.clone())
+    let mut purged_blobs_by_digest: HashMap<NarDigest, u64> = HashMap::new();
+    for entry in query_res.matched_entries.values() {
+        purged_blobs_by_digest
+            .entry(entry.nar_digest.clone())
+            .and_modify(|size| *size = (*size).max(entry.nar_size))
+            .or_insert(entry.nar_size);
+    }
+    let mut purged_blobs: Vec<PurgedBlob> = purged_blobs_by_digest
+        .into_iter()
+        .map(|(digest, size)| PurgedBlob { digest, size })
         .collect();
+    purged_blobs.sort_by(|left, right| left.digest.cmp(&right.digest));
 
     Ok(PurgeEvaluationResult {
         kept_entries: query_res.unmatched_entries,
         purged_entries: query_res.matched_entries,
         purged_hashes: query_res.final_matched_hashes,
-        purged_nar_digests,
+        purged_blobs,
         updated_gc_roots,
         estimated_freed_bytes: query_res.matched_bytes,
         reason_map: query_res.reason_map,

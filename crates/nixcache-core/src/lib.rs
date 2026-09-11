@@ -21,7 +21,8 @@ pub use lookup::{
 };
 pub use narinfo::NarInfo;
 pub use purge::{
-    PurgeEvaluationResult, evaluate_arch_cache_purge, evaluate_cache_purge, prune_broken_gc_roots,
+    PurgeEvaluationResult, PurgedBlob, evaluate_arch_cache_purge, evaluate_cache_purge,
+    prune_broken_gc_roots,
 };
 pub use sharding::{
     NIX_BASE32_ALPHABET, calculate_shard_id, calculate_shard_id_from_str, compute_merkle_root,
@@ -859,7 +860,7 @@ CA: fixed:sha256:000000000000000000000000000000000000000000000000000000000000000
         assert!(result.kept_entries.is_empty());
         assert_eq!(result.purged_entries.len(), 2);
         assert_eq!(result.purged_hashes.len(), 2);
-        assert_eq!(result.purged_nar_digests.len(), 2);
+        assert_eq!(result.purged_blobs.len(), 2);
         assert_eq!(result.estimated_freed_bytes, 3000);
         assert!(result.updated_gc_roots.is_empty());
 

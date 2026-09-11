@@ -7,6 +7,7 @@ use crate::{
     backend::BlobUploadStrategy,
     codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, IndexCodec},
     error::{OciError, TransportError},
+    integrity::ContentDigest,
     manifest::EMPTY_CONFIG_DIGEST,
     transport::{HashingStream, OciTransport, parse_range_header},
     upload::UploadConfig,
@@ -38,7 +39,11 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         }
     }
 
-    async fn execute_two_step_put(&self, digest: &str, bytes: Bytes) -> Result<String, OciError> {
+    async fn execute_two_step_put(
+        &self,
+        digest: &ContentDigest,
+        bytes: Bytes,
+    ) -> Result<(), OciError> {
         let upload_init_url = endpoint::upload_url(self.client.endpoint(), self.client.repo());
         let (status, response_headers) = self
             .client
@@ -53,7 +58,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             .and_then(|value| value.to_str().ok())
             .ok_or(OciError::UploadLocationMissing)?;
         let session_url = endpoint::resolved_location(self.client.endpoint(), location)?;
-        let put_url = endpoint::with_digest(&session_url, digest);
+        let put_url = endpoint::with_digest(&session_url, digest.as_str());
         let mut headers = self.client.get_auth_headers().await?;
         headers.insert(
             "Content-Type",
@@ -70,7 +75,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                 StatusCode::CREATED | StatusCode::ACCEPTED | StatusCode::OK
             ) {
                 info!("Successfully uploaded blob via two-step PUT: {}", digest);
-                Ok(digest.to_string())
+                Ok(())
             } else {
                 Err(OciError::BlobUploadFailed(put_status))
             }
@@ -83,14 +88,28 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         result
     }
 
-    pub async fn push_bytes_with_digest(
+    async fn push_bytes_verified(&self, bytes: Bytes) -> Result<ContentDigest, OciError> {
+        let digest = ContentDigest::from_bytes(&bytes);
+        self.push_bytes_with_digest(&digest, bytes).await?;
+        Ok(digest)
+    }
+
+    async fn push_bytes_with_digest(
         &self,
-        digest: &str,
+        digest: &ContentDigest,
         bytes: Bytes,
-    ) -> Result<String, OciError> {
-        if self.head(digest).await? {
+    ) -> Result<(), OciError> {
+        let actual = ContentDigest::from_bytes(&bytes);
+        if actual != *digest {
+            return Err(OciError::DigestMismatch {
+                target: "blob upload body".to_string(),
+                expected: digest.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+        if self.head(digest.as_str()).await? {
             info!("Blob {} already exists, skipping upload.", digest);
-            return Ok(digest.to_string());
+            return Ok(());
         }
 
         match self.client.driver.capabilities().fixed_upload_strategy {
@@ -99,7 +118,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
             | BlobUploadStrategy::ResumableChunkedPatch => {
                 let monolithic_url = endpoint::with_digest(
                     &endpoint::upload_url(self.client.endpoint(), self.client.repo()),
-                    digest,
+                    digest.as_str(),
                 );
                 let mut headers = self.client.get_auth_headers().await?;
                 headers.insert(
@@ -122,7 +141,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                             "Successfully uploaded blob via 1-RTT Monolithic POST: {}",
                             digest
                         );
-                        Ok(digest.to_string())
+                        Ok(())
                     }
                     Ok(status) => {
                         warn!(
@@ -143,77 +162,20 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         }
     }
 
-    pub async fn push_bytes(&self, bytes: Bytes) -> Result<String, OciError> {
-        let digest = endpoint::compute_sha256_digest(&bytes);
-        self.push_bytes_with_digest(&digest, bytes).await
+    pub async fn push_bytes(&self, bytes: Bytes) -> Result<ContentDigest, OciError> {
+        self.push_bytes_verified(bytes).await
     }
 
     pub async fn ensure_empty_config(&self) -> Result<(), OciError> {
-        if !self.head(EMPTY_CONFIG_DIGEST).await? {
-            self.push_bytes_with_digest(EMPTY_CONFIG_DIGEST, Bytes::from_static(b"{}"))
-                .await?;
+        let digest = self.push_bytes(Bytes::from_static(b"{}")).await?;
+        if digest.as_str() != EMPTY_CONFIG_DIGEST {
+            return Err(OciError::DigestMismatch {
+                target: "empty config".to_string(),
+                expected: EMPTY_CONFIG_DIGEST.to_string(),
+                actual: digest.to_string(),
+            });
         }
         Ok(())
-    }
-
-    pub async fn push_stream(
-        &self,
-        digest: &str,
-        stream: T::BodyStream,
-        content_len: u64,
-    ) -> Result<String, OciError> {
-        if self.head(digest).await? {
-            info!("Blob {} already exists, skipping upload.", digest);
-            return Ok(digest.to_string());
-        }
-
-        let upload_init_url = endpoint::upload_url(self.client.endpoint(), self.client.repo());
-        let (status, response_headers) = self
-            .client
-            .request_post_with_auth_retry(&upload_init_url, "initialize blob stream upload")
-            .await?;
-        if !status.is_success() {
-            return Err(OciError::BlobUploadFailed(status));
-        }
-        let location = response_headers
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(OciError::UploadLocationMissing)?;
-        let session_url = endpoint::resolved_location(self.client.endpoint(), location)?;
-        let put_url = endpoint::with_digest(&session_url, digest);
-        let mut headers = self.client.get_auth_headers().await?;
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_static("application/octet-stream"),
-        );
-
-        let result = async {
-            let put_status = self
-                .client
-                .request_put_stream_with_auth_retry(
-                    &put_url,
-                    headers,
-                    stream,
-                    content_len,
-                    "upload blob stream",
-                )
-                .await?;
-            if matches!(
-                put_status,
-                StatusCode::CREATED | StatusCode::ACCEPTED | StatusCode::OK
-            ) {
-                info!("Successfully uploaded blob stream: {}", digest);
-                Ok(digest.to_string())
-            } else {
-                Err(OciError::BlobUploadFailed(put_status))
-            }
-        }
-        .await;
-
-        if result.is_err() {
-            self.abort_upload_session(&session_url).await;
-        }
-        result
     }
 
     async fn probe_upload_session(
@@ -391,7 +353,7 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         &self,
         stream: T::BodyStream,
         config: &UploadConfig,
-    ) -> Result<(String, u64), OciError> {
+    ) -> Result<(ContentDigest, u64), OciError> {
         let (hashing_stream, hash_state) = HashingStream::new(stream);
         let mut pinned_stream = pin!(hashing_stream);
         let capabilities = self.client.driver.capabilities();
@@ -421,15 +383,11 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                 let bytes: Bytes = item?;
                 buffer.extend_from_slice(&bytes);
             }
-            let final_digest = hash_state.force_finalize();
+            hash_state
+                .digest()
+                .ok_or(OciError::UploadDigestUnavailable)?;
             let total_size = hash_state.bytes_streamed();
-            if self.head(&final_digest).await? {
-                info!("Blob {} already exists, skipping upload.", final_digest);
-                return Ok((final_digest, total_size));
-            }
-            let pushed_digest = self
-                .push_bytes_with_digest(&final_digest, buffer.freeze())
-                .await?;
+            let pushed_digest = self.push_bytes(buffer.freeze()).await?;
             info!(
                 "Successfully uploaded streaming blob {} ({} bytes)",
                 pushed_digest, total_size
@@ -485,9 +443,11 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
                 current_offset += chunk_bytes.len() as u64;
             }
 
-            let final_digest = hash_state.force_finalize();
+            let final_digest = hash_state
+                .digest()
+                .ok_or(OciError::UploadDigestUnavailable)?;
             let total_size = hash_state.bytes_streamed();
-            let finish_url = endpoint::with_digest(&session_url, &final_digest);
+            let finish_url = endpoint::with_digest(&session_url, final_digest.as_str());
             let headers = self.client.get_auth_headers().await?;
             let finish_status = self
                 .client
@@ -519,18 +479,15 @@ impl<'a, T: OciTransport + Clone> BlobClient<'a, T> {
         upload_result
     }
 
-    pub async fn push_zstd<S: Serialize>(&self, data: &S) -> Result<(String, u64, u64), OciError> {
+    pub async fn push_zstd<S: Serialize>(
+        &self,
+        data: &S,
+    ) -> Result<(ContentDigest, u64, u64), OciError> {
         let raw_json = serde_json::to_vec(data)?;
         let uncompressed_size = raw_json.len() as u64;
         let compressed_bytes = IndexCodec::encode_zstd(data, DEFAULT_ZSTD_COMPRESSION_LEVEL)?;
         let compressed_size = compressed_bytes.len() as u64;
-        let digest = endpoint::compute_sha256_digest(&compressed_bytes);
-        if self.head(&digest).await? {
-            return Ok((digest, compressed_size, uncompressed_size));
-        }
-        let pushed_digest = self
-            .push_bytes_with_digest(&digest, compressed_bytes)
-            .await?;
+        let pushed_digest = self.push_bytes(compressed_bytes).await?;
         Ok((pushed_digest, compressed_size, uncompressed_size))
     }
 }

@@ -1,19 +1,23 @@
 use crate::{
     error::BuilderError,
     nix::resolve_flake_output_hashes,
-    summary::{write_package_deletion_summary, write_purge_step_summary},
+    summary::{
+        BlobDeletionReport, write_package_deletion_summary, write_purge_step_summary,
+        write_purge_step_summary_with_report,
+    },
 };
 use chrono::Utc;
 use futures_util::future::try_join_all;
 use nixcache_cli::PurgeArgs;
 use nixcache_core::{
-    IndexEntry, NUM_SHARDS, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
+    IndexEntry, NUM_SHARDS, PurgedBlob, SCHEMA_VERSION_V8, ShardDataPayload, ShardDescriptor,
     ShardedArchCacheIndexData, StoreHash, SystemArch, evaluate_cache_purge,
     partition_entries_by_shard,
 };
 use nixcache_oci::{
-    ManifestCasSupport, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OciArtifactManifest, OciDescriptor,
-    OciError, OciPlatform, PackageDeletionSupport, RegistryCredentials, build_image_index,
+    BlobDeletionTarget, DeletionBatchResult, ManifestCasSupport, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OciArtifactManifest, OciDescriptor, OciError, OciPlatform, PackageDeletionSupport,
+    RegistryCredentials, build_image_index,
 };
 use nixcache_oci_backend::create_tokio_reqwest_client;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +34,10 @@ pub async fn run_purge(
     let delete_blobs = args.resolve_delete_blobs();
     let strict_mode = args.resolve_strict();
     let is_all = args.selector.resolve_all();
+    let mut blob_deletion_report = BlobDeletionReport {
+        complete: true,
+        ..Default::default()
+    };
 
     info!(
         "Starting cache purge workflow for {}/{} (dry_run: {}, delete_blobs: {}, strict: {}, is_all: {})",
@@ -61,16 +69,7 @@ pub async fn run_purge(
                         preview.manifests_discovered,
                         preview.blobs_discovered
                     );
-                    write_package_deletion_summary(
-                        true,
-                        preview.tags_discovered,
-                        preview.manifests_discovered,
-                        preview.blobs_discovered,
-                        0,
-                        0,
-                        0,
-                    )
-                    .await;
+                    write_package_deletion_summary(true, &preview).await;
                     return Ok(());
                 }
 
@@ -86,19 +85,24 @@ pub async fn run_purge(
                 );
                 let summary = oci.deletion().delete_entire_package().await?;
                 info!(
-                    "Package deletion completed: {} manifest(s), {} blob(s) deleted; {} already absent",
-                    summary.manifests_deleted, summary.blobs_deleted, summary.already_absent
-                );
-                write_package_deletion_summary(
-                    false,
-                    summary.tags_discovered,
-                    summary.manifests_discovered,
-                    summary.blobs_discovered,
+                    "Package deletion result: complete={}, {} manifest(s), {} blob(s) deleted; {} manifest(s) and {} blob(s) already absent; {} failure(s)",
+                    summary.complete,
                     summary.manifests_deleted,
                     summary.blobs_deleted,
-                    summary.already_absent,
-                )
-                .await;
+                    summary.manifests_already_absent,
+                    summary.blobs_already_absent,
+                    summary.failures.len()
+                );
+                write_package_deletion_summary(false, &summary).await;
+                if strict_mode && !summary.complete {
+                    return Err(BuilderError::Oci(OciError::DeletionVerificationFailed {
+                        target: format!("{registry}/{repo}"),
+                        details: format!(
+                            "package deletion was partial with {} failure(s)",
+                            summary.failures.len()
+                        ),
+                    }));
+                }
                 return Ok(());
             }
         }
@@ -200,9 +204,13 @@ pub async fn run_purge(
 
     let selector = args.to_purge_filter(&extra_hashes)?;
     let purge_result = evaluate_cache_purge(&all_entries, &all_gc_roots, &selector)?;
+    let selected_blob_bytes = purge_result
+        .purged_blobs
+        .iter()
+        .fold(0u64, |total, blob| total.saturating_add(blob.size));
 
     info!(
-        "Purge Evaluation: Total Before: {}, Purged: {}, Kept: {}, Estimated Space Freed: {} bytes",
+        "Purge Evaluation: Total Before: {}, Purged: {}, Kept: {}, Matched Entry Bytes: {}",
         all_entries.len(),
         purge_result.purged_entries.len(),
         purge_result.kept_entries.len(),
@@ -226,7 +234,7 @@ pub async fn run_purge(
             true,
             purge_result.purged_entries.len(),
             purge_result.kept_entries.len(),
-            purge_result.estimated_freed_bytes,
+            selected_blob_bytes,
             0,
         )
         .await;
@@ -351,8 +359,7 @@ pub async fn run_purge(
     info!("Successfully updated multi-arch cache-index after purge.");
 
     // 4. 处理 Blobs 物理删除
-    let mut deleted_blobs = 0;
-    if delete_blobs && !purge_result.purged_nar_digests.is_empty() {
+    if delete_blobs && !purge_result.purged_blobs.is_empty() {
         if !oci.capabilities().supports_blob_physical_deletion {
             if strict_mode {
                 return Err(BuilderError::Oci(
@@ -370,30 +377,74 @@ pub async fn run_purge(
                     "Notice: backend '{}' does not support standalone blob deletion; skipping blob physical deletion stage.",
                     oci.kind()
                 );
+                blob_deletion_report.failed_count = purge_result.purged_blobs.len();
+                blob_deletion_report.complete = false;
             }
         } else {
             info!(
                 "Attempting physical deletion of {} OCI NAR blobs...",
-                purge_result.purged_nar_digests.len()
+                purge_result.purged_blobs.len()
             );
-            let summary = oci
-                .deletion()
-                .batch_delete_blobs(&purge_result.purged_nar_digests, 8, strict_mode)
-                .await?;
+            let targets: Vec<BlobDeletionTarget> = purge_result
+                .purged_blobs
+                .iter()
+                .map(|blob: &PurgedBlob| BlobDeletionTarget {
+                    digest: blob.digest.clone(),
+                    size: blob.size,
+                })
+                .collect();
+            let summary = oci.deletion().batch_delete_blobs(&targets, 8).await?;
+            let (result_summary, is_complete) = match summary {
+                DeletionBatchResult::Complete(summary) => (summary, true),
+                DeletionBatchResult::Partial(summary) => (summary, false),
+            };
             info!(
-                "Blob deletion complete: {} physically deleted, {} failed/skipped.",
-                summary.deleted_count, summary.failed_count
+                "Blob deletion result: complete={}, {} physically deleted ({} bytes), {} already absent, {} failed.",
+                is_complete,
+                result_summary.deleted_count,
+                result_summary.deleted_bytes,
+                result_summary.already_absent_count,
+                result_summary.failed_count
             );
-            deleted_blobs = summary.deleted_count;
+            for failure in &result_summary.failures {
+                info!(
+                    "Blob deletion failure for {}: {}",
+                    failure.digest, failure.details
+                );
+            }
+            blob_deletion_report = BlobDeletionReport {
+                deleted_count: result_summary.deleted_count,
+                already_absent_count: result_summary.already_absent_count,
+                failed_count: result_summary.failed_count,
+                deleted_bytes: result_summary.deleted_bytes,
+                complete: is_complete,
+            };
+            if strict_mode && !is_complete {
+                write_purge_step_summary_with_report(
+                    false,
+                    purge_result.purged_entries.len(),
+                    purge_result.kept_entries.len(),
+                    selected_blob_bytes,
+                    blob_deletion_report,
+                )
+                .await;
+                return Err(BuilderError::Oci(OciError::DeletionVerificationFailed {
+                    target: format!("{registry}/{repo}"),
+                    details: format!(
+                        "blob deletion was partial with {} failure(s)",
+                        result_summary.failed_count
+                    ),
+                }));
+            }
         }
     }
 
-    write_purge_step_summary(
+    write_purge_step_summary_with_report(
         false,
         purge_result.purged_entries.len(),
         purge_result.kept_entries.len(),
-        purge_result.estimated_freed_bytes,
-        deleted_blobs,
+        selected_blob_bytes,
+        blob_deletion_report,
     )
     .await;
 

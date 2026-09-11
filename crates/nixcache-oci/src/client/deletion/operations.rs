@@ -1,4 +1,8 @@
-use super::{DeletionClient, DeletionOutcome, DeletionSummary, PackageDeletionSummary};
+use super::{
+    BlobDeletionOutcome, BlobDeletionTarget, DeletionBatchResult, DeletionClient, DeletionFailure,
+    DeletionFailureKind, DeletionObjectType, DeletionSummary, ManifestDeletionOutcome,
+    PackageDeletionScope, PackageDeletionSummary,
+};
 use crate::{
     backend::{GitHubPackagesClient, PackageDeletionSupport, RegistryDeletionStrategy},
     client::endpoint,
@@ -8,7 +12,6 @@ use crate::{
 };
 use futures_util::StreamExt;
 use http::StatusCode;
-use nixcache_core::NarDigest;
 use tracing::warn;
 
 impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
@@ -88,7 +91,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
     pub(super) async fn delete_manifest_strict(
         &self,
         digest: &str,
-    ) -> Result<DeletionOutcome, OciError> {
+    ) -> Result<ManifestDeletionOutcome, OciError> {
         let url = endpoint::manifest_url(self.client.endpoint(), self.client.repo(), digest);
         let status = self
             .client
@@ -96,9 +99,9 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
             .await?;
         if status.is_success() || status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT
         {
-            Ok(DeletionOutcome::Deleted)
+            Ok(ManifestDeletionOutcome::Deleted)
         } else if status == StatusCode::NOT_FOUND {
-            Ok(DeletionOutcome::AlreadyAbsent)
+            Ok(ManifestDeletionOutcome::AlreadyAbsent)
         } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             Err(OciError::InsufficientPermission {
                 target: digest.to_string(),
@@ -129,8 +132,8 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
 
     pub(super) async fn delete_blob_strict(
         &self,
-        digest: &str,
-    ) -> Result<DeletionOutcome, OciError> {
+        target: &BlobDeletionTarget,
+    ) -> Result<BlobDeletionOutcome, OciError> {
         if !self.client.capabilities().supports_blob_physical_deletion {
             return Err(OciError::OperationNotSupported {
                 operation: "delete_blob",
@@ -141,6 +144,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                 ),
             });
         }
+        let digest = target.digest.as_ref();
         let url = endpoint::blob_url(self.client.endpoint(), self.client.repo(), digest);
         let status = self
             .client
@@ -148,9 +152,9 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
             .await?;
         if status.is_success() || status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT
         {
-            Ok(DeletionOutcome::Deleted)
+            Ok(BlobDeletionOutcome::Deleted { bytes: target.size })
         } else if status == StatusCode::NOT_FOUND {
-            Ok(DeletionOutcome::AlreadyAbsent)
+            Ok(BlobDeletionOutcome::AlreadyAbsent)
         } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             Err(OciError::InsufficientPermission {
                 target: digest.to_string(),
@@ -180,46 +184,58 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
 
     pub(super) async fn batch_delete_blobs_strict(
         &self,
-        digests: &[NarDigest],
+        targets: &[BlobDeletionTarget],
         concurrency: usize,
-        strict: bool,
-    ) -> Result<DeletionSummary, OciError> {
-        if digests.is_empty() {
-            return Ok(DeletionSummary::default());
+    ) -> Result<DeletionBatchResult, OciError> {
+        if targets.is_empty() {
+            return Ok(DeletionBatchResult::Complete(DeletionSummary::default()));
         }
         if !self.client.capabilities().supports_blob_physical_deletion {
-            if strict {
-                return Err(OciError::OperationNotSupported {
-                    operation: "batch_delete_blobs",
-                    backend: self.client.kind(),
-                    reason: format!(
-                        "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
-                        self.client.kind()
-                    ),
-                });
-            }
-            return Ok(DeletionSummary {
-                failed_count: digests.len(),
-                ..Default::default()
+            return Err(OciError::OperationNotSupported {
+                operation: "batch_delete_blobs",
+                backend: self.client.kind(),
+                reason: format!(
+                    "Backend '{}' does not support standalone physical OCI blob deletion. Blobs are automatically reclaimed with package/version removal.",
+                    self.client.kind()
+                ),
             });
         }
         let concurrency = concurrency.clamp(1, 32);
-        let mut stream = futures_util::stream::iter(digests)
-            .map(|digest| async move { self.delete_blob_strict(digest.as_ref()).await })
+        let mut stream = futures_util::stream::iter(targets.iter().cloned())
+            .map(|target| async move {
+                let digest = target.digest.to_string();
+                let result = self.delete_blob_strict(&target).await;
+                (digest, result)
+            })
             .buffer_unordered(concurrency);
-        let mut summary = DeletionSummary::default();
+        let mut summary = DeletionSummary {
+            requested_count: targets.len(),
+            ..Default::default()
+        };
         while let Some(result) = stream.next().await {
+            let (digest, result) = result;
             match result {
-                Ok(DeletionOutcome::Deleted) => summary.deleted_count += 1,
-                Ok(DeletionOutcome::AlreadyAbsent) => summary.not_found_count += 1,
-                Err(error) if strict => return Err(error),
+                Ok(BlobDeletionOutcome::Deleted { bytes }) => {
+                    summary.deleted_count += 1;
+                    summary.deleted_bytes = summary.deleted_bytes.saturating_add(bytes);
+                }
+                Ok(BlobDeletionOutcome::AlreadyAbsent) => summary.already_absent_count += 1,
                 Err(error) => {
                     summary.failed_count += 1;
+                    summary.failures.push(deletion_failure(
+                        digest,
+                        DeletionObjectType::Blob,
+                        &error,
+                    ));
                     warn!("Non-fatal error deleting blob: {}", error);
                 }
             }
         }
-        Ok(summary)
+        if summary.is_complete() {
+            Ok(DeletionBatchResult::Complete(summary))
+        } else {
+            Ok(DeletionBatchResult::Partial(summary))
+        }
     }
 
     pub(super) async fn delete_entire_package_strict(
@@ -228,7 +244,11 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
         match self.client.capabilities().package_deletion_support {
             PackageDeletionSupport::NativeComplete => {
                 self.ghcr()?.delete_entire_package().await?;
-                Ok(PackageDeletionSummary::default())
+                Ok(PackageDeletionSummary {
+                    scope: PackageDeletionScope::NativePackageApi,
+                    counts_known: false,
+                    ..Default::default()
+                })
             }
             PackageDeletionSupport::TaggedGraphOnly => {
                 let plan = self.discover_tag_reachable_graph().await?;
@@ -236,47 +256,85 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
                 let mut manifests: Vec<_> = plan.manifests.keys().cloned().collect();
                 manifests.sort();
                 for digest in manifests {
-                    match self.delete_manifest_strict(&digest).await? {
-                        DeletionOutcome::Deleted => summary.manifests_deleted += 1,
-                        DeletionOutcome::AlreadyAbsent => summary.already_absent += 1,
+                    match self.delete_manifest_strict(&digest).await {
+                        Ok(ManifestDeletionOutcome::Deleted) => summary.manifests_deleted += 1,
+                        Ok(ManifestDeletionOutcome::AlreadyAbsent) => {
+                            summary.manifests_already_absent += 1
+                        }
+                        Err(error) => summary.failures.push(deletion_failure(
+                            digest,
+                            DeletionObjectType::Manifest,
+                            &error,
+                        )),
                     }
                 }
                 let mut blobs: Vec<_> = plan.blobs.keys().cloned().collect();
                 blobs.sort();
                 for digest in blobs {
-                    match self.delete_blob_strict(&digest).await? {
-                        DeletionOutcome::Deleted => summary.blobs_deleted += 1,
-                        DeletionOutcome::AlreadyAbsent => summary.already_absent += 1,
+                    let target = BlobDeletionTarget {
+                        digest: digest.parse().map_err(OciError::from)?,
+                        size: plan.blobs[&digest],
+                    };
+                    match self.delete_blob_strict(&target).await {
+                        Ok(BlobDeletionOutcome::Deleted { bytes }) => {
+                            summary.blobs_deleted += 1;
+                            summary.deleted_blob_bytes =
+                                summary.deleted_blob_bytes.saturating_add(bytes);
+                        }
+                        Ok(BlobDeletionOutcome::AlreadyAbsent) => summary.blobs_already_absent += 1,
+                        Err(error) => summary.failures.push(deletion_failure(
+                            digest,
+                            DeletionObjectType::Blob,
+                            &error,
+                        )),
                     }
                 }
 
-                let remaining_tags = self.list_tags_for_deletion().await.map_err(|error| {
-                    OciError::DeletionDiscoveryFailed {
-                        stage: "final_list_tags",
-                        target: self.client.repo().to_string(),
-                        details: error.to_string(),
-                    }
-                })?;
-                if !remaining_tags.is_empty() {
-                    return Err(OciError::DeletionVerificationFailed {
-                        target: self.client.repo().to_string(),
-                        details: format!(
-                            "{} tag(s) remain after deleting the discovered graph",
-                            remaining_tags.len()
-                        ),
-                    });
-                }
-                for digest in plan.manifests.keys() {
-                    self.verify_manifest_absent(digest).await?;
-                }
-                for digest in plan.blobs.keys() {
-                    if self.client.blobs().head(digest).await? {
-                        return Err(OciError::DeletionVerificationFailed {
-                            target: digest.clone(),
-                            details: "blob is still present after DELETE".to_string(),
+                match self.list_tags_for_deletion().await {
+                    Ok(remaining_tags) if !remaining_tags.is_empty() => {
+                        summary.failures.push(DeletionFailure {
+                            digest: self.client.repo().to_string(),
+                            object_type: DeletionObjectType::Tag,
+                            kind: DeletionFailureKind::Verification,
+                            details: format!(
+                                "{} tag(s) remain after deleting the discovered graph",
+                                remaining_tags.len()
+                            ),
                         });
                     }
+                    Ok(_) => {}
+                    Err(error) => summary.failures.push(deletion_failure(
+                        self.client.repo(),
+                        DeletionObjectType::Tag,
+                        &error,
+                    )),
                 }
+                for digest in plan.manifests.keys() {
+                    if let Err(error) = self.verify_manifest_absent(digest).await {
+                        summary.failures.push(deletion_failure(
+                            digest,
+                            DeletionObjectType::Manifest,
+                            &error,
+                        ));
+                    }
+                }
+                for digest in plan.blobs.keys() {
+                    match self.client.blobs().head(digest).await {
+                        Ok(true) => summary.failures.push(DeletionFailure {
+                            digest: digest.clone(),
+                            object_type: DeletionObjectType::Blob,
+                            kind: DeletionFailureKind::Verification,
+                            details: "blob is still present after DELETE".to_string(),
+                        }),
+                        Ok(false) => {}
+                        Err(error) => summary.failures.push(deletion_failure(
+                            digest,
+                            DeletionObjectType::Blob,
+                            &error,
+                        )),
+                    }
+                }
+                summary.complete = summary.failures.is_empty();
                 Ok(summary)
             }
             PackageDeletionSupport::Unsupported => Err(OciError::OperationNotSupported {
@@ -317,5 +375,30 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
             self.client.token_manager().auth_token(),
             self.client.repo(),
         ))
+    }
+}
+
+fn deletion_failure(
+    digest: impl Into<String>,
+    object_type: DeletionObjectType,
+    error: &OciError,
+) -> DeletionFailure {
+    let kind = match error {
+        OciError::InsufficientPermission { .. } => DeletionFailureKind::PermissionDenied,
+        OciError::OperationNotSupported { .. } => DeletionFailureKind::NotSupported,
+        OciError::DeletionFailed { .. }
+        | OciError::BlobCheckFailed(_)
+        | OciError::BlobUploadFailed(_)
+        | OciError::ManifestFetchFailed(_)
+        | OciError::ManifestPushFailed(_) => DeletionFailureKind::HttpStatus,
+        OciError::Transport(_) | OciError::Io(_) => DeletionFailureKind::Transport,
+        OciError::DeletionVerificationFailed { .. } => DeletionFailureKind::Verification,
+        _ => DeletionFailureKind::Other,
+    };
+    DeletionFailure {
+        digest: digest.into(),
+        object_type,
+        kind,
+        details: error.to_string(),
     }
 }

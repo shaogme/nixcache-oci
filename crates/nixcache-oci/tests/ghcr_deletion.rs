@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use nixcache_oci::{
-    GitHubPackagesClient, MockResponse, MockRouterTransport, OciClient, OciError,
-    backend::driver::GhcrDriver,
+    BlobDeletionTarget, GitHubPackagesClient, MockResponse, MockRouterTransport, NarDigest,
+    OciClient, OciError, backend::driver::GhcrDriver,
 };
 
 #[tokio::test]
@@ -226,6 +226,13 @@ async fn test_ghcr_client_integration_via_oci_client() {
     assert!(oci.deletion().delete_tag("run-99").await.is_ok());
 
     // delete_blob_strict on GHCR must fail fast with OperationNotSupported
-    let blob_err = oci.deletion().delete_blob("sha256:blob").await.unwrap_err();
+    let blob_err = oci
+        .deletion()
+        .delete_blob(&BlobDeletionTarget {
+            digest: NarDigest::default(),
+            size: 1,
+        })
+        .await
+        .unwrap_err();
     assert!(matches!(blob_err, OciError::OperationNotSupported { .. }));
 }

@@ -31,6 +31,12 @@ struct OciTagsListResponse {
     tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagList {
+    pub tags: Vec<String>,
+    pub pages_fetched: usize,
+}
+
 fn deserialize_nullable_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -142,10 +148,23 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
         }
     }
 
-    pub async fn list_tags(&self) -> Result<Vec<String>, OciError> {
+    pub async fn list_tags(&self) -> Result<TagList, OciError> {
         let mut all_tags = Vec::new();
         let mut last_tag: Option<String> = None;
+        let mut pages_fetched = 0usize;
+        const PAGE_SIZE: usize = 100;
+        const MAX_TAG_PAGES: usize = 10_000;
+        const MAX_TAGS: usize = 2_000_000;
         loop {
+            if pages_fetched >= MAX_TAG_PAGES {
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: format!("tag pagination exceeded the {MAX_TAG_PAGES}-page limit"),
+                });
+            }
             let base_url = endpoint::tags_url(self.client.endpoint(), self.client.repo());
             let url = match last_tag.as_deref() {
                 Some(cursor) => endpoint::with_last_cursor(&base_url, cursor),
@@ -159,65 +178,89 @@ impl<'a, T: OciTransport + Clone> ManifestClient<'a, T> {
                     "list tags",
                     self.client.limits().max_manifest_bytes(),
                 )
-                .await?;
-            if status == StatusCode::NOT_FOUND {
-                if !all_tags.is_empty() {
-                    return Err(OciError::DeletionDiscoveryFailed {
-                        stage: "list_tags",
-                        target: self.client.repo().to_string(),
-                        details: "registry returned 404 after a partial tag listing".to_string(),
+                .await
+                .map_err(|error| OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: error.to_string(),
+                })?;
+            if !status.is_success() {
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: format!("HTTP {status} while requesting {url}"),
+                });
+            }
+            let response: OciTagsListResponse =
+                serde_json::from_slice(&body).map_err(|error| OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: error.to_string(),
+                })?;
+            pages_fetched += 1;
+            if response.tags.is_empty() {
+                if last_tag.is_none() {
+                    return Ok(TagList {
+                        tags: all_tags,
+                        pages_fetched,
                     });
                 }
-                all_tags.sort();
-                all_tags.dedup();
-                return Ok(all_tags);
-            }
-            if !status.is_success() {
-                if last_tag.is_none() {
-                    let (plain_status, _, plain_body) = self
-                        .client
-                        .request_get_with_auth_retry(
-                            &base_url,
-                            "list tags fallback",
-                            self.client.limits().max_manifest_bytes(),
-                        )
-                        .await?;
-                    if plain_status.is_success() {
-                        let response = serde_json::from_slice::<OciTagsListResponse>(&plain_body)
-                            .map_err(OciError::Json)?;
-                        all_tags.extend(response.tags);
-                        all_tags.sort();
-                        all_tags.dedup();
-                        return Ok(all_tags);
-                    }
-                }
-                return Err(OciError::Transport(TransportError::HttpStatus {
-                    status,
-                    message: Some(format!("Failed to list tags from {url}")),
-                }));
-            }
-            let response: OciTagsListResponse = serde_json::from_slice(&body)?;
-            if response.tags.is_empty() {
-                break;
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: "registry returned an empty page after a full page".to_string(),
+                });
             }
             let count = response.tags.len();
             let new_last = response.tags.last().cloned();
+            if all_tags.len().saturating_add(count) > MAX_TAGS {
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: format!("tag pagination exceeded the {MAX_TAGS}-tag limit"),
+                });
+            }
+            let previous_count = all_tags.len();
             all_tags.extend(response.tags);
-            if count < 100 {
+            all_tags.sort();
+            all_tags.dedup();
+            if last_tag.is_some() && all_tags.len() == previous_count {
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
+                    details: "registry returned a duplicate page with no new tags".to_string(),
+                });
+            }
+            if count < PAGE_SIZE {
                 break;
             }
             if new_last == last_tag || new_last.is_none() {
-                return Err(OciError::DeletionDiscoveryFailed {
-                    stage: "list_tags",
-                    target: self.client.repo().to_string(),
+                return Err(OciError::PaginationFailed {
+                    repository: self.client.repo().to_string(),
+                    cursor: last_tag.clone(),
+                    pages_fetched,
+                    collected_tags: all_tags.len(),
                     details: "registry returned a non-advancing pagination cursor".to_string(),
                 });
             }
             last_tag = new_last;
         }
-        all_tags.sort();
-        all_tags.dedup();
-        Ok(all_tags)
+        Ok(TagList {
+            tags: all_tags,
+            pages_fetched,
+        })
     }
 
     pub async fn fetch_artifact(

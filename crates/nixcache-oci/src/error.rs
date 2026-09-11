@@ -121,6 +121,17 @@ pub enum OciError {
     #[error("Deletion discovery exceeded the object limit for '{target}'")]
     DeletionObjectLimitExceeded { target: String },
 
+    #[error(
+        "Tag pagination failed for repository '{repository}' at cursor {cursor:?} after {pages_fetched} page(s) and {collected_tags} tag(s): {details}"
+    )]
+    PaginationFailed {
+        repository: String,
+        cursor: Option<String>,
+        pages_fetched: usize,
+        collected_tags: usize,
+        details: String,
+    },
+
     #[error("Operation '{operation}' not supported on registry backend '{backend}': {reason}")]
     OperationNotSupported {
         operation: &'static str,
@@ -176,6 +187,9 @@ pub enum OciError {
 
     #[error("Upload session location missing in 202 Accepted response")]
     UploadLocationMissing,
+
+    #[error("Upload stream ended before a complete digest was observed")]
+    UploadDigestUnavailable,
 
     #[error("Invalid upload session range: {details}")]
     UploadRangeInvalid { details: String },

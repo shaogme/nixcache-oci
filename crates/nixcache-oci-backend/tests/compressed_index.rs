@@ -205,7 +205,7 @@ async fn test_push_zstd_blob_and_fetch_sharded_arch_cache_index() {
     // Push blob
     let (pushed_digest, comp_size, uncomp_size) =
         client.blobs().push_zstd(&arch_data).await.unwrap();
-    assert_eq!(pushed_digest, blob_digest);
+    assert_eq!(pushed_digest.as_str(), blob_digest);
     assert_eq!(comp_size, blob_size);
     assert!(uncomp_size > comp_size);
 

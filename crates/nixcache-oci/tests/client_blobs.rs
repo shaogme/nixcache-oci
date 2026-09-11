@@ -6,7 +6,6 @@ use nixcache_oci::{
     MockPatchRequest, MockResponse, MockRouterTransport, OciClient, OciError, OciReadLimits,
     StreamHashState, TransportError, UploadConfig, parse_range_header,
 };
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 #[test]
@@ -29,15 +28,32 @@ async fn monolithic_post_upload_is_available() {
         Default::default(),
     )
     .unwrap();
-    let digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    assert_eq!(
-        client
-            .blobs()
-            .push_bytes_with_digest(digest, Bytes::from_static(b"fast monolithic payload"))
-            .await
-            .unwrap(),
-        digest
-    );
+    let body = Bytes::from_static(b"fast monolithic payload");
+    let digest = ContentDigest::from_bytes(&body);
+    assert_eq!(client.blobs().push_bytes(body).await.unwrap(), digest);
+}
+
+#[tokio::test]
+async fn bytes_upload_uses_body_digest_in_head_and_post_requests() {
+    let transport = MockRouterTransport::default();
+    let client = OciClient::new(
+        "docker.io",
+        "test/repo",
+        "token123",
+        true,
+        DockerHubDriver,
+        transport.clone(),
+        Default::default(),
+    )
+    .unwrap();
+    let body = Bytes::from_static(b"body-owned digest");
+    let expected = ContentDigest::from_bytes(&body);
+
+    let actual = client.blobs().push_bytes(body.clone()).await.unwrap();
+    assert_eq!(actual, expected);
+    let (url, posted_body) = transport.posted_bodies.pop().unwrap();
+    assert_eq!(posted_body, body);
+    assert!(url.ends_with(&format!("?digest={}", expected.as_str())));
 }
 
 #[tokio::test]
@@ -72,7 +88,7 @@ async fn ghcr_resumable_upload_uses_fixed_two_step_strategy() {
         .await
         .unwrap();
     assert_eq!(size, data.len() as u64);
-    assert!(digest.starts_with("sha256:"));
+    assert!(digest.as_str().starts_with("sha256:"));
 }
 
 #[tokio::test]
@@ -91,6 +107,22 @@ async fn stream_hash_state_is_shared_without_losing_progress() {
     assert_eq!(state_clone.bytes_streamed(), 13);
     assert_eq!(state.digest(), None);
     assert!(stream_state.digest().is_some());
+}
+
+#[tokio::test]
+async fn stream_hash_state_never_exposes_digest_after_input_error() {
+    let input = futures_util::stream::iter(vec![
+        Ok::<Bytes, TransportError>(Bytes::from_static(b"partial")),
+        Err(TransportError::Io(std::io::Error::other("read failed"))),
+    ]);
+    let (mut stream, state) = HashingStream::new(input);
+    assert_eq!(
+        stream.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"partial")
+    );
+    assert!(stream.next().await.unwrap().is_err());
+    assert_eq!(state.bytes_streamed(), 7);
+    assert!(state.digest().is_none());
 }
 
 fn chunked_config(max_retry_attempts: usize) -> UploadConfig {
@@ -266,6 +298,30 @@ async fn chunk_retry_replays_body_and_consumes_one_retry() {
         Some(Duration::from_millis(100))
     );
     assert!(transport.delete_requests.pop().is_none());
+    let finish = transport.put_requests.pop().expect("finish request");
+    assert!(finish.url.ends_with(&format!(
+        "?digest={}",
+        ContentDigest::from_bytes(&data).as_str()
+    )));
+}
+
+#[tokio::test]
+async fn stream_error_before_eof_aborts_session_without_finish() {
+    let transport = MockRouterTransport::default();
+    let error = chunked_client(transport.clone())
+        .blobs()
+        .push_resumable(
+            Box::pin(futures_util::stream::iter(vec![
+                Ok::<Bytes, TransportError>(Bytes::from(vec![0x5e; 1024 * 1024])),
+                Err(TransportError::Io(std::io::Error::other("stream failed"))),
+            ])),
+            &chunked_config(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OciError::Transport(TransportError::Io(_))));
+    assert!(transport.put_requests.pop().is_none());
+    assert!(transport.delete_requests.pop().is_some());
 }
 
 #[tokio::test]
@@ -392,16 +448,7 @@ async fn probe_resends_only_uncommitted_suffix() {
         .unwrap();
     let requests = drain_patch_requests(&transport);
     assert_eq!(size, data.len() as u64);
-    assert_eq!(
-        digest,
-        format!(
-            "sha256:{}",
-            Sha256::digest(&data)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        )
-    );
+    assert_eq!(digest, ContentDigest::from_bytes(&data));
     assert_eq!(requests[1].body, data.slice(1..));
     assert_eq!(requests[1].byte_range, (1, data.len() as u64 - 1));
 }

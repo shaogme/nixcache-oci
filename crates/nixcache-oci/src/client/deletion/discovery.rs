@@ -27,6 +27,8 @@ pub(super) struct DeletionPlan {
 impl DeletionPlan {
     pub(super) fn summary(&self) -> PackageDeletionSummary {
         PackageDeletionSummary {
+            scope: super::PackageDeletionScope::TagReachableGraph,
+            counts_known: true,
             tags_discovered: self.tags.len(),
             manifests_discovered: self.manifests.len(),
             blobs_discovered: self.blobs.len(),
@@ -237,7 +239,7 @@ impl<'a, T: OciTransport + Clone> DeletionClient<'a, T> {
     }
 
     pub(super) async fn list_tags_for_deletion(&self) -> Result<Vec<String>, OciError> {
-        let mut tags = self.client.manifests().list_tags().await?;
+        let mut tags = self.client.manifests().list_tags().await?.tags;
         if tags.is_empty()
             && self.client.capabilities().deletion_strategy
                 == RegistryDeletionStrategy::GitHubPackagesRestApi

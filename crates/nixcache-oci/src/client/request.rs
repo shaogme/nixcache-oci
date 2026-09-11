@@ -296,24 +296,6 @@ impl<T: OciTransport + Clone> OciClient<T> {
         Ok(second.0)
     }
 
-    pub(super) async fn request_put_stream_with_auth_retry(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-        stream: T::BodyStream,
-        content_len: u64,
-        operation: &'static str,
-    ) -> Result<StatusCode, OciError> {
-        let (status, _) = self
-            .transport
-            .put_stream_with_headers(url, headers, stream, content_len)
-            .await?;
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(OciError::AuthenticationNotReplayable { operation });
-        }
-        Ok(status)
-    }
-
     pub(super) async fn request_delete_with_auth_retry(
         &self,
         url: &str,

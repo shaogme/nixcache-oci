@@ -23,8 +23,10 @@ pub use backend::{
     driver_for_kind,
 };
 pub use client::{
-    BlobClient, DeletionClient, DeletionOutcome, DeletionSummary, FetchedOciArtifact, IndexClient,
-    ManifestCasCondition, ManifestClient, OciClient, PackageDeletionSummary,
+    BlobClient, BlobDeletionOutcome, BlobDeletionTarget, DeletionBatchResult, DeletionClient,
+    DeletionFailure, DeletionFailureKind, DeletionObjectType, DeletionSummary, FetchedOciArtifact,
+    IndexClient, ManifestCasCondition, ManifestClient, ManifestDeletionOutcome, OciClient,
+    PackageDeletionScope, PackageDeletionSummary, TagList,
 };
 pub use codec::{DEFAULT_ZSTD_COMPRESSION_LEVEL, DecodedIndex, IndexCodec};
 pub use error::{OciError, TokenError, TransportError};

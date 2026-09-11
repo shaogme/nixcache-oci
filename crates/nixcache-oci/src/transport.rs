@@ -123,7 +123,7 @@ pub struct UploadChunkResponse {
 #[derive(Debug, Default)]
 struct StreamHashInner {
     bytes_streamed: AtomicU64,
-    finalized_digest: OnceLock<String>,
+    finalized_digest: OnceLock<ContentDigest>,
 }
 
 /// 零锁流式哈希与进度观察句柄
@@ -143,19 +143,8 @@ impl StreamHashState {
     }
 
     #[inline]
-    pub fn digest(&self) -> Option<String> {
+    pub fn digest(&self) -> Option<ContentDigest> {
         self.inner.finalized_digest.get().cloned()
-    }
-
-    /// 若流提前终止需要强制计算已传输部分的哈希
-    pub fn force_finalize(&self) -> String {
-        if let Some(d) = self.inner.finalized_digest.get() {
-            return d.clone();
-        }
-        let d = self.inner.finalized_digest.get_or_init(|| {
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()
-        });
-        d.clone()
     }
 }
 
@@ -308,15 +297,10 @@ where
             Some(Err(e)) => Poll::Ready(Some(Err(e))),
             None => {
                 // 流结束，一次性无锁计算并存入 OnceLock
-                this.state.inner.finalized_digest.get_or_init(|| {
-                    let hash = this.hasher.clone().finalize();
-                    format!(
-                        "sha256:{}",
-                        hash.iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<String>()
-                    )
-                });
+                this.state
+                    .inner
+                    .finalized_digest
+                    .get_or_init(|| ContentDigest::from_hasher(this.hasher.clone()));
                 Poll::Ready(None)
             }
         }

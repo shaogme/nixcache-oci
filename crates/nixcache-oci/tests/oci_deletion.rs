@@ -5,8 +5,8 @@ use nixcache_core::{
     ShardedArchCacheIndexData, StoreHash, SystemArch,
 };
 use nixcache_oci::{
-    CacheLayerMediaType, GenericOciDriver, IndexCodec, MockResponse, MockRouterTransport,
-    OciClient, OciError,
+    BlobDeletionTarget, CacheLayerMediaType, DeletionBatchResult, GenericOciDriver, IndexCodec,
+    MockResponse, MockRouterTransport, OciClient, OciError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -163,32 +163,45 @@ async fn test_generic_oci_batch_delete_blobs_strict_vs_lenient() {
     )
     .unwrap();
 
-    let digests = vec![
-        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000001")
+    let targets = vec![
+        BlobDeletionTarget {
+            digest: NarDigest::new_sha256(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
             .unwrap(),
-        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000002")
+            size: 11,
+        },
+        BlobDeletionTarget {
+            digest: NarDigest::new_sha256(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )
             .unwrap(),
-        NarDigest::new_sha256("0000000000000000000000000000000000000000000000000000000000000003")
+            size: 22,
+        },
+        BlobDeletionTarget {
+            digest: NarDigest::new_sha256(
+                "0000000000000000000000000000000000000000000000000000000000000003",
+            )
             .unwrap(),
+            size: 33,
+        },
     ];
 
-    // Non-strict mode accumulates failures without aborting
-    let summary = client
+    let result = client
         .deletion()
-        .batch_delete_blobs(&digests, 4, false)
+        .batch_delete_blobs(&targets, 4)
         .await
         .unwrap();
+    let DeletionBatchResult::Partial(summary) = result else {
+        panic!("a failed target must produce a partial result");
+    };
+    assert_eq!(summary.requested_count, 3);
     assert_eq!(summary.deleted_count, 1); // b1 (202)
-    assert_eq!(summary.not_found_count, 1); // b2 (404 idempotent)
+    assert_eq!(summary.already_absent_count, 1); // b2 (404 idempotent)
     assert_eq!(summary.failed_count, 1); // b3 (500)
-
-    // Strict mode aborts on non-404 error
-    let strict_err = client
-        .deletion()
-        .batch_delete_blobs(&digests, 4, true)
-        .await
-        .unwrap_err();
-    assert!(matches!(strict_err, OciError::DeletionFailed { .. }));
+    assert_eq!(summary.deleted_bytes, 11);
+    assert_eq!(summary.failures.len(), 1);
+    assert!(!summary.is_complete());
 }
 
 #[tokio::test]
@@ -239,7 +252,9 @@ async fn test_generic_oci_deletes_complete_tag_reachable_graph() {
     assert_eq!(summary.blobs_discovered, 4);
     assert_eq!(summary.manifests_deleted, 3);
     assert_eq!(summary.blobs_deleted, 4);
-    assert_eq!(summary.already_absent, 0);
+    assert_eq!(summary.manifests_already_absent, 0);
+    assert_eq!(summary.blobs_already_absent, 0);
+    assert!(summary.complete);
 }
 
 #[tokio::test]
@@ -323,7 +338,9 @@ async fn test_generic_oci_deletes_root_shard_and_nar_blobs() {
     assert_eq!(summary.blobs_discovered, 4);
     assert_eq!(summary.manifests_deleted, 1);
     assert_eq!(summary.blobs_deleted, 4);
-    assert_eq!(summary.already_absent, 0);
+    assert_eq!(summary.manifests_already_absent, 0);
+    assert_eq!(summary.blobs_already_absent, 0);
+    assert!(summary.complete);
 }
 
 #[tokio::test]
@@ -387,5 +404,7 @@ async fn test_generic_oci_deletes_direct_shard_with_manifest_system_context() {
     assert_eq!(summary.blobs_discovered, 3);
     assert_eq!(summary.manifests_deleted, 1);
     assert_eq!(summary.blobs_deleted, 3);
-    assert_eq!(summary.already_absent, 0);
+    assert_eq!(summary.manifests_already_absent, 0);
+    assert_eq!(summary.blobs_already_absent, 0);
+    assert!(summary.complete);
 }

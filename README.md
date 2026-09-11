@@ -245,7 +245,9 @@ jobs:
 
 - **全量清空与彻底重置 (`--all`)**：GHCR 通过 GitHub Packages REST API 删除完整 Package；GCP、Azure 和 Generic OCI 只删除当前 `tags/list` 可达的 manifest/config/layer/NAR Blob 图，并执行最终验证。标准 OCI API 无法发现 untagged 历史对象，不能把该范围称为完整 Package 清空；Docker Hub 与 ECR 当前明确报告不支持。
 - **物理删除 Blobs (`--delete-blobs`)**：在支持 OCI 物理删除的后端（如 Generic OCI / Harbor）上物理删除失效 NAR Blobs；在 GHCR 上 Blob 随 Package Version 自动垃圾回收。
-- **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。若遇到权限不足（401/403）或远程操作失败，将立即抛出强类型错误并输出精准修复指导，坚决杜绝静默吞掉异常。
+- **严格错误模式 (`--strict` / `--no-strict`)**：默认开启。批量删除会尝试所有独立目标并生成审计结果；出现 `Partial` 时严格模式在写出完整报告后以非零状态退出，非严格模式保留失败明细并继续运行。
+
+删除报告中的 `Deleted Blob Bytes` 只表示本次 Registry `DELETE` 已接受的、来自 descriptor 或本地索引的已知 blob 字节数，不承诺 Registry 垃圾回收已经完成。`Already Absent` 和 `Failures` 分开统计，分页发现不完整时不会进入破坏性删除。
 
 ##### 6. 构建缓存多维查询与统计（list Action）
 
@@ -717,6 +719,12 @@ nixcache-builder purge \
 | `--github-token <TOKEN>` | `GITHUB_TOKEN` / `GH_TOKEN` | （无） | GitHub 认证 Token |
 
 `purge` 的索引合并路径会根据后端能力选择严格 CAS 或显式 single-writer 更新。GHCR、AWS ECR 和 Generic OCI 不支持条件发布能力时，必须由 CI concurrency 或外部锁保证同一目标索引不会并发更新；不满足该约束时请先配置单写者调度或外部锁。
+
+##### OCI 客户端完整性与分页契约
+
+- Blob 上传入口只接受实际 bytes 或完整 stream：`push_bytes`、`push_resumable` 和 `push_zstd` 返回客户端从 body 计算的强类型 `ContentDigest`，调用方不能传入未经验证的 digest。流式上传只有在观察到 EOF 并完成哈希后才会发送 finish PUT；中途读取失败会中止上传会话。
+- `ManifestClient::list_tags` 返回带 `pages_fetched` 的 `TagList`。`Ok` 只表示所有分页已完成；HTTP、JSON、重复页或 cursor 不推进会返回带 repository、cursor、页数和已收集数量的 `PaginationFailed`。
+- `batch_delete_blobs` 返回 `Complete` 或 `Partial`，每个 blob 目标携带已知大小，结果分别报告 deleted、already absent、failed 和 `deleted_bytes`。`--strict`/`--no-strict` 只在 builder 层决定 Partial 的退出行为，底层 API 不再使用容易误读的布尔开关。
 
 #### 6. `list` (构建缓存多维查询、列表与统计)
 

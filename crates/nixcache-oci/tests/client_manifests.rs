@@ -8,6 +8,20 @@ use nixcache_oci::{
     OciClient, OciError,
 };
 
+fn tags_response(tags: &[String]) -> MockResponse {
+    MockResponse {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        body: Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "test/repo",
+                "tags": tags,
+            }))
+            .unwrap(),
+        ),
+    }
+}
+
 #[tokio::test]
 async fn get_and_put_manifest_use_manifest_client() {
     let manifest_content =
@@ -283,4 +297,129 @@ async fn get_manifest_with_digest_rejects_invalid_utf8() {
             .unwrap_err(),
         OciError::InvalidUtf8Manifest(_)
     ));
+}
+
+#[tokio::test]
+async fn list_tags_collects_all_pages_with_context() {
+    let transport = MockRouterTransport::default();
+    let first: Vec<String> = (0..100).map(|index| format!("tag-{index:03}")).collect();
+    let second: Vec<String> = (100..200).map(|index| format!("tag-{index:03}")).collect();
+    let third = vec!["tag-200".to_string()];
+    transport.add_route("GET", "/tags/list?n=100", tags_response(&first));
+    transport.add_route(
+        "GET",
+        "/tags/list?n=100&last=tag-099",
+        tags_response(&second),
+    );
+    transport.add_route(
+        "GET",
+        "/tags/list?n=100&last=tag-199",
+        tags_response(&third),
+    );
+
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        transport,
+        Default::default(),
+    )
+    .unwrap();
+    let result = client.manifests().list_tags().await.unwrap();
+    assert_eq!(result.pages_fetched, 3);
+    assert_eq!(result.tags.len(), 201);
+    assert_eq!(result.tags.first().map(String::as_str), Some("tag-000"));
+    assert_eq!(result.tags.last().map(String::as_str), Some("tag-200"));
+}
+
+#[tokio::test]
+async fn list_tags_fails_closed_when_a_later_page_is_invalid() {
+    let transport = MockRouterTransport::default();
+    let first: Vec<String> = (0..100).map(|index| format!("tag-{index:03}")).collect();
+    transport.add_route("GET", "/tags/list?n=100", tags_response(&first));
+    transport.add_route(
+        "GET",
+        "/tags/list?n=100&last=tag-099",
+        MockResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"not json"),
+        },
+    );
+
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        transport,
+        Default::default(),
+    )
+    .unwrap();
+    let error = client.manifests().list_tags().await.unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::PaginationFailed {
+            pages_fetched: 1,
+            collected_tags: 100,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn list_tags_rejects_a_duplicate_page_without_looping() {
+    let transport = MockRouterTransport::default();
+    let page: Vec<String> = (0..100).map(|index| format!("tag-{index:03}")).collect();
+    transport.add_route("GET", "/tags/list?n=100", tags_response(&page));
+    transport.add_route("GET", "/tags/list?n=100&last=tag-099", tags_response(&page));
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        false,
+        transport,
+        Default::default(),
+    )
+    .unwrap();
+    let error = client.manifests().list_tags().await.unwrap_err();
+    assert!(matches!(
+        error,
+        OciError::PaginationFailed {
+            pages_fetched: 2,
+            collected_tags: 100,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn list_tags_percent_encodes_cursor_and_does_not_delete_on_failure() {
+    let transport = MockRouterTransport::default();
+    let mut first: Vec<String> = (0..99).map(|index| format!("tag-{index:03}")).collect();
+    first.push("last +/% 测试".to_string());
+    transport.add_route("GET", "/tags/list?n=100", tags_response(&first));
+    transport.add_route(
+        "GET",
+        "/tags/list?n=100&last=last%20%2B%2F%25%20%E6%B5%8B%E8%AF%95",
+        MockResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        },
+    );
+
+    let client = OciClient::with_transport(
+        "example.com",
+        "test/repo",
+        "",
+        true,
+        transport.clone(),
+        Default::default(),
+    )
+    .unwrap();
+    let error = client.deletion().delete_entire_package().await.unwrap_err();
+    assert!(matches!(error, OciError::PaginationFailed { .. }));
+    assert!(transport.delete_requests.pop().is_none());
 }
