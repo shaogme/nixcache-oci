@@ -3,3 +3,9 @@ target/
 result
 result*
 /**/node_modules/
+
+# Local Cloudflare and E2E test configuration/credentials
+crates/nixcache-worker/wrangler.toml
+test-worker-secret.key
+test-worker-public.key
+result-builder-worker

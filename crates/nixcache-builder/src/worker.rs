@@ -42,6 +42,7 @@ impl Drop for ProxyGuard {
 pub async fn setup_self_substituter(
     repo: &str,
     registry: &str,
+    baseline_tag: &str,
     github_token: &str,
     registry_username: Option<&str>,
     signing_key_file: Option<&str>,
@@ -57,6 +58,7 @@ pub async fn setup_self_substituter(
         .env("NIXCACHE_PORT", "37515")
         .env("NIXCACHE_LISTEN", "127.0.0.1")
         .env("NIXCACHE_UPSTREAM", "")
+        .env("NIXCACHE_BASELINE_TAG", baseline_tag)
         .env("GITHUB_TOKEN", github_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -141,10 +143,11 @@ pub async fn setup_self_substituter(
 pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
     oci: &OciClient<T>,
     system: &SystemArch,
+    baseline_tag: &str,
 ) -> HashSet<StoreHash> {
     let mut own_hashes = HashSet::new();
 
-    if let Ok(Some((root_data, _))) = oci.indexes().get_sharded_root("cache-index", system).await {
+    if let Ok(Some((root_data, _))) = oci.indexes().get_sharded_root(baseline_tag, system).await {
         let non_empty_shards: Vec<_> = root_data
             .shards
             .iter()
@@ -168,10 +171,11 @@ pub async fn fetch_remote_arch_hashes<T: OciTransport + Clone>(
 #[cfg(test)]
 pub async fn fetch_remote_cache_hashes<T: OciTransport + Clone>(
     oci: &OciClient<T>,
+    baseline_tag: &str,
 ) -> HashSet<StoreHash> {
     let mut own_hashes = HashSet::new();
     for sys in SystemArch::all() {
-        let hashes = fetch_remote_arch_hashes(oci, &sys).await;
+        let hashes = fetch_remote_arch_hashes(oci, &sys, baseline_tag).await;
         own_hashes.extend(hashes);
     }
     own_hashes
@@ -185,6 +189,7 @@ pub struct BuildWorkerOptions<'a> {
     pub signing_key_file: Option<&'a str>,
     pub github_token: &'a str,
     pub credentials: RegistryCredentials,
+    pub baseline_tag: &'a str,
     pub output_receipt_path: &'a Path,
     pub strict: bool,
     pub export_concurrency: usize,
@@ -218,6 +223,7 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
     let mut proxy_guard = setup_self_substituter(
         opts.repo,
         opts.registry,
+        opts.baseline_tag,
         opts.github_token,
         opts.credentials.username(),
         opts.signing_key_file,
@@ -241,11 +247,12 @@ pub async fn run_build_worker(opts: &BuildWorkerOptions<'_>) -> Result<(), Build
         true,
         Default::default(),
     )?;
-    let own_hashes = fetch_remote_arch_hashes(&oci, &system).await;
+    let own_hashes = fetch_remote_arch_hashes(&oci, &system, opts.baseline_tag).await;
     info!(
-        "Remote index contains {} previously-cached entries for {}",
+        "Remote index '{}' contains {} previously-cached entries for {}",
+        opts.baseline_tag,
         own_hashes.len(),
-        system
+        system,
     );
 
     let own_hashes_vec: Vec<String> = own_hashes.into_iter().map(|h| h.into_inner()).collect();
@@ -402,7 +409,8 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
+        let hashes =
+            fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux, "cache-index").await;
         assert!(hashes.is_empty());
     }
 
@@ -459,11 +467,22 @@ mod tests {
             .await
             .unwrap();
 
-        let hashes = fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux).await;
+        let hashes =
+            fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux, "cache-index").await;
         assert_eq!(hashes.len(), 1);
         assert!(hashes.contains(&h1));
 
-        let all_hashes = fetch_remote_cache_hashes(&client).await;
+        client
+            .indexes()
+            .push_sharded_root("cache-index-e2e-x86_64-linux", &root_data)
+            .await
+            .unwrap();
+        let e2e_hashes =
+            fetch_remote_arch_hashes(&client, &SystemArch::X86_64Linux, "cache-index-e2e").await;
+        assert_eq!(e2e_hashes.len(), 1);
+        assert!(e2e_hashes.contains(&h1));
+
+        let all_hashes = fetch_remote_cache_hashes(&client, "cache-index").await;
         assert_eq!(all_hashes.len(), 1);
         assert!(all_hashes.contains(&h1));
     }

@@ -10,31 +10,70 @@ fi
 
 # Strip trailing slash if present
 TEST_WORKER_URL="${TEST_WORKER_URL%/}"
+TEST_WORKER_BASELINE_TAG="${TEST_WORKER_BASELINE_TAG-cache-index-e2e}"
+WORKER_SUBSTITUTION_ATTEMPTS="${WORKER_SUBSTITUTION_ATTEMPTS-24}"
+WORKER_SUBSTITUTION_DELAY_SECONDS="${WORKER_SUBSTITUTION_DELAY_SECONDS-5}"
+
+validate_positive_integer() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "::error::$name must be a positive integer, got '$value'."
+        exit 1
+    fi
+}
+
+if [[ -z "$TEST_WORKER_BASELINE_TAG" ]]; then
+    echo "::error::TEST_WORKER_BASELINE_TAG must not be empty."
+    exit 1
+fi
+if [[ "$TEST_WORKER_BASELINE_TAG" == "cache-index" ]]; then
+    echo "::error::TEST_WORKER_BASELINE_TAG must not be the production cache-index tag."
+    exit 1
+fi
+validate_positive_integer "WORKER_SUBSTITUTION_ATTEMPTS" "$WORKER_SUBSTITUTION_ATTEMPTS"
+validate_positive_integer "WORKER_SUBSTITUTION_DELAY_SECONDS" "$WORKER_SUBSTITUTION_DELAY_SECONDS"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nixcache-worker-e2e.XXXXXX")"
+SECRET_KEY_FILE="$WORK_DIR/test-worker-secret.key"
+PUBLIC_KEY_FILE="$WORK_DIR/test-worker-public.key"
+RECEIPT_FILE="$WORK_DIR/receipt.json"
+DIAGNOSTIC_HEADERS_FILE="$WORK_DIR/diagnostic.headers"
+DIAGNOSTIC_BODY_FILE="$WORK_DIR/diagnostic.body"
+FLAKE_FILE="examples/flake/flake.nix"
+FLAKE_BACKUP_FILE="$WORK_DIR/flake.nix.bak"
+TEST_STORE_PATH=""
+WAIT_BUDGET_SECONDS=$(( (WORKER_SUBSTITUTION_ATTEMPTS - 1) * WORKER_SUBSTITUTION_DELAY_SECONDS ))
+
 echo "=== Starting Nix Cloudflare Worker E2E Integration Test ==="
 echo "Worker URL: $TEST_WORKER_URL"
+echo "Worker baseline tag: $TEST_WORKER_BASELINE_TAG"
+echo "Substitution retry budget: $WORKER_SUBSTITUTION_ATTEMPTS attempts, ${WORKER_SUBSTITUTION_DELAY_SECONDS}s delay, ${WAIT_BUDGET_SECONDS}s maximum wait"
 
 # Ensure clean state on exit
 cleanup() {
+    local exit_code=$?
+
     echo ">>> Cleaning up worker test resources..."
-    if [[ -f examples/flake/flake.nix.bak ]]; then
-        mv -f examples/flake/flake.nix.bak examples/flake/flake.nix
-    else
-        git checkout -- examples/flake/flake.nix 2>/dev/null || true
+    if [[ -f "$FLAKE_BACKUP_FILE" ]]; then
+        mv -f "$FLAKE_BACKUP_FILE" "$FLAKE_FILE"
     fi
-    rm -f test-worker-secret.key test-worker-public.key result-builder-worker
+    if [[ -n "$TEST_STORE_PATH" ]]; then
+        nix-store --delete "$TEST_STORE_PATH" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$WORK_DIR"
     echo ">>> Cleanup complete."
+    return "$exit_code"
 }
 trap cleanup EXIT
 
 # 1. Generate signing key
 echo ">>> Generating signing key pair..."
-rm -f test-worker-secret.key test-worker-public.key
-nix-store --generate-binary-cache-key test-worker-key-1 test-worker-secret.key test-worker-public.key
+nix-store --generate-binary-cache-key test-worker-key-1 "$SECRET_KEY_FILE" "$PUBLIC_KEY_FILE"
 
 # 2. Build builder and proxy binaries
 find_binaries() {
@@ -77,6 +116,17 @@ echo "Worker status: $STATUS_JSON"
 
 TARGET_REPO=$(echo "$STATUS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('repo', ''))")
 TARGET_REGISTRY=$(echo "$STATUS_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('registry', 'ghcr.io'))")
+STATUS_BASELINE_TAG=$(echo "$STATUS_JSON" | python3 -c "import sys, json; value=json.load(sys.stdin).get('baseline_tag'); print(value if isinstance(value, str) else '')")
+
+if [[ -z "$STATUS_BASELINE_TAG" ]]; then
+    echo "::error::Worker status does not expose a non-empty baseline_tag. Refusing to test an unverified Worker configuration."
+    exit 1
+fi
+if [[ "$STATUS_BASELINE_TAG" != "$TEST_WORKER_BASELINE_TAG" ]]; then
+    echo "::error::Worker baseline_tag '$STATUS_BASELINE_TAG' does not match expected '$TEST_WORKER_BASELINE_TAG'."
+    exit 1
+fi
+echo ">>> Worker baseline tag verified: $STATUS_BASELINE_TAG"
 
 if [[ -z "$TARGET_REPO" || "$TARGET_REPO" == "null" ]]; then
     echo ">>> Target repo not found in Worker status, detecting from git repository..."
@@ -88,7 +138,8 @@ echo ">>> Target Registry: $TARGET_REGISTRY, Target Repo: $TARGET_REPO"
 echo ">>> Building and pushing test package to registry..."
 export NIXCACHE_REGISTRY="$TARGET_REGISTRY"
 export NIXCACHE_REPO="$TARGET_REPO"
-export NIXCACHE_SIGNING_KEY_FILE="test-worker-secret.key"
+export NIXCACHE_SIGNING_KEY_FILE="$SECRET_KEY_FILE"
+export NIXCACHE_BASELINE_TAG="$TEST_WORKER_BASELINE_TAG"
 export NIXCACHE_MODE="flake"
 export NIXCACHE_CONFIG_DIR="examples/flake"
 
@@ -100,10 +151,10 @@ fi
 
 # Modify flake.nix to guarantee a unique hash that has no signatures and is not cached
 echo ">>> Modifying examples/flake/flake.nix to generate a unique package hash..."
-cp examples/flake/flake.nix examples/flake/flake.nix.bak
-sed -i "s/Built at: [^\"]*/Built at: $(date +%s%N)/" examples/flake/flake.nix
+cp "$FLAKE_FILE" "$FLAKE_BACKUP_FILE"
+sed -i "s/Built at: [^\"]*/Built at: $(date +%s%N)/" "$FLAKE_FILE"
 
-if cmp -s examples/flake/flake.nix examples/flake/flake.nix.bak; then
+if cmp -s "$FLAKE_FILE" "$FLAKE_BACKUP_FILE"; then
     echo "::error::Failed to mutate examples/flake/flake.nix. Hash will not be unique!"
     exit 1
 fi
@@ -114,68 +165,59 @@ TEST_HASH=$(basename "$TEST_STORE_PATH" | cut -d'-' -f1)
 echo ">>> Target package hash: $TEST_HASH"
 
 # Execute the builder (inject PROXY_BIN directory into PATH so it can spawn nixcache-proxy)
-RECEIPT_FILE="$(mktemp --suffix=.json)"
 RUST_LOG="${RUST_LOG:-info}" PATH="$(cd "$(dirname "$PROXY_BIN")" && pwd):$PATH" "$BUILDER_BIN" build --output-receipt "$RECEIPT_FILE"
-RUST_LOG="${RUST_LOG:-info}" "$BUILDER_BIN" promote --receipt "$RECEIPT_FILE"
-rm -f "$RECEIPT_FILE"
+RUST_LOG="${RUST_LOG:-info}" "$BUILDER_BIN" promote \
+    --receipt "$RECEIPT_FILE" \
+    --target-tag "$TEST_WORKER_BASELINE_TAG"
 
-# 5. Deterministic Resource Convergence Verification
-# Instead of polling /_status (which has edge KV propagation delays and false convergence),
-# we directly verify deterministic convergence on the target .narinfo endpoint.
-# With Read-Through SWR self-healing in Worker, this resolves deterministically with zero jitter.
-echo ">>> Verifying deterministic convergence on target .narinfo endpoint..."
-NARINFO_RESP_HEADERS="$(mktemp)"
-NARINFO_CONTENT=""
-CONVERGED=false
-
-for i in {1..20}; do
-    HTTP_CODE=$(curl -s -o /tmp/narinfo_body.tmp -w "%{http_code}" -D "$NARINFO_RESP_HEADERS" "$TEST_WORKER_URL/${TEST_HASH}.narinfo" || true)
-    
-    if [[ "$HTTP_CODE" == "200" ]]; then
-        NARINFO_CONTENT=$(cat /tmp/narinfo_body.tmp)
-        if echo "$NARINFO_CONTENT" | grep -q "StorePath: $TEST_STORE_PATH"; then
-            echo ">>> Deterministic convergence achieved at attempt $i!"
-            echo ">>> Diagnostic Headers:"
-            grep -i "^x-nixcache" "$NARINFO_RESP_HEADERS" || true
-            echo ">>> Retrieved narinfo:"
-            echo "$NARINFO_CONTENT"
-            CONVERGED=true
-            break
-        fi
-    fi
-    echo ">>> Waiting for target .narinfo convergence (HTTP $HTTP_CODE), retrying in 2 seconds ($i/20)..."
-    sleep 2
-done
-rm -f "$NARINFO_RESP_HEADERS" /tmp/narinfo_body.tmp
-
-if [[ "$CONVERGED" != "true" ]]; then
-    echo "!!! Failed to deterministically converge on target .narinfo after retries."
-    exit 1
-fi
-
-# 6. Perform substitution test from Worker
+# 5. Perform substitution test from Worker
 echo ">>> Deleting local store path from Nix store (if possible)..."
 nix-store --delete "$TEST_STORE_PATH" || true
 
 echo ">>> Realising store path from Cloudflare Worker substituter..."
+echo ">>> narinfo-cache-negative-ttl=0 and narinfo-cache-positive-ttl=0 disable only local Nix narinfo caching; they do not provide remote strong consistency."
 REALISE_SUCCESS=false
-for attempt in 1 2 3; do
-    echo ">>> Substitution attempt $attempt/3..."
+for ((attempt = 1; attempt <= WORKER_SUBSTITUTION_ATTEMPTS; attempt++)); do
+    echo ">>> Substitution attempt $attempt/$WORKER_SUBSTITUTION_ATTEMPTS..."
     if nix-store --realise "$TEST_STORE_PATH" \
       --option substituters "$TEST_WORKER_URL" \
-      --option trusted-public-keys "$(cat test-worker-public.key)" \
+      --option trusted-public-keys "$(cat "$PUBLIC_KEY_FILE")" \
       --option require-sigs true \
       --option narinfo-cache-negative-ttl 0 \
-      --option narinfo-cache-positive-ttl 0 -vvvvv; then
+      --option narinfo-cache-positive-ttl 0 \
+      -vvvvv; then
         REALISE_SUCCESS=true
         break
     fi
-    echo ">>> Attempt $attempt failed, retrying in 10 seconds..."
-    sleep 10
+    if (( attempt < WORKER_SUBSTITUTION_ATTEMPTS )); then
+        echo ">>> Attempt $attempt failed, retrying in ${WORKER_SUBSTITUTION_DELAY_SECONDS} seconds..."
+        sleep "$WORKER_SUBSTITUTION_DELAY_SECONDS"
+    fi
 done
 
 if [[ "$REALISE_SUCCESS" != "true" ]]; then
-    echo "!!! Failed to realise store path from Worker substituter after 3 attempts."
+    echo "!!! Failed to realise store path from Worker substituter after $WORKER_SUBSTITUTION_ATTEMPTS attempts."
+    echo ">>> Running one failure-only diagnostic observation for ${TEST_HASH}.narinfo..."
+    DIAGNOSTIC_HTTP_CODE="000"
+    if ! DIAGNOSTIC_HTTP_CODE=$(curl -sS \
+        -o "$DIAGNOSTIC_BODY_FILE" \
+        -D "$DIAGNOSTIC_HEADERS_FILE" \
+        -w "%{http_code}" \
+        "$TEST_WORKER_URL/${TEST_HASH}.narinfo"); then
+        echo ">>> Diagnostic curl failed before receiving an HTTP response."
+    fi
+    echo ">>> Diagnostic observation (not a success gate): HTTP $DIAGNOSTIC_HTTP_CODE"
+    for header in cf-ray x-nixcache-digest x-nixcache-self-healed x-nixcache-shard; do
+        header_value=$(awk -F': ' -v name="$header" \
+            'tolower($1) == tolower(name) { gsub("\\r", "", $2); print $2; exit }' \
+            "$DIAGNOSTIC_HEADERS_FILE" 2>/dev/null || true)
+        echo "    $header: ${header_value:-<missing>}"
+    done
+    if [[ -f "$DIAGNOSTIC_BODY_FILE" ]] && grep -Fq "StorePath: $TEST_STORE_PATH" "$DIAGNOSTIC_BODY_FILE"; then
+        echo ">>> Diagnostic response contains target StorePath: yes"
+    else
+        echo ">>> Diagnostic response contains target StorePath: no"
+    fi
     exit 1
 fi
 

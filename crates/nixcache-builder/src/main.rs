@@ -14,7 +14,9 @@ use nixcache_builder::{
     },
     worker::{BuildWorkerOptions, run_build_worker},
 };
-use nixcache_cli::{DEFAULT_NIXCACHE_REPO, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT};
+use nixcache_cli::{
+    CachePolicyArgs, DEFAULT_NIXCACHE_REPO, DEFAULT_SERVER_LISTEN, DEFAULT_SERVER_PORT,
+};
 use std::{path::Path, process};
 
 #[global_allocator]
@@ -76,6 +78,7 @@ async fn main() -> Result<(), BuilderError> {
                 let targets = args.resolve_targets();
                 let capture_mode = args.resolve_capture_mode();
                 let strict_closure = args.resolve_strict_closure();
+                let baseline_tag = CachePolicyArgs::default().resolve_baseline_tag();
                 let workspace_root = Path::new(".");
 
                 let capture_opts = SessionCaptureOptions {
@@ -86,6 +89,7 @@ async fn main() -> Result<(), BuilderError> {
                     system_opt: system.as_deref(),
                     signing_key_file: signing_key.as_deref(),
                     credentials,
+                    baseline_tag: &baseline_tag,
                     output_receipt_path: output_receipt.as_deref(),
                     proxy_url: Some(&proxy_url),
                     snapshot_before: Some(&snapshot_before),
@@ -125,6 +129,7 @@ async fn main() -> Result<(), BuilderError> {
             let strict = args.resolve_strict();
             let receipt_path = args.resolve_output_receipt(system_name.as_deref());
             let export_concurrency = args.resolve_export_concurrency();
+            let baseline_tag = CachePolicyArgs::default().resolve_baseline_tag();
 
             let build_config = BuildConfig {
                 system: system_name,
@@ -141,6 +146,7 @@ async fn main() -> Result<(), BuilderError> {
                 signing_key_file: signing_key.as_deref(),
                 github_token: &active_token,
                 credentials,
+                baseline_tag: &baseline_tag,
                 output_receipt_path: &receipt_path,
                 strict,
                 export_concurrency,

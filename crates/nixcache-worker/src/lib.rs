@@ -132,6 +132,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                         "remote_error": e.to_string(),
                         "registry": "ghcr.io",
                         "repo": "",
+                        "baseline_tag": "",
                         "tier0_hot_entries": 0,
                         "baseline_entries": 0,
                         "total_unique_entries": 0,

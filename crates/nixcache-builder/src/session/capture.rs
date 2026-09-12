@@ -27,6 +27,7 @@ pub struct SessionCaptureOptions<'a> {
     pub system_opt: Option<&'a str>,
     pub signing_key_file: Option<&'a str>,
     pub credentials: RegistryCredentials,
+    pub baseline_tag: &'a str,
     pub output_receipt_path: Option<&'a Path>,
     pub proxy_url: Option<&'a str>,
     pub snapshot_before: Option<&'a Path>,
@@ -108,8 +109,8 @@ pub async fn run_session_capture(opts: &SessionCaptureOptions<'_>) -> Result<(),
         Default::default(),
     )?;
 
-    // 4. 获取远端已缓存 StoreHash 集合 (从生产基线 cache-index)
-    let all_known_hashes = worker::fetch_remote_arch_hashes(&oci, &system).await;
+    // 4. 获取远端已缓存 StoreHash 集合 (基线 tag 默认 cache-index)
+    let all_known_hashes = worker::fetch_remote_arch_hashes(&oci, &system, opts.baseline_tag).await;
 
     // 5. 先验过滤分类 (直接消费 closure_res.items，零二次 path-info 查询)
     let own_pub_key = get_own_public_key(opts.signing_key_file).await;

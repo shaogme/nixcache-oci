@@ -1,4 +1,4 @@
-name = "nixcache-worker"
+name = "nixcache-worker-e2e"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-04-03"
 
@@ -7,10 +7,10 @@ NIXCACHE_REPO = "YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME"
 NIXCACHE_REGISTRY = "ghcr.io"
 NIXCACHE_UPSTREAM = "https://cache.nixos.org"
 NIXCACHE_INDEX_TTL = "300"
-NIXCACHE_BASELINE_TAG = "cache-index"
+NIXCACHE_BASELINE_TAG = "cache-index-e2e"
 
 [[kv_namespaces]]
-binding = "NIXCACHE_KV"
+binding = "NIXCACHE_KV_E2E"
 id = "nixcache_kv_placeholder"
 
 [build]

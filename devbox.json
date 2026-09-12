@@ -3,7 +3,9 @@
   "packages": [
     "pkg-config@latest",
     "npins@latest",
-    "openssl@latest"
+    "openssl@latest",
+    "shellcheck@latest",
+    "actionlint@latest"
   ],
   "shell": {
     "init_hook": [

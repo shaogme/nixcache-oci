@@ -1,0 +1,75 @@
+name: Deploy Production Cloudflare Worker
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: nixcache-worker-production-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-production-worker:
+    name: Deploy Production Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust Toolchain (with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo Cache
+        uses: actions/cache@main
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-worker-production-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-worker-production-
+
+      - name: Install Node.js
+        uses: actions/setup-node@main
+        with:
+          node-version: 22
+
+      - name: Install worker-build
+        run: |
+          if ! command -v worker-build &>/dev/null; then
+            cargo install -q worker-build
+          fi
+
+      - name: Configure production wrangler.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_KV_ID: ${{ secrets.CLOUDFLARE_KV_ID }}
+          NIXCACHE_REPO: ${{ vars.NIXCACHE_REPO || github.repository }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Missing required secret: CLOUDFLARE_API_TOKEN is not set."
+            exit 1
+          fi
+          if [ -z "$CLOUDFLARE_KV_ID" ]; then
+            echo "::error::Missing required secret: CLOUDFLARE_KV_ID is not set."
+            exit 1
+          fi
+          if [ -z "$NIXCACHE_REPO" ]; then
+            echo "::error::Missing required variable: NIXCACHE_REPO is not set."
+            exit 1
+          fi
+          sed -e "s|YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME|${NIXCACHE_REPO}|g" \
+              -e "s|nixcache_kv_placeholder|${CLOUDFLARE_KV_ID}|g" \
+              crates/nixcache-worker/wrangler.toml.example > crates/nixcache-worker/wrangler.toml
+
+      - name: Deploy Production Worker to Cloudflare
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: "crates/nixcache-worker"
