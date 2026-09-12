@@ -15,6 +15,8 @@ use worker::{Env, js_sys::Date};
 
 pub type WorkerOciClient = OciClient<WorkerFetchTransport>;
 
+pub const DEFAULT_KV_BINDING: &str = "NIXCACHE_KV";
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RefreshResult {
     pub total_entries: usize,
@@ -41,6 +43,7 @@ pub struct WorkerProxyConfig {
     pub registry: String,
     pub repo: String,
     pub baseline_tag: String,
+    pub kv_binding: String,
     pub upstream_caches: Vec<String>,
     pub baseline_ttl_secs: u64,
     pub target_system: SystemArch,
@@ -52,6 +55,7 @@ impl Default for WorkerProxyConfig {
             registry: "ghcr.io".to_string(),
             repo: String::new(),
             baseline_tag: "cache-index".to_string(),
+            kv_binding: DEFAULT_KV_BINDING.to_string(),
             upstream_caches: vec!["https://cache.nixos.org".to_string()],
             baseline_ttl_secs: 300,
             target_system: SystemArch::X86_64Linux,
@@ -292,7 +296,7 @@ impl CacheStore {
         // 2. L2 Cloudflare KV (Content-Addressable: shard_v8_{blob_digest})
         let kv_key = format!("shard_v8_{}", blob_digest);
 
-        if let Ok(kv) = env.kv("NIXCACHE_KV")
+        if let Ok(kv) = env.kv(&self.config.kv_binding)
             && let Ok(Some(wrapper)) = kv
                 .get(&kv_key)
                 .json::<KVCacheWrapper<ShardDataPayload>>()
@@ -326,7 +330,7 @@ impl CacheStore {
                 self.set_remote_status(true, None);
                 let nar_lookup = build_nar_lookup_map(&payload.entries);
 
-                if let Ok(kv) = env.kv("NIXCACHE_KV") {
+                if let Ok(kv) = env.kv(&self.config.kv_binding) {
                     let wrapper = KVCacheWrapper {
                         data: payload.clone(),
                         last_refresh: now,
@@ -356,7 +360,7 @@ impl CacheStore {
             }
             Err(e) => {
                 self.set_remote_status(false, Some(format!("GHCR shard {}: {}", blob_digest, e)));
-                if let Ok(kv) = env.kv("NIXCACHE_KV")
+                if let Ok(kv) = env.kv(&self.config.kv_binding)
                     && let Ok(Some(wrapper)) = kv
                         .get(&kv_key)
                         .json::<KVCacheWrapper<ShardDataPayload>>()
@@ -389,9 +393,9 @@ impl CacheStore {
 
         // 2. L2 Cloudflare KV (单原子 baseline_v8_{system})
         let kv = env
-            .kv("NIXCACHE_KV")
+            .kv(&self.config.kv_binding)
             .map_err(|e| WorkerStoreError::KvGetFailed {
-                key: "NIXCACHE_KV".to_string(),
+                key: self.config.kv_binding.clone(),
                 message: e.to_string(),
             })?;
         let baseline_key = format!("baseline_v8_{}", self.config.target_system.as_str());
@@ -481,9 +485,9 @@ impl CacheStore {
         }
 
         let kv = env
-            .kv("NIXCACHE_KV")
+            .kv(&self.config.kv_binding)
             .map_err(|e| WorkerStoreError::KvGetFailed {
-                key: "NIXCACHE_KV".to_string(),
+                key: self.config.kv_binding.clone(),
                 message: e.to_string(),
             })?;
         let baseline_key = format!("baseline_v8_{}", self.config.target_system.as_str());
@@ -521,7 +525,7 @@ impl CacheStore {
         let old_shards = if let Some(cached) = WorkerState::global().mem_baseline_cache.load_full()
         {
             cached.root.shards.clone()
-        } else if let Ok(kv) = env.kv("NIXCACHE_KV") {
+        } else if let Ok(kv) = env.kv(&self.config.kv_binding) {
             let baseline_key = format!("baseline_v8_{}", self.config.target_system.as_str());
             if let Ok(Some(wrapper)) = kv
                 .get(&baseline_key)
@@ -601,7 +605,7 @@ impl CacheStore {
             Ok((ref b, ref digest)) => (b.total_entries(), digest.clone(), b.generated.clone()),
             Err(_) => {
                 let baseline_key = format!("baseline_v8_{}", self.config.target_system.as_str());
-                let kv_data = match env.kv("NIXCACHE_KV") {
+                let kv_data = match env.kv(&self.config.kv_binding) {
                     Ok(kv) => kv
                         .get(&baseline_key)
                         .json::<KVCacheWrapper<ShardedArchCacheIndexData>>()
@@ -717,6 +721,7 @@ mod tests {
         let config = WorkerProxyConfig::default();
         assert_eq!(config.registry, "ghcr.io");
         assert_eq!(config.baseline_tag, "cache-index");
+        assert_eq!(config.kv_binding, "NIXCACHE_KV");
         assert_eq!(config.baseline_ttl_secs, 300);
         assert_eq!(config.target_system, SystemArch::X86_64Linux);
     }

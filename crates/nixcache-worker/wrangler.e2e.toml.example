@@ -8,6 +8,7 @@ NIXCACHE_REGISTRY = "ghcr.io"
 NIXCACHE_UPSTREAM = "https://cache.nixos.org"
 NIXCACHE_INDEX_TTL = "300"
 NIXCACHE_BASELINE_TAG = "cache-index-e2e"
+NIXCACHE_KV_BINDING = "NIXCACHE_KV_E2E"
 
 [[kv_namespaces]]
 binding = "NIXCACHE_KV_E2E"

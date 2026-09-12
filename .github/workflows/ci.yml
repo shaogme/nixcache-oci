@@ -230,6 +230,7 @@ jobs:
           NIXCACHE_REGISTRY: ${{ vars.NIXCACHE_REGISTRY || 'ghcr.io' }}
           NIXCACHE_UPSTREAM: ${{ vars.NIXCACHE_UPSTREAM || 'https://cache.nixos.org' }}
           NIXCACHE_INDEX_TTL: ${{ vars.NIXCACHE_INDEX_TTL || '300' }}
+          NIXCACHE_KV_BINDING: ${{ vars.NIXCACHE_KV_BINDING || 'NIXCACHE_KV_E2E' }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "::error::Missing required secret: CLOUDFLARE_API_TOKEN is not set."
@@ -244,6 +245,7 @@ jobs:
             exit 1
           fi
           sed -e "s|YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME|${NIXCACHE_REPO}|g" \
+              -e "s|NIXCACHE_KV_E2E|${NIXCACHE_KV_BINDING}|g" \
               -e "s|nixcache_kv_placeholder|${CLOUDFLARE_E2E_KV_ID}|g" \
               crates/nixcache-worker/wrangler.e2e.toml.example > crates/nixcache-worker/wrangler.toml
 

@@ -35,7 +35,7 @@ wrangler kv namespace create NIXCACHE_KV
 binding = "NIXCACHE_KV"
 id = "your-kv-namespace-id"
 ```
-将该输出中的 `id` 复制并替换到 `wrangler.toml` 文件中相应的 `id` 占位符上。
+将该输出中的 `id` 复制并替换到 `wrangler.toml` 文件中相应的 `id` 占位符上。`binding` 是 Worker 访问该命名空间时使用的名称，可以自定义。
 
 ### 3. 配置环境变量 (`wrangler.toml`)
 打开 [wrangler.toml](./wrangler.toml) 并根据您的需求修改环境变量：
@@ -43,6 +43,16 @@ id = "your-kv-namespace-id"
 - `NIXCACHE_UPSTREAM` (选填): 多个上游缓存源（如 `https://cache.nixos.org`），以空格或逗号分隔。
 - `NIXCACHE_INDEX_TTL` (选填): 索引在 KV 和内存中的最大缓存时间（默认 300 秒）。
 - `NIXCACHE_BASELINE_TAG` (选填): OCI baseline tag，生产默认 `cache-index`。
+- `NIXCACHE_KV_BINDING` (选填): Cloudflare KV binding 名称，必须与 `[[kv_namespaces]]` 中的 `binding` 完全一致，默认 `NIXCACHE_KV`。
+
+例如，若 binding 改为 `NIXCACHE_KV_E2E`，请同时配置：
+```toml
+[vars]
+NIXCACHE_KV_BINDING = "NIXCACHE_KV_E2E"
+
+[[kv_namespaces]]
+binding = "NIXCACHE_KV_E2E"
+```
 
 > [!IMPORTANT]
 > `NIXCACHE_REPO` 为必填项。在 `wrangler.toml` 中其默认配置为占位符 `"YOUR_GITHUB_USERNAME_OR_ORG/YOUR_REPO_NAME"`，你必须修改该配置。若保持默认占位符不改动，代理服务运行时将直接报错拦截。
@@ -61,7 +71,7 @@ wrangler deploy
 ```
 Wrangler 将自动调用 `worker-build` 编译 Rust 项目为 WASM，并将其上传发布至 Cloudflare 边缘。
 
-仓库中的 [`wrangler.toml.example`](./wrangler.toml.example) 是生产 Worker 模板，读取 `cache-index`；[`wrangler.e2e.toml.example`](./wrangler.e2e.toml.example) 是 CI 专用 E2E 模板，使用独立 Worker、独立 KV 和 `cache-index-e2e`。E2E KV 的 ID 只能通过 CI secret 注入。由 Wrangler 生成的本地 `wrangler.toml` 已被 Git 忽略。
+仓库中的 [`wrangler.toml.example`](./wrangler.toml.example) 是生产 Worker 模板，读取 `cache-index`；[`wrangler.e2e.toml.example`](./wrangler.e2e.toml.example) 是 CI 专用 E2E 模板，使用独立 Worker、独立 KV binding `NIXCACHE_KV_E2E` 和 `cache-index-e2e`。E2E KV 的 ID 只能通过 CI secret 注入。由 Wrangler 生成的本地 `wrangler.toml` 已被 Git 忽略。
 
 ---
 

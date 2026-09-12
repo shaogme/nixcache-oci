@@ -4,7 +4,7 @@ mod store;
 mod transport;
 
 use crate::{
-    store::{CacheStore, WorkerOciClient, WorkerProxyConfig},
+    store::{CacheStore, DEFAULT_KV_BINDING, WorkerOciClient, WorkerProxyConfig},
     transport::WorkerFetchTransport,
 };
 pub use error::WorkerStoreError;
@@ -41,6 +41,13 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "cache-index".to_string());
 
+    let kv_binding = env
+        .var("NIXCACHE_KV_BINDING")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|binding| !binding.is_empty())
+        .unwrap_or_else(|| DEFAULT_KV_BINDING.to_string());
+
     let upstream_str = env
         .var("NIXCACHE_UPSTREAM_CACHES")
         .or_else(|_| env.var("NIXCACHE_UPSTREAM"))
@@ -63,6 +70,7 @@ pub fn get_worker_config(env: &Env) -> Result<WorkerProxyConfig> {
         registry,
         repo,
         baseline_tag,
+        kv_binding,
         upstream_caches,
         baseline_ttl_secs,
         target_system,
