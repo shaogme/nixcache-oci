@@ -374,7 +374,9 @@ impl SystemArch {
 
     /// 探测当前运行环境的系统架构 (基于运行时 OS/ARCH，零子进程开销)
     pub fn detect_current() -> Self {
-        let os = env::consts::OS;
+        // Rust reports macOS as `macos`, while OCI platform metadata uses
+        // `darwin` for the same operating system.
+        let os = normalize_runtime_os(env::consts::OS);
         let arch = env::consts::ARCH;
         let detected = Self::from_oci(os, arch, None);
         if detected.is_known() {
@@ -392,6 +394,13 @@ impl SystemArch {
         } else {
             Err(TypeError::UnknownSystemArch { raw: s.to_string() })
         }
+    }
+}
+
+fn normalize_runtime_os(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        os => os,
     }
 }
 
@@ -1676,5 +1685,16 @@ impl<'de> Deserialize<'de> for BuildReceipt {
             .validate_structure()
             .map_err(serde::de::Error::custom)?;
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_runtime_os;
+
+    #[test]
+    fn normalize_runtime_os_maps_macos_to_darwin() {
+        assert_eq!(normalize_runtime_os("macos"), "darwin");
+        assert_eq!(normalize_runtime_os("linux"), "linux");
     }
 }
